@@ -37,13 +37,21 @@ public class LogFileWriter implements LogFile.Writer {
     private LogFileWriterContext context;
     private LogFileFormatWriter writer;
     private boolean closed = false;
+    private long generation;
 
     public LogFileWriter() {
-
     }
 
     public LogFileWriterContext getContext() {
         return context;
+    }
+
+    public void setGeneration(long generation) {
+        this.generation = generation;
+    }
+
+    public long getGeneration() {
+        return generation;
     }
 
     @Override
@@ -112,7 +120,7 @@ public class LogFileWriter implements LogFile.Writer {
     @Override
     public String toString() {
         return "LogFileWriter [writerContext=" + context + ", formatWriter=" + writer
-            + ", closed=" + closed + "]";
+            + ", closed=" + closed + ", generation=" + generation + "]";
     }
 
 }
