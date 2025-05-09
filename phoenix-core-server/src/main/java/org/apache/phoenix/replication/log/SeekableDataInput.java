@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,10 +15,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.phoenix.hbase.index.balancer;
+package org.apache.phoenix.replication.log;
 
-import org.apache.hadoop.hbase.master.balancer.StochasticLoadBalancer;
+import java.io.Closeable;
+import java.io.DataInput;
+import java.io.IOException;
+import org.apache.hadoop.fs.PositionedReadable;
+import org.apache.hadoop.fs.Seekable;
 
-public class IndexLoadBalancer extends StochasticLoadBalancer {
+/**
+ * The parts of the HDFS FSDataInputStream interface contract that we want to generalize.
+ */
+public interface SeekableDataInput extends DataInput, Closeable, Seekable, PositionedReadable {
+
+  int read(byte[] buf) throws IOException;
+
+  int read(byte[] buf, int pos, int len) throws IOException;
 
 }

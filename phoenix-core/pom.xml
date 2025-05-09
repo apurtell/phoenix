@@ -127,6 +127,11 @@
       <artifactId>hbase-mapreduce</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-compression-aircompressor</artifactId>
+      <scope>test</scope>
+    </dependency>
 
     <!-- HBase Adjacent Dependencies -->
     <dependency>
@@ -460,6 +465,7 @@
             <ignoredUnusedDeclaredDependency>org.apache.logging.log4j:log4j-1.2-api</ignoredUnusedDeclaredDependency>
             <ignoredUnusedDeclaredDependency>org.slf4j:jul-to-slf4j</ignoredUnusedDeclaredDependency>
             <ignoredUnusedDeclaredDependency>org.slf4j:jcl-over-slf4j</ignoredUnusedDeclaredDependency>
+            <ignoredUnusedDeclaredDependency>org.apache.hbase:hbase-compression-aircompressor</ignoredUnusedDeclaredDependency>
           </ignoredUnusedDeclaredDependencies>
           <ignoredNonTestScopedDependencies>
             <ignoredNonTestScopedDependency>org.apache.phoenix:phoenix-core-client</ignoredNonTestScopedDependency>
