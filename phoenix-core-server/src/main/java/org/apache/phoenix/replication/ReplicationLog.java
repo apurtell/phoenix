@@ -570,7 +570,7 @@ public class ReplicationLog {
         }
     }
 
-    static class Record {
+    protected static class Record {
         public String tableName;
         public long commitId;
         public Mutation mutation;
@@ -583,7 +583,7 @@ public class ReplicationLog {
     }
 
     // Event structure for the Disruptor ring buffer
-    static class LogEvent {
+    protected static class LogEvent {
         public static final EventFactory<LogEvent> EVENT_FACTORY = LogEvent::new;
 
         public byte type;
@@ -591,7 +591,8 @@ public class ReplicationLog {
         public CompletableFuture<Void> syncFuture; // Used only for SYNC events
         public long sequence; // Sequence number for tracking
 
-        public void setValues(byte type, Record record, CompletableFuture<Void> syncFuture, long sequence) {
+        public void setValues(byte type, Record record, CompletableFuture<Void> syncFuture,
+                long sequence) {
             this.type = type;
             this.record = record;
             this.syncFuture = syncFuture;
@@ -600,7 +601,7 @@ public class ReplicationLog {
     }
 
     // Handles events from the Disruptor
-    class LogEventHandler implements EventHandler<LogEvent> {
+    protected class LogEventHandler implements EventHandler<LogEvent> {
         private final int maxRetries; // Configurable max retries for sync
         private final List<Record> currentBatch = new ArrayList<>();
 
@@ -618,8 +619,8 @@ public class ReplicationLog {
             long generation = writer.getGeneration();
             while (attempt <= maxRetries) {
                 try {
-                    // If the writer has been rotated, we need to replay the current batch of in-flight
-                    // appends into the new writer.
+                    // If the writer has been rotated, we need to replay the current batch of
+                    // in-flight appends into the new writer.
                     if (writer.getGeneration() > generation) {
                         generation = writer.getGeneration();
                         for (Record r: currentBatch) {
@@ -630,8 +631,8 @@ public class ReplicationLog {
                     case EVENT_TYPE_DATA:
                         writer.append(event.record.tableName, event.record.commitId,
                             event.record.mutation);
-                        // Add to current batch after we attempt to append, so we don't replay it
-                        // twice.
+                        // Add to current batch only after we succeed at appending, so we don't
+                        // replay it twice.
                         currentBatch.add(event.record);
                         return;
                     case EVENT_TYPE_SYNC:
@@ -668,7 +669,7 @@ public class ReplicationLog {
      * data loss. Users of the writer will immediately notice it is closed by the resulting
      * IOExceptions and can take whatever steps are necessary to recover (or abort).
      */
-    class LogExceptionHandler implements ExceptionHandler<LogEvent> {
+    protected class LogExceptionHandler implements ExceptionHandler<LogEvent> {
         @Override
         public void handleEventException(Throwable e, long sequence, LogEvent event) {
             String message = "Exception processing sequence " + sequence + "  for event " + event;
