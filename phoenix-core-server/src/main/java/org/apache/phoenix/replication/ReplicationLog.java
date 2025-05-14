@@ -429,17 +429,22 @@ public class ReplicationLog {
     protected LogFileWriter rotateLog() throws IOException {
         lock.lock(); // Lock is reentrant, so this is fine.
         try {
+            // Try to get the new writer first. If it fails we continue using the current writer.
+            // Increment the writer generation
+            LogFileWriter newWriter = createNewWriter(standbyFs, standbyUrl);
+            LOG.debug("Created new writer: {}", newWriter);
             // Close the current writer
             if (currentWriter != null) {
                 LOG.debug("Closing current writer: {}", currentWriter);
                 closeWriter(currentWriter);
-                currentWriter = null;
             }
-            // Increment the writer generation
-            currentWriter = createNewWriter(standbyFs, standbyUrl);
-            LOG.debug("Created new writer: {}", currentWriter);
-            lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
+            currentWriter = newWriter;
             return currentWriter;
+        } catch (IOException e) {
+            LOG.warn("Exception while attempting to rotate the log writer", e);
+            // Update the last rotation time anyway. We will try again next time.
+            lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
+            throw e; // Rethrow
         } finally {
             lock.unlock();
         }

@@ -94,7 +94,7 @@ public class ReplicationLogTest {
         // Small size threshold for testing
         conf.setLong(ReplicationLog.REPLICATION_LOG_ROTATION_SIZE_BYTES_KEY, TEST_ROTATION_SIZE_BYTES);
 
-        logWriter = new TestableReplicationLogWriter(conf, serverName);
+        logWriter = spy(new TestableReplicationLogWriter(conf, serverName));
         logWriter.init();
     }
 
@@ -500,6 +500,41 @@ public class ReplicationLogTest {
         verify(writerBeforeRotation, times(1)).sync();
         // Verify the initial writer was closed
         verify(writerBeforeRotation, times(1)).close();
+    }
+
+    @Test
+    public void testFailedRotation() throws Exception {
+        final String tableName = "TBLFR";
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+        long commitId = 1L;
+
+        // Get the initial writer
+        LogFileWriter initialWriter = logWriter.getWriter();
+        assertNotNull("Initial writer should not be null", initialWriter);
+
+        // Append some data
+        logWriter.append(tableName, commitId, put);
+        logWriter.sync();
+
+        // Now configure the log writer to fail when creating new writers
+        doThrow(new IOException("Simulated failure to create new writer"))
+            .when(logWriter).createNewWriter(any(FileSystem.class), any(URI.class));
+
+        // Wait for rotation time to elapse plus a small buffer
+        Thread.sleep((long)(TEST_ROTATION_TIME * 1.25));
+
+        // Try to append more data - this should still work with the original writer
+        logWriter.append(tableName, commitId + 1, put);
+        logWriter.sync();
+
+        // Verify we're still using the original writer
+        LogFileWriter currentWriter = logWriter.getWriter();
+        assertTrue("Should still be using original writer", currentWriter == initialWriter);
+
+        // Verify all operations went to the original writer
+        verify(initialWriter, times(1)).append(eq(tableName), eq(commitId), eq(put));
+        verify(initialWriter, times(1)).append(eq(tableName), eq(commitId + 1), eq(put));
+        verify(initialWriter, times(2)).sync();
     }
 
     static class TestableReplicationLogWriter extends ReplicationLog {
