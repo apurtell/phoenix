@@ -350,7 +350,7 @@ public class ReplicationLog {
         }
     }
 
-    private long getRotationCheckInterval(long rotationTimeMs) {
+    protected long getRotationCheckInterval(long rotationTimeMs) {
         long interval;
         if (rotationTimeMs > 0) {
             interval = rotationTimeMs / 4;
@@ -519,6 +519,20 @@ public class ReplicationLog {
         }
     }
 
+    /** Force closes the log upon an unrecoverable internal error. */
+    protected void closeOnError() {
+        // Stop the time based rotation check.
+        stopRotationExecutor();
+        // We expect a final sync will not work. Just close the inner writer.
+        if (currentWriter != null) {
+            closeWriter(currentWriter);
+            currentWriter = null;
+        }
+        // Directly halt the disruptor. shutdown() would wait for events to drain. We are expecting
+        // that will not work.
+        disruptor.halt();
+    }
+
     /** Closes the log. */
     public void close() {
         // Stop the time based rotation check.
@@ -683,20 +697,20 @@ public class ReplicationLog {
         public void handleEventException(Throwable e, long sequence, LogEvent event) {
             String message = "Exception processing sequence " + sequence + "  for event " + event;
             LOG.error(message, e);
-            close();
+            closeOnError();
         }
 
         @Override
         public void handleOnStartException(Throwable e) {
             LOG.error("Exception during Disruptor startup", e);
-            close();
+            closeOnError();
         }
 
         @Override
         public void handleOnShutdownException(Throwable e) {
             // Should not happen, but if it does, the regionserver is aborting or shutting down.
             LOG.error("Exception during Disruptor shutdown", e);
-            close();
+            closeOnError();
         }
     }
 

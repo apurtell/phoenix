@@ -537,6 +537,42 @@ public class ReplicationLogTest {
         verify(initialWriter, times(2)).sync();
     }
 
+    @Test
+    public void testEventProcessingException() throws Exception {
+        final String tableName = "TBLEPE";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the inner writer
+        LogFileWriter innerWriter = logWriter.getWriter();
+        assertNotNull("Writer should not be null", innerWriter);
+
+        // Configure writer to throw a RuntimeException on append
+        doThrow(new RuntimeException("Simulated critical error"))
+            .when(innerWriter).append(anyString(), anyLong(), any(Mutation.class));
+
+        // Append data. This should trigger the LogExceptionHandler, which will close logWriter.
+        logWriter.append(tableName, commitId, put);
+        try {
+            logWriter.sync();
+            fail("Should have thrown IOException because sync timed out");
+        } catch (IOException e) {
+            assertTrue("Expected timeout exception", e.getCause() instanceof TimeoutException);
+        }
+
+        // Verify that subsequent operations fail because the log is closed
+        try {
+            logWriter.append(tableName, commitId + 1, put);
+            fail("Should have thrown IOException because log is closed");
+        } catch (IOException e) {
+          assertTrue("Expected an IOException because log is closed",
+              e.getMessage().contains("Closed"));
+        }
+
+        // Verify that the inner writer was closed by the LogExceptionHandler
+        verify(innerWriter, times(1)).close();
+    }
+
     static class TestableReplicationLogWriter extends ReplicationLog {
 
         protected TestableReplicationLogWriter(Configuration conf, ServerName serverName) {
