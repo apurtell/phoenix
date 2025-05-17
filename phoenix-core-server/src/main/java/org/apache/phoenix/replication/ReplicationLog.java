@@ -442,10 +442,14 @@ public class ReplicationLog {
             return currentWriter;
         } catch (IOException e) {
             LOG.warn("Exception while attempting to rotate the log writer", e);
-            // Update the last rotation time anyway. We will try again next time.
-            lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
             throw e; // Rethrow
         } finally {
+            // Update the last rotation time no matter what. We will try again next time. We do
+            // this so we are not constantly trying to rotate the log instead of making progress
+            // with the existing writer when there is some hopefully transient issue during
+            // rolling.
+            // TODO: Escalate error response after some consecutive number of failed rolls.
+            lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
             lock.unlock();
         }
     }
