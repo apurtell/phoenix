@@ -573,6 +573,39 @@ public class ReplicationLogTest {
         verify(innerWriter, times(1)).close();
     }
 
+    @Test
+    public void testSyncFailureAllRetriesExhausted() throws Exception {
+        final String tableName = "TBLSAFR";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the initial writer
+        LogFileWriter initialWriter = logWriter.getWriter();
+        assertNotNull("Initial writer should not be null", initialWriter);
+
+        // Configure initial writer to fail on sync
+        doThrow(new IOException("Simulated sync failure"))
+            .when(initialWriter).sync();
+
+        // createNewWriter should keep returning the bad writer
+        doAnswer(invocation -> initialWriter).when(logWriter)
+            .createNewWriter(any(FileSystem.class), any(URI.class));
+
+        // Append data
+        logWriter.append(tableName, commitId, put);
+
+        // Try to sync. Should fail after exhausting retries.
+        try {
+            logWriter.sync();
+            fail("Expected sync to fail after exhausting retries");
+        } catch (IOException e) {
+            assertTrue("Expected timeout exception", e.getCause() instanceof TimeoutException);
+        }
+
+        // Each retry creates a new writer, so that is 1 + 5 retries.
+        verify(logWriter, times(6)).createNewWriter(any(FileSystem.class), any(URI.class));
+    }
+
     static class TestableReplicationLogWriter extends ReplicationLog {
 
         protected TestableReplicationLogWriter(Configuration conf, ServerName serverName) {

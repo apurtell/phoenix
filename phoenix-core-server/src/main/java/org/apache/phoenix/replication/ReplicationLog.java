@@ -543,11 +543,11 @@ public class ReplicationLog {
             // Sync before shutting down to flush all pending appends.
             try {
                 sync();
+                disruptor.shutdown(); // Wait for a clean shutdown.
             } catch (IOException e) {
                 LOG.warn("Error during final sync on close", e);
+                disruptor.halt(); // Go directly to halt.
             }
-            // Wait for the disruptor to drain all posted events.
-            disruptor.shutdown(); // Wait for a clean shutdown.
             closeWriter(currentWriter);
             currentWriter = null;
         }
@@ -640,7 +640,7 @@ public class ReplicationLog {
             int attempt = 0;
             LogFileWriter writer = getWriter();
             long generation = writer.getGeneration();
-            while (attempt <= maxRetries) {
+            while (attempt < maxRetries) {
                 try {
                     // If the writer has been rotated, we need to replay the current batch of
                     // in-flight appends into the new writer.
