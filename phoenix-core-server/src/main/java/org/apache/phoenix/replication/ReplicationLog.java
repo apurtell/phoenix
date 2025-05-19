@@ -320,7 +320,7 @@ public class ReplicationLog {
             } catch (URISyntaxException e) {
                 throw new IOException(REPLICATION_FALLBACK_HDFS_URL_KEY + " is not valid", e);
             }
-            this.fallbackFs = FileSystem.get(fallbackUrl, conf);
+            this.fallbackFs = getFileSystem(fallbackUrl);
             Path fallbackLogDir = new Path(fallbackUrl.getPath());
             if (!fallbackFs.exists(fallbackLogDir)) {
                 LOG.info("Creating directory {}", fallbackUrlString);
@@ -340,7 +340,7 @@ public class ReplicationLog {
         }
         // Configuration is sorted, and possibly store-and-forward directories have been created,
         // now create the standby side directories as needed.
-        this.standbyFs = FileSystem.get(standbyUrl, conf);
+        this.standbyFs = getFileSystem(standbyUrl);
         Path standbyLogDir = new Path(standbyUrl.getPath());
         if (!standbyFs.exists(standbyLogDir)) {
             LOG.info("Creating directory {}", standbyUrlString);
@@ -348,6 +348,10 @@ public class ReplicationLog {
                 throw new IOException("Failed to create directory: " + standbyUrlString);
             }
         }
+    }
+
+    protected FileSystem getFileSystem(URI uri) throws IOException {
+        return FileSystem.get(uri, conf);
     }
 
     protected long getRotationCheckInterval(long rotationTimeMs) {

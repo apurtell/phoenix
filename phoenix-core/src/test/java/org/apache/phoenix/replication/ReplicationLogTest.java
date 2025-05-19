@@ -655,6 +655,28 @@ public class ReplicationLogTest {
         verify(writerBeforeRotation, times(1)).close();
     }
 
+    @Test
+    public void testFsInitFailure() throws Exception {
+        // Create a mock FileSystem that fails to create directories
+        FileSystem mockFs = Mockito.mock(FileSystem.class);
+        doThrow(new IOException("Failed to create directory")).when(mockFs)
+            .mkdirs(any(Path.class));
+        // Create a new ReplicationLog instance with the mock FileSystem
+        ReplicationLog logWriter = new TestableReplicationLogWriter(conf, serverName) {
+            @Override
+            protected FileSystem getFileSystem(URI uri) throws IOException {
+                return mockFs;
+            }
+        };
+        // Attempt to initialize. Should fail fast and throw an IOException.
+        try {
+            logWriter.init();
+            fail("Expected IOException during initialization");
+        } catch (IOException e) {
+            // Expected
+        }
+    }
+
     static class TestableReplicationLogWriter extends ReplicationLog {
 
         protected TestableReplicationLogWriter(Configuration conf, ServerName serverName) {
