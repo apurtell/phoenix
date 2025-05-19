@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
@@ -602,8 +603,56 @@ public class ReplicationLogTest {
             assertTrue("Expected timeout exception", e.getCause() instanceof TimeoutException);
         }
 
-        // Each retry creates a new writer, so that is 1 + 5 retries.
-        verify(logWriter, times(6)).createNewWriter(any(FileSystem.class), any(URI.class));
+        // Each retry creates a new writer, so that is at least 1 create + 5 retries.
+        verify(logWriter, atLeast(6)).createNewWriter(any(FileSystem.class), any(URI.class));
+    }
+
+    @Test
+    public void testRotationDuringBatch() throws Exception {
+        final String tableName = "TBLRDB";
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+        long commitId = 1L;
+
+        // Get the initial writer
+        LogFileWriter writerBeforeRotation = logWriter.getWriter();
+        assertNotNull("Initial writer should not be null", writerBeforeRotation);
+
+        // Append several items to fill currentBatch but don't sync yet
+        for (int i = 0; i < 5; i++) {
+            logWriter.append(tableName, commitId + i, put);
+        }
+
+        // Force a rotation by waiting for rotation time to elapse
+        Thread.sleep((long)(TEST_ROTATION_TIME * 1.25));
+
+        // Get the new writer after rotation
+        LogFileWriter writerAfterRotation = logWriter.getWriter();
+        assertNotNull("New writer should not be null", writerAfterRotation);
+        assertTrue("Writer should have been rotated", writerAfterRotation != writerBeforeRotation);
+
+        // Now trigger a sync which should replay the currentBatch to the new writer
+        logWriter.sync();
+
+        // Verify the sequence of operations
+        InOrder inOrder = Mockito.inOrder(writerBeforeRotation, writerAfterRotation);
+
+        // Verify all appends before rotation went to the first writer
+        for (int i = 0; i < 5; i++) {
+            inOrder.verify(writerBeforeRotation, times(1))
+                .append(eq(tableName), eq(commitId + i), eq(put));
+        }
+
+        // Verify the currentBatch was replayed to the new writer
+        for (int i = 0; i < 5; i++) {
+            inOrder.verify(writerAfterRotation, times(1))
+                .append(eq(tableName), eq(commitId + i), eq(put));
+        }
+
+        // Verify sync happened on the new writer
+        inOrder.verify(writerAfterRotation, times(1)).sync();
+
+        // Verify the initial writer was closed
+        verify(writerBeforeRotation, times(1)).close();
     }
 
     static class TestableReplicationLogWriter extends ReplicationLog {

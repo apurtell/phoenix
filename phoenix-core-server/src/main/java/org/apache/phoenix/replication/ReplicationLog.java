@@ -627,24 +627,27 @@ public class ReplicationLog {
     protected class LogEventHandler implements EventHandler<LogEvent> {
         private final int maxRetries; // Configurable max retries for sync
         private final List<Record> currentBatch = new ArrayList<>();
+        private LogFileWriter writer;
+        private long generation;
 
-        LogEventHandler() {
+        LogEventHandler() throws IOException {
             this.maxRetries = conf.getInt(REPLICATION_LOG_SYNC_RETRIES_KEY,
                 DEFAULT_REPLICATION_LOG_SYNC_RETRIES);
+            this.writer = getWriter();
+            this.generation = writer.getGeneration();
         }
 
-        @SuppressWarnings("resource")
         @Override
         public void onEvent(LogEvent event, long sequence, boolean endOfBatch) throws Exception {
+            writer = getWriter();
             CompletableFuture<Void> futureToComplete = null;
             int attempt = 0;
-            LogFileWriter writer = getWriter();
-            long generation = writer.getGeneration();
             while (attempt < maxRetries) {
                 try {
                     // If the writer has been rotated, we need to replay the current batch of
                     // in-flight appends into the new writer.
                     if (writer.getGeneration() > generation) {
+                        LOG.trace("Writer has been rotated, replaying in-flight batch");
                         generation = writer.getGeneration();
                         for (Record r: currentBatch) {
                             writer.append(r.tableName,  r.commitId,  r.mutation);
