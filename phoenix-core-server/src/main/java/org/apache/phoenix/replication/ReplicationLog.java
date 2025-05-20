@@ -60,8 +60,53 @@ import com.lmax.disruptor.dsl.ProducerType;
  * rotation based on time and size thresholds and provides the currently active LogFileWriter.
  * This class is intended to be thread-safe.
  * <p>
- * TODO: This class will switch between active (synchronous) and store-and-forward fallback
- * writer depending on error handling/retry strategy.
+ * Architecture Overview:
+ * <pre>
+ * ┌──────────────────────────────────────────────────────────────────────┐
+ * │                           ReplicationLog                             │
+ * │                                                                      │
+ * │  ┌─────────────┐     ┌────────────────────────────────────────────┐  │
+ * │  │             │     │                                            │  │
+ * │  │  Producers  │     │  Disruptor Ring Buffer                     │  │
+ * │  │  (append/   │────▶│  ┌─────────┐ ┌─────────┐ ┌─────────┐       │  │
+ * │  │   sync)     │     │  │ Event 1 │ │ Event 2 │ │ Event 3 │ ...   │  │
+ * │  │             │     │  └─────────┘ └─────────┘ └─────────┘       │  │
+ * │  └─────────────┘     └────────────────────────────────────────────┘  │
+ * │                                │                                     │
+ * │                                │                                     │
+ * │                                ▼                                     │
+ * │  ┌─────────────────────────────────────────────────────────────┐     │
+ * │  │                                                             │     │
+ * │  │  LogEventHandler                                            │     │
+ * │  │  ┌──────────────────────────────────────────────────────┐   │     │
+ * │  │  │                                                      │   │     │
+ * │  │  │  - Batch Management                                  │   │     │
+ * │  │  │  - Writer Rotation                                   │   │     │
+ * │  │  │  - Error Handling                                    │   │     │
+ * │  │  │  - Mode Transitions                                  │   │     │
+ * │  │  │                                                      │   │     │
+ * │  │  └──────────────────────────────────────────────────────┘   │     │
+ * │  │                             │                               │     │
+ * │  │                             ▼                               │     │
+ * │  │  ┌──────────────────────────────────────────────────────┐   │     │
+ * │  │  │                                                      │   │     │
+ * │  │  │  LogFileWriter                                       │   │     │
+ * │  │  │  - File Management                                   │   │     │
+ * │  │  │  - Compression                                       │   │     │
+ * │  │  │  - HDFS Operations                                   │   │     │
+ * │  │  │                                                      │   │     │
+ * │  │  └──────────────────────────────────────────────────────┘   │     │
+ * │  └─────────────────────────────────────────────────────────────┘     │
+ * └──────────────────────────────────────────────────────────────────────┘
+ * </pre>
+ * <p>
+ * The Disruptor provides a high-performance ring buffer that decouples the API from the complexity
+ * of writer management. Producers (callers of append/sync) simply publish events to the ring
+ * buffer and generally return quickly. The LogEventHandler processes these events asynchronously,
+ * handling all the complexity of batching mutations for efficiency, rotating writers based on time
+ * or size, error handling and retries, and mode transitions for store-and-forward. This architecture
+ * allows the API to remain simple and non-blocking, except for sync, while the complex writer
+ * management logic is handled asynchronously.
  */
 @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = { "EI_EXPOSE_REP", "EI_EXPOSE_REP2" },
     justification = "Intentional")
@@ -141,6 +186,81 @@ public class ReplicationLog {
     private Disruptor<LogEvent> disruptor;
     private RingBuffer<LogEvent> ringBuffer;
     private final ConcurrentHashMap<Path,Object> shardMap = new ConcurrentHashMap<>();
+
+    /**
+     * Tracks the current replication mode of the ReplicationLog.
+     * <p>
+     * The replication mode determines how mutations are handled:
+     * <ul>
+     *   <li>SYNC: Normal operation where mutations are written directly to the standby cluster's
+     *   HDFS.
+     *   This is the default and primary mode of operation.</li>
+     *   <li>STORE_AND_FORWARD: Fallback mode when the standby cluster's HDFS is unavailable.
+     *   Mutations are stored locally and will be forwarded when connectivity is restored.</li>
+     *   <li>SYNC_AND_FORWARD: Transitional mode where new mutations are written directly to the
+     *   standby cluster while concurrently draining the local queue of previously stored
+     *   mutations.</li>
+     * </ul>
+     * <p>
+     * Mode transitions occur automatically based on the availability of the standby cluster's HDFS
+     * and the state of the local mutation queue.
+     */
+    protected enum ReplicationMode {
+        /**
+         * Normal operation where mutations are written directly to the standby cluster's HDFS.
+         * This is the default and primary mode of operation.
+         */
+        SYNC,
+
+        /**
+         * Fallback mode when the standby cluster's HDFS is unavailable. Mutations are stored
+         * locally and will be forwarded when connectivity is restored.
+         */
+        STORE_AND_FORWARD,
+
+        /**
+         * Transitional mode where new mutations are written directly to the standby cluster
+         * while concurrently draining the local queue of previously stored mutations. This mode
+         * is entered when connectivity to the standby cluster is restored while there are still
+         * mutations in the local queue.
+         */
+        SYNC_AND_FORWARD;
+    }
+
+    /**
+     * The current replication mode. Always SYNC for now.
+     * <p>TODO: Implement mode transitions to STORE_AND_FORWARD when standby becomes unavailable.
+     * <p>TODO: Implement mode transitions to SYNC_AND_FORWARD when draining queue.
+     */
+    protected volatile ReplicationMode currentMode = ReplicationMode.SYNC;
+
+    // TODO: Add configuration keys for store-and-forward behavior
+    // - Maximum retry attempts before switching to store-and-forward
+    // - Retry delay between attempts
+    // - Queue drain batch size
+    // - Queue drain interval
+
+    // TODO: Add state tracking fields
+    // - Queue of pending changes when in store-and-forward mode
+    // - Timestamp of last successful standby write
+    // - Error count for tracking consecutive failures
+
+    // TODO: Add methods for state transitions
+    // - switchToStoreAndForward() - Called when standby becomes unavailable
+    // - switchToSync() - Called when standby becomes available again
+    // - drainQueue() - Background task to process queued changes
+
+    // TODO: Enhance error handling in LogEventHandler
+    // - Track consecutive failures
+    // - Switch to store-and-forward after max retries
+    // - Implement queue draining when in SYNC_AND_FORWARD state
+
+    // TODO: Add metrics for monitoring
+    // - Current replication mode
+    // - Queue size
+    // - Time in store-and-forward mode
+    // - Number of failed writes
+    // - Queue drain rate
 
     /**
      * Gets the singleton instance of the ReplicationLogManager using the lazy initializer pattern.
