@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.replication;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -35,6 +36,8 @@ import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeoutException;
@@ -46,6 +49,9 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.logging.Log4jUtils;
+import org.apache.phoenix.replication.log.LogFile;
+import org.apache.phoenix.replication.log.LogFileReader;
+import org.apache.phoenix.replication.log.LogFileReaderContext;
 import org.apache.phoenix.replication.log.LogFileTestUtil;
 import org.apache.phoenix.replication.log.LogFileWriter;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -674,6 +680,54 @@ public class ReplicationLogTest {
             fail("Expected IOException during initialization");
         } catch (IOException e) {
             // Expected
+        }
+    }
+
+    @Test
+    public void testReadAfterWrite() throws Exception {
+        final String tableName = "TBLRAW";
+        final int NUM_RECORDS = 100;
+        List<LogFile.Record> originalRecords = new ArrayList<>();
+
+        // Get the path of the log file
+        Path logPath = logWriter.getWriter().getContext().getFilePath();
+
+        // Create and write records
+        for (int i = 0; i < NUM_RECORDS; i++) {
+            LogFile.Record record = LogFileTestUtil.newPutRecord(tableName, i, "row" + i, i, 1);
+            originalRecords.add(record);
+            logWriter.append(record.getHBaseTableName(), record.getCommitId(),
+                record.getMutation());
+        }
+        logWriter.sync();
+
+        // Force a rotation to close the current writer.
+        logWriter.rotateLog();
+
+        assertTrue("Log file should exist", localFs.exists(logPath));
+
+        // Read and verify all records
+        LogFileReader reader = new LogFileReader();
+        LogFileReaderContext readerContext = new LogFileReaderContext(conf)
+            .setFileSystem(localFs)
+            .setFilePath(logPath);
+        reader.init(readerContext);
+
+        List<LogFile.Record> readRecords = new ArrayList<>();
+        LogFile.Record record;
+        while ((record = reader.next()) != null) {
+            readRecords.add(record);
+        }
+
+        reader.close();
+
+        // Verify we got the expected number of records
+        assertEquals("Number of records mismatch", NUM_RECORDS, readRecords.size());
+
+        // Verify each record matches the original
+        for (int i = 0; i < NUM_RECORDS; i++) {
+            LogFileTestUtil.assertRecordEquals("Record mismatch at index " + i,
+                originalRecords.get(i), readRecords.get(i));
         }
     }
 
