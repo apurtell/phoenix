@@ -364,7 +364,8 @@ public class ReplicationLog {
         long sequence = ringBuffer.next();
         try {
             LogEvent event = ringBuffer.get(sequence);
-            event.setValues(EVENT_TYPE_DATA, new Record(tableName, commitId, mutation), null, sequence);
+            event.setValues(EVENT_TYPE_DATA, new Record(tableName, commitId, mutation), null,
+                sequence);
         } finally {
             ringBuffer.publish(sequence);
         }
