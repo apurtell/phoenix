@@ -37,7 +37,11 @@ import static org.mockito.Mockito.verify;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeoutException;
@@ -64,8 +68,12 @@ import org.mockito.InOrder;
 import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class ReplicationLogTest {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ReplicationLogTest.class);
 
     @Rule
     public TemporaryFolder testFolder = new TemporaryFolder();
@@ -113,6 +121,11 @@ public class ReplicationLogTest {
         localFs.delete(new Path(standbyUri.getPath()), true);
     }
 
+    /**
+     * Tests basic append and sync functionality of the replication log. Verifies that mutations
+     * are correctly appended to the log and that sync operations properly commit the changes to
+     * disk.
+     */
     @Test
     public void testAppendAndSync() throws Exception {
         final String tableName = "TESTTBL";
@@ -150,6 +163,10 @@ public class ReplicationLogTest {
         inOrder.verify(writer, times(1)).sync();
     }
 
+    /**
+     * Tests the behavior when an append operation fails. Verifies that the system properly handles
+     * append failures by rolling to a new writer and retrying the operation.
+     */
     @Test
     public void testAppendFailureAndRetry() throws Exception {
         final String tableName = "TBLAFR";
@@ -181,6 +198,10 @@ public class ReplicationLogTest {
         inOrder.verify(writerAfterRoll, times(1)).sync();
     }
 
+    /**
+     * Tests the behavior when a sync operation fails. Verifies that the system properly handles
+     * sync failures by rolling to a new writer and retrying the operation.
+     */
     @Test
     public void testSyncFailureAndRetry() throws Exception {
       final String tableName = "TBLSFR";
@@ -211,6 +232,10 @@ public class ReplicationLogTest {
       inOrder.verify(writerAfterRoll, times(1)).sync(); // Succeeded
     }
 
+    /**
+     * Tests the blocking behavior when the ring buffer is full. Verifies that append operations
+     * block when the ring buffer is full and resume as soon as space becomes available again.
+     */
     @Test
     public void testBlockingWhenRingFull() throws Exception {
         final String tableName = "TBLBWRF";
@@ -268,6 +293,10 @@ public class ReplicationLogTest {
         verify(innerWriter, timeout(10000).times(1)).append(eq(tableName), eq(myCommitId), any());
     }
 
+    /**
+     * Tests the sync timeout behavior. Verifies that sync operations time out after the configured
+     * interval if they cannot complete.
+     */
     @Test
     public void testSyncTimeout() throws Exception {
         final String tableName = "TBLST";
@@ -299,6 +328,10 @@ public class ReplicationLogTest {
         }
     }
 
+    /**
+     * Tests concurrent append operations from multiple producers. Verifies that the system
+     * correctly handles concurrent appends from multiple threads and maintains data consistency.
+     */
     @Test
     public void testConcurrentProducers() throws Exception {
         final String tableName = "TBLCP";
@@ -366,6 +399,10 @@ public class ReplicationLogTest {
 
     }
 
+    /**
+     * Tests time-based log rotation. Verifies that the log file is rotated after the configured
+     * rotation time period and that operations continue correctly with the new log file.
+     */
     @Test
     public void testTimeBasedRotation() throws Exception {
         final String tableName = "TBLTBR";
@@ -404,6 +441,10 @@ public class ReplicationLogTest {
         inOrder.verify(writerAfterRotation, times(1)).sync();
     }
 
+    /**
+     * Tests size-based log rotation. Verifies that the log file is rotated when it exceeds the
+     * configured size threshold and that operations continue correctly with the new log file.
+     */
     @Test
     public void testSizeBasedRotation() throws Exception {
         final String tableName = "TBLSBR";
@@ -444,6 +485,10 @@ public class ReplicationLogTest {
         inOrder.verify(writerAfterRotation, times(1)).sync();
     }
 
+    /**
+     * Tests the close operation of the replication log. Verifies that the log properly closes its
+     * resources and prevents further operations after being closed.
+     */
     @Test
     public void testClose() throws Exception {
         final String tableName = "TBLCLOSE";
@@ -483,6 +528,10 @@ public class ReplicationLogTest {
         logWriter.close();
     }
 
+    /**
+     * Tests the automatic rotation task. Verifies that the background rotation task correctly
+     * rotates log files based on the configured rotation time.
+     */
     @Test
     public void testRotationTask() throws Exception {
         final String tableName = "TBLRT";
@@ -509,6 +558,14 @@ public class ReplicationLogTest {
         verify(writerBeforeRotation, times(1)).close();
     }
 
+    /**
+     * Tests behavior when log rotation fails. Verifies that the system continues to operate with
+     * the existing writer when rotation fails to create a new writer.
+     * <p>
+     * TODO: The system should close the log after too many failed log rotation attempts. For now
+     * we simply continue with the current writer in the hopes some other rotation attempt will
+     * succeed soon.
+     */
     @Test
     public void testFailedRotation() throws Exception {
         final String tableName = "TBLFR";
@@ -544,6 +601,10 @@ public class ReplicationLogTest {
         verify(initialWriter, times(2)).sync();
     }
 
+    /**
+     * Tests handling of critical exceptions during event processing. Verifies that the system
+     * properly handles critical errors by closing the log and preventing further operations.
+     */
     @Test
     public void testEventProcessingException() throws Exception {
         final String tableName = "TBLEPE";
@@ -580,6 +641,10 @@ public class ReplicationLogTest {
         verify(innerWriter, times(1)).close();
     }
 
+    /**
+     * Tests behavior when all sync retry attempts are exhausted. Verifies that the system properly
+     * handles the case where sync operations fail repeatedly and eventually timeout.
+     */
     @Test
     public void testSyncFailureAllRetriesExhausted() throws Exception {
         final String tableName = "TBLSAFR";
@@ -613,6 +678,10 @@ public class ReplicationLogTest {
         verify(logWriter, atLeast(6)).createNewWriter(any(FileSystem.class), any(URI.class));
     }
 
+    /**
+     * Tests log rotation behavior during batch operations. Verifies that the system correctly
+     * handles rotation when there are pending batch operations, ensuring no data loss.
+     */
     @Test
     public void testRotationDuringBatch() throws Exception {
         final String tableName = "TBLRDB";
@@ -661,6 +730,7 @@ public class ReplicationLogTest {
         verify(writerBeforeRotation, times(1)).close();
     }
 
+    /** Tests initialization failure when filesystem operations fail. */
     @Test
     public void testFsInitFailure() throws Exception {
         // Create a mock FileSystem that fails to create directories
@@ -683,23 +753,26 @@ public class ReplicationLogTest {
         }
     }
 
+    /**
+     * Tests reading records after writing them to the log. Verifies that records written to the
+     * log can be correctly read back and match the original data.
+     */
     @Test
     public void testReadAfterWrite() throws Exception {
         final String tableName = "TBLRAW";
         final int NUM_RECORDS = 100;
         List<LogFile.Record> originalRecords = new ArrayList<>();
 
-        // Get the path of the log file
+        // Get the path of the log file.
         Path logPath = logWriter.getWriter().getContext().getFilePath();
 
-        // Create and write records
         for (int i = 0; i < NUM_RECORDS; i++) {
             LogFile.Record record = LogFileTestUtil.newPutRecord(tableName, i, "row" + i, i, 1);
             originalRecords.add(record);
             logWriter.append(record.getHBaseTableName(), record.getCommitId(),
                 record.getMutation());
         }
-        logWriter.sync();
+        logWriter.sync(); // Sync to commit the appends to the current writer.
 
         // Force a rotation to close the current writer.
         logWriter.rotateLog();
@@ -721,14 +794,152 @@ public class ReplicationLogTest {
 
         reader.close();
 
-        // Verify we got the expected number of records
+        // Verify we have the expected number of records.
         assertEquals("Number of records mismatch", NUM_RECORDS, readRecords.size());
 
-        // Verify each record matches the original
+        // Verify each record matches the original.
         for (int i = 0; i < NUM_RECORDS; i++) {
             LogFileTestUtil.assertRecordEquals("Record mismatch at index " + i,
                 originalRecords.get(i), readRecords.get(i));
         }
+    }
+
+    /**
+     * Tests reading records after multiple log rotations. Verifies that records can be correctly
+     * read across multiple log files after several rotations, maintaining data consistency.
+     */
+    @Test
+    public void testReadAfterMultipleRotations() throws Exception {
+        final String tableName = "TBLRAMR";
+        final int NUM_RECORDS_PER_ROTATION = 100;
+        final int NUM_ROTATIONS = 10;
+        final int TOTAL_RECORDS = NUM_RECORDS_PER_ROTATION * NUM_ROTATIONS;
+        List<LogFile.Record> originalRecords = new ArrayList<>();
+        List<Path> logPaths = new ArrayList<>();
+
+        // Write records across multiple rotations.
+        for (int rotation = 0; rotation < NUM_ROTATIONS; rotation++) {
+            // Get the path of the current log file.
+            Path logPath = logWriter.getWriter().getContext().getFilePath();
+            logPaths.add(logPath);
+
+            for (int i = 0; i < NUM_RECORDS_PER_ROTATION; i++) {
+                int commitId = (rotation * NUM_RECORDS_PER_ROTATION) + i;
+                LogFile.Record record = LogFileTestUtil.newPutRecord(tableName, commitId,
+                    "row" + commitId, commitId, 1);
+                originalRecords.add(record);
+                logWriter.append(record.getHBaseTableName(), record.getCommitId(),
+                    record.getMutation());
+            }
+            logWriter.sync(); // Sync to commit the appends to the current writer.
+            // Force a rotation to close the current writer.
+            logWriter.rotateLog();
+        }
+
+        // Verify all log files exist
+        for (Path logPath : logPaths) {
+            assertTrue("Log file should exist: " + logPath, localFs.exists(logPath));
+        }
+
+        // Read and verify all records from each log file, in the order in which the log files
+        // were written.
+        List<LogFile.Record> readRecords = new ArrayList<>();
+        for (Path logPath : logPaths) {
+            LogFileReader reader = new LogFileReader();
+            LogFileReaderContext readerContext = new LogFileReaderContext(conf)
+                .setFileSystem(localFs)
+                .setFilePath(logPath);
+            reader.init(readerContext);
+
+            LogFile.Record record;
+            while ((record = reader.next()) != null) {
+                readRecords.add(record);
+            }
+            reader.close();
+        }
+
+        // Verify we have the expected number of records.
+        assertEquals("Total number of records mismatch", TOTAL_RECORDS, readRecords.size());
+
+        // Verify each record matches the original. This confirms the total ordering of all records
+        // in all files.
+        for (int i = 0; i < TOTAL_RECORDS; i++) {
+            LogFileTestUtil.assertRecordEquals("Record mismatch at index " + i,
+                originalRecords.get(i), readRecords.get(i));
+        }
+    }
+
+    /**
+     * Tests reading records after multiple rotations with intermittent syncs. If we do not sync
+     * when we roll a file, the in-flight batch is replayed into the new writer when we do finally
+     * sync (with the new writer). Verifies that records can be correctly read even when syncs are
+     * not performed before each rotation, ensuring data consistency.
+     */
+    @Test
+    public void testReadAfterMultipleRotationsWithReplay() throws Exception {
+        final String tableName = "TBLRAMRIS";
+        final int NUM_RECORDS_PER_ROTATION = 100;
+        final int NUM_ROTATIONS = 10;
+        final int TOTAL_RECORDS = NUM_RECORDS_PER_ROTATION * NUM_ROTATIONS;
+        List<LogFile.Record> originalRecords = new ArrayList<>();
+        List<Path> logPaths = new ArrayList<>();
+
+        // Write records across multiple rotations, only syncing 50% of the time.
+        for (int rotation = 0; rotation < NUM_ROTATIONS; rotation++) {
+            // Get the path of the current log file.
+            Path logPath = logWriter.getWriter().getContext().getFilePath();
+            logPaths.add(logPath);
+
+            for (int i = 0; i < NUM_RECORDS_PER_ROTATION; i++) {
+                int commitId = (rotation * NUM_RECORDS_PER_ROTATION) + i;
+                LogFile.Record record = LogFileTestUtil.newPutRecord(tableName, commitId,
+                    "row" + commitId, commitId, 1);
+                originalRecords.add(record);
+                logWriter.append(record.getHBaseTableName(), record.getCommitId(),
+                    record.getMutation());
+            }
+
+            // Only sync 50% of the time before rotation. To ensure we sync on the last file
+            // we are going to write, use 'rotation % 2 == 1' instead of 'rotation % 2 == 0'.
+            if (rotation % 2 == 1) {
+                logWriter.sync(); // Sync to commit the appends to the current writer.
+            }
+            // Force a rotation to close the current writer.
+            logWriter.rotateLog();
+        }
+
+        // Verify all log files exist
+        for (Path logPath : logPaths) {
+            assertTrue("Log file should exist: " + logPath, localFs.exists(logPath));
+        }
+
+        // Read and verify all records from each log file, tracking unique records and duplicates.
+        Set<LogFile.Record> uniqueRecords = new HashSet<>();
+        List<LogFile.Record> allReadRecords = new ArrayList<>();
+        Map<Long, Integer> commitIdCounts = new HashMap<>();
+
+        for (Path logPath : logPaths) {
+            LogFileReader reader = new LogFileReader();
+            LogFileReaderContext readerContext = new LogFileReaderContext(conf)
+                .setFileSystem(localFs)
+                .setFilePath(logPath);
+            reader.init(readerContext);
+            LogFile.Record record;
+            while ((record = reader.next()) != null) {
+                allReadRecords.add(record);
+                uniqueRecords.add(record);
+                commitIdCounts.merge(record.getCommitId(), 1, Integer::sum);
+            }
+            reader.close();
+        }
+
+        // Print statistics about duplicates for informational purposes.
+        LOG.info("{} total records across all files", allReadRecords.size());
+        LOG.info("{} unique records", uniqueRecords.size());
+        LOG.info("{} duplicate records", allReadRecords.size() - uniqueRecords.size());
+
+        // Verify we have all the expected unique records
+        assertEquals("Number of unique records mismatch", TOTAL_RECORDS, uniqueRecords.size());
     }
 
     static class TestableReplicationLogWriter extends ReplicationLog {
