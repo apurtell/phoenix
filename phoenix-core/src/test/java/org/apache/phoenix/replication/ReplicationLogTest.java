@@ -349,6 +349,8 @@ public class ReplicationLogTest {
         // Perform a sync to ensure all appends are processed.
         InOrder inOrder = Mockito.inOrder(innerWriter); // To verify the below sync.
         logWriter.sync();
+        // Verify the final sync was called.
+        inOrder.verify(innerWriter, times(1)).sync();
 
         // Verify that all of appends were processed by the internal writer.
         for (int i = 0; i < APPENDS_PER_THREAD * 2; i++) {
@@ -356,8 +358,6 @@ public class ReplicationLogTest {
             verify(innerWriter, times(1)).append(eq(tableName), eq(commitId), any());
         }
 
-        // Verify the final sync was called.
-        inOrder.verify(innerWriter, times(1)).sync();
     }
 
     @Test

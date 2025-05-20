@@ -648,13 +648,15 @@ public class ReplicationLog {
             int attempt = 0;
             while (attempt < maxRetries) {
                 try {
-                    // If the writer has been rotated, we need to replay the current batch of
-                    // in-flight appends into the new writer.
                     if (writer.getGeneration() > generation) {
-                        LOG.trace("Writer has been rotated, replaying in-flight batch");
                         generation = writer.getGeneration();
-                        for (Record r: currentBatch) {
-                            writer.append(r.tableName,  r.commitId,  r.mutation);
+                        // If the writer has been rotated, we need to replay the current batch of
+                        // in-flight appends into the new writer.
+                        if (!currentBatch.isEmpty()) {
+                            LOG.trace("Writer has been rotated, replaying in-flight batch");
+                            for (Record r: currentBatch) {
+                                writer.append(r.tableName,  r.commitId,  r.mutation);
+                            }
                         }
                     }
                     switch (event.type) {
