@@ -464,14 +464,12 @@ public class ReplicationLogTest {
 
         // Verify the sequence of operations
         InOrder inOrder = Mockito.inOrder(writerBeforeRotation, writerAfterRotation);
-        
         // Verify all appends before rotation went to the first writer.
         for (int i = 1; i < commitId; i++) {
-            inOrder.verify(writerBeforeRotation, times(1))
-                .append(eq(tableName), eq((long)i), eq(put));
+            inOrder.verify(writerBeforeRotation, times(1)).append(eq(tableName), eq((long)i),
+                eq(put));
         }
         inOrder.verify(writerBeforeRotation, times(1)).sync();
-
         // Verify the final append went to the new writer.
         inOrder.verify(writerAfterRotation, times(1))
             .append(eq(tableName), eq(commitId), eq(put));

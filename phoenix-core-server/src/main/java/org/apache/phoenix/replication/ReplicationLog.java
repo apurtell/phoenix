@@ -102,14 +102,13 @@ import com.lmax.disruptor.dsl.ProducerType;
  * <p>
  * The Disruptor provides a high-performance ring buffer that decouples the API from the complexity
  * of writer management. Producers (callers of append/sync) simply publish events to the ring
- * buffer and generally return quickly. The LogEventHandler processes these events asynchronously,
- * handling all the complexity of batching mutations for efficiency, rotating writers based on time
- * or size, error handling and retries, and mode transitions for store-and-forward. This architecture
- * allows the API to remain simple and non-blocking, except for sync, while the complex writer
- * management logic is handled asynchronously.
+ * buffer and generally return quickly, except for sync(), where the writer will suspend the caller
+ * until the sync operation is successful. The LogEventHandler processes these events, handling the
+ * complexity of batching mutations for efficiency, rotating writers based on time or size, error
+ * handling and retries, and mode transitions for store-and-forward.
  */
-@edu.umd.cs.findbugs.annotations.SuppressWarnings(value = { "EI_EXPOSE_REP", "EI_EXPOSE_REP2" },
-    justification = "Intentional")
+@edu.umd.cs.findbugs.annotations.SuppressWarnings(value = { "EI_EXPOSE_REP", "EI_EXPOSE_REP2",
+    "MS_EXPOSE_REP" }, justification = "Intentional")
 public class ReplicationLog {
 
     /** The path on the standby HDFS where log files should be written. (The "IN" directory.) */
@@ -156,36 +155,36 @@ public class ReplicationLog {
         "phoenix.replication.log.sync.retries";
     public static final int DEFAULT_REPLICATION_LOG_SYNC_RETRIES = 5;
 
-    private static final String SHARD_DIR_FORMAT = "shard%05d";
-    private static final String FILE_NAME_FORMAT = "%d-%s.plog";
+    public static final String SHARD_DIR_FORMAT = "shard%05d";
+    public static final String FILE_NAME_FORMAT = "%d-%s.plog";
 
-    private static final byte EVENT_TYPE_DATA = 0;
-    private static final byte EVENT_TYPE_SYNC = 1;
+    static final byte EVENT_TYPE_DATA = 0;
+    static final byte EVENT_TYPE_SYNC = 1;
 
-    private static final Logger LOG = LoggerFactory.getLogger(ReplicationLog.class);
+    static final Logger LOG = LoggerFactory.getLogger(ReplicationLog.class);
 
-    private static volatile ReplicationLog instance;
+    protected static volatile ReplicationLog instance;
 
-    private final Configuration conf;
-    private final ServerName serverName;
+    protected final Configuration conf;
+    protected final ServerName serverName;
     protected FileSystem standbyFs;
     protected FileSystem fallbackFs; // For store-and-forward (future use)
     protected int numShards;
     protected URI standbyUrl;
     protected URI fallbackUrl; // For store-and-forward (future use)
-    private final long rotationTimeMs;
-    private final long rotationSizeBytes;
-    private final Compression.Algorithm compression;
-    private final ReentrantLock lock = new ReentrantLock();
+    protected final long rotationTimeMs;
+    protected final long rotationSizeBytes;
+    protected final Compression.Algorithm compression;
+    protected final ReentrantLock lock = new ReentrantLock();
     protected volatile LogFileWriter currentWriter; // Current writer
     protected final AtomicLong lastRotationTime = new AtomicLong();
     protected final AtomicLong writerGeneration = new AtomicLong();
-    private ScheduledExecutorService rotationExecutor;
-    private final int ringBufferSize;
-    private final long syncTimeoutMs;
-    private Disruptor<LogEvent> disruptor;
-    private RingBuffer<LogEvent> ringBuffer;
-    private final ConcurrentHashMap<Path,Object> shardMap = new ConcurrentHashMap<>();
+    protected ScheduledExecutorService rotationExecutor;
+    protected final int ringBufferSize;
+    protected final long syncTimeoutMs;
+    protected Disruptor<LogEvent> disruptor;
+    protected RingBuffer<LogEvent> ringBuffer;
+    protected final ConcurrentHashMap<Path, Object> shardMap = new ConcurrentHashMap<>();
 
     /**
      * Tracks the current replication mode of the ReplicationLog.
@@ -320,6 +319,11 @@ public class ReplicationLog {
                 + ", but the limit is " + MAX_REPLICATION_NUM_SHARDS);
         }
         initializeFileSystems();
+        // Start time based rotation.
+        lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
+        startRotationExecutor();
+        // Create the initial writer. Do this before we call LogEventHandler.init().
+        currentWriter = createNewWriter(standbyFs, standbyUrl);
         // Initialize the Disruptor. We use ProducerType.MULTI because multiple handlers might
         // call append concurrently. We use YieldingWaitStrategy for low latency. When the ring
         // buffer is full (controlled by REPLICATION_WRITER_RINGBUFFER_SIZE_KEY), producers
@@ -329,14 +333,13 @@ public class ReplicationLog {
             new ThreadFactoryBuilder().setNameFormat("ReplicationLogEventHandler-%d")
                 .setDaemon(true).build(),
             ProducerType.MULTI, new YieldingWaitStrategy());
-        disruptor.handleEventsWith(new LogEventHandler());
-        disruptor.setDefaultExceptionHandler(new LogExceptionHandler());
+        LogEventHandler eventHandler = new LogEventHandler();
+        eventHandler.init();
+        disruptor.handleEventsWith(eventHandler);
+        LogExceptionHandler exceptionHandler = new LogExceptionHandler();
+        disruptor.setDefaultExceptionHandler(exceptionHandler);
         ringBuffer = disruptor.start();
         LOG.info("ReplicationLogWriter started with ring buffer size {}", ringBufferSize);
-        // For now we just initialize currentWriter
-        currentWriter = createNewWriter(standbyFs, standbyUrl);
-        lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
-        startRotationExecutor();
     }
 
     /**
@@ -565,9 +568,6 @@ public class ReplicationLog {
             }
             currentWriter = newWriter;
             return currentWriter;
-        } catch (IOException e) {
-            LOG.warn("Exception while attempting to rotate the log writer", e);
-            throw e; // Rethrow
         } finally {
             // Update the last rotation time no matter what. We will try again next time. We do
             // this so we are not constantly trying to rotate the log instead of making progress
@@ -755,9 +755,12 @@ public class ReplicationLog {
         private LogFileWriter writer;
         private long generation;
 
-        LogEventHandler() throws IOException {
+        protected LogEventHandler() {
             this.maxRetries = conf.getInt(REPLICATION_LOG_SYNC_RETRIES_KEY,
                 DEFAULT_REPLICATION_LOG_SYNC_RETRIES);
+        }
+
+        protected void init() throws IOException {
             this.writer = getWriter();
             this.generation = writer.getGeneration();
         }
