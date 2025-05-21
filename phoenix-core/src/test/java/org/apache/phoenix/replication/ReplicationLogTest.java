@@ -50,7 +50,6 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.Mutation;
-import org.apache.hadoop.hbase.logging.Log4jUtils;
 import org.apache.phoenix.replication.log.LogFile;
 import org.apache.phoenix.replication.log.LogFileReader;
 import org.apache.phoenix.replication.log.LogFileReaderContext;
@@ -86,10 +85,6 @@ public class ReplicationLogTest {
     static final int TEST_SYNC_TIMEOUT = 1000;
     static final int TEST_ROTATION_TIME = 5000;
     static final int TEST_ROTATION_SIZE_BYTES = 10 * 1024;
-
-    static {
-        Log4jUtils.setLogLevel("org.apache.phoenix.replication.ReplicationLog", "TRACE");
-    }
 
     @Before
     public void setUp() throws IOException {
