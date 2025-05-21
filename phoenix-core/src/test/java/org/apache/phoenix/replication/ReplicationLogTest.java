@@ -43,6 +43,8 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
@@ -929,6 +931,297 @@ public class ReplicationLogTest {
 
         // Verify we have all the expected unique records
         assertEquals("Number of unique records mismatch", TOTAL_RECORDS, uniqueRecords.size());
+    }
+
+    /**
+     * Tests behavior when a RuntimeException occurs during writer.getLength() in shouldRotate().
+     * Verifies that the system properly handles critical errors by closing the log and preventing
+     * further operations.
+     */
+    @Test
+    public void testRuntimeExceptionDuringLengthCheck() throws Exception {
+        final String tableName = "TBLRDL";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the inner writer
+        LogFileWriter innerWriter = logWriter.getWriter();
+        assertNotNull("Writer should not be null", innerWriter);
+
+        // Configure writer to throw RuntimeException on getLength()
+        doThrow(new RuntimeException("Simulated critical error"))
+            .when(innerWriter).getLength();
+
+        // Append data. This should trigger the LogExceptionHandler, which will close logWriter.
+        logWriter.append(tableName, commitId, put);
+        try {
+            logWriter.sync();
+            fail("Should have thrown IOException because sync timed out");
+        } catch (IOException e) {
+            assertTrue("Expected timeout exception", e.getCause() instanceof TimeoutException);
+        }
+
+        // Verify that subsequent operations fail because the log is closed
+        try {
+            logWriter.append(tableName, commitId + 1, put);
+            fail("Should have thrown IOException because log is closed");
+        } catch (IOException e) {
+            assertTrue("Expected an IOException because log is closed",
+                e.getMessage().contains("Closed"));
+        }
+
+        // Verify that the inner writer was closed by the LogExceptionHandler
+        verify(innerWriter, times(1)).close();
+    }
+
+    /**
+     * Tests behavior when a RuntimeException occurs during append() after closeOnError() has been
+     * called. Verifies that the system properly rejects sync operations after being closed.
+     */
+    @Test
+    public void testAppendAfterCloseOnError() throws Exception {
+        final String tableName = "TBLAAE";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the inner writer
+        LogFileWriter innerWriter = logWriter.getWriter();
+        assertNotNull("Writer should not be null", innerWriter);
+
+        // Configure writer to throw RuntimeException on append
+        doThrow(new RuntimeException("Simulated critical error"))
+            .when(innerWriter).append(anyString(), anyLong(), any(Mutation.class));
+
+        // Append data to trigger closeOnError()
+        logWriter.append(tableName, commitId, put);
+        try {
+            logWriter.sync();
+            fail("Should have thrown IOException because sync timed out");
+        } catch (IOException e) {
+            assertTrue("Expected timeout exception", e.getCause() instanceof TimeoutException);
+        }
+
+        // Verify that subsequent append operations fail because the log is closed
+        try {
+            logWriter.append(tableName, commitId, put);
+            fail("Should have thrown IOException because log is closed");
+        } catch (IOException e) {
+            assertTrue("Expected an IOException because log is closed",
+                e.getMessage().contains("Closed"));
+        }
+
+        // Verify that the inner writer was closed by the LogExceptionHandler
+        verify(innerWriter, times(1)).close();
+    }
+
+    /**
+     * Tests behavior when a RuntimeException occurs during sync() after closeOnError() has been
+     * called. Verifies that the system properly rejects sync operations after being closed.
+     */
+    @Test
+    public void testSyncAfterCloseOnError() throws Exception {
+        final String tableName = "TBLSAE";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the inner writer
+        LogFileWriter innerWriter = logWriter.getWriter();
+        assertNotNull("Writer should not be null", innerWriter);
+
+        // Configure writer to throw RuntimeException on append
+        doThrow(new RuntimeException("Simulated critical error"))
+            .when(innerWriter).append(anyString(), anyLong(), any(Mutation.class));
+
+        // Append data to trigger closeOnError()
+        logWriter.append(tableName, commitId, put);
+        try {
+            logWriter.sync();
+            fail("Should have thrown IOException because sync timed out");
+        } catch (IOException e) {
+            assertTrue("Expected timeout exception", e.getCause() instanceof TimeoutException);
+        }
+
+        // Verify that subsequent sync operations fail because the log is closed
+        try {
+            logWriter.sync();
+            fail("Should have thrown IOException because log is closed");
+        } catch (IOException e) {
+            assertTrue("Expected an IOException because log is closed",
+                e.getMessage().contains("Closed"));
+        }
+
+        // Verify that the inner writer was closed by the LogExceptionHandler
+        verify(innerWriter, times(1)).close();
+    }
+
+    /**
+     * Tests race condition between LogRotationTask and LogEventHandler when both try to rotate
+     * the writer simultaneously. Verifies that despite concurrent rotation attempts, the log is
+     * only rotated once. Uses latches to ensure true concurrency and verify the sequence of
+     * operations.
+     */
+    @Test
+    public void testConcurrentRotationAttempts() throws Exception {
+        final String tableName = "TBLCR";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the initial writer
+        LogFileWriter initialWriter = logWriter.getWriter();
+        assertNotNull("Initial writer should not be null", initialWriter);
+
+        // Create latches to control timing and track rotation attempts
+        final CountDownLatch rotationTaskStarted = new CountDownLatch(1);
+        final CountDownLatch rotationTaskCanProceed = new CountDownLatch(1);
+        final CountDownLatch eventHandlerStarted = new CountDownLatch(1);
+        final CountDownLatch eventHandlerCanProceed = new CountDownLatch(1);
+        final AtomicInteger rotationCount = new AtomicInteger(0);
+        final CountDownLatch bothAttemptsStarted = new CountDownLatch(2);
+
+        // Configure the rotation task to pause at specific points and track attempts
+        doAnswer(invocation -> {
+            rotationTaskStarted.countDown(); // Signal that rotation task has started
+            bothAttemptsStarted.countDown(); // Signal that this attempt has started
+            rotationTaskCanProceed.await();  // Wait for permission to proceed
+            rotationCount.incrementAndGet(); // Track this rotation attempt
+            return invocation.callRealMethod();
+        }).when(logWriter).rotateLog();
+
+        // Configure the event handler to pause at specific points
+        doAnswer(invocation -> {
+            eventHandlerStarted.countDown(); // Signal that event handler has started
+            bothAttemptsStarted.countDown(); // Signal that this attempt has started
+            eventHandlerCanProceed.await();  // Wait for permission to proceed
+            return invocation.callRealMethod();
+        }).when(logWriter).getWriter();
+
+        // Start a thread that will trigger rotation via the background task
+        Thread rotationThread = new Thread(() -> {
+            try {
+                // Force rotation by waiting for rotation time
+                Thread.sleep((long)(TEST_ROTATION_TIME * 1.25));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        rotationThread.start();
+
+        // Start append operation in main thread
+        logWriter.append(tableName, commitId, put);
+
+        // Wait for both attempts to start - this ensures true concurrency
+        assertTrue("Both rotation attempts should start",
+            bothAttemptsStarted.await(5, TimeUnit.SECONDS));
+
+        // Verify both attempts have started before proceeding
+        assertEquals("Both attempts should have started", 0, bothAttemptsStarted.getCount());
+
+        // Allow both operations to proceed simultaneously
+        eventHandlerCanProceed.countDown();
+        rotationTaskCanProceed.countDown();
+
+        // Wait for both operations to complete
+        rotationThread.join();
+
+        // Verify the final state
+        LogFileWriter finalWriter = logWriter.getWriter();
+        assertNotNull("Final writer should not be null", finalWriter);
+        assertTrue("Writer should have been rotated", finalWriter != initialWriter);
+
+        // Verify only one rotation actually occurred
+        assertEquals("Should have only one actual rotation", 1, rotationCount.get());
+
+        // Verify all operations completed successfully
+        logWriter.sync();
+
+        // Verify the sequence of operations through the latches
+        assertTrue("Rotation task should have started", rotationTaskStarted.getCount() == 0);
+        assertTrue("Event handler should have started", eventHandlerStarted.getCount() == 0);
+    }
+
+    /**
+     * Tests race condition between LogEventHandler retry loop and LogRotationTask when both
+     * try to rotate the writer simultaneously. Verifies that despite concurrent rotation attempts
+     * during a retry scenario, the log is only rotated once. Uses latches to ensure true
+     * concurrency and verify the sequence of operations.
+     */
+    @Test
+    public void testConcurrentRotationDuringRetry() throws Exception {
+        final String tableName = "TBLCRR";
+        final long commitId = 1L;
+        final Mutation put = LogFileTestUtil.newPut("row", 1, 1);
+
+        // Get the initial writer
+        LogFileWriter initialWriter = logWriter.getWriter();
+        assertNotNull("Initial writer should not be null", initialWriter);
+
+        // Create latches to control timing and track rotation attempts
+        final CountDownLatch retryStarted = new CountDownLatch(1);
+        final CountDownLatch retryCanProceed = new CountDownLatch(1);
+        final CountDownLatch rotationTaskStarted = new CountDownLatch(1);
+        final CountDownLatch rotationTaskCanProceed = new CountDownLatch(1);
+        final AtomicInteger rotationCount = new AtomicInteger(0);
+        final CountDownLatch bothAttemptsStarted = new CountDownLatch(2);
+
+        // Configure the writer to fail on first append, succeed on retry
+        doAnswer(invocation -> {
+            retryStarted.countDown(); // Signal that retry has started
+            bothAttemptsStarted.countDown(); // Signal that this attempt has started
+            retryCanProceed.await(); // Wait for permission to proceed
+            return invocation.callRealMethod();
+        }).when(initialWriter).append(anyString(), anyLong(), any(Mutation.class));
+
+        // Configure the rotation task to pause at specific points and track attempts
+        doAnswer(invocation -> {
+            rotationTaskStarted.countDown(); // Signal that rotation task has started
+            bothAttemptsStarted.countDown(); // Signal that this attempt has started
+            rotationTaskCanProceed.await(); // Wait for permission to proceed
+            rotationCount.incrementAndGet(); // Track this rotation attempt
+            return invocation.callRealMethod();
+        }).when(logWriter).rotateLog();
+
+        // Start a thread that will trigger rotation via the background task
+        Thread rotationThread = new Thread(() -> {
+            try {
+                // Force rotation by waiting for rotation time
+                Thread.sleep((long)(TEST_ROTATION_TIME * 1.25));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        rotationThread.start();
+
+        // Start append operation in main thread
+        logWriter.append(tableName, commitId, put);
+
+        // Wait for both attempts to start - this ensures true concurrency
+        assertTrue("Both rotation attempts should start",
+            bothAttemptsStarted.await(5, TimeUnit.SECONDS));
+
+        // Verify both attempts have started before proceeding
+        assertEquals("Both attempts should have started", 0, bothAttemptsStarted.getCount());
+
+        // Allow both operations to proceed simultaneously
+        retryCanProceed.countDown();
+        rotationTaskCanProceed.countDown();
+
+        // Wait for both operations to complete
+        rotationThread.join();
+
+        // Verify the final state
+        LogFileWriter finalWriter = logWriter.getWriter();
+        assertNotNull("Final writer should not be null", finalWriter);
+        assertTrue("Writer should have been rotated", finalWriter != initialWriter);
+
+        // Verify only one rotation actually occurred
+        assertEquals("Should have only one actual rotation", 1, rotationCount.get());
+
+        // Verify all operations completed successfully
+        logWriter.sync();
+
+        // Verify the sequence of operations through the latches
+        assertTrue("Retry should have started", retryStarted.getCount() == 0);
+        assertTrue("Rotation task should have started", rotationTaskStarted.getCount() == 0);
     }
 
     static class TestableReplicationLogWriter extends ReplicationLog {
