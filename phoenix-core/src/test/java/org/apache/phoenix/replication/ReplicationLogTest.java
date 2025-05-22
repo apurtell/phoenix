@@ -60,7 +60,7 @@ import org.apache.phoenix.replication.log.LogFileWriter;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Rule;
+import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.mockito.InOrder;
@@ -74,8 +74,8 @@ public class ReplicationLogTest {
 
     private static final Logger LOG = LoggerFactory.getLogger(ReplicationLogTest.class);
 
-    @Rule
-    public TemporaryFolder testFolder = new TemporaryFolder();
+    @ClassRule
+    public static TemporaryFolder testFolder = new TemporaryFolder();
 
     private Configuration conf;
     private ServerName serverName;
@@ -109,11 +109,10 @@ public class ReplicationLogTest {
     }
 
     @After
-    public void tearDown() throws IllegalArgumentException, IOException {
+    public void tearDown() throws IOException {
         if (logWriter != null) {
             logWriter.close();
         }
-        localFs.delete(new Path(standbyUri.getPath()), true);
     }
 
     /**
