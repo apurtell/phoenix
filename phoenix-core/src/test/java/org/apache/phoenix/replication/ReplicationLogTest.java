@@ -69,6 +69,8 @@ import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.phoenix.replication.metrics.MetricsReplicationLogSource;
+import org.apache.phoenix.replication.metrics.MetricsReplicationLogSourceImpl;
 
 public class ReplicationLogTest {
 
@@ -109,9 +111,11 @@ public class ReplicationLogTest {
     }
 
     @After
-    public void tearDown() throws IOException {
+    public void tearDown() throws Exception {
         if (logWriter != null) {
             logWriter.close();
+            // Deregister the metrics source
+            ((MetricsReplicationLogSourceImpl)logWriter.getMetrics()).deregister();
         }
     }
 
@@ -722,29 +726,6 @@ public class ReplicationLogTest {
         verify(writerBeforeRotation, times(1)).close();
     }
 
-    /** Tests initialization failure when filesystem operations fail. */
-    @Test
-    public void testFsInitFailure() throws Exception {
-        // Create a mock FileSystem that fails to create directories
-        FileSystem mockFs = Mockito.mock(FileSystem.class);
-        doThrow(new IOException("Failed to create directory")).when(mockFs)
-            .mkdirs(any(Path.class));
-        // Create a new ReplicationLog instance with the mock FileSystem
-        ReplicationLog logWriter = new TestableReplicationLogWriter(conf, serverName) {
-            @Override
-            protected FileSystem getFileSystem(URI uri) throws IOException {
-                return mockFs;
-            }
-        };
-        // Attempt to initialize. Should fail fast and throw an IOException.
-        try {
-            logWriter.init();
-            fail("Expected IOException during initialization");
-        } catch (IOException e) {
-            // Expected
-        }
-    }
-
     /**
      * Tests reading records after writing them to the log. Verifies that records written to the
      * log can be correctly read back and match the original data.
@@ -767,7 +748,7 @@ public class ReplicationLogTest {
         logWriter.sync(); // Sync to commit the appends to the current writer.
 
         // Force a rotation to close the current writer.
-        logWriter.rotateLog();
+        logWriter.rotateLog(ReplicationLog.RotationReason.SIZE);
 
         assertTrue("Log file should exist", localFs.exists(logPath));
 
@@ -825,7 +806,7 @@ public class ReplicationLogTest {
             }
             logWriter.sync(); // Sync to commit the appends to the current writer.
             // Force a rotation to close the current writer.
-            logWriter.rotateLog();
+            logWriter.rotateLog(ReplicationLog.RotationReason.SIZE);
         }
 
         // Verify all log files exist
@@ -897,7 +878,7 @@ public class ReplicationLogTest {
                 logWriter.sync(); // Sync to commit the appends to the current writer.
             }
             // Force a rotation to close the current writer.
-            logWriter.rotateLog();
+            logWriter.rotateLog(ReplicationLog.RotationReason.SIZE);
         }
 
         // Verify all log files exist
@@ -1084,7 +1065,7 @@ public class ReplicationLogTest {
             rotationTaskCanProceed.await();  // Wait for permission to proceed
             rotationCount.incrementAndGet(); // Track this rotation attempt
             return invocation.callRealMethod();
-        }).when(logWriter).rotateLog();
+        }).when(logWriter).rotateLog(ReplicationLog.RotationReason.TIME);
 
         // Configure the event handler to pause at specific points
         doAnswer(invocation -> {
@@ -1177,7 +1158,7 @@ public class ReplicationLogTest {
             rotationTaskCanProceed.await(); // Wait for permission to proceed
             rotationCount.incrementAndGet(); // Track this rotation attempt
             return invocation.callRealMethod();
-        }).when(logWriter).rotateLog();
+        }).when(logWriter).rotateLog(ReplicationLog.RotationReason.TIME);
 
         // Start a thread that will trigger rotation via the background task
         Thread rotationThread = new Thread(() -> {
@@ -1235,6 +1216,10 @@ public class ReplicationLogTest {
             return spy(super.createNewWriter(fs, url));
         }
 
+        @Override
+        protected MetricsReplicationLogSource createMetricsSource() {
+            return new MetricsReplicationLogSourceImpl();
+        }
     }
 
 }

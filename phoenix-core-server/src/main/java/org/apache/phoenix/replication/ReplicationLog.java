@@ -41,6 +41,8 @@ import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.phoenix.replication.log.LogFileWriter;
 import org.apache.phoenix.replication.log.LogFileWriterContext;
+import org.apache.phoenix.replication.metrics.MetricsReplicationLogSource;
+import org.apache.phoenix.replication.metrics.MetricsReplicationLogSourceImpl;
 import org.apache.phoenix.thirdparty.com.google.common.base.Preconditions;
 import org.apache.phoenix.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -185,6 +187,7 @@ public class ReplicationLog {
     protected Disruptor<LogEvent> disruptor;
     protected RingBuffer<LogEvent> ringBuffer;
     protected final ConcurrentHashMap<Path, Object> shardMap = new ConcurrentHashMap<>();
+    protected final MetricsReplicationLogSource metrics;
 
     /**
      * Tracks the current replication mode of the ReplicationLog.
@@ -226,6 +229,16 @@ public class ReplicationLog {
         SYNC_AND_FORWARD;
     }
 
+    /** The reason for requesting a log rotation. */
+    protected enum RotationReason {
+        /** Rotation requested due to time threshold being exceeded. */
+        TIME,
+        /** Rotation requested due to size threshold being exceeded. */
+        SIZE,
+        /** Rotation requested due to an error condition. */
+        ERROR;
+    }
+
     /**
      * The current replication mode. Always SYNC for now.
      * <p>TODO: Implement mode transitions to STORE_AND_FORWARD when standby becomes unavailable.
@@ -253,13 +266,6 @@ public class ReplicationLog {
     // - Track consecutive failures
     // - Switch to store-and-forward after max retries
     // - Implement queue draining when in SYNC_AND_FORWARD state
-
-    // TODO: Add metrics for monitoring
-    // - Current replication mode
-    // - Queue size
-    // - Time in store-and-forward mode
-    // - Number of failed writes
-    // - Queue drain rate
 
     /**
      * Gets the singleton instance of the ReplicationLogManager using the lazy initializer pattern.
@@ -310,6 +316,15 @@ public class ReplicationLog {
             DEFAULT_REPLICATION_LOG_RINGBUFFER_SIZE);
         this.syncTimeoutMs = conf.getLong(REPLICATION_LOG_SYNC_TIMEOUT_KEY,
             DEFAULT_REPLICATION_LOG_SYNC_TIMEOUT);
+        this.metrics = createMetricsSource();
+    }
+
+    protected MetricsReplicationLogSource createMetricsSource() {
+        return new MetricsReplicationLogSourceImpl();
+    }
+
+    public MetricsReplicationLogSource getMetrics() {
+        return metrics;
     }
 
     @SuppressWarnings("unchecked")
@@ -361,6 +376,7 @@ public class ReplicationLog {
         if (currentWriter == null) {
             throw new IOException("Closed");
         }
+        long startTime = System.nanoTime();
         // ringBuffer.next() claims the next sequence number. Because we initialize the Disruptor
         // with ProducerType.MULTI and the blocking YieldingWaitStrategy this call WILL BLOCK if
         // the ring buffer is full, thus providing backpressure to the callers.
@@ -369,7 +385,9 @@ public class ReplicationLog {
             LogEvent event = ringBuffer.get(sequence);
             event.setValues(EVENT_TYPE_DATA, new Record(tableName, commitId, mutation), null,
                 sequence);
+            metrics.updateAppendTime(System.nanoTime() - startTime);
         } finally {
+            // Update ring buffer events metric
             ringBuffer.publish(sequence);
         }
     }
@@ -390,12 +408,15 @@ public class ReplicationLog {
         if (currentWriter == null) {
             throw new IOException("Closed");
         }
+        syncInternal();
+    }
+
+    protected void syncInternal() throws IOException {
+        long startTime = System.nanoTime();
         CompletableFuture<Void> syncFuture = new CompletableFuture<>();
-        long sequence;
-        sequence = ringBuffer.next();
+        long sequence = ringBuffer.next();
         try {
             LogEvent event = ringBuffer.get(sequence);
-            // Publish a special SYNC event
             event.setValues(EVENT_TYPE_SYNC, null, syncFuture, sequence);
         } finally {
             ringBuffer.publish(sequence);
@@ -404,6 +425,7 @@ public class ReplicationLog {
         try {
             // Wait for the event handler to process up to and including this sync event
             syncFuture.get(syncTimeoutMs, TimeUnit.MILLISECONDS);
+            metrics.updateSyncTime(System.nanoTime() - startTime);
         } catch (InterruptedException e) {
             // Almost certainly the regionserver is shutting down or aborting.
             // TODO: Do we need to do more here?
@@ -511,7 +533,7 @@ public class ReplicationLog {
         lock.lock();
         try {
             if (shouldRotate()) {
-                rotateLog();
+                rotateLog(RotationReason.SIZE);
             }
             return currentWriter;
         } finally {
@@ -554,7 +576,7 @@ public class ReplicationLog {
      * Closes the current log writer and opens a new one.
      * @throws IOException If closing the old writer or creating the new one fails.
      */
-    protected LogFileWriter rotateLog() throws IOException {
+    protected LogFileWriter rotateLog(RotationReason reason) throws IOException {
         // We had a spotbugs warning here previously, UL_UNRELEASED_LOCK_EXCEPTION_PATH. It is a
         // false positive but is simple enough to avoid by even moving the lock() into the try
         // block.
@@ -572,6 +594,19 @@ public class ReplicationLog {
                 closeWriter(currentWriter);
             }
             currentWriter = newWriter;
+            // Update metrics based on rotation reason
+            switch (reason) {
+                case TIME:
+                    metrics.incrementTimeBasedRotationCounter();
+                    break;
+                case SIZE:
+                    metrics.incrementSizeBasedRotationCounter();
+                    break;
+                case ERROR:
+                    metrics.incrementErrorBasedRotationCounter();
+                    break;
+            }
+            metrics.incrementTotalRotationCounter();
             return currentWriter;
         } finally {
             // Update the last rotation time no matter what. We will try again next time. We do
@@ -703,7 +738,7 @@ public class ReplicationLog {
                         LOG.debug("Time based rotation needed ({} ms elapsed, threshold {} ms).",
                               now - last, rotationTimeMs);
                         try {
-                            rotateLog(); // rotateLog updates lastRotationTime
+                            rotateLog(RotationReason.TIME); // rotateLog updates lastRotationTime
                         } catch (IOException e) {
                             LOG.error("Failed to rotate log, currentWriter is {}", currentWriter,
                                 e);
@@ -745,6 +780,7 @@ public class ReplicationLog {
         public Record record;
         public CompletableFuture<Void> syncFuture; // Used only for SYNC events
         public long sequence; // Sequence number for tracking
+        public long timestampNs; // Timestamp when event was created
 
         public void setValues(byte type, Record record, CompletableFuture<Void> syncFuture,
                 long sequence) {
@@ -752,6 +788,7 @@ public class ReplicationLog {
             this.record = record;
             this.syncFuture = syncFuture;
             this.sequence = sequence;
+            this.timestampNs = System.nanoTime();
         }
     }
 
@@ -774,6 +811,11 @@ public class ReplicationLog {
 
         @Override
         public void onEvent(LogEvent event, long sequence, boolean endOfBatch) throws Exception {
+            // Calculate time spent in ring buffer
+            long currentTimeNs = System.nanoTime();
+            long ringBufferTimeNs = currentTimeNs - event.timestampNs;
+            metrics.updateRingBufferTime(ringBufferTimeNs);
+
             writer = getWriter();
             CompletableFuture<Void> futureToComplete = null;
             int attempt = 0;
@@ -817,10 +859,9 @@ public class ReplicationLog {
                     LOG.debug("Attempt " + (attempt + 1) + "/" + maxRetries + " failed", e);
                     attempt++;
                     if (attempt > maxRetries) {
-                        // Throw if we have exceeded our allowable retries.
                         throw e;
                     }
-                    writer = rotateLog();
+                    writer = rotateLog(RotationReason.ERROR);
                 }
             }
         }
