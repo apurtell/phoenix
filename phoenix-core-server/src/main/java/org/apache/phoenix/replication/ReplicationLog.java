@@ -555,8 +555,13 @@ public class ReplicationLog {
      * @throws IOException If closing the old writer or creating the new one fails.
      */
     protected LogFileWriter rotateLog() throws IOException {
-        lock.lock(); // Lock is reentrant, so this is fine.
+        // We had a spotbugs warning here previously, UL_UNRELEASED_LOCK_EXCEPTION_PATH. It is a
+        // false positive but is simple enough to avoid by even moving the lock() into the try
+        // block.
+        boolean locked = false;
         try {
+            lock.lock();
+            locked = true;
             // Try to get the new writer first. If it fails we continue using the current writer.
             // Increment the writer generation
             LogFileWriter newWriter = createNewWriter(standbyFs, standbyUrl);
@@ -575,7 +580,9 @@ public class ReplicationLog {
             // rolling.
             // TODO: Escalate error response after some consecutive number of failed rolls.
             lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
-            lock.unlock();
+            if (locked) {
+                lock.unlock();
+            }
         }
     }
 
