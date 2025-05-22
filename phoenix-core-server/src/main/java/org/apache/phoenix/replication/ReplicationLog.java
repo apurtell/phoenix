@@ -188,6 +188,7 @@ public class ReplicationLog {
     protected RingBuffer<LogEvent> ringBuffer;
     protected final ConcurrentHashMap<Path, Object> shardMap = new ConcurrentHashMap<>();
     protected final MetricsReplicationLogSource metrics;
+    protected volatile boolean isClosed = false;
 
     /**
      * Tracks the current replication mode of the ReplicationLog.
@@ -373,7 +374,7 @@ public class ReplicationLog {
         if (LOG.isTraceEnabled()) {
             LOG.trace("Append: table={}, commitId={}, mutation={}", tableName, commitId, mutation);
         }
-        if (currentWriter == null) {
+        if (isClosed) {
             throw new IOException("Closed");
         }
         long startTime = System.nanoTime();
@@ -405,7 +406,7 @@ public class ReplicationLog {
      * @throws IOException If the sync operation fails after retries, or if interrupted.
      */
     public void sync() throws IOException {
-        if (currentWriter == null) {
+        if (isClosed) {
             throw new IOException("Closed");
         }
         syncInternal();
@@ -688,13 +689,16 @@ public class ReplicationLog {
 
     /** Force closes the log upon an unrecoverable internal error. */
     protected void closeOnError() {
+        synchronized (this) {
+            if (isClosed) {
+                return;
+            }
+            isClosed = true;
+        }
         // Stop the time based rotation check.
         stopRotationExecutor();
         // We expect a final sync will not work. Just close the inner writer.
-        if (currentWriter != null) {
-            closeWriter(currentWriter);
-            currentWriter = null;
-        }
+        closeWriter(currentWriter);
         // Directly halt the disruptor. shutdown() would wait for events to drain. We are expecting
         // that will not work.
         disruptor.halt();
@@ -702,28 +706,33 @@ public class ReplicationLog {
 
     /** Closes the log. */
     public void close() {
+        synchronized (this) {
+            if (isClosed) {
+                return;
+            }
+            isClosed = true;
+        }
         // Stop the time based rotation check.
         stopRotationExecutor();
-        // We use 'currentWriter' to determine if we have already gracefully closed the current
-        // writer.
-        if (currentWriter != null) {
-            // Sync before shutting down to flush all pending appends.
-            try {
-                sync();
-                disruptor.shutdown(); // Wait for a clean shutdown.
-            } catch (IOException e) {
-                LOG.warn("Error during final sync on close", e);
-                disruptor.halt(); // Go directly to halt.
-            }
-            closeWriter(currentWriter);
-            currentWriter = null;
+        // Sync before shutting down to flush all pending appends.
+        try {
+            syncInternal();
+            disruptor.shutdown(); // Wait for a clean shutdown.
+        } catch (IOException e) {
+            LOG.warn("Error during final sync on close", e);
+            disruptor.halt(); // Go directly to halt.
         }
+        // We must for the disruptor before closing the current writer.
+        closeWriter(currentWriter);
     }
 
     /** Implements time based rotation independent of in-line checking during append(). */
     protected class LogRotationTask implements Runnable {
         @Override
         public void run() {
+            if (isClosed) {
+                return;
+            }
             // Use tryLock with a timeout to avoid blocking indefinitely if another thread holds
             // the lock for an unexpectedly long time (e.g., during a problematic rotation).
             boolean acquired = false;
@@ -734,7 +743,7 @@ public class ReplicationLog {
                     // Check only the time condition here, size is handled by getWriter
                     long now = EnvironmentEdgeManager.currentTimeMillis();
                     long last = lastRotationTime.get();
-                    if (currentWriter != null && now - last >= rotationTimeMs) {
+                    if (!isClosed && now - last >= rotationTimeMs) {
                         LOG.debug("Time based rotation needed ({} ms elapsed, threshold {} ms).",
                               now - last, rotationTimeMs);
                         try {
