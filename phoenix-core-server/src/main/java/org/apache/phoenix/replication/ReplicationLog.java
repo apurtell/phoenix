@@ -577,14 +577,11 @@ public class ReplicationLog {
      * Closes the current log writer and opens a new one.
      * @throws IOException If closing the old writer or creating the new one fails.
      */
+    @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "UL_UNRELEASED_LOCK",
+        justification = "False positive")
     protected LogFileWriter rotateLog(RotationReason reason) throws IOException {
-        // We had a spotbugs warning here previously, UL_UNRELEASED_LOCK_EXCEPTION_PATH. It is a
-        // false positive but is simple enough to avoid by even moving the lock() into the try
-        // block.
-        boolean locked = false;
+        lock.lock();
         try {
-            lock.lock();
-            locked = true;
             // Try to get the new writer first. If it fails we continue using the current writer.
             // Increment the writer generation
             LogFileWriter newWriter = createNewWriter(standbyFs, standbyUrl);
@@ -597,15 +594,15 @@ public class ReplicationLog {
             currentWriter = newWriter;
             // Update metrics based on rotation reason
             switch (reason) {
-                case TIME:
-                    metrics.incrementTimeBasedRotationCounter();
-                    break;
-                case SIZE:
-                    metrics.incrementSizeBasedRotationCounter();
-                    break;
-                case ERROR:
-                    metrics.incrementErrorBasedRotationCounter();
-                    break;
+            case TIME:
+                metrics.incrementTimeBasedRotationCounter();
+                break;
+            case SIZE:
+                metrics.incrementSizeBasedRotationCounter();
+                break;
+            case ERROR:
+                metrics.incrementErrorBasedRotationCounter();
+                break;
             }
             metrics.incrementTotalRotationCounter();
             return currentWriter;
@@ -616,9 +613,7 @@ public class ReplicationLog {
             // rolling.
             // TODO: Escalate error response after some consecutive number of failed rolls.
             lastRotationTime.set(EnvironmentEdgeManager.currentTimeMillis());
-            if (locked) {
-                lock.unlock();
-            }
+            lock.unlock();
         }
     }
 

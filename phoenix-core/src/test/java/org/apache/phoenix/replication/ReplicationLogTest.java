@@ -52,6 +52,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.Mutation;
+import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.phoenix.replication.log.LogFile;
 import org.apache.phoenix.replication.log.LogFileReader;
 import org.apache.phoenix.replication.log.LogFileReaderContext;
@@ -104,9 +105,10 @@ public class ReplicationLogTest {
         // Set rotation time to 10 seconds
         conf.setLong(ReplicationLog.REPLICATION_LOG_ROTATION_TIME_MS_KEY, TEST_ROTATION_TIME);
         // Small size threshold for testing
-        conf.setLong(ReplicationLog.REPLICATION_LOG_ROTATION_SIZE_BYTES_KEY, TEST_ROTATION_SIZE_BYTES);
+        conf.setLong(ReplicationLog.REPLICATION_LOG_ROTATION_SIZE_BYTES_KEY,
+            TEST_ROTATION_SIZE_BYTES);
 
-        logWriter = spy(new TestableReplicationLogWriter(conf, serverName));
+        logWriter = spy(new TestableReplicationLog(conf, serverName));
         logWriter.init();
     }
 
@@ -114,9 +116,11 @@ public class ReplicationLogTest {
     public void tearDown() throws Exception {
         if (logWriter != null) {
             logWriter.close();
-            // Deregister the metrics source
-            ((MetricsReplicationLogSourceImpl)logWriter.getMetrics()).deregister();
         }
+        // Deregister the metrics source that the replication log registers during initialization
+        // so the next unit will be able to register it again and successfully initialize.
+        DefaultMetricsSystem.instance()
+            .unregisterSource(MetricsReplicationLogSource.METRICS_JMX_CONTEXT);
     }
 
     /**
@@ -1204,9 +1208,9 @@ public class ReplicationLogTest {
         assertTrue("Rotation task should have started", rotationTaskStarted.getCount() == 0);
     }
 
-    static class TestableReplicationLogWriter extends ReplicationLog {
+    static class TestableReplicationLog extends ReplicationLog {
 
-        protected TestableReplicationLogWriter(Configuration conf, ServerName serverName) {
+        protected TestableReplicationLog(Configuration conf, ServerName serverName) {
             super(conf, serverName);
         }
 

@@ -20,8 +20,6 @@ package org.apache.phoenix.replication.metrics;
 import org.apache.hadoop.hbase.metrics.BaseSourceImpl;
 import org.apache.hadoop.metrics2.MetricHistogram;
 import org.apache.hadoop.metrics2.lib.MutableFastCounter;
-import org.apache.phoenix.thirdparty.com.google.common.annotations.VisibleForTesting;
-import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 
 /** Implementation of metrics source for ReplicationLog operations. */
 public class MetricsReplicationLogSourceImpl extends BaseSourceImpl
@@ -94,7 +92,7 @@ public class MetricsReplicationLogSourceImpl extends BaseSourceImpl
     }
 
     @Override
-    @VisibleForTesting
+    // Visible for testing
     public ReplicationLogMetricValues getCurrentMetricValues() {
         return new ReplicationLogMetricValues.Builder()
             .setTimeBasedRotationCount(timeBasedRotationCount.value())
@@ -106,10 +104,6 @@ public class MetricsReplicationLogSourceImpl extends BaseSourceImpl
             .setRotationTime(rotationTime.getCount())
             .setRingBufferTime(ringBufferTime.getCount())
             .build();
-    }
-
-    public void deregister() {
-        DefaultMetricsSystem.instance().unregisterSource(METRICS_JMX_CONTEXT);
     }
 
 }
