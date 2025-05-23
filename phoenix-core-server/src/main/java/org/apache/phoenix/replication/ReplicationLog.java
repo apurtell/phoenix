@@ -689,11 +689,14 @@ public class ReplicationLog {
 
     /** Force closes the log upon an unrecoverable internal error. */
     protected void closeOnError() {
-        synchronized (this) {
+        lock.lock();
+        try {
             if (isClosed) {
                 return;
             }
             isClosed = true;
+        } finally {
+            lock.unlock();
         }
         // Stop the time based rotation check.
         stopRotationExecutor();
@@ -706,11 +709,14 @@ public class ReplicationLog {
 
     /** Closes the log. */
     public void close() {
-        synchronized (this) {
+        lock.lock();
+        try {
             if (isClosed) {
                 return;
             }
             isClosed = true;
+        } finally {
+            lock.unlock();
         }
         // Stop the time based rotation check.
         stopRotationExecutor();
