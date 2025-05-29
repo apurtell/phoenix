@@ -15,10 +15,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.phoenix.hbase.index.balancer;
 
-import org.apache.hadoop.hbase.master.balancer.StochasticLoadBalancer;
-
-public class IndexLoadBalancer extends StochasticLoadBalancer {
-
-}
+/**
+ * This package contains classes and utilities for handling replication, including replication log
+ * management and system catalog WAL entry filtering.
+ */
+package org.apache.phoenix.replication;
