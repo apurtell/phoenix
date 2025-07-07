@@ -49,6 +49,10 @@ public interface MetricsIndexerSource extends BaseSource {
   String SLOW_DUPLICATE_KEY_DESC =
     "The number of on duplicate key checks slower than the configured threshold";
 
+  String REPLICATION_SYNC_TIME = "replicationSyncTime";
+  String REPLICATION_SYNC_TIME_DESC =
+    "Histogram for the time in milliseconds to synchronously replicate a batch of mutations";
+
   String PRE_WAL_RESTORE_TIME = "preWALRestoreTime";
   String PRE_WAL_RESTORE_TIME_DESC =
     "Histogram for the time in milliseconds for Indexer's preWALRestore";
@@ -223,4 +227,11 @@ public interface MetricsIndexerSource extends BaseSource {
    * @param dataTableName Physical data table name
    */
   void incrementPostIndexUpdateFailures(String dataTableName);
+
+  /**
+   * Updates the replication sync time histogram.
+   * @param dataTableName Physical data table name
+   * @param t             time taken in milliseconds
+   */
+  void updateReplicationSyncTime(String dataTableName, long t);
 }

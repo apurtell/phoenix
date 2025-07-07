@@ -497,6 +497,7 @@ public class QueryServicesOptions {
   public static final int DEFAULT_CQSI_THREAD_POOL_MAX_QUEUE = 512;
   public static final Boolean DEFAULT_CQSI_THREAD_POOL_ALLOW_CORE_THREAD_TIMEOUT = true;
   public static final Boolean DEFAULT_CQSI_THREAD_POOL_METRICS_ENABLED = false;
+  public static final Boolean DEFAULT_SYNCHRONOUS_REPLICATION_ENABLED = false;
   public static final int DEFAULT_CDC_TTL_MUTATION_MAX_RETRIES = 5;
   public static final int DEFAULT_CDC_TTL_MUTATION_BATCH_SIZE = 50;
   public static final int DEFAULT_CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS = 1200;
@@ -624,6 +625,8 @@ public class QueryServicesOptions {
       .setIfUnset(CQSI_THREAD_POOL_ALLOW_CORE_THREAD_TIMEOUT,
         DEFAULT_CQSI_THREAD_POOL_ALLOW_CORE_THREAD_TIMEOUT)
       .setIfUnset(CQSI_THREAD_POOL_METRICS_ENABLED, DEFAULT_CQSI_THREAD_POOL_METRICS_ENABLED)
+      .setIfUnset(QueryServices.SYNCHRONOUS_REPLICATION_ENABLED,
+        DEFAULT_SYNCHRONOUS_REPLICATION_ENABLED)
       .setIfUnset(CDC_TTL_MUTATION_MAX_RETRIES, DEFAULT_CDC_TTL_MUTATION_MAX_RETRIES)
       .setIfUnset(CDC_TTL_MUTATION_BATCH_SIZE, DEFAULT_CDC_TTL_MUTATION_BATCH_SIZE)
       .setIfUnset(CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS, DEFAULT_CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS);
@@ -868,6 +871,11 @@ public class QueryServicesOptions {
   public boolean isCQSIThreadPoolMetricsEnabled() {
     return config.getBoolean(CQSI_THREAD_POOL_METRICS_ENABLED,
       DEFAULT_CQSI_THREAD_POOL_METRICS_ENABLED);
+  }
+
+  public boolean isSynchronousReplicationEnabled() {
+    return config.getBoolean(QueryServices.SYNCHRONOUS_REPLICATION_ENABLED,
+      DEFAULT_SYNCHRONOUS_REPLICATION_ENABLED);
   }
 
   public void setCQSIThreadPoolMetricsEnabled(boolean enabled) {

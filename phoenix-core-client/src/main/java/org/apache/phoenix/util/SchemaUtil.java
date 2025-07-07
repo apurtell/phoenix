@@ -1517,4 +1517,14 @@ public class SchemaUtil {
     }
     return false;
   }
+
+  public static boolean shouldReplicateTable(byte[] tableName) {
+    if (!isSystemTable(tableName)) {
+      return true;
+    }
+    if (isMetaTable(tableName) || isChildLinkTable(tableName)) {
+      return true;
+    }
+    return false;
+  }
 }
