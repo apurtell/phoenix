@@ -24,17 +24,15 @@ import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.REPLI
 import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.TTL;
 import static org.apache.hadoop.hbase.client.MetricsConnection.CLIENT_SIDE_METRICS_ENABLED_KEY;
 import static org.apache.hadoop.hbase.ipc.RpcControllerFactory.CUSTOM_CONTROLLER_CONF_KEY;
-import static org.apache.phoenix.coprocessorclient.BaseScannerRegionObserverConstants.PHOENIX_MAX_LOOKBACK_AGE_CONF_KEY;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_4_15_0;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_4_16_0;
-import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0;
+import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.PHOENIX_MAJOR_VERSION;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.PHOENIX_MINOR_VERSION;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.PHOENIX_PATCH_NUMBER;
 import static org.apache.phoenix.coprocessorclient.MetaDataProtocol.getVersion;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.ARRAY_SIZE;
-import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.CDC_STREAM_CONDITIONAL_TTL_EXPRESSION;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_DEF;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_FAMILY;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_NAME;
@@ -188,20 +186,19 @@ import org.apache.hadoop.hbase.ipc.HBaseRpcController;
 import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
 import org.apache.hadoop.hbase.ipc.ServerRpcController;
 import org.apache.hadoop.hbase.ipc.controller.InvalidateMetadataCacheControllerFactory;
-import org.apache.hadoop.hbase.ipc.controller.ServerRpcControllerFactory;
 import org.apache.hadoop.hbase.ipc.controller.ServerSideRPCControllerFactory;
 import org.apache.hadoop.hbase.ipc.controller.ServerToServerRpcController;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.snapshot.SnapshotCreationException;
+import org.apache.hadoop.hbase.util.ByteStringer;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.hadoop.hbase.zookeeper.ZKConfig;
 import org.apache.hadoop.ipc.RemoteException;
-import org.apache.phoenix.compat.hbase.ByteStringer;
 import org.apache.phoenix.compile.MutationPlan;
 import org.apache.phoenix.coprocessor.generated.ChildLinkMetaDataProtos.ChildLinkMetaDataService;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos;
@@ -1289,16 +1286,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     }
   }
 
-  private void modifyTableDescriptor(TableDescriptorBuilder td, Map<String, Object> props) {
-    if (props != null) {
-      for (Entry<String, Object> entry : props.entrySet()) {
-        String propName = entry.getKey();
-        Object value = entry.getValue();
-        td.setValue(propName, value == null ? null : value.toString());
-      }
-    }
-  }
-
   private TableDescriptorBuilder generateTableDescriptor(byte[] physicalTableName,
     byte[] parentPhysicalTableName, TableDescriptor existingDesc, PTableType tableType,
     Map<String, Object> tableProps, List<Pair<byte[], Map<String, Object>>> families,
@@ -1333,10 +1320,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
         // PHYSICAL_DATA_TABLE_NAME points to the name of the view instead of the physical base
         // table
         baseTableDesc = existingDesc;
-      }
-      String baseTableMaxLookbackVal = baseTableDesc.getValue(PHOENIX_MAX_LOOKBACK_AGE_CONF_KEY);
-      if (baseTableMaxLookbackVal != null) {
-        tableProps.put(PHOENIX_MAX_LOOKBACK_AGE_CONF_KEY, baseTableMaxLookbackVal);
       }
       dataTableColDescForIndexTablePropSyncing = baseTableDesc.getColumnFamily(defaultFamilyBytes);
       // It's possible that the table has specific column families and none of them are declared
@@ -1656,9 +1639,16 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
         }
       }
 
-      // PhoenixTTLRegionObserver should no longer be in use
-      if (newDesc.hasCoprocessor(QueryConstants.PHOENIX_TTL_REGION_OBSERVER_CLASSNAME)) {
-        builder.removeCoprocessor(QueryConstants.PHOENIX_TTL_REGION_OBSERVER_CLASSNAME);
+      // The priority for this co-processor should be set higher than the GlobalIndexChecker so that
+      // the read repair scans
+      // are intercepted by the TTLAwareRegionObserver and only the rows that are not ttl-expired
+      // are returned.
+      if (!SchemaUtil.isSystemTable(tableName)) {
+        if (!newDesc.hasCoprocessor(QueryConstants.PHOENIX_TTL_REGION_OBSERVER_CLASSNAME)) {
+          builder.setCoprocessor(CoprocessorDescriptorBuilder
+            .newBuilder(QueryConstants.PHOENIX_TTL_REGION_OBSERVER_CLASSNAME)
+            .setPriority(priority - 2).setProperties(Collections.emptyMap()).build());
+        }
       }
 
       if (
@@ -1733,16 +1723,16 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
       ConnectionQueryServicesImpl.this.props.getLong(QueryServices.DELAY_FOR_SCHEMA_UPDATE_CHECK,
         QueryServicesOptions.DEFAULT_DELAY_FOR_SCHEMA_UPDATE_CHECK);
     boolean success = false;
-    int numTries = 0;
+    int numTries = 1;
     PhoenixStopWatch watch = new PhoenixStopWatch();
     watch.start();
     do {
       try {
         success = op.checkForCompletion();
       } catch (Exception ex) {
-        // If we encounter any exception on the first try, propagate the exception and fail.
+        // If we encounter any exception on the first or last try, propagate the exception and fail.
         // Else, we swallow the exception and retry till we reach maxRetries.
-        if (numTries == 0) {
+        if (numTries == 1 || numTries == maxRetries) {
           watch.stop();
           TimeoutException toThrow = new TimeoutException("Operation " + op.getOperationName()
             + " didn't complete because of exception. Time elapsed: " + watch.elapsedMillis());
@@ -1751,9 +1741,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
         }
       }
       numTries++;
-      if (numTries < maxRetries && !success) {
-        Thread.sleep(sleepInterval);
-      }
+      Thread.sleep(sleepInterval);
     } while (numTries < maxRetries && !success);
 
     watch.stop();
@@ -3288,7 +3276,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     Integer newReplicationScope = null;
     KeepDeletedCells newKeepDeletedCells = null;
     TransactionFactory.Provider txProvider = null;
-    Integer newMaxLookback = null;
     for (String family : properties.keySet()) {
       List<Pair<String, Object>> propsList = properties.get(family);
       if (propsList != null && propsList.size() > 0) {
@@ -3315,14 +3302,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
                   .setMessage("Column Family: " + family + ", Property: " + propName)
                   .setSchemaName(table.getSchemaName().getString())
                   .setTableName(table.getTableName().getString()).build().buildException();
-            }
-            if (PHOENIX_MAX_LOOKBACK_AGE_CONF_KEY.equals(propName)) {
-              if (table.getType() == PTableType.INDEX) {
-                throw new SQLExceptionInfo.Builder(
-                  SQLExceptionCode.CANNOT_SET_OR_ALTER_MAX_LOOKBACK_FOR_INDEX)
-                    .setMessage("Property: " + propName).build().buildException();
-              }
-              newMaxLookback = (Integer) propValue;
             }
             tableProps.put(propName, propValue);
           } else {
@@ -3658,7 +3637,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     // the column families of each of its indexes (including indexes on this base table's views)
     // and store those table descriptor mappings as well
     setSyncedPropertiesForTableIndexes(table, tableAndIndexDescriptorMappings,
-      applyPropsToAllIndexColFams, getNewSyncedPropsMapForTableDescriptor(newMaxLookback));
+      applyPropsToAllIndexColFams);
     return tableAndIndexDescriptorMappings;
   }
 
@@ -3763,15 +3742,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     return newSyncedProps;
   }
 
-  private Map<String, Object> getNewSyncedPropsMapForTableDescriptor(Integer newMaxLookback) {
-    if (newMaxLookback == null) {
-      return null;
-    }
-    Map<String, Object> newSyncedProps = new HashMap<>(1);
-    setPropIfNotNull(newSyncedProps, PHOENIX_MAX_LOOKBACK_AGE_CONF_KEY, newMaxLookback);
-    return newSyncedProps;
-  }
-
   /**
    * Set the new values for properties that are to be kept in sync amongst those column families of
    * the table which are not referenced in the context of our alter table command, including the
@@ -3801,16 +3771,11 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
    * @param table                           base table
    * @param tableAndIndexDescriptorMappings old to new table descriptor mappings
    * @param applyPropsToAllIndexesDefaultCF new properties to apply to all index column families
-   * @param applyPropsToAllIndexesTd        new properties to apply to all index table descriptors
    */
   private void setSyncedPropertiesForTableIndexes(PTable table,
     Map<TableDescriptor, TableDescriptor> tableAndIndexDescriptorMappings,
-    Map<String, Object> applyPropsToAllIndexesDefaultCF,
-    Map<String, Object> applyPropsToAllIndexesTd) throws SQLException {
-    if (
-      (applyPropsToAllIndexesDefaultCF == null || applyPropsToAllIndexesDefaultCF.isEmpty())
-        && (applyPropsToAllIndexesTd == null || applyPropsToAllIndexesTd.isEmpty())
-    ) {
+    Map<String, Object> applyPropsToAllIndexesDefaultCF) throws SQLException {
+    if (applyPropsToAllIndexesDefaultCF == null || applyPropsToAllIndexesDefaultCF.isEmpty()) {
       return;
     }
 
@@ -3823,7 +3788,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
         this.getTableDescriptor(indexTable.getPhysicalName().getBytes());
       TableDescriptorBuilder newIndexDescriptorBuilder =
         TableDescriptorBuilder.newBuilder(origIndexDescriptor);
-      modifyTableDescriptor(newIndexDescriptorBuilder, applyPropsToAllIndexesTd);
 
       byte[] defaultIndexColFam = SchemaUtil.getEmptyColumnFamily(indexTable);
       ColumnFamilyDescriptorBuilder indexDefaultColDescriptorBuilder = ColumnFamilyDescriptorBuilder
@@ -4092,13 +4056,11 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
   }
 
   protected String getCDCStreamDDL() {
-    long partitionExpiryMinAge =
-      getProps().getLong(QueryServices.PHOENIX_CDC_STREAM_PARTITION_EXPIRY_MIN_AGE_MS,
-        QueryServicesOptions.DEFAULT_PHOENIX_CDC_STREAM_PARTITION_EXPIRY_MIN_AGE_MS);
-    String ttlExpression =
-      String.format(CDC_STREAM_CONDITIONAL_TTL_EXPRESSION, partitionExpiryMinAge);
-    String ddl = setSystemDDLProperties(QueryConstants.CREATE_CDC_STREAM_METADATA);
-    return ddl + ",TTL='" + ttlExpression + "'";
+    return setSystemDDLProperties(QueryConstants.CREATE_CDC_STREAM_METADATA);
+  }
+
+  protected String getHAGroupDDL() {
+    return setSystemDDLProperties(QueryConstants.CREATE_HA_GROUP_METADATA);
   }
 
   private String setSystemDDLProperties(String ddl) {
@@ -4137,16 +4099,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
             try {
               GLOBAL_QUERY_SERVICES_COUNTER.increment();
               LOGGER.info("An instance of ConnectionQueryServices was created.");
-              boolean isServerSideConnection =
-                config.getBoolean(QueryUtil.IS_SERVER_CONNECTION, false);
-              if (isServerSideConnection) {
-                Configuration clonedConfiguration = PropertiesUtil.cloneConfig(config);
-                clonedConfiguration.setClass(CUSTOM_CONTROLLER_CONF_KEY,
-                  ServerRpcControllerFactory.class, RpcControllerFactory.class);
-                connection = openConnection(clonedConfiguration);
-              } else {
-                connection = openConnection(config);
-              }
+              connection = openConnection(config);
               hConnectionEstablished = true;
               boolean lastDDLTimestampValidationEnabled =
                 getProps().getBoolean(QueryServices.LAST_DDL_TIMESTAMP_VALIDATION_ENABLED,
@@ -4154,10 +4107,9 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
               if (lastDDLTimestampValidationEnabled) {
                 refreshLiveRegionServers();
               }
-              boolean skipSystemExistenceCheck =
-                getProps().getBoolean(QueryServices.SKIP_SYSTEM_TABLES_EXISTENCE_CHECK,
-                  QueryServicesOptions.DEFAULT_SKIP_SYSTEM_TABLES_EXISTENCE_CHECK);
-              if (skipSystemExistenceCheck) {
+              String skipSystemExistenceCheck =
+                props.getProperty(SKIP_SYSTEM_TABLES_EXISTENCE_CHECK);
+              if (skipSystemExistenceCheck != null && Boolean.valueOf(skipSystemExistenceCheck)) {
                 initialized = true;
                 success = true;
                 return null;
@@ -4388,8 +4340,8 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
 
   private void createOtherSystemTables(PhoenixConnection metaConnection)
     throws SQLException, IOException {
-    try {
-      metaConnection.createStatement().execute(getSystemSequenceTableDDL(nSequenceSaltBuckets));
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.execute(getSystemSequenceTableDDL(nSequenceSaltBuckets));
       // When creating the table above, DDL statements are
       // used. However, the CFD level properties are not set
       // via DDL commands, hence we are explicitly setting
@@ -4398,40 +4350,44 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     } catch (TableAlreadyExistsException e) {
       nSequenceSaltBuckets = getSaltBuckets(e);
     }
-    try {
-      metaConnection.createStatement().execute(QueryConstants.CREATE_STATS_TABLE_METADATA);
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.execute(QueryConstants.CREATE_STATS_TABLE_METADATA);
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().execute(getFunctionTableDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.execute(getFunctionTableDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().execute(getLogTableDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.execute(getLogTableDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().executeUpdate(getChildLinkDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.execute(getChildLinkDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().executeUpdate(getMutexDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getMutexDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().executeUpdate(getTaskDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getTaskDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().executeUpdate(getTransformDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getTransformDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().executeUpdate(getCDCStreamStatusDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getCDCStreamStatusDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
-    try {
-      metaConnection.createStatement().executeUpdate(getCDCStreamDDL());
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getCDCStreamDDL());
+    } catch (TableAlreadyExistsException ignore) {
+    }
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getHAGroupDDL());
     } catch (TableAlreadyExistsException ignore) {
     }
   }
@@ -4753,24 +4709,24 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
         }
       }
     }
-    if (currentServerSideTableTimeStamp < MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0) {
+    if (currentServerSideTableTimeStamp < MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0) {
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 9,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 7,
         PhoenixDatabaseMetaData.PHYSICAL_TABLE_NAME + " " + PVarchar.INSTANCE.getSqlTypeName());
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 8,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 6,
         PhoenixDatabaseMetaData.SCHEMA_VERSION + " " + PVarchar.INSTANCE.getSqlTypeName());
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 7,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 5,
         PhoenixDatabaseMetaData.EXTERNAL_SCHEMA_ID + " " + PVarchar.INSTANCE.getSqlTypeName());
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 6,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 4,
         PhoenixDatabaseMetaData.STREAMING_TOPIC_NAME + " " + PVarchar.INSTANCE.getSqlTypeName());
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 5,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 3,
         PhoenixDatabaseMetaData.INDEX_WHERE + " " + PVarchar.INSTANCE.getSqlTypeName());
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 4,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 2,
         PhoenixDatabaseMetaData.CDC_INCLUDE_TABLE + " " + PVarchar.INSTANCE.getSqlTypeName());
 
       /**
@@ -4778,16 +4734,16 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
        * PHOENIX_TTL Column. See PHOENIX-7023
        */
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 3,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0 - 1,
         PhoenixDatabaseMetaData.TTL + " " + PVarchar.INSTANCE.getSqlTypeName());
       metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 2,
+        MIN_SYSTEM_TABLE_TIMESTAMP_5_3_0,
         PhoenixDatabaseMetaData.ROW_KEY_MATCHER + " " + PVarbinary.INSTANCE.getSqlTypeName());
-      metaConnection = addColumnsIfNotExists(metaConnection, PhoenixDatabaseMetaData.SYSTEM_CATALOG,
-        MIN_SYSTEM_TABLE_TIMESTAMP_5_4_0 - 1,
-        PhoenixDatabaseMetaData.IS_STRICT_TTL + " " + PBoolean.INSTANCE.getSqlTypeName());
-      // Add any 5.4.0 specific upgrade logic here if needed in the future
-      // Currently no new schema changes required for 5.4.0
+      // Values in PHOENIX_TTL column will not be used for further release as PHOENIX_TTL column is
+      // being deprecated
+      // and will be removed in later release. To copy copyDataFromPhoenixTTLtoTTL(metaConnection)
+      // can be used but
+      // as that feature was not fully built we are not moving old value to new column
 
       // move TTL values stored in descriptor to SYSCAT TTL column.
       moveTTLFromHBaseLevelTTLToPhoenixLevelTTL(metaConnection);
@@ -5006,7 +4962,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     metaConnection = upgradeSystemMutex(metaConnection);
     metaConnection = upgradeSystemCDCStreamStatus(metaConnection);
     metaConnection = upgradeSystemCDCStream(metaConnection);
-
+    metaConnection = upgradeSystemHAGroup(metaConnection);
     // As this is where the most time will be spent during an upgrade,
     // especially when there are large number of views.
     // Upgrade the SYSTEM.CHILD_LINK towards the end,
@@ -5186,6 +5142,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     try (Statement statement = metaConnection.createStatement()) {
       statement.executeUpdate(getTaskDDL());
     } catch (NewerTableAlreadyExistsException ignored) {
+
     } catch (TableAlreadyExistsException e) {
       // take snapshot first
       takeSnapshotOfSysTable(systemTableToSnapshotMap, e);
@@ -5323,6 +5280,15 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     throws SQLException {
     try {
       metaConnection.createStatement().executeUpdate(getCDCStreamDDL());
+    } catch (TableAlreadyExistsException ignored) {
+    }
+    return metaConnection;
+  }
+
+  private PhoenixConnection upgradeSystemHAGroup(PhoenixConnection metaConnection)
+    throws SQLException {
+    try (Statement stmt = metaConnection.createStatement()) {
+      stmt.executeUpdate(getHAGroupDDL());
     } catch (TableAlreadyExistsException ignored) {
     }
     return metaConnection;
@@ -6918,29 +6884,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
     }
   }
 
-  /*
-   * Delete any metadata related to this table in the System tables for Streams.
-   */
-  @Override
-  public void deleteAllStreamMetadataForTable(java.sql.Connection conn, String tableName)
-    throws SQLException {
-    String deleteStreamStatusQuery =
-      "DELETE FROM " + SYSTEM_CDC_STREAM_STATUS_NAME + " WHERE TABLE_NAME = ?";
-    String deleteStreamPartitionsQuery =
-      "DELETE FROM " + SYSTEM_CDC_STREAM_NAME + " WHERE TABLE_NAME = ?";
-    LOGGER.info("Deleting Stream Metadata for table {}", tableName);
-    try (PreparedStatement ps = conn.prepareStatement(deleteStreamStatusQuery)) {
-      ps.setString(1, tableName);
-      ps.executeUpdate();
-      conn.commit();
-    }
-    try (PreparedStatement ps = conn.prepareStatement(deleteStreamPartitionsQuery)) {
-      ps.setString(1, tableName);
-      ps.executeUpdate();
-      conn.commit();
-    }
-  }
-
   /**
    * Invalidate metadata cache on all regionservers with retries for the given list of
    * InvalidateServerMetadataCacheRequest. Each InvalidateServerMetadataCacheRequest contains
@@ -7062,5 +7005,28 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices
       builder.addInvalidateServerMetadataCacheRequests(innerBuilder.build());
     }
     return builder.build();
+  }
+
+  /**
+   * Delete any metadata related to this table in the System tables for Streams.
+   */
+  @Override
+  public void deleteAllStreamMetadataForTable(java.sql.Connection conn, String tableName)
+    throws SQLException {
+    String deleteStreamStatusQuery =
+      "DELETE FROM " + SYSTEM_CDC_STREAM_STATUS_NAME + " WHERE TABLE_NAME = ?";
+    String deleteStreamPartitionsQuery =
+      "DELETE FROM " + SYSTEM_CDC_STREAM_NAME + " WHERE TABLE_NAME = ?";
+    LOGGER.info("Deleting Stream Metadata for table {}", tableName);
+    try (PreparedStatement ps = conn.prepareStatement(deleteStreamStatusQuery)) {
+      ps.setString(1, tableName);
+      ps.executeUpdate();
+      conn.commit();
+    }
+    try (PreparedStatement ps = conn.prepareStatement(deleteStreamPartitionsQuery)) {
+      ps.setString(1, tableName);
+      ps.executeUpdate();
+      conn.commit();
+    }
   }
 }

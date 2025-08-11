@@ -128,6 +128,7 @@ public class BaseScannerRegionObserverConstants {
   public static final String UPGRADE_DESC_ROW_KEY = "_UPGRADE_DESC_ROW_KEY";
   public static final String SCAN_REGION_SERVER = "_SCAN_REGION_SERVER";
   public static final String RUN_UPDATE_STATS_ASYNC_ATTRIB = "_RunUpdateStatsAsync";
+  public static final String HA_GROUP_NAME_ATTRIB = "_HAGroupName";
   public static final String SKIP_REGION_BOUNDARY_CHECK = "_SKIP_REGION_BOUNDARY_CHECK";
   public static final String TX_SCN = "_TxScn";
   public static final String TTL = "_TTL";

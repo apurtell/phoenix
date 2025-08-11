@@ -31,11 +31,9 @@ import static org.apache.phoenix.monitoring.MetricType.NUM_METADATA_LOOKUP_FAILU
 import static org.apache.phoenix.monitoring.MetricType.UPSERT_AGGREGATE_FAILURE_SQL_COUNTER;
 import static org.apache.phoenix.monitoring.MetricType.UPSERT_AGGREGATE_SUCCESS_SQL_COUNTER;
 import static org.apache.phoenix.query.QueryServices.INDEX_REGION_OBSERVER_ENABLED_ALL_TABLES_ATTRIB;
-import static org.apache.phoenix.query.QueryServices.SERVER_SIDE_IMMUTABLE_INDEXES_ENABLED_ATTRIB;
 import static org.apache.phoenix.query.QueryServices.SOURCE_OPERATION_ATTRIB;
 import static org.apache.phoenix.query.QueryServices.WILDCARD_QUERY_DYNAMIC_COLS_ATTRIB;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_INDEX_REGION_OBSERVER_ENABLED_ALL_TABLES;
-import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_SERVER_SIDE_IMMUTABLE_INDEXES_ENABLED;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_WILDCARD_QUERY_DYNAMIC_COLS_ATTRIB;
 import static org.apache.phoenix.thirdparty.com.google.common.base.Preconditions.checkNotNull;
 
@@ -55,6 +53,7 @@ import java.util.Map.Entry;
 import java.util.Set;
 import javax.annotation.Nonnull;
 import javax.annotation.concurrent.Immutable;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
@@ -202,6 +201,10 @@ public class MutationState implements SQLCloseable {
     allUpsertsMutations = true;
   }
 
+  public void setMutationQueryParsingTime(long time) {
+    mutationQueryParsingTimeMS = time;
+  }
+
   public MutationState(int maxSize, long maxSizeBytes, PhoenixConnection connection) {
     this(maxSize, maxSizeBytes, connection, false, null);
   }
@@ -266,8 +269,8 @@ public class MutationState implements SQLCloseable {
       .getQueryServices().getConfiguration().get(INDEX_REGION_OBSERVER_ENABLED_ALL_TABLES_ATTRIB,
         DEFAULT_INDEX_REGION_OBSERVER_ENABLED_ALL_TABLES));
     this.serverSideImmutableIndexes = this.connection.getQueryServices().getConfiguration()
-      .getBoolean(SERVER_SIDE_IMMUTABLE_INDEXES_ENABLED_ATTRIB,
-        DEFAULT_SERVER_SIDE_IMMUTABLE_INDEXES_ENABLED);
+      .getBoolean(QueryServices.SERVER_SIDE_IMMUTABLE_INDEXES_ENABLED_ATTRIB,
+        QueryServicesOptions.DEFAULT_SERVER_SIDE_IMMUTABLE_INDEXES_ENABLED);
   }
 
   public MutationState(TableRef table, MultiRowMutationState mutations, long sizeOffset,
@@ -841,10 +844,6 @@ public class MutationState implements SQLCloseable {
         for (Mutation mutation : rowMutations) {
           if (onDupKeyBytes != null) {
             mutation.setAttribute(PhoenixIndexBuilderHelper.ATOMIC_OP_ATTRIB, onDupKeyBytes);
-            if (rowEntry.getValue().isUpdateOnly()) {
-              mutation.setAttribute(PhoenixIndexBuilderHelper.ATOMIC_OP_UPDATE_ONLY_ATTRIB,
-                PhoenixIndexBuilderHelper.ATOMIC_OP_UPDATE_ONLY_ATTRIB_VALUE);
-            }
           }
           if (this.returnResult != null) {
             if (this.returnResult == ReturnResult.NEW_ROW_ON_SUCCESS) {
@@ -905,8 +904,11 @@ public class MutationState implements SQLCloseable {
       table.getExternalSchemaId() != null ? Bytes.toBytes(table.getExternalSchemaId()) : null;
     byte[] lastDDLTimestamp =
       table.getLastDDLTimestamp() != null ? Bytes.toBytes(table.getLastDDLTimestamp()) : null;
+    byte[] haGroupName = StringUtils.isNotBlank(connection.getHAGroupName())
+      ? Bytes.toBytes(connection.getHAGroupName())
+      : null;
     WALAnnotationUtil.annotateMutation(mutation, tenantId, schemaName, tableName, tableType,
-      lastDDLTimestamp);
+      lastDDLTimestamp, haGroupName);
   }
 
   /**
@@ -1685,17 +1687,16 @@ public class MutationState implements SQLCloseable {
           mutationCommitTime = EnvironmentEdgeManager.currentTimeMillis() - startTime;
           GLOBAL_MUTATION_COMMIT_TIME.update(mutationCommitTime);
           MutationMetric failureMutationMetrics = MutationMetric.EMPTY_METRIC;
-          long mutationQueryParsingTimeMS = this.mutationQueryParsingTimeMS;
           if (!areAllBatchesSuccessful) {
             failureMutationMetrics =
               updateMutationBatchFailureMetrics(currentMutationBatch, htableNameStr,
-                numFailedMutations, table.isTransactional(), mutationQueryParsingTimeMS);
+                numFailedMutations, table.isTransactional(), this.mutationQueryParsingTimeMS);
           }
 
           MutationMetric committedMutationsMetric =
             getCommittedMutationsMetric(totalMutationBytesObject, mutationBatchList, numMutations,
               numFailedMutations, numFailedPhase3Mutations, mutationCommitTime, totalBatchCount,
-              mutationQueryParsingTimeMS);
+              this.mutationQueryParsingTimeMS);
           // Combine failure mutation metrics with committed ones for the final picture
           committedMutationsMetric.combineMetric(failureMutationMetrics);
           mutationMetricQueue.addMetricsForTable(htableNameStr, committedMutationsMetric);
@@ -1885,7 +1886,7 @@ public class MutationState implements SQLCloseable {
       }
       PTable logicalTable = tableInfo.getPTable();
       if (
-        !this.serverSideImmutableIndexes && tableInfo.getOrigTableRef().getTable().isImmutableRows()
+        tableInfo.getOrigTableRef().getTable().isImmutableRows()
           && (this.indexRegionObserverEnabledAllTables
             || IndexUtil.isGlobalIndexCheckerEnabled(connection, tableInfo.getHTableName()))
       ) {
@@ -2392,10 +2393,6 @@ public class MutationState implements SQLCloseable {
       return onDupKeyBytes;
     }
 
-    boolean isUpdateOnly() {
-      return onDupKeyType == OnDuplicateKeyType.UPDATE_ONLY;
-    }
-
     public Map<PColumn, byte[]> getColumnValues() {
       return columnValues;
     }
@@ -2431,9 +2428,6 @@ public class MutationState implements SQLCloseable {
       // increments of the same row in the same commit batch.
       this.onDupKeyBytes =
         PhoenixIndexBuilderHelper.combineOnDupKey(this.onDupKeyBytes, newRow.onDupKeyBytes);
-      if (newRow.onDupKeyType == OnDuplicateKeyType.UPDATE_ONLY) {
-        this.onDupKeyType = OnDuplicateKeyType.UPDATE_ONLY;
-      }
       statementIndexes = joinSortedIntArrays(statementIndexes, newRow.getStatementIndexes());
       return true;
     }
@@ -2468,10 +2462,6 @@ public class MutationState implements SQLCloseable {
     }
     timeSpent += time;
     timeInExecuteMutationMap.put(tableName, timeSpent);
-  }
-
-  public void setMutationQueryParsingTime(long time) {
-    mutationQueryParsingTimeMS = time;
   }
 
   public void resetExecuteMutationTimeMap() {

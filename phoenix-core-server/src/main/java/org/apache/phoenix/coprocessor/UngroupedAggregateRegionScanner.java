@@ -61,7 +61,6 @@ import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.coprocessor.ObserverContext;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
-import org.apache.hadoop.hbase.regionserver.PhoenixScannerContext;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.regionserver.RegionScanner;
 import org.apache.hadoop.hbase.regionserver.ScannerContext;
@@ -110,6 +109,7 @@ import org.apache.phoenix.transaction.TransactionFactory;
 import org.apache.phoenix.util.ByteUtil;
 import org.apache.phoenix.util.ClientUtil;
 import org.apache.phoenix.util.EncodedColumnsUtil;
+import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.ExpressionUtil;
 import org.apache.phoenix.util.IndexUtil;
 import org.apache.phoenix.util.LogUtil;
@@ -603,6 +603,7 @@ public class UngroupedAggregateRegionScanner extends BaseRegionScanner {
   public boolean next(List<Cell> resultsToReturn, ScannerContext scannerContext)
     throws IOException {
     boolean hasMore;
+    long startTime = EnvironmentEdgeManager.currentTimeMillis();
     Configuration conf = env.getConfiguration();
     final TenantCache tenantCache = GlobalCache.getTenantCache(env, ScanUtil.getTenantId(scan));
     try (MemoryManager.MemoryChunk em = tenantCache.getMemoryManager().allocate(0)) {
@@ -645,10 +646,6 @@ public class UngroupedAggregateRegionScanner extends BaseRegionScanner {
                 resultsToReturn.addAll(results);
                 return true;
               }
-              // we got a page timeout from the lower scanner but hasAny is true which means that
-              // we have a valid result which we can return to the client instead of a dummy but we
-              // still need to finish the rpc and release the handler
-              PhoenixScannerContext.setReturnImmediately(scannerContext);
               break;
             }
             if (!results.isEmpty()) {
@@ -702,16 +699,9 @@ public class UngroupedAggregateRegionScanner extends BaseRegionScanner {
               aggregators.aggregate(rowAggregators, result);
               hasAny = true;
             }
-            if (
-              PhoenixScannerContext.isReturnImmediately(scannerContext)
-                || PhoenixScannerContext.isTimedOut(scannerContext, pageSizeMs)
-            ) {
-              // we could have a valid result which we can return to the client instead of a dummy,
-              // but we still need to finish the rpc and release the handler
-              PhoenixScannerContext.setReturnImmediately(scannerContext);
-              break;
-            }
-          } while (hasMore);
+          } while (
+            hasMore && (EnvironmentEdgeManager.currentTimeMillis() - startTime) < pageSizeMs
+          );
           if (!mutations.isEmpty()) {
             if (!isSingleRowDelete) {
               annotateAndCommit(mutations);
@@ -819,9 +809,11 @@ public class UngroupedAggregateRegionScanner extends BaseRegionScanner {
     byte[] tableType = scan.getAttribute(MutationState.MutationMetadataType.TABLE_TYPE.toString());
     byte[] ddlTimestamp =
       scan.getAttribute(MutationState.MutationMetadataType.TIMESTAMP.toString());
+    byte[] haGroupName = scan.getAttribute(BaseScannerRegionObserverConstants.HA_GROUP_NAME_ATTRIB);
 
     for (Mutation m : mutationsList) {
-      annotateMutation(m, tenantId, schemaName, logicalTableName, tableType, ddlTimestamp);
+      annotateMutation(m, tenantId, schemaName, logicalTableName, tableType, ddlTimestamp,
+        haGroupName);
     }
   }
 

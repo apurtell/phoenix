@@ -31,8 +31,8 @@ import java.util.Properties;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.ipc.ServerRpcController;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.util.ByteStringer;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.phoenix.compat.hbase.ByteStringer;
 import org.apache.phoenix.coprocessor.PhoenixRegionServerEndpoint;
 import org.apache.phoenix.coprocessor.generated.RegionServerEndpointProtos;
 import org.apache.phoenix.exception.StaleMetadataCacheException;
@@ -154,18 +154,6 @@ public class PhoenixRegionServerEndpointIT extends BaseTest {
       coprocessor.validateLastDDLTimestamp(controller, request, null);
       assertFalse(controller.failed());
     }
-  }
-
-  @Test
-  public void testInvalidateHAGroupStoreClient() {
-    HRegionServer regionServer = utility.getMiniHBaseCluster().getRegionServer(0);
-    PhoenixRegionServerEndpoint coprocessor = getPhoenixRegionServerEndpoint(regionServer);
-    assertNotNull(coprocessor);
-    ServerRpcController controller = new ServerRpcController();
-    RegionServerEndpointProtos.InvalidateHAGroupStoreClientRequest request =
-      RegionServerEndpointProtos.InvalidateHAGroupStoreClientRequest.newBuilder().build();
-    coprocessor.invalidateHAGroupStoreClient(controller, request, null);
-    assertFalse(controller.failed());
   }
 
   private String getCreateTableStmt(String tableName) {
