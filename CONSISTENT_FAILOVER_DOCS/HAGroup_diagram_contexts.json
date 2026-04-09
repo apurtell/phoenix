@@ -1,0 +1,65 @@
+[
+  {
+    "para_index": 46,
+    "num_drawings": 2,
+    "inline_text": "Phoenix ServerPhoenix Dual Cluster ClientHDFS Data NodeEBSHBase ClientPrimary ClusterStandby Cluster             Phoenix ServerHDFS ClientHDFS FileHBase TableAsynchronous Log ReplayStore and Forward Log WriterSynchronous Log WriterReplication Log WriterHA Group Store ManagerHA Group Store ClientPhoenix CoprocZookeeper QuorumZookeeper QuorumHA Group Store ClientReplication Log ReaderPhoenix CompactionHDFS Data NodeEBSHDFS ClientHDFS FileHDFS ClientHDFS FileHA Group StoreRPC HA Group Store ManagerRPC Green - Core HAGroup related ComponentsOrange - ClientsBlue - DependenciesHA Group Store Components in HA Re-architecture for Consistent Failover",
+    "nearest_heading": "Overall Design",
+    "prev_para_text": "Taken from Phoenix HA Rearchitecture for Consistent Failover"
+  },
+  {
+    "para_index": 108,
+    "num_drawings": 2,
+    "inline_text": "For a single ZK Quorum, HAGroupStoreManager instances across regionservers can receive multiple concurrent updates to HAGroupRecords.HAGroup StoreRegionServer1HDFSOut directory NOT emptyCheck OutDirectoryRegionServer2Out directory emptyCheck OutDirectoryRegionServer3Out directory NOT emptyCheck OutDirectoryHAGroupStoreManagerHAGroupStoreManagerHAGroupStoreManagerUpdate status to ActiveNotInSyncUpdate status to ActiveInSyncUpdate status to ActiveNotInSyncReplicationLogWriterReplicationLogWriterReplicationLogWriterZK1Z2ActiveStandby",
+    "nearest_heading": "Problem 1 : Ensuring Atomicity of Updates within the cluster(Single ZK Quorum)",
+    "prev_para_text": "Problem 1 : Ensuring Atomicity of Updates within the cluster(Single ZK Quorum)"
+  },
+  {
+    "para_index": 241,
+    "num_drawings": 2,
+    "inline_text": "HAGroup StoreRegionServer1HDFSOut directory NOT emptyCheck OutDirectoryRegionServer2Out directory emptyCheck OutDirectoryRegionServer3Out directory NOT emptyCheck OutDirectoryHAGroupStoreManagerHAGroupStoreManagerHAGroupStoreManagerUpdate status to ActiveNotInSyncUpdate status to ActiveUpdate status to ActiveNotInSyncReplicationLogWriterReplicationLogWriterReplicationLogWriterRegionServer1\u2019HDFSReplay NOTHealthyCheck ReplayHealthRegionServer2\u2019Replay HealthyCheck ReplayHealthRegionServer3\u2019Replay NOTHealthyCheck ReplayHealthHAGroupStoreManagerHAGroupStoreManagerHAGroupStoreManagerUpdate status to DegradedStandbyForReaderUpdate status to StandbyUpdate status to DegradedStandbyForReaderReplicationLogReaderReplicationLogReaderReplicationLogReaderZK1ZK2PrimaryStandby",
+    "nearest_heading": "Description of race condition during updates",
+    "prev_para_text": "As can be seen in the above section for Overall design, multiple components interact with HAGroupStoreManager. In fact, multiple regionservers across peers can try to send updates at the same time. This can be seen in the diagram below. ReplicationLogWriter and Reader can query HDFS at different times and can see different states of IN/OUT directories. This can cause them to send their own local state to HAGroupStore causing a race condition."
+  },
+  {
+    "para_index": 309,
+    "num_drawings": 2,
+    "inline_text": "How to read combined State Transition DiagramAIS,SSTA,SA, ac1Initial Cluster1 RoleInitial Cluster2 RoleActorAction orEventFinal Cluster1 RoleFinal Cluster2 Role",
+    "nearest_heading": "For both cluster states",
+    "prev_para_text": "For both cluster states"
+  },
+  {
+    "para_index": 320,
+    "num_drawings": 2,
+    "inline_text": "a. Wait for specific transition from A -> ATS or DSFR -> ATS and then only move S -> STA. For any other state transition, M2 can ignore.b. Admin can impose a timeout and abort if no progress. AIS,SW, iANIS,SANIS,DSM2, kW, jAISTS,SA, ac1AISTS,STAM2, bAISTS,A*R, cS,AISM1, dAbTA,AbTSAbTA,SM2, hAIS?,AbTSM1, fM2, hA, eW, fATS,AbTSA, ac2M1, gActorsA   : AdminR   : ReplicationLogReaderW  : ReplicationLogWriterM1: HAGroupStoreManager for Cluster1M2: HAGroupStoreManager for Cluster2 StatesATS: Active To StandbyS: StandbyAIS: Active In SyncANIS: Active Not In SyncANISTS: Active Not In Sync To StandbyDS: Degraded StandbyAbTA: Abort To ActiveAbTS: Abort To StandbyA* : Either of AIS or ANISActionac1: Start Failoverac2: Admin decides to abort failoverEventsb: Detect transition to ATS state for peer clusterc: Logs completely replayed and ready to transitiond: Detect transition to AIS/ANIS state for peer cluster and local state is ATS.f:  Detect transition to AbTA  /change local state to AIS/ANIS based on local state of Wg: Detect transition to AbTS state for peer clusterh: Peer state is changed to AbTAi: W changes to Store and Forward Mode j: OUT directory empty (Every W is in sync mode)k: Detect transition to ANIS for peer clusterl:  Detect transition to AIS for peer clusterAIS,DSW, jM2, lANISTS,SA, ac1W, j",
+    "nearest_heading": "For both cluster states",
+    "prev_para_text": "Final Cluster2 Role"
+  },
+  {
+    "para_index": 396,
+    "num_drawings": 2,
+    "inline_text": "AIS(Active In Sync)ATS(Active To Standby)S(Standby)AbTAIS(Abort To ActiveInSync)ANIS(Active Not In Sync)/Operator changes state from AIS to ATS to initiate failoverPeer transitions from STA to AIS/AINSDetect transition from STA to AbTS in peerDetect transition to AbTAISW changes to Store and Forward ModeOUT directory emptyAWOP(Active With Offline Peer)Peer changes to OFFLINEModePeer not in OFFLINEModeANISTS(Active Not In Sync To Standby)/Operator changes state from ANIS to ANISTS to initiate failoverOUT directory emptyANISWOP(Active Not In Sync With Offline Peer)Peer not in OFFLINEModePeer changes to OFFLINEMode/Operator aborts failoverAbTANIS(Abort To ActiveNotInSync)Detect transition to AbTANIS",
+    "nearest_heading": "State Transition Diagram for Active Cluster",
+    "prev_para_text": "State Transition Diagram for Active Cluster"
+  },
+  {
+    "para_index": 422,
+    "num_drawings": 2,
+    "inline_text": "StandbySTA(Standby To Active)AIS(Active In Sync)AbTS(Abort To Standby)DS(Degraded Standby)Replay completefor Replication LogsDetect peer transition to ANIS(Active Not In Sync)Detect peertransition to AIS(Active In Sync)OFFLINE/Operator changes state to OFFLINE/Operator changes state to STANDBY/Operator abortsfailoverDetect peertransition to AIS(Active In Sync)Detect peer transition to ANIS(Active Not In Sync)Detect peer transition to ATS(Active To Standby)",
+    "nearest_heading": "State Transition Diagram for Standby Cluster",
+    "prev_para_text": "State Transition Diagram for Standby Cluster"
+  },
+  {
+    "para_index": 503,
+    "num_drawings": 2,
+    "inline_text": "Timet0Local: AISPeer: STANDBYt1Local: ANISPeer: STANDBYRS1/RS2 switches from Sync to Store&Forward Modet2Local: ANISPeer: DSFWPeer reacts to change from AIS to ANISRS1 can now write logs in Sync modeRS2 still in Store&Forward modet3Local: ANISPeer: DSFWRS1/RS2 can now write logs in Sync modet4Local: ANISPeer: DSFWRS1 tries to update the state to Sync mode but update is rejected as other RS can still be in Store&Forward ModeRS1 tries to update the state to Sync mode but update is rejected as ZK_Session_Timeouttime has not yet elapsedt5Local: AISPeer: StandbyLocal now in Sync modeas ZK_Session_Timeout time has elapsedZK_Session_Timeout",
+    "nearest_heading": "Avoiding flapping between Store&Forward and Sync mode in case of different modes across RegionServers",
+    "prev_para_text": "This means synchronous replication failures can be potentially the source of consistency issues. If a region server starts logging mutations locally by switching to the store-and-forward replication mode after a synchronous replication failure but fails to update the global HA store with the state ACTIVE_NOT_IN_SYNC, this can cause a consistency issue. For example, just after acknowledging the write commit in the store-and-forward replication mode, the HA group may failover before detecting this mode switch."
+  },
+  {
+    "para_index": 798,
+    "num_drawings": 2,
+    "inline_text": "Old Combined State Transition Diagrama. Wait for specific transition from A -> ATS or DSFR -> ATS and then only move S -> STA. For any other state transition, M2 can ignore.b. Admin can impose a timeout and abort if no progress. AIS,SW, iANIS,SANIS,DSFWM2, kAIS,DSFRR, mANIS,DSFRW, iANIS,DSM2, kR, mR, nW, jW, jR, nATS,SA, ac1ATS,STAM2, bATS,A*R, cS,AISM1, dAbTA,AbTSAbTA,SM2, hA*,AbTSW, fM2, hA, eW, fAbTA,STAA, ac2M2, gA*,STAW, fM2, gActorsA   : AdminR   : ReplicationLogReaderW  : ReplicationLogWriterM1: HAGroupStoreManager for Cluster1M2: HAGroupStoreManager for Cluster2 StatesATS: Active To StandbyS: StandbyAIS: Active In SyncANIS: Active Not In SyncANISTS: ANIS: Active Not In Sync To StandbyDS: Degraded StandbyDSFR: Degraded Standby For ReaderDSFW: Degraded Standby For WriterAbTA: Abort To ActiveAbTS: Abort To StandbyA* : Either of AIS or ANISActionac1: Start Failoverac2: Admin decides to abort failoverEventsb: Detect transition from AIS to ATS state for peer clusterc: Logs completely replayed and ready to transitiond: Detect transition from STA to AIS/ANIS state for peer clusterf:  Detect transition from ATS to AbTA  /change local state to AIS/ANIS based on local state of Wg: Detect transition from ATS to AbTA state for peer clusterh: Local state is changed to AbTSi: W changes to Store and Forward Mode j: OUT directory empty (Every W is in sync mode)k: Detect transition from AIS to ANIS for peer clusterl:  Detect transition from ANIS to AIS for peer clusterm: R has lag exceeding threshold n: R lag is now below thresholdAIS,DSFWW, jM2, lAIS,DSW, jM2, lANISTS,SA, ac1W, j",
+    "nearest_heading": "Appendix",
+    "prev_para_text": "Appendix"
+  }
+]

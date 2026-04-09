@@ -1,0 +1,58 @@
+[
+  {
+    "para_index": 12,
+    "num_drawings": 2,
+    "inline_text": "Application ServerHBase  Cluster 1 ApplicationPhoenix ClientHBase ClientSQLHBase ClientScans/ MutationsRegion ServerHMasterZookeeperRegion ServerHMasterZookeeperPhoenix Dual Cluster ClientHA Group StoreHA GroupHBase  Cluster 2 Update and Monitor RecordsAsynchronous Replication",
+    "nearest_heading": "Background",
+    "prev_para_text": "The asynchronous replication leaves open a small window of unreplicated writes and thus clients may temporarily miss recent writes if we do an unplanned failover. Because of this data loss possibility, the dual cluster HA feature (that is, the Phoenix-Ultra HA feature) is supported only for a specific use case, namely Vagabond."
+  },
+  {
+    "para_index": 83,
+    "num_drawings": 2,
+    "inline_text": "Application ServerHBase  Cluster 1 ApplicationPhoenix ClientHBase ClientSQLHBase ClientScans/ MutationsRegion ServerHMasterZookeeperHMasterZookeeperPhoenix Dual Cluster ClientHA Group Store HA GroupUpdate and MonitorHBase  Cluster 2 Phoenix ServerRegion ServerPhoenix ServerSynchronous ReplicationPull Push",
+    "nearest_heading": "HA Architecture",
+    "prev_para_text": "Phoenix servers are responsible for synchronously replicating mutations to the peer cluster."
+  },
+  {
+    "para_index": 163,
+    "num_drawings": 2,
+    "inline_text": "ApplicationPhoenix ClientPhoenix TableHBase ClientHBase TableHBase Region ServerPhoenix ServerHDFS ClientHDFS FileHDFS Data NodeEBSHBase ClientHDFS Data NodeEBSHBase ClientPrimary ClusterStandby ClusterSynchronous ReplicationHDFS ClientHDFS File Store and Forward  ReplicationPhoenix ServerHDFS ClientHDFS FileHBase TableAsynchronous Log Replay1121Secondary Index UpdateHBase TableWAL Write3",
+    "nearest_heading": "Phoenix Synchronous Replication",
+    "prev_para_text": "The following figure illustrates that Phoenix server synchronously replicates the data and index table change records to the standby cluster\u2019s HDFS directory before the data table change records are appended to WAL on the primary cluster. It also shows that the first phase of two phase updates of the covered indexes and the uncovered index updates are done in parallel with the synchronous replication. The store and forward replication is done only when the synchronous replication cannot be done due to the network or standby cluster issues which will be explained later."
+  },
+  {
+    "para_index": 242,
+    "num_drawings": 2,
+    "inline_text": "HBaseHDFSPhoenixWALHBase on EBS ClusterHFileHBaseHDFSPhoenixWALPhoenix Synchronous ReplicationHBase on S3 Cluster",
+    "nearest_heading": "HBase on EBS and HBase on S3 Pair",
+    "prev_para_text": "In this option, one cluster uses EBS to store its HFiles and the other cluster uses S3. In this option, it is expected that the performance will be degraded after failover to the HBase on S3 cluster. This option is described here. The cost of HBase on S3 cluster is expected to be 25% of its HBase on EBS peer."
+  },
+  {
+    "para_index": 266,
+    "num_drawings": 2,
+    "inline_text": "HBaseHDFSPhoenixWALHBase on EBS ClusterHFileHBaseHDFSPhoenixPhoenix Synchronous ReplicationHBase on EBS ClusterWALHFile",
+    "nearest_heading": "HBase on EBS Pair",
+    "prev_para_text": "During reads only one replica is used. Reducing the replica count from 3 to 2 means impacting the theoretical total cluster maximum read throughput by 33%. If we assume that the cluster traffic is 50% write and 50% read, at any given time there will be 3x write IOPS and 1x read IOPS over 3 replicas. With 2 replicas, there will be 2x write IOPS and 1x read IOPS over 2 replicas. This means per replica IOPS will increase 4/3=1.333 to 3/2=1.5 which is about a 13% increase. This increase will cause performance degradation only when EBS utilization is over 87%. We know that usually the EBS IOPS utilization is well below 87% in our clusters."
+  },
+  {
+    "para_index": 341,
+    "num_drawings": 2,
+    "inline_text": "OfflineStandbyDegradedStandbyActiveActiveToStandbyAbortToActiveStandbyToActiveAbortToStandby",
+    "nearest_heading": "",
+    "prev_para_text": "The failover process can be aborted. This is signalled by setting the role of the cluster from ActiveToStandby to AbortToActive. The active cluster will move back to Active state."
+  },
+  {
+    "para_index": 357,
+    "num_drawings": 2,
+    "inline_text": "Phoenix ServerPhoenix Dual Cluster ClientHDFS Data NodeEBSHBase ClientPrimary ClusterStandby ClusterPhoenix ServerHDFS ClientHDFS FileHBase TableAsynchronous Log ReplayStore and Forward Log WriterSynchronous Log WriterReplication Log WriterHA Group Store ManagerHA Group Store ClientPhoenix CoprocZookeeper QuorumZookeeper QuorumHA Group Store ManagerHA Group Store ClientReplication Log ReaderPhoenix CompactionHDFS Data NodeEBSHDFS ClientHDFS FileHDFS ClientHDFS FileHA Group Store",
+    "nearest_heading": "High Level Components",
+    "prev_para_text": "High Level Components"
+  },
+  {
+    "para_index": 442,
+    "num_drawings": 2,
+    "inline_text": "SYNCSYNC & ForwardStore & Forward DegradedAll stored logs forwardedDegradedRecovery Detected",
+    "nearest_heading": "State Tracking",
+    "prev_para_text": "We can illustrate their expected transitions with the below diagram."
+  }
+]
