@@ -696,30 +696,9 @@ Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`
 
 `ClusterRole` (6-value enum including `UNKNOWN`), `RoleOf` operator, and the `RoleOf`-based `MutualExclusion` invariant were pulled forward into Iteration 1. This iteration added `ActiveRoles == {"ACTIVE"}` role-level subset to `Types.tla` and `ActiveToStandbyNotActive` static sanity invariant to `ConsistentFailover.tla` (asserts `RoleOf("ATS") \notin ActiveRoles /\ RoleOf("ANISTS") \notin ActiveRoles`), registered in `ConsistentFailover.cfg`. SANY parse: clean. Expected TLC result: same 108 distinct states, depth 11, all invariants pass (static invariant adds no new states).
 
-#### Iteration 3 — Peer-reactive transitions (FailoverManagementListener)
+#### ~~Iteration 3 — Peer-reactive transitions (FailoverManagementListener)~~ ✅ COMPLETE
 
-**Modules created:** `HAGroupStore.tla`, `Admin.tla`.
-**Modules modified:** `ConsistentFailover.tla`.
-
-**What to add:**
-
-`HAGroupStore.tla`:
-- `EXTENDS Types`.
-- Declares all shared variables as `VARIABLE`.
-- `PeerReact(c, peer)`: When `clusterState[peer]` matches a trigger condition, transition `clusterState[c]` per the reactive table (§3.5).
-- `AutoComplete(c)`: AbTS→S, AbTAIS→AIS, AbTANIS→ANIS.
-
-`Admin.tla`:
-- `EXTENDS Types`.
-- Declares all shared variables as `VARIABLE`.
-- `AdminStartFailover(c)`, `AdminAbortFailover(c)` with appropriate guards.
-
-`ConsistentFailover.tla`:
-- Add `INSTANCE` declarations: `haGroupStore == INSTANCE HAGroupStore`, `admin == INSTANCE Admin`.
-- Replace direct transition actions in `Next` with actor-driven disjuncts: `haGroupStore!PeerReact(...)`, `haGroupStore!AutoComplete(...)`, `admin!AdminStartFailover(...)`, `admin!AdminAbortFailover(...)`.
-- Invariant: `AbortSafety`.
-
-**Expected TLC result:** State space may grow significantly as interleavings between admin and reactive actions are explored. `MutualExclusion` and `AbortSafety` must pass.
+Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS` covering §3.5 table rows for peer ATS/ANIS/AbTS, plus `AutoComplete` for AbTS→S, AbTAIS→AIS, AbTANIS→ANIS) and `Admin.tla` (`AdminStartFailover` with guard `clusterState[c] = "AIS"` for AIS→ATS, `AdminAbortFailover` with guard `clusterState[c] = "STA"` for STA→AbTS). Refactored `ConsistentFailover.tla`: removed non-deterministic `Transition(c)`, added `haGroupStore == INSTANCE HAGroupStore` and `admin == INSTANCE Admin`, replaced `Next` with actor-driven disjuncts, added `AbortSafety` invariant (if cluster is AbTAIS then peer must be in {AbTS, S}), registered in `ConsistentFailover.cfg`. PeerReactToAIS (peer AIS → local ATS→S) deferred to Iteration 4 (non-atomic failover decomposition). Exhaustive TLC: 7 distinct states, depth 6, all invariants pass, no errors. State space is smaller than Iteration 1-2's 108 states because actor-driven actions restrict reachable transitions to the failover-initiation-and-abort cycle; states requiring writer/reader/environment actions (ANIS, DS, ANISTS) are not yet reachable.
 
 #### Iteration 4 — Non-atomic failover: two-step final transition
 

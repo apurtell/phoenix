@@ -3,42 +3,34 @@
  * TLA+ specification of the Phoenix Consistent Failover protocol.
  *
  * Root orchestrator module: declares variables, defines Init, Next,
- * Spec, invariants, and action constraints.
+ * Spec, invariants, and action constraints. Composes actor-driven
+ * actions from sub-modules via INSTANCE.
  *
  * Models the HA group state machine for two paired Phoenix/HBase
  * clusters. Each cluster maintains an HA group state in ZooKeeper.
  * State transitions are driven by admin actions, peer-reactive
  * listeners, and writer/reader state changes.
  *
- * Iteration 1 scope:
- *   - Cluster state variable (clusterState)
- *   - Non-deterministic valid transitions (Transition action)
- *   - Safety invariants: TypeOK, MutualExclusion
- *   - Action constraint: TransitionValid
- *
- * Iteration 2 scope (additive):
- *   - ActiveRoles role-level subset (Types.tla)
- *   - ActiveToStandbyNotActive static sanity invariant
- *
- * Action logic is initially defined directly in this module.
- * Future iterations (3+) will factor actions into sub-modules:
- *   - HAGroupStore.tla: peer-reactive transitions, auto-complete
+ * Sub-modules:
+ *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - Admin.tla: operator-initiated failover/abort
- *   - Writer.tla: replication writer mode state machine (per-RS)
- *   - Reader.tla: replication reader/replay state machine
- *   - Environment.tla: HDFS availability, clock tick
  *
  * Implementation traceability:
  *
  *   Modeled concept         | Java class / field
  *   ------------------------+---------------------------------------------
  *   clusterState            | HAGroupStoreRecord per-cluster ZK znode
- *   Transition              | HAGroupStoreClient.setHAGroupStatusIfNeeded()
- *                           |   (L325-394); isTransitionAllowed() (L130)
+ *   PeerReact* actions      | FailoverManagementListener
+ *                           |   (HAGroupStoreManager.java L633-706)
+ *   AutoComplete            | createLocalStateTransitions() L140-150
+ *   AdminStartFailover      | initiateFailoverOnActiveCluster() L375-400
+ *   AdminAbortFailover      | setHAGroupStatusToAbortToStandby() L419-425
  *   Init (AIS, S)           | Default initial states per team confirmation
  *                           |   (see PHOENIX_HA_TLA_PLAN.md Appendix A.6)
  *   MutualExclusion         | Architecture safety argument: at most one
  *                           |   cluster in ACTIVE role at any time
+ *   AbortSafety             | Abort originates from STA side; AbTAIS
+ *                           |   only reachable via peer AbTS detection
  *   AllowedTransitions      | HAGroupStoreRecord.java L99-123
  *)
 EXTENDS Types
@@ -60,6 +52,17 @@ vars == <<clusterState>>
 
 ---------------------------------------------------------------------------
 
+(* Sub-module instances *)
+
+\* Peer-reactive transitions and auto-completion.
+\* No WITH clause — TLA+ matches the clusterState variable by name.
+haGroupStore == INSTANCE HAGroupStore
+
+\* Operator-initiated failover and abort.
+admin == INSTANCE Admin
+
+---------------------------------------------------------------------------
+
 (* Initial state *)
 
 \* The system starts with one cluster active and in sync (AIS)
@@ -67,8 +70,7 @@ vars == <<clusterState>>
 \* active is deterministic: CHOOSE picks an arbitrary but fixed
 \* element of Cluster as the initial active.
 \*
-\* Source: Default initial states updated per team confirmation
-\*         (PHOENIX_HA_TLA_PLAN.md Appendix A.6).
+\* Source: PHOENIX_HA_TLA_PLAN.md Appendix A.6.
 Init ==
     \* Deterministically assign one cluster to AIS and the other to S.
     \* CHOOSE x \in Cluster : TRUE picks an arbitrary fixed cluster.
@@ -78,64 +80,41 @@ Init ==
 
 ---------------------------------------------------------------------------
 
-(* Actions *)
-
-(*
- * Non-deterministic state transition for a single cluster.
- *
- * Pre:  The current state of cluster c has at least one allowed
- *       outgoing transition in the AllowedTransitions table.
- *       Additionally, if the transition would cause the cluster
- *       to enter the ACTIVE role from a non-ACTIVE role, the
- *       peer must not currently be in the ACTIVE role (mutual
- *       exclusion coordination).
- * Post: clusterState[c] is updated to newState where
- *       <<clusterState[c], newState>> is in AllowedTransitions.
- *       All other cluster states are unchanged.
- *
- * Source: HAGroupStoreClient.setHAGroupStatusIfNeeded() L325-394
- *         validates transitions via isTransitionAllowed() (L130)
- *         before writing to ZK. The coordination guard models the
- *         FailoverManagementListener (HAGroupStoreManager.java
- *         L633-706) which only triggers STA->AIS after detecting
- *         the peer in ATS (a non-ACTIVE role). Detailed
- *         peer-reactive transition guards are added in Iteration 3.
- *)
-Transition(c) ==
-    \* Non-deterministically choose a valid target state.
-    \E newState \in HAGroupState :
-        \* The transition must be in the allowed set.
-        /\ <<clusterState[c], newState>> \in AllowedTransitions
-        \* Coordination guard: a cluster entering the ACTIVE role
-        \* from a non-ACTIVE role (i.e., STA->AIS) requires the
-        \* peer to not be in the ACTIVE role. This prevents
-        \* dual-active states. In the implementation, this is
-        \* enforced by the peer-reactive protocol: STA->AIS only
-        \* fires after the peer has entered ATS (ACTIVE_TO_STANDBY
-        \* role), and ATS->AbTAIS only fires when the peer is AbTS.
-        \* Source: FailoverManagementListener L633-706; peer ATS
-        \*         detection triggers S/DS->STA; replay completion
-        \*         triggers STA->AIS only when peer is in ATS.
-        /\ (RoleOf(clusterState[c]) # "ACTIVE" /\ RoleOf(newState) = "ACTIVE")
-              => RoleOf(clusterState[Peer(c)]) # "ACTIVE"
-        \* Update this cluster's state; leave the other unchanged.
-        /\ clusterState' = [clusterState EXCEPT ![c] = newState]
-
----------------------------------------------------------------------------
-
 (* Next-state relation *)
 
-\* In each step, exactly one cluster performs a valid transition.
+(*
+ * In each step, exactly one cluster performs one actor-driven action.
+ * Actions are factored by actor:
+ *   - haGroupStore: peer-reactive transitions and auto-completion
+ *     (FailoverManagementListener + local resolvers)
+ *   - admin: operator-initiated failover and abort
+ *
+ * Each action encodes the precise guard (peer state or local state)
+ * under which the transition fires, modeling the implementation's
+ * actual trigger conditions.
+ *)
 Next ==
-    \E c \in Cluster : Transition(c)
+    \E c \in Cluster :
+        \* Peer-reactive: standby detects peer entered ATS (failover).
+        \/ haGroupStore!PeerReactToATS(c)
+        \* Peer-reactive: cluster detects peer entered ANIS (degraded).
+        \/ haGroupStore!PeerReactToANIS(c)
+        \* Peer-reactive: active detects peer entered AbTS (abort).
+        \/ haGroupStore!PeerReactToAbTS(c)
+        \* Local auto-completion: AbTS->S, AbTAIS->AIS, AbTANIS->ANIS.
+        \/ haGroupStore!AutoComplete(c)
+        \* Admin initiates failover: AIS->ATS.
+        \/ admin!AdminStartFailover(c)
+        \* Admin aborts failover: STA->AbTS.
+        \/ admin!AdminAbortFailover(c)
 
 ---------------------------------------------------------------------------
 
 (* Specification *)
 
 \* Safety specification: initial state, followed by zero or more
-\* Next steps (or stuttering). No fairness in Iteration 1 —
-\* this is a safety-only model.
+\* Next steps (or stuttering). No fairness yet — this is a
+\* safety-only model.
 Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
@@ -191,6 +170,33 @@ ActiveToStandbyNotActive ==
 
 ---------------------------------------------------------------------------
 
+(*
+ * Abort safety: if a cluster is in AbTAIS (ABORT_TO_ACTIVE_IN_SYNC),
+ * the peer must be in AbTS (the abort originator) or S (the peer
+ * already auto-completed AbTS->S). This ensures abort was properly
+ * initiated from the STA side, preventing dual-active races where
+ * both clusters could independently transition toward ACTIVE.
+ *
+ * The abort protocol is:
+ *   (ATS, STA) --[Admin]--> (ATS, AbTS) --[PeerReact]--> (AbTAIS, AbTS)
+ *   then auto-complete both sides back to (AIS, S).
+ *
+ * AbTAIS can only be reached via PeerReactToAbTS, which requires
+ * the peer to be in AbTS. The peer can then auto-complete to S
+ * before the local AbTAIS auto-completes to AIS, yielding (AbTAIS, S).
+ *
+ * Source: Architecture safety argument; abort originates from
+ *         setHAGroupStatusToAbortToStandby() (L419-425) on the
+ *         STA side; active detects via FailoverManagementListener
+ *         peer AbTS resolver (L132).
+ *)
+AbortSafety ==
+    \A c \in Cluster :
+        clusterState[c] = "AbTAIS" =>
+            clusterState[Peer(c)] \in {"AbTS", "S"}
+
+---------------------------------------------------------------------------
+
 (* Action constraints *)
 
 \* Every state change in every step follows the AllowedTransitions
@@ -210,10 +216,9 @@ TransitionValid ==
 
 (* Symmetry *)
 
-\* Placeholder for symmetry reduction. No RS introduced yet;
-\* Cluster members have asymmetric initial roles (AIS vs S) so
-\* they are not interchangeable. Will become Permutations(RS) in
-\* Iteration 5 when per-RS writer mode is added.
+\* Placeholder for symmetry reduction. Cluster members have
+\* asymmetric initial roles (AIS vs S) so they are not
+\* interchangeable.
 Symmetry == {}
 
 ---------------------------------------------------------------------------
@@ -225,5 +230,8 @@ THEOREM Spec => []TypeOK
 
 \* Safety: mutual exclusion holds in every reachable state.
 THEOREM Spec => []MutualExclusion
+
+\* Safety: abort is always initiated from the correct side.
+THEOREM Spec => []AbortSafety
 
 ============================================================================

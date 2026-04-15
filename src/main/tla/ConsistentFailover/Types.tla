@@ -5,8 +5,8 @@
  * Phoenix Consistent Failover specification.
  *
  * No variables are declared in this module. All definitions are
- * pure (stateless) and imported by the root module and future
- * sub-modules via EXTENDS.
+ * pure (stateless) and imported by the root module and sub-modules
+ * via EXTENDS.
  *
  * Definitions provided:
  *   HAGroupState      — the 14 HA group states
