@@ -11,6 +11,18 @@
  * State transitions are driven by admin actions, peer-reactive
  * listeners, and writer/reader state changes.
  *
+ * ZK WATCHER DELIVERY: Peer-reactive transitions and auto-
+ * completion transitions depend on ZooKeeper watcher notification
+ * chains (peerPathChildrenCache for peer detection, pathChildrenCache
+ * for local auto-completion). ZK does NOT formally guarantee
+ * unconditional delivery (see ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md
+ * and Appendix A.16). In this model, peer-reactive actions fire
+ * whenever their guard is satisfied. TLC's interleaving semantics
+ * cover arbitrary delivery delay (safety verification is sound).
+ * Iteration 13 adds explicit ZK connectivity guards and
+ * UseZKSessionExpiryQuirk for liveness verification under watcher
+ * delivery failure.
+ *
  * Sub-modules:
  *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - Admin.tla: operator-initiated failover/abort
@@ -22,13 +34,21 @@
  *   clusterState            | HAGroupStoreRecord per-cluster ZK znode
  *   PeerReact* actions      | FailoverManagementListener
  *                           |   (HAGroupStoreManager.java L633-706)
+ *                           |   Delivered via peerPathChildrenCache
+ *                           |   (ZK watcher — conditional delivery)
+ *   StandbyBecomesActive    | triggerFailover() L535-548 →
+ *                           |   setHAGroupStatusToSync() L341-355
  *   AutoComplete            | createLocalStateTransitions() L140-150
+ *                           |   Delivered via local pathChildrenCache
+ *                           |   (ZK watcher — conditional delivery)
  *   AdminStartFailover      | initiateFailoverOnActiveCluster() L375-400
  *   AdminAbortFailover      | setHAGroupStatusToAbortToStandby() L419-425
  *   Init (AIS, S)           | Default initial states per team confirmation
  *                           |   (see PHOENIX_HA_TLA_PLAN.md Appendix A.6)
  *   MutualExclusion         | Architecture safety argument: at most one
  *                           |   cluster in ACTIVE role at any time
+ *   NonAtomicFailoverSafe   | Safety during (ATS, AIS) window;
+ *                           |   isMutationBlocked()=true for ATS
  *   AbortSafety             | Abort originates from STA side; AbTAIS
  *                           |   only reachable via peer AbTS detection
  *   AllowedTransitions      | HAGroupStoreRecord.java L99-123
@@ -87,7 +107,10 @@ Init ==
  * Actions are factored by actor:
  *   - haGroupStore: peer-reactive transitions and auto-completion
  *     (FailoverManagementListener + local resolvers)
+ *     ALL of these depend on ZK watcher notification chains for
+ *     delivery. See HAGroupStore.tla module header for details.
  *   - admin: operator-initiated failover and abort
+ *     These are direct ZK writes (not watcher-dependent).
  *
  * Each action encodes the precise guard (peer state or local state)
  * under which the transition fires, modeling the implementation's
@@ -95,17 +118,21 @@ Init ==
  *)
 Next ==
     \E c \in Cluster :
-        \* Peer-reactive: standby detects peer entered ATS (failover).
+        \* [ZK watcher] Peer-reactive: standby detects peer ATS.
         \/ haGroupStore!PeerReactToATS(c)
-        \* Peer-reactive: cluster detects peer entered ANIS (degraded).
+        \* [ZK watcher] Peer-reactive: cluster detects peer ANIS.
         \/ haGroupStore!PeerReactToANIS(c)
-        \* Peer-reactive: active detects peer entered AbTS (abort).
+        \* [ZK watcher] Peer-reactive: active detects peer AbTS.
         \/ haGroupStore!PeerReactToAbTS(c)
-        \* Local auto-completion: AbTS->S, AbTAIS->AIS, AbTANIS->ANIS.
+        \* [ZK watcher] Local auto-completion: AbTS->S, etc.
         \/ haGroupStore!AutoComplete(c)
-        \* Admin initiates failover: AIS->ATS.
+        \* [ZK watcher] Local: standby completes failover: STA->AIS.
+        \/ haGroupStore!StandbyBecomesActive(c)
+        \* [ZK watcher] Peer-reactive: cluster detects peer AIS.
+        \/ haGroupStore!PeerReactToAIS(c)
+        \* [Direct ZK write] Admin initiates failover: AIS->ATS.
         \/ admin!AdminStartFailover(c)
-        \* Admin aborts failover: STA->AbTS.
+        \* [Direct ZK write] Admin aborts failover: STA->AbTS.
         \/ admin!AdminAbortFailover(c)
 
 ---------------------------------------------------------------------------
@@ -197,6 +224,29 @@ AbortSafety ==
 
 ---------------------------------------------------------------------------
 
+(*
+ * Non-atomic failover safety: during the window between the new
+ * active writing AIS and the old active writing S, mutual exclusion
+ * is maintained because ATS maps to role ACTIVE_TO_STANDBY, which
+ * is not an active role (isMutationBlocked()=true).
+ *
+ * This is a state-dependent specialization of the static
+ * ActiveToStandbyNotActive invariant, expressed over reachable
+ * states to explicitly name the non-atomic failover window.
+ *
+ * Source: Architecture safety argument; ClusterRoleRecord.java
+ *         L84 — ACTIVE_TO_STANDBY has isMutationBlocked()=true.
+ *         IMPL_CROSS_REFERENCE.md §11.3.
+ *)
+NonAtomicFailoverSafe ==
+    \A c1, c2 \in Cluster :
+        /\ c1 # c2
+        /\ clusterState[c1] = "ATS"
+        /\ clusterState[c2] = "AIS"
+        => RoleOf(clusterState[c1]) \notin ActiveRoles
+
+---------------------------------------------------------------------------
+
 (* Action constraints *)
 
 \* Every state change in every step follows the AllowedTransitions
@@ -233,5 +283,8 @@ THEOREM Spec => []MutualExclusion
 
 \* Safety: abort is always initiated from the correct side.
 THEOREM Spec => []AbortSafety
+
+\* Safety: non-atomic failover window preserves mutual exclusion.
+THEOREM Spec => []NonAtomicFailoverSafe
 
 ============================================================================

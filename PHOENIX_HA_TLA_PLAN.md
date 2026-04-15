@@ -41,12 +41,39 @@ The plan is organized as an iterative series of increasingly detailed TLA+ modul
 | Channel | Direction | Mechanism |
 |---------|-----------|-----------|
 | State updates | Cluster → own ZK | `setData().withVersion()` (optimistic locking) |
-| Peer detection | Peer ZK → local cluster | Curator `PathChildrenCache` watchers |
+| Peer detection | Peer ZK → local cluster | Curator `PathChildrenCache` watchers (⚠ delivery is conditional) |
 | Replication data | Active Writer → Standby HDFS `/IN` | Direct HDFS write (SYNC mode) |
 | Buffered data | Active Writer → Local HDFS `/OUT` | Local HDFS write (S&F mode) |
 | Forwarded data | Local `/OUT` → Peer `/IN` | `ReplicationLogDiscoveryForwarder` background copy; triggers `S&F→S&FWD` on throughput check and `ANIS→AIS`/`ANISTS→ATS` on drain complete |
 | Replay | Standby Reader ← Standby HDFS `/IN` | Round-based log consumption |
 | Admin commands | Operator → `PhoenixHAAdminTool` | CLI RPC to `HAGroupStoreManager` |
+
+### 2.4 ZooKeeper as Coordination Substrate
+
+The protocol operates on top of ZooKeeper. The TLA+ model treats the following ZK properties as core environment assumptions.
+
+**ZK properties that the protocol depends on:**
+
+| Property | Guarantee | Source |
+|----------|-----------|--------|
+| Linearizable writes | `setData().withVersion()` provides CAS semantics | ZK spec §Consistency Guarantees |
+| Ordered delivery | Watcher events delivered in zxid order per session | `zookeeperProgrammers.md` L322-335 |
+| Happens-before | Client sees watch notification before seeing new data | `zookeeperProgrammers.md` L342-350 |
+| At-most-once watches | Standard watches fire at most once per registration | `zookeeperProgrammers.md` L355-368 |
+
+**ZK properties that the protocol must tolerate:**
+
+| Property | Behavior | Impact on Protocol |
+|----------|----------|--------------------|
+| Conditional watcher delivery | Notifications require active session + TCP connection; not delivered during disconnection; permanently lost on session expiry | Peer-reactive transitions may be delayed (disconnect) or permanently lost (session expiry) |
+| Session expiry | Server evicts session after timeout; all watches lost; client must establish new session | All peer-reactive transitions disabled until session recovery |
+| Non-atomic cross-ensemble writes | No atomic multi-op across two independent ZK quorums | Final failover step is two separate writes with an interleaving window |
+| Bounded retries with permanent loss | Application-level retry exhaustion (2 retries in `FailoverManagementListener`) + at-most-once delivery = transition permanently lost | Peer-reactive transition fails silently; no polling fallback exists |
+| Server-side silent failures | Unchecked exceptions in `WatchManager`, NIO/Netty serialization failures can silently drop notifications | Watcher delivery is best-effort, not guaranteed |
+
+**Curator PathChildrenCache mitigation:** Phoenix uses Curator's `PathChildrenCache`, which provides eventual delivery on reconnection by re-querying ZK and generating synthetic `CHILD_UPDATED` events. This is the primary reliability backstop for transient disconnections. It does NOT protect against session expiry or permanent network partition.
+
+**Modeling approach:** The TLA+ model includes ZK session state (`zkPeerConnected`, `zkPeerSessionAlive`) and retry exhaustion as first-class protocol variables. ZK failures are always in the model's state space. Safety is proven under arbitrary ZK failure combinations. Liveness is explicitly conditioned on ZK session survival and eventual reconnection.
 
 ---
 
@@ -217,6 +244,8 @@ The standby may be in `DEGRADED_STANDBY` when failover is initiated from `ANIS` 
 
 ### 3.5 Peer-Reactive Transitions (FailoverManagementListener)
 
+**ZooKeeper Watcher Delivery Dependency.** All peer-reactive transitions depend on a ZK watcher notification chain for delivery. ZooKeeper does not formally guarantee unconditional watcher deliver. Delivery is conditional on: (1) the ZK session being alive, (2) a TCP connection being established or re-established, and (3) no server-side exception during notification. The TLA+ model must verify that safety holds regardless of notification delay or permanent loss, and that liveness is conditioned on ZK session survival and eventual reconnection.
+
 From `HAGroupStoreManager.java` lines 104-150 (`createPeerStateTransitions()` and `createLocalStateTransitions()`):
 
 | Peer Transitions To | Local Current | Local Moves To | Source |
@@ -232,7 +261,7 @@ From `HAGroupStoreManager.java` lines 104-150 (`createPeerStateTransitions()` an
 
 **No peer reaction for ANISTS**: The peer transitions map has no entry for `ACTIVE_NOT_IN_SYNC_TO_STANDBY`. When the active transitions `ANIS → ANISTS`, the standby does not react and remains in its current state (e.g., `DEGRADED_STANDBY`). The standby only reacts when the active subsequently transitions `ANISTS → ATS` (= `ACTIVE_IN_SYNC_TO_STANDBY`).
 
-**Reactive transition retry exhaustion**: The `FailoverManagementListener` (`HAGroupStoreManager.java` L653-704) retries each reactive transition exactly 2 times. After exhaustion, the transition is permanently lost — the method returns silently with only a log error. Events are not requeued (`notifySubscribers()` at `HAGroupStoreClient.java` L1141-1150 catches and swallows exceptions). Same-state ZK re-writes do not re-trigger because `handleStateChange()` (L1104-1110) suppresses notifications when `oldState.equals(newState)` and `lastKnownPeerState` is already advanced. There is no periodic reconciliation — the sync job (`syncZKToSystemTable()` L735-784) only syncs ZK to system table, not failover state. Recovery requires a different peer state change, a ZK session reconnect (which may cause `PathChildrenCache` to re-deliver via `CHILD_ADDED`), or manual intervention. The `isStateAlreadyUpdated()` check (L739-753) provides a safety net for concurrent success. The TLA+ model includes `UseRetryExhaustionQuirk` to toggle this behavior.
+**Reactive transition retry exhaustion**: The `FailoverManagementListener` (`HAGroupStoreManager.java` L653-704) retries each reactive transition exactly 2 times. After exhaustion, the transition is permanently lost — the method returns silently with only a log error. Events are not requeued (`notifySubscribers()` at `HAGroupStoreClient.java` L1141-1150 catches and swallows exceptions). Same-state ZK re-writes do not re-trigger because `handleStateChange()` (L1104-1110) suppresses notifications when `oldState.equals(newState)` and `lastKnownPeerState` is already advanced. There is no periodic reconciliation — the sync job (`syncZKToSystemTable()` L735-784) only syncs ZK to system table, not failover state. Recovery requires a different peer state change, a ZK session reconnect (which may cause `PathChildrenCache` to re-deliver via `CHILD_ADDED`), or manual intervention. The `isStateAlreadyUpdated()` check (L739-753) provides a safety net for concurrent success. Retry exhaustion is a direct consequence of ZK's at-most-once watcher delivery combined with the application's bounded retry policy — the TLA+ model includes it as a core part of the ZK watcher delivery model (see §2.4).
 
 **Auto-completion transitions** (local, no peer trigger):
 
@@ -316,16 +345,21 @@ This delay must be modeled in the TLA+ spec for the ANISTS failover path.
 
 ### 4.2 Liveness Properties
 
+All liveness properties in this specification include explicit ZK session assumptions as formal preconditions. ZooKeeper watcher delivery is conditional (see §2.4): it requires an active session and an established TCP connection. These are not implicit assumptions — they are part of the formal liveness specification. If a ZK session expires permanently and is not recovered, the protocol stalls. This is a defined boundary of the protocol's operational envelope, not a bug.
+
+**ZK Liveness Assumption (ZLA):** `∀ c ∈ Cluster: □◇ (zkPeerSessionAlive[c] ∧ zkPeerConnected[c])`  
+This states that for every cluster, ZK sessions are eventually alive and connected. All liveness properties below are predicated on ZLA. Without ZLA, peer-reactive transitions are permanently disabled and the protocol requires manual intervention.
+
 1. **Failover Completion**: If failover is initiated and not aborted, it eventually completes.
-   - `□(failoverInitiated ∧ ¬aborted ⇒ ◇ failoverComplete)` (under fairness)
-   - Requires: HDFS available on standby (for replay and trigger checks), forwarder drains successfully (for ANISTS→ATS path), and reactive transitions succeed (peer detects state changes). If any of these fail, liveness requires admin abort. The quirk flags `UseForwarderStuckQuirk` and `UseRetryExhaustionQuirk` model these failure modes explicitly.
+   - `ZLA ⇒ □(failoverInitiated ∧ ¬aborted ⇒ ◇ failoverComplete)` (under fairness)
+   - Requires: ZK sessions alive and eventually connected (ZLA), HDFS available on standby (for replay and trigger checks), forwarder drains successfully (for ANISTS→ATS path), and reactive transitions eventually succeed (which follows from ZLA + weak fairness on `PeerReact*` actions). If forwarder is permanently stuck (`UseForwarderStuckQuirk = TRUE`), liveness requires admin abort.
 
 2. **Degradation Recovery**: If HDFS connectivity recovers permanently, the cluster eventually returns to AIS.
-   - `□(clusterState[c] = ANIS ∧ ◇□ hdfsAvailable[peer] ⇒ ◇ clusterState[c] = AIS)`
+   - `ZLA ⇒ □(clusterState[c] = ANIS ∧ ◇□ hdfsAvailable[peer] ⇒ ◇ clusterState[c] = AIS)`
 
 3. **Abort Completion**: If abort is initiated, the system eventually returns to `(A*, S)`.
-   - `□(abortInitiated ⇒ ◇ (clusterState[active] ∈ {AIS, ANIS} ∧ clusterState[standby] = S))`
-   - Requires reactive transitions to succeed (peer detects abort). If `UseRetryExhaustionQuirk = TRUE`, abort completion may require admin intervention on the peer side.
+   - `ZLA ⇒ □(abortInitiated ⇒ ◇ (clusterState[active] ∈ {AIS, ANIS} ∧ clusterState[standby] = S))`
+   - Requires: ZK sessions alive and eventually connected (ZLA), so that the active cluster detects peer AbTS and completes `ATS → AbTAIS → AIS`. Under retry exhaustion (always modeled), abort may require a subsequent ZK reconnect to re-deliver the missed event.
 
 4. **Anti-Flapping Bound**: ANIS/AIS oscillation is bounded (modeled via the timing gate).
 
@@ -336,7 +370,7 @@ This delay must be modeled in the TLA+ spec for the ANISTS failover path.
 3. **RS crash during S&F**: Writer in S&F mode encounters write error, RS aborts (`StoreAndForwardModeImpl.onFailure()` → `logGroup.abort()`). OUT directory shards are time-based (not per-RS), so surviving RS forwarders can drain a crashed RS's fully-written files from the shared HDFS shard directories. However, mid-write files have unclosed HDFS leases and the forwarder has no lease recovery in its read path (`RecoverLeaseFSUtils` is only used on the IN side). These files are orphaned until HDFS lease expiry (~10 min). RS restart resumes draining via `initializeLastRoundProcessed()`. Source: `ReplicationShardDirectoryManager.java` L116-136; `StoreAndForwardModeImpl.java` L116-123.
 4. **Concurrent RS mode changes**: Multiple RS race to update ZK state (optimistic locking). Verify only valid transitions succeed.
 5. **Replay rewind after degradation**: SYNCED_RECOVERY rewinds `lastRoundProcessed` to `lastRoundInSync`. Verify no data loss.
-6. **ZK watcher delay and retry exhaustion**: Peer state change not immediately detected. Verify safety during detection lag. Additionally, `FailoverManagementListener` retries exactly 2 times (`HAGroupStoreManager.java` L659). After exhaustion, the transition is permanently lost — no event requeue, no periodic reconciliation, and same-state ZK re-writes are suppressed by `handleStateChange()` (L1104-1110) because `lastKnownPeerState` is already advanced. Recovery requires a different peer state change, ZK session reconnect, or manual intervention. The model includes a  `ReactiveTransitionFail` action to verify liveness under retry exhaustion.
+6. **ZK watcher delivery failure and retry exhaustion**: The entire peer-reactive transition mechanism depends on ZK watcher notification delivery. Three distinct failure modes can prevent a peer-reactive transition from completing: (a) ZK disconnection (transient), (b) ZK session expiry (permanent until recovery), (c) retry exhaustion (application-level, consequence of at-most-once delivery + bounded retries). The TLA+ model verifies safety under all three failure modes and verifies that liveness requires ZK session survival and eventual reconnection.
 7. **ANIS failover with standby in DEGRADED_STANDBY**: When failover is initiated from ANIS, the standby is typically in `DEGRADED_STANDBY` (because it reacted to peer `ANIS` by entering `DS`). The sequence is: `(ANIS, DS) → (ANISTS, DS) → (ATS, DS) → (ATS, STA) → (ATS, AIS) → (S, AIS)`. The `DEGRADED_STANDBY → STANDBY_TO_ACTIVE` transition has been added to the `allowedTransitions` table, so the standby can enter `STA` from `DS` when it detects peer `ATS`. The TLA+ model should verify that this path completes successfully end-to-end, including replay completeness before `STA → AIS`.
 8. **HDFS failure during failover `(ATS, STA)`**: Mutations are blocked during ATS (`isMutationBlocked()=true`, `ClusterRoleRecord.java` L84), so no new data enters the pipeline. HDFS failure during STA stalls replay (retries every 60s, `ReplicationLogDiscoveryReplay` L309-317) and blocks `shouldTriggerFailover()` (L500-533) because its HDFS reads throw `IOException`. The standby stays in STA indefinitely — no automatic abort path exists. Safety is preserved (no dual-active, no data loss) but liveness requires HDFS recovery or manual abort.
 
@@ -409,8 +443,10 @@ SANY syntax checking is performed locally in the Cursor environment before stagi
 | Writer mode state machine | **Concrete** | SYNC/S&F/SYNC&FWD mode changes drive cluster state transitions |
 | Replay state machine (SM6) | **Concrete** | Implementation-only but critical for NoDataLoss verification |
 | Anti-flapping protocol | **Concrete** (abstract timing) | Modeled via logical clock + threshold guard; no real-time |
-| ZK optimistic locking | **Abstract** | Modeled as non-deterministic choice among concurrent updaters; version numbers omitted initially |
-| ZK watcher delay | **Abstract** | Modeled as non-deterministic delay (peer state change visible after 0-N steps); reactive transitions can permanently fail after 2 retries (see `UseRetryExhaustionQuirk`) |
+| ZK session lifecycle | **Core Protocol** | ZK sessions can disconnect, expire, and recover. Session state (`zkPeerConnected`, `zkPeerSessionAlive`) is always part of the model. Peer-reactive transitions are guarded on session liveness. See §2.4. |
+| ZK watcher delivery | **Core Protocol** | Conditional delivery modeled via TLC interleaving (arbitrary delay) plus three permanent failure modes always in the model: (1) retry exhaustion (2 retries, then lost), (2) session expiry (all watches lost), (3) disconnection (transient). No polling fallback exists. Curator PathChildrenCache provides eventual delivery on reconnection only. |
+| ZK optimistic locking | **Core Protocol** | Version-based CAS (`setData().withVersion()`) modeled as non-deterministic choice among concurrent updaters; version numbers introduced in Iteration 9. |
+| ZK cross-ensemble non-atomicity | **Core Protocol** | No atomic multi-op across two independent ZK quorums. The final failover step is two separate writes with an interleaving window. This is a ZK property, not an implementation defect. |
 | HDFS availability | **Abstract** | Non-deterministic boolean per cluster |
 | OUT/IN directory state | **Abstract** | Boolean predicates (empty/non-empty); no file-level modeling. Forwarder drain has no timeout (see `UseForwarderStuckQuirk`). Shards are time-based/shared across RS. |
 | Replication log format | **Omitted** | Not relevant to protocol safety |
@@ -420,8 +456,8 @@ SANY syntax checking is performed locally in the Cursor environment before stagi
 | Client-side connections | **Omitted** | Focus on server-side protocol; client role detection is a consequence |
 | Metrics | **Omitted** | Observability, not correctness |
 | Reader lag (DSFR) | **Deferred** (Iteration 8+) | Design sub-state collapsed in implementation; add if needed |
-| Forced failover | **Deferred** (Iteration 10+) | Operator escape hatch; model after normal path verified |
-| OFFLINE state | **Deferred** (Iteration 18) | Intentional sink state; `--force` bypass modeled as separate action |
+| Forced failover | **Deferred** (Iteration 17) | Operator escape hatch; model after normal path verified |
+| OFFLINE state | **Deferred** (Iteration 16) | Intentional sink state; `--force` bypass modeled as separate action |
 | RS crash/abort | **Concrete** (Phase 3) | Writer fail-stop in S&F is a protocol-relevant failure mode |
 | Number of RS per cluster | **Parameterized** | 2 for exhaustive (with RS symmetry reduction), 3 for simulation (no symmetry); races between RS matter |
 | Degraded standby sub-states | **Implementation** (single DS) | Follow implementation's collapsed `DEGRADED_STANDBY`; design's DSFW/DSFR/DS intentionally removed for simplicity |
@@ -468,7 +504,7 @@ Sub-modules declare shorthand tuples for variable groups used in `UNCHANGED` cla
 2. Every action has a docstring with summary, Pre/Post conditions, and Source traceability.
 3. Every line of TLA+ has a natural-language comment directly above it.
 4. Implementation cross-references use `Source:` annotations with class names, method names, and line numbers.
-5. Quirk flags and design divergences are explained inline at the point where the behavior differs.
+5. ZK coordination properties (§2.4) are documented as core protocol assumptions.
 6. Variable groups are defined as shorthand tuples with comments.
 7. `UNCHANGED` clauses use the shorthand tuples and have a summary comment listing what categories of state are unchanged.
 
@@ -700,7 +736,7 @@ Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`
 
 Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS` covering §3.5 table rows for peer ATS/ANIS/AbTS, plus `AutoComplete` for AbTS→S, AbTAIS→AIS, AbTANIS→ANIS) and `Admin.tla` (`AdminStartFailover` with guard `clusterState[c] = "AIS"` for AIS→ATS, `AdminAbortFailover` with guard `clusterState[c] = "STA"` for STA→AbTS). Refactored `ConsistentFailover.tla`: removed non-deterministic `Transition(c)`, added `haGroupStore == INSTANCE HAGroupStore` and `admin == INSTANCE Admin`, replaced `Next` with actor-driven disjuncts, added `AbortSafety` invariant (if cluster is AbTAIS then peer must be in {AbTS, S}), registered in `ConsistentFailover.cfg`. PeerReactToAIS (peer AIS → local ATS→S) deferred to Iteration 4 (non-atomic failover decomposition). Exhaustive TLC: 7 distinct states, depth 6, all invariants pass, no errors. State space is smaller than Iteration 1-2's 108 states because actor-driven actions restrict reachable transitions to the failover-initiation-and-abort cycle; states requiring writer/reader/environment actions (ANIS, DS, ANISTS) are not yet reachable.
 
-#### Iteration 4 — Non-atomic failover: two-step final transition
+#### ~~Iteration 4 — Non-atomic failover: two-step final transition~~ ✅ COMPLETE
 
 **Modules modified:** `HAGroupStore.tla`, `ConsistentFailover.tla`.
 
@@ -708,16 +744,22 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 
 `HAGroupStore.tla`:
 - Decompose the final failover step `(ATS, AIS) → (S, AIS)` into two separate actions:
-  1. `StandbyBecomesActive(c)`: `STA → AIS` (standby writes its own ZK).
-  2. `OldActiveBecomesStandby(c)`: `ATS → S` (old active reacts to peer AIS).
-- These are two separate `PeerReact` actions, not one atomic step.
+  1. `StandbyBecomesActive(c)`: `STA → AIS` (standby writes its own ZK). This is a **local action** driven by the reader (`ReplicationLogDiscoveryReplay.triggerFailover()` L535-548 → `setHAGroupStatusToSync()` L341-355), not a peer-reactive action. For Iteration 4, modeled as a non-deterministic action with the sole guard `clusterState[c] = "STA"`. Full reader guards (failoverPending, inProgressDirEmpty, no new files) are deferred to `TriggerFailover(c)` in `Reader.tla` (Iteration 11), at which point this placeholder action will be replaced.
+  2. `PeerReactToAIS(c)`: peer enters AIS, two local-state cases (source: `createPeerStateTransitions()` L112-120):
+     - `ATS → S`: old active completes failover when peer enters AIS (L113-114).
+     - `DS → S`: standby recovers from degraded when peer returns to AIS (L116-117). Not reachable until Writer/Environment actions make DS reachable (Iteration 5+), but modeled now for completeness.
+- These are two separate actions (one local, one peer-reactive), not one atomic step.
 
 `ConsistentFailover.tla`:
-- `NonAtomicFailoverSafe` invariant: During the window where one cluster is AIS and the other is ATS, `RoleOf(ATS) ∉ ActiveRoles`.
+- `NonAtomicFailoverSafe` invariant: During the window where one cluster is AIS and the other is ATS, `RoleOf(ATS) ∉ ActiveRoles`. This is a state-dependent specialization of the static `ActiveToStandbyNotActive` invariant, expressed as a conditional over reachable states to explicitly name the non-atomic failover window scenario.
 
-**Expected TLC result:** TLC explores the interleaving between steps 1 and 2. `MutualExclusion` must pass, verifying the implementation's safety argument.
+**Expected TLC result:** TLC explores the interleaving between steps 1 and 2. `MutualExclusion` must pass, verifying the implementation's safety argument. State space should grow significantly from the Iteration 3 baseline (7 states, depth 6) because the full failover cycle is now completable and round-trip failover is explorable.
 
 **Note:** The failover tool has a built-in timeout that bounds the duration of the non-atomic window. If the old active does not react within the timeout, admin intervention is required. The TLA+ model does not explicitly model this timeout but verifies that safety holds regardless of window duration.
+
+**TLC finding — (ATS, ATS) deadlock**: Initial TLC run discovered that an admin can initiate a new failover on the newly-active cluster during the non-atomic window, producing an irrecoverable `(ATS, ATS)` state. The fix is a peer-state guard on `AdminStartFailover`: `clusterState[Peer(c)] ∈ {"S", "DS"}`. With this guard, TLC verifies deadlock freedom. See Appendix A.15 and `PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md`.
+
+**TLC result (with fix):** 17 distinct states, depth 10, all invariants pass, no deadlocks.
 
 ---
 
@@ -913,24 +955,39 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 
 **Expected TLC result:** RS failures inject non-deterministic disruptions into the protocol. Verify mutual exclusion and no data loss under failures.
 
-#### Iteration 13 — ZK connectivity and session expiry
+#### Iteration 13 — ZK coordination model (session lifecycle, watcher delivery, retry exhaustion)
 
-**Modules modified:** `Environment.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
+**Modules modified:** `Types.tla`, `Environment.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
 
 **What to add:**
 
+This iteration introduces the full ZK coordination model as a core part of the protocol specification (see §2.4). ZK's conditional watcher delivery, session lifecycle, and application-level retry exhaustion are protocol-defining properties — the failover protocol was designed for this coordination substrate and its behavior is inseparable from ZK's semantics. Three ZK failure modes are modeled as always-on environment actions:
+
+1. **ZK disconnection (transient):** The `peerPathChildrenCache` or local `pathChildrenCache` loses its ZK connection. During disconnection, no watcher notifications are delivered. On reconnect, Curator's PathChildrenCache re-queries ZK and generates synthetic `CHILD_UPDATED` events for any missed changes, providing eventual delivery.
+
+2. **ZK session expiry (permanent until recovery):** The ZK session expires (server hasn't received heartbeats within the session timeout). All watches are permanently lost. The client receives a `SESSION_EXPIRED` event and must establish a new session. Peer-reactive transitions are disabled until session recovery.
+
+3. **Reactive transition retry exhaustion:** The `FailoverManagementListener` retries each reactive transition exactly 2 times. After exhaustion, the transition is permanently lost (`HAGroupStoreManager.java` L653-704). This is a direct consequence of ZK's at-most-once watcher delivery combined with the application's bounded retry policy. Recovery requires a different peer state change, a ZK reconnect (PathChildrenCache re-delivery), or manual intervention.
+
 `Environment.tla`:
-- `ZKDisconnect(c, rs)`: RS loses ZK connection → RS aborts (modeling the implementation's fail-stop on DISCONNECTED).
-- `ZKReconnect(c, rs)`: RS reconnects to ZK.
+- `ZKDisconnect(c)`: Cluster c's peer ZK connection drops → peer-reactive transitions for c are suppressed (guard `zkPeerConnected[c] = TRUE` on `PeerReact*` actions). Models the peerPathChildrenCache disconnection from the peer ZK cluster. Note: this is at the cluster level (one PathChildrenCache per cluster), not per-RS.
+- `ZKReconnect(c)`: Cluster c's peer ZK connection is re-established. Curator re-syncs PathChildrenCache, generating synthetic events. Modeled by re-enabling peer-reactive transitions (set `zkPeerConnected[c] = TRUE`).
+- `ZKSessionExpiry(c)`: Non-deterministically expires cluster c's peer ZK session → `zkPeerSessionAlive[c] = FALSE`. All peer-reactive transitions for c are permanently disabled until `ZKSessionRecover(c)`.
+- `ZKSessionRecover(c)`: Re-establishes a new ZK session → `zkPeerSessionAlive[c] = TRUE`, re-registers watches, re-enables peer-reactive transitions.
+- `ZKDisconnectRS(c, rs)`: RS-level ZK disconnect → RS aborts (modeling the implementation's fail-stop on DISCONNECTED; `HAGroupStoreClient` sets `isHealthy = false` on CONNECTION_LOST for local cache).
 
 `HAGroupStore.tla`:
-- Guard reactive transitions on ZK connectivity.
-- Impact: delayed or missed peer state detection.
+- Guard all `PeerReact*` actions on `zkPeerConnected[c] = TRUE ∧ zkPeerSessionAlive[c] = TRUE`. This models the ZK watcher delivery dependency: notifications cannot be delivered during disconnection, and are permanently lost on session expiry.
+- `ReactiveTransitionFail(c)` action: a `PeerReact` action non-deterministically fails (both retries exhausted). The transition is permanently lost — `lastKnownPeerState` is advanced but the local state is not updated. Models `FailoverManagementListener.onStateChange()` (`HAGroupStoreManager.java` L653-704) where 2 retries fail and the method returns silently. Recovery modeled via: (a) a subsequent different peer state change produces a new event; (b) `ZKReconnect` action can re-deliver initial state; (c) admin manual intervention.
+- Guard `AutoComplete` actions on local ZK connectivity (these also depend on the local pathChildrenCache watcher chain).
 
 `ConsistentFailover.tla`:
-- Variable: `zkConnected ∈ [Cluster → [RS → BOOLEAN]]`.
+- Variables: `zkPeerConnected ∈ [Cluster → BOOLEAN]`, `zkPeerSessionAlive ∈ [Cluster → BOOLEAN]`.
+- Safety invariants must hold regardless of ZK connectivity state — ATS blocks mutations via `isMutationBlocked()=true`, so no dual-active or data loss occurs even when peer-reactive transitions are permanently disabled.
+- Liveness properties (`FailoverCompletion`, `AbortCompletion`) are explicitly predicated on the ZK Liveness Assumption (ZLA, see §4.2). Without ZLA, failover stalls — this is a defined protocol boundary.
+- `SafetyUnderZKFailure` invariant: mutual exclusion holds under arbitrary combinations of ZK disconnection, session expiry, and retry exhaustion.
 
-**Expected TLC result:** ZK connectivity failures may delay failover but should not violate safety properties.
+**Expected TLC result:** Safety properties pass regardless of ZK connectivity state — the protocol is safe under arbitrary watcher delivery delay or permanent loss. Liveness properties require weak fairness on `ZKReconnect` and `ZKSessionRecover`. Without recovery, failover stalls indefinitely in states where peer-reactive transitions are needed — this confirms the protocol's defined dependency on ZK session survival.
 
 ---
 
@@ -945,9 +1002,10 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 `ConsistentFailover.tla`:
 - `Fairness` formula:
   - Weak fairness (WF) on all deterministic protocol steps (auto-completion, peer reactions, replay advance) — referencing sub-module actions via `haGroupStore!AutoComplete(c)`, `reader!ReplayAdvance(c)`, etc.
+  - Weak fairness (WF) on ZK recovery actions (`environment!ZKReconnect(c)`, `environment!ZKSessionRecover(c)`) — this encodes the ZK Liveness Assumption (ZLA, §4.2) as a fairness condition.
   - Strong fairness (SF) on environmental recovery actions (`environment!HDFSRecover(c)`, `environment!RSRestart(c, rs)`).
-  - No fairness on non-deterministic environmental faults (HDFS failure, RS crash, ZK disconnect).
-- Liveness properties:
+  - No fairness on non-deterministic environmental faults (HDFS failure, RS crash, ZK disconnect, ZK session expiry, reactive transition failure).
+- Liveness properties (all predicated on ZLA):
   - `FailoverCompletion`: initiated failover eventually completes (or aborted).
   - `DegradationRecovery`: ANIS eventually returns to AIS if HDFS recovers.
   - `AbortCompletion`: initiated abort eventually completes.
@@ -956,7 +1014,7 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 - Created with `PROPERTY FailoverCompletion DegradationRecovery AbortCompletion`.
 - No `SYMMETRY` (TLC does not support symmetry reduction with liveness).
 
-**Expected TLC result:** Liveness properties pass under fairness assumptions with all quirk flags OFF (idealized model). Liveness config required (`ConsistentFailover-liveness.cfg`, no `SYMMETRY` — TLC does not support symmetry reduction with liveness checking). Iterations 21-22 re-check liveness with quirk flags ON to expose known implementation gaps.
+**Expected TLC result:** Liveness properties pass under fairness assumptions. ZK failures are part of the core model.
 
 #### Iteration 15 — ANISTS failover path
 
@@ -979,71 +1037,34 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 
 ---
 
-### Phase 7: Quirk Flags and Bug Modeling
+### Phase 7: Implementation Quirk Flags and Design Exploration
 
-#### Iteration 16 — UseNonAtomicFailoverQuirk
+This phase introduces toggle flags for two distinct purposes: (1) **implementation quirks** — behaviors where the implementation deviates from the design in ways that could be changed, and (2) **design exploration** — counterfactual toggles for comparing the actual protocol against hypothetical alternatives. ZK substrate properties (session lifecycle, watcher delivery, retry exhaustion) are NOT modeled as quirk flags — they are part of the core protocol model (Iteration 13; see §2.4).
 
-**Modules modified:** `Types.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
+---
 
-**What to add:**
+### Phase 8: OFFLINE State, Forced Failover, and Edge Cases
 
-`Types.tla`:
-- `UseAtomicFailover ∈ BOOLEAN` constant with `ASSUME`.
-
-`HAGroupStore.tla`:
-- When `UseAtomicFailover = TRUE`: single action `(ATS, STA) → (S, AIS)`.
-- When `UseAtomicFailover = FALSE` (default): two separate actions as modeled in Iteration 4.
-
-`ConsistentFailover.tla`:
-- Verify `MutualExclusion` passes in both modes.
-
-**Expected TLC result:** Both modes pass safety. The quirk flag documents the design-vs-implementation divergence.
-
-#### Iteration 17 — UseCollapsedDegradedQuirk (Low Priority)
-
-**Note:** The team confirmed that the collapsed single `DEGRADED_STANDBY` state is an intentional simplification, not a deferred feature. This iteration is retained for optional exploratory analysis but is low priority.
-
-**Modules modified:** `Types.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Types.tla`:
-- `UseDesignDegradedStates ∈ BOOLEAN` constant with `ASSUME`.
-
-`HAGroupStore.tla`:
-- When `UseDesignDegradedStates = TRUE`: use DSFW/DSFR/DS sub-states from the design.
-- When `UseDesignDegradedStates = FALSE` (default): use single `DEGRADED_STANDBY` from implementation.
-
-`ConsistentFailover.tla`:
-- Verify safety properties hold in both modes.
-
-**Expected TLC result:** Safety holds regardless of degraded sub-state granularity.
-
-#### Iteration 18 — OFFLINE state and --force bypass
+#### Iteration 16 — OFFLINE state and --force recovery
 
 **Modules modified:** `Types.tla`, `Admin.tla`, `ConsistentFailover.tla`.
 
 **What to add:**
 
 `Types.tla`:
-- `UseForceQuirk ∈ BOOLEAN` constant with `ASSUME`.
+- `UseForceQuirk ∈ BOOLEAN` constant (default FALSE) with `ASSUME`.
 
 `Admin.tla`:
-- `AdminGoOffline(c)`: transition to OFFLINE (via normal transition table).
-- `AdminForceRecoverFromOffline(c)`: OFFLINE → S (guarded by `UseForceQuirk = TRUE`). This models the `PhoenixHAAdminTool update
-  --force --state STANDBY` command, which bypasses the transition table validation entirely. This is the intentional operational procedure for recovering from OFFLINE.
+- `AdminGoOffline(c)`: transitions cluster to OFFLINE (sink state — no outbound transitions in normal mode). Source: `PhoenixHAAdminTool` `update` command with `--state OFFLINE`.
+- `AdminForceRecoverFromOffline(c)`: when `UseForceQuirk = TRUE`, transitions OFFLINE → S bypassing the normal transition table. Source: `PhoenixHAAdminTool update --force --state STANDBY`. Models the operational runbook procedure for recovering from OFFLINE.
 
 `ConsistentFailover.tla`:
-- Verify safety properties hold with and without `--force` recovery.
-- `OFFLINESink` invariant: when `UseForceQuirk = FALSE`, once a cluster enters OFFLINE it cannot leave.
+- `OFFLINESink` invariant: `clusterState[c] = OFFLINE ⇒ clusterState'[c] = OFFLINE` unless `UseForceQuirk = TRUE`. Verifies OFFLINE is a terminal sink state under normal operation (§4.1 property 10).
+- With `UseForceQuirk = TRUE`, `OFFLINESink` is relaxed to allow the `--force` recovery path.
 
-**Expected TLC result:** With `UseForceQuirk = FALSE`, OFFLINE is a true sink state. With `UseForceQuirk = TRUE`, the `--force` bypass allows recovery to STANDBY. Safety (mutual exclusion) holds in both modes.
+**Expected TLC result:** With `UseForceQuirk = FALSE`, OFFLINE is a terminal state and `OFFLINESink` holds. With `UseForceQuirk = TRUE`, recovery from OFFLINE is possible and `MutualExclusion` must still hold.
 
----
-
-### Phase 8: Forced Failover and Edge Cases
-
-#### Iteration 19 — Forced failover
+#### Iteration 17 — Forced failover
 
 **Modules modified:** `Types.tla`, `Admin.tla`, `ConsistentFailover.tla`.
 
@@ -1061,7 +1082,7 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 
 **Expected TLC result:** `MutualExclusion` passes; `NoDataLoss` fails (expected, by design).
 
-#### Iteration 20 — Replay rewind verification
+#### Iteration 18 — Replay rewind verification
 
 **Modules modified:** `Reader.tla`, `ConsistentFailover.tla`.
 
@@ -1080,9 +1101,9 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 
 ### Phase 9: Implementation Liveness Gaps
 
-These iterations model known implementation behaviors that can prevent liveness. Each uses a quirk flag: with the quirk ON, the model faithfully represents the implementation (liveness may not hold without admin intervention). With the quirk OFF, the behavior is idealized, allowing TLC to check for other unexpected liveness problems.
+This phase models implementation-specific behaviors that can prevent liveness. These are genuine implementation gaps (not ZK substrate properties), modeled as quirk flags. ZK-related liveness constraints (session expiry, retry exhaustion) are part of the core protocol model introduced in Iteration 13 — they are not deferred to this phase because they are properties of the coordination substrate, not application-level gaps.
 
-#### Iteration 21 — UseForwarderStuckQuirk
+#### Iteration 19 — UseForwarderStuckQuirk
 
 **Modules modified:** `Types.tla`, `Environment.tla`, `Writer.tla`, `ConsistentFailover.tla`.
 
@@ -1105,24 +1126,7 @@ These iterations model known implementation behaviors that can prevent liveness.
 
 **Expected TLC result:** With quirk ON, TLC finds that failover stalls when forwarder is stuck and admin does not abort — this is a known implementation characteristic. With quirk OFF, verify no other liveness gaps exist on the ANISTS path.
 
-#### Iteration 22 — UseRetryExhaustionQuirk
 
-**Modules modified:** `Types.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Types.tla`:
-- `UseRetryExhaustionQuirk ∈ BOOLEAN` constant with `ASSUME`.
-
-`HAGroupStore.tla`:
-- `ReactiveTransitionFail(c)` action: when `UseRetryExhaustionQuirk = TRUE`, a `PeerReact` action non-deterministically fails (both retries exhausted). The transition is permanently lost — `lastKnownPeerState` is advanced but the local state is not updated. Models `FailoverManagementListener.onStateChange()` (`HAGroupStoreManager.java` L653-704) where 2 retries fail and the method returns silently.
-- Recovery modeled via: (a) a subsequent different peer state change produces a new event; (b) `ZKReconnect` action can re-deliver initial state; (c) admin manual intervention.
-
-`ConsistentFailover.tla`:
-- With quirk ON: `FailoverCompletion` and `AbortCompletion` may require alternative recovery paths (subsequent peer state change, ZK reconnect, or admin action). Expected to reveal stall scenarios.
-- With quirk OFF: reactive transitions always succeed (weak fairness), verifying liveness without this implementation gap.
-
-**Expected TLC result:** With quirk ON, TLC may find that failover or abort stalls when a critical reactive transition is lost (e.g., standby fails to detect peer ATS, or old active fails to detect new active AIS). These are known implementation characteristics. With quirk OFF, verify no other liveness gaps in the reactive transition protocol.
 
 ---
 
@@ -1130,15 +1134,15 @@ These iterations model known implementation behaviors that can prevent liveness.
 
 | Design Event / Code Path | TLA+ Action | Module | Iter | Status |
 |--------------------------|-------------|--------|------|--------|
-| `initiateFailoverOnActiveCluster()` | `AdminStartFailover(c)` | `Admin.tla` | 3 | ⏳ |
-| `setHAGroupStatusToAbortToStandby()` | `AdminAbortFailover(c)` | `Admin.tla` | 3 | ⏳ |
-| `FailoverManagementListener` peer ATS detected | `PeerReactToATS(c)` | `HAGroupStore.tla` | 3 | ⏳ |
-| `FailoverManagementListener` peer AIS detected (old active → S) | `PeerReactToAIS(c)` | `HAGroupStore.tla` | 4 | ⏳ |
-| `FailoverManagementListener` peer ANIS detected (standby → DS) | `PeerReactToANIS(c)` | `HAGroupStore.tla` | 3 | ⏳ |
-| `FailoverManagementListener` peer AbTS detected (active → AbTAIS) | `PeerReactToAbTS(c)` | `HAGroupStore.tla` | 3 | ⏳ |
-| Auto-completion: AbTS → S | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ⏳ |
-| Auto-completion: AbTAIS → AIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ⏳ |
-| Auto-completion: AbTANIS → ANIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ⏳ |
+| `initiateFailoverOnActiveCluster()` | `AdminStartFailover(c)` | `Admin.tla` | 3 | ✅ |
+| `setHAGroupStatusToAbortToStandby()` | `AdminAbortFailover(c)` | `Admin.tla` | 3 | ✅ |
+| `FailoverManagementListener` peer ATS detected | `PeerReactToATS(c)` | `HAGroupStore.tla` | 3 | ✅ |
+| `FailoverManagementListener` peer AIS detected (old active → S) | `PeerReactToAIS(c)` | `HAGroupStore.tla` | 4 | ✅ |
+| `FailoverManagementListener` peer ANIS detected (standby → DS) | `PeerReactToANIS(c)` | `HAGroupStore.tla` | 3 | ✅ |
+| `FailoverManagementListener` peer AbTS detected (active → AbTAIS) | `PeerReactToAbTS(c)` | `HAGroupStore.tla` | 3 | ✅ |
+| Auto-completion: AbTS → S | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
+| Auto-completion: AbTAIS → AIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
+| Auto-completion: AbTANIS → ANIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
 | `SyncModeImpl.onFailure()` (L61-77) → `setHAGroupStatusToStoreAndForward()` | `WriterToSF(c, rs)` | `Writer.tla` | 5 | ⏳ |
 | `SyncAndForwardModeImpl.onFailure()` (L66-82) → `STORE_AND_FORWARD` | `WriterSyncFwdToSF(c, rs)` | `Writer.tla` | 5 | ⏳ |
 | `ReplicationLogDiscoveryForwarder.processFile()` (L133-152) throughput check → `S&F→S&FWD` | `WriterSFToSyncFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
@@ -1154,15 +1158,19 @@ These iterations model known implementation behaviors that can prevent liveness.
 | SYNCED_RECOVERY rewind | `ReplayRewind(c)` | `Reader.tla` | 10 | ⏳ |
 | RS abort (fail-stop in S&F) | `RSCrash(c, rs)` | `Environment.tla` | 12 | ⏳ |
 | RS restart | `RSRestart(c, rs)` | `Environment.tla` | 12 | ⏳ |
-| ZK DISCONNECTED event → RS abort | `ZKDisconnect(c, rs)` | `Environment.tla` | 13 | ⏳ |
+| Peer ZK connection lost (PathChildrenCache) | `ZKDisconnect(c)` | `Environment.tla` | 13 | ⏳ |
+| Peer ZK connection re-established | `ZKReconnect(c)` | `Environment.tla` | 13 | ⏳ |
+| ZK session expiry (all watches lost) | `ZKSessionExpiry(c)` | `Environment.tla` | 13 | ⏳ |
+| ZK session re-established | `ZKSessionRecover(c)` | `Environment.tla` | 13 | ⏳ |
+| ZK DISCONNECTED event → RS abort | `ZKDisconnectRS(c, rs)` | `Environment.tla` | 13 | ⏳ |
 | HDFS becomes unavailable | `HDFSFail(c)` | `Environment.tla` | 6 | ⏳ |
 | HDFS recovers | `HDFSRecover(c)` | `Environment.tla` | 6 | ⏳ |
-| `PhoenixHAAdminTool update --force` | `AdminForceFailover(c)` | `Admin.tla` | 19 | ⏳ |
-| Peer goes OFFLINE | `AdminGoOffline(c)` | `Admin.tla` | 18 | ⏳ |
-| `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE recovery) | `AdminForceRecoverFromOffline(c)` | `Admin.tla` | 18 | ⏳ |
+| `PhoenixHAAdminTool update --force` | `AdminForceFailover(c)` | `Admin.tla` | 17 | ⏳ |
+| Peer goes OFFLINE | `AdminGoOffline(c)` | `Admin.tla` | 16 | ⏳ |
+| `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE recovery) | `AdminForceRecoverFromOffline(c)` | `Admin.tla` | 16 | ⏳ |
 | `setData().withVersion()` (ZK optimistic locking) | `ZKUpdate(c, rs, newState)` | `HAGroupStore.tla` | 9 | ⏳ |
-| Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Environment.tla` | 21 | ⏳ |
-| `FailoverManagementListener` retry exhaustion (2 retries, then lost) | `ReactiveTransitionFail(c)` | `HAGroupStore.tla` | 22 | ⏳ |
+| Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Environment.tla` | 19 | ⏳ |
+| `FailoverManagementListener` retry exhaustion (2 retries, then lost) | `ReactiveTransitionFail(c)` | `HAGroupStore.tla` | 13 | ⏳ |
 
 ---
 
@@ -1230,8 +1238,7 @@ There is no third "acceptable" terminal state. Spurious violations caused by mod
 
 Each iteration follows a fixed loop:
 
-1. **CODE ANALYSIS** — Before writing TLA+, analyze the relevant implementation code paths for this iteration's scope. Ground the model in the actual implementation behavior. The spec captures
-   the correct protocol behavior — do NOT model known bugs (use quirk flags instead). At the end of each iteration, compare the model against the implementation to identify gaps where the code diverges from the correct protocol. These gaps are the findings.
+1. **CODE ANALYSIS** — Before writing TLA+, analyze the relevant implementation code paths for this iteration's scope. Ground the model in the actual implementation behavior. At the end of each iteration, compare the model against the implementation to identify gaps where the code diverges from the correct protocol. These gaps are the findings.
 2. **WRITE / EDIT** — Add or modify spec per the iteration's scope (see Section 7 for iteration descriptions). All editing is done locally in Cursor.
 3. **SYNTAX CHECK (local)** — Parse with SANY on the local machine. Fix all parse errors before proceeding to remote execution.
    ```
@@ -1264,15 +1271,6 @@ When TLC produces a counterexample trace, classify it as one of:
 | **Legitimate finding** | The implementation has a real bug or race | Document with trace; file JIRA |
 | **Design ambiguity** | The design docs are unclear or contradictory | Resolve with design authors |
 
-### 10.4 Quirk Flag Methodology
-
-When a legitimate finding is identified:
-
-1. Add a `UseXxxQuirk ∈ BOOLEAN` constant to `Types.tla`.
-2. Model the buggy behavior guarded by `UseXxxQuirk = TRUE`.
-3. Verify: with quirk ON, the relevant invariant FAILS (reproducing the bug).
-4. Verify: with quirk OFF (default), all invariants PASS (validating the fix).
-5. Document the quirk flag in this plan and in the spec comments.
 
 ---
 
@@ -1294,7 +1292,7 @@ The TLA+ model decomposes this into two separate actions in Iteration 4. The `No
 
 The design defines three degraded standby sub-states: `DSFW` (Degraded Standby For Writer — peer writer cannot replicate synchronously), `DSFR` (Degraded Standby For Reader — local reader lag exceeds threshold), and `DS` (both degraded). These sub-states have distinct transitions between them (`state-machines.md` §3). The implementation collapses all three into a single `DEGRADED_STANDBY` enum value (`HAGroupStoreRecord.java` L61). The reader and writer degradation status is not distinguished at the ZK or HA-group-record level; `setReaderToDegraded()` and `setReaderToHealthy()` in `HAGroupStoreManager` (L427-475) transition between `STANDBY` and `DEGRADED_STANDBY` without distinguishing the cause.
 
-The team confirmed this was intentionally removed to make the state machine simpler. The single `DEGRADED_STANDBY` state is the permanent design, not a deferred implementation. For safety verification the single state is sufficient because mutual exclusion does not depend on degradation sub-types. The TLA+ model follows the implementation's collapsed model throughout. Iteration 17 retains an optional `UseDesignDegradedStates` quirk flag for exploratory analysis, but this is low priority.
+The team confirmed this was intentionally removed to make the state machine simpler. The single `DEGRADED_STANDBY` state is the permanent design, not a deferred implementation. For safety verification the single state is sufficient because mutual exclusion does not depend on degradation sub-types. The TLA+ model follows the implementation's collapsed model throughout. A future iteration may introduce an optional `UseDesignDegradedStates` quirk flag for exploratory analysis, but this is low priority.
 
 ### A.3 OFFLINE as Sink State (Intentional)
 
@@ -1302,7 +1300,7 @@ The design shows bidirectional transitions `S → OFFLINE` and `OFFLINE → S` (
 
 The team confirmed this is intentional, not an oversight. The admin decides when to place a cluster offline and when to bring it back via `--force`. The `--force` recovery procedure should be documented as a standard operational runbook step.
 
-The TLA+ model uses the implementation's sink behavior. Iteration 18 models the `--force` bypass as a separate action that operates outside the normal transition table, reflecting the actual operational procedure.
+The TLA+ model uses the implementation's sink behavior. Iteration 16 models the `--force` bypass as a separate action that operates outside the normal transition table, reflecting the actual operational procedure.
 
 ### A.4 Replay State Machine (Implementation-Only)
 
@@ -1407,6 +1405,40 @@ The resulting interleaving is: `DEGRADED → SYNCED_RECOVERY → DEGRADED`, whic
 
 The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYNC` if re-degradation occurs. The TLA+ model must include the `SYNCED_RECOVERY → DEGRADED` transition to avoid falsely proving that recovery always completes in one step. In `Reader.tla`, the `ReplayStateDegrade` action must be enabled from both `SYNC` and `SYNCED_RECOVERY` states. The CAS in `ReplayStateRecover` must be modeled as a conditional: it succeeds only if the state is still `SYNCED_RECOVERY` at the linearization point.
 
+### A.15 Missing Peer-State Guard on Failover Initiation (TLC Finding — Iteration 4)
+
+**Finding**: TLC exhaustive model checking (Iteration 4) discovered that `initiateFailoverOnActiveCluster()` (`HAGroupStoreManager.java` L375-400) does not validate the peer cluster's state before initiating failover. This allows an admin to initiate a new failover on the newly-active cluster during the non-atomic window of a prior failover, producing an irrecoverable `(ATS, ATS)` deadlock where both clusters are in `ACTIVE_IN_SYNC_TO_STANDBY` with mutations blocked and no action enabled. The admin starts a second failover on c2 (which just became `AIS`) before c1's `FailoverManagementListener` reacts to the peer `AIS` and completes `ATS → S`. The method only checks `currentState == AIS || ANIS` and does not query the peer's state via `getHAGroupStoreRecordFromPeer()` (available on `HAGroupStoreClient` L421-427).
+
+**Planned fix**: Add a peer-state precondition to `initiateFailoverOnActiveCluster()` requiring the peer to be in `STANDBY` or `DEGRADED_STANDBY` before allowing `AIS → ATS` or `ANIS → ANISTS`. The TLA+ model (`Admin.tla`) encodes this as `clusterState[Peer(c)] ∈ {"S", "DS"}` on the `AdminStartFailover` action. With the guard, TLC verifies deadlock freedom for the full reachable state space.
+
+### A.16 ZK Watcher Delivery Is Not Formally Guaranteed (Source Code Analysis)
+
+**Finding**: Source code analysis of ZooKeeper confirms that watcher notification delivery is conditional, not unconditional. ZooKeeper guarantees ordering (events delivered in zxid order), happens-before (client sees watch before new data), and at-most-once (standard watches fire at most once). It does NOT guarantee: delivery during disconnection, session survival, unconditional delivery (server-side exceptions can silently drop notifications), cross-client simultaneity, or bounded delivery time.
+
+**Impact on Phoenix failover protocol**: Every peer-reactive transition in the protocol depends on the ZK watcher notification chain:
+
+| TLA+ Action | ZK Watcher Chain | If Notification Lost |
+|---|---|---|
+| `PeerReactToATS(c)` | peerPathChildrenCache → handleStateChange → FailoverManagementListener | Standby never enters STA; failover stalls indefinitely |
+| `PeerReactToAIS(c)` | peerPathChildrenCache → handleStateChange → FailoverManagementListener | Old active stays in ATS forever; mutations blocked |
+| `PeerReactToANIS(c)` | peerPathChildrenCache → handleStateChange → FailoverManagementListener | Standby stays in S when it should be DS; consistency point tracking incorrect |
+| `PeerReactToAbTS(c)` | peerPathChildrenCache → handleStateChange → FailoverManagementListener | Active stays in ATS; abort does not propagate |
+| `AutoComplete(c)` | pathChildrenCache (local) → handleStateChange → FailoverManagementListener | Cluster stays in AbTS/AbTAIS/AbTANIS indefinitely |
+| `StandbyBecomesActive(c)` | pathChildrenCache (local) → ReplicationLogDiscoveryReplay listeners | `failoverPending` never set; STA→AIS never fires |
+
+**Failure modes (5 identified in ZK source)**:
+1. **Session expiry**: All watches permanently lost. Client receives `SESSION_EXPIRED` on reconnect. Recovery requires new session + fresh watch registration. (Source: `zookeeperProgrammers.md` L398-413)
+2. **Server-side exception in WatchManager**: `triggerWatch()` iterates watchers with no try/catch — an unchecked exception in one watcher's `process()` skips all remaining watchers. (Source: `WatchManager.java` L140-217)
+3. **NIO silent serialization failure**: `NIOServerCnxn.sendResponse()` catches all `Exception` types and logs a warning. The notification is silently dropped. (Source: `NIOServerCnxn.java` L690-702)
+4. **Netty write failure**: The `onSendBufferDoneListener` silently ignores `writeAndFlush` failures. (Source: `NettyServerCnxn.java` L222-227)
+5. **Disconnection**: No notifications delivered while disconnected. On reconnect, `primeConnection()` re-registers watches with `lastZxid` and the server fires any missed changes. Curator's `PathChildrenCache` also re-queries and generates synthetic events. (Source: `ClientCnxn.java` L1006-1082)
+
+**No polling fallback**: The `syncZKToSystemTable()` periodic job (every 900s) syncs ZK → System Table for observability only. It does NOT re-evaluate peer state, re-fire subscriber notifications, or detect missed watcher events. There is no application-level mechanism to recover from a permanently missed watcher notification without a ZK session reconnect or manual intervention.
+
+**Curator PathChildrenCache mitigation**: Phoenix uses Curator's `PathChildrenCache` rather than raw ZK watches. PathChildrenCache provides eventual delivery on reconnection by re-querying ZK and generating synthetic `CHILD_UPDATED` events for any changes detected during disconnection. This is the primary reliability backstop. However, PathChildrenCache does NOT protect against session expiry (the ZK session is dead; Curator must establish a new one) or permanent network partition (no reconnection possible).
+
+**Formal modeling implications**: ZK's conditional watcher delivery is modeled as a core protocol property. For **safety**, TLC's interleaving semantics already cover the case where peer-reactive actions are enabled but not taken — TLC explores all orderings, including paths where another action fires first. Safety (mutual exclusion, no data loss) holds regardless of watcher delivery delay because ATS/ANISTS map to `ACTIVE_TO_STANDBY` with `isMutationBlocked()=true`. For **liveness**, ZK session lifecycle (disconnect, expiry, recovery) and retry exhaustion are always part of the model (Iteration 13). Liveness properties are explicitly predicated on the ZK Liveness Assumption (ZLA, §4.2): ZK sessions are eventually alive and connected. Without ZLA, peer-reactive transitions are permanently disabled and the protocol stalls — this is a defined boundary of the protocol's operational envelope.
+
 ---
 
 ## Appendix B: Invariant Summary Table
@@ -1430,11 +1462,11 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 | 15 | `FailoverCompletion` | Liveness | Iter 14 | Initiated failover eventually completes |
 | 16 | `DegradationRecovery` | Liveness | Iter 14 | ANIS eventually recovers to AIS |
 | 17 | `AbortCompletion` | Liveness | Iter 14 | Initiated abort eventually completes |
-| 18 | `OFFLINESink` | Safety | Iter 18 | OFFLINE is terminal unless `UseForceQuirk` |
-| 19 | `ForcedFailoverSafety` | Safety | Iter 19 | Mutual exclusion under forced failover |
-| 20 | `ReplayRewindCorrectness` | Safety | Iter 20 | Rewind resets `lastRoundProcessed` correctly |
-| 21 | `FailoverCompletionWithStuck` | Liveness | Iter 21 | With `UseForwarderStuckQuirk`, failover requires admin abort when forwarder stuck |
-| 22 | `FailoverCompletionWithRetryFail` | Liveness | Iter 22 | With `UseRetryExhaustionQuirk`, failover/abort may require alternative recovery |
+| 18 | `OFFLINESink` | Safety | Iter 16 | OFFLINE is terminal unless `UseForceQuirk` |
+| 19 | `ForcedFailoverSafety` | Safety | Iter 17 | Mutual exclusion under forced failover |
+| 20 | `ReplayRewindCorrectness` | Safety | Iter 18 | Rewind resets `lastRoundProcessed` correctly |
+| 21 | `FailoverCompletionWithStuck` | Liveness | Iter 19 | With `UseForwarderStuckQuirk`, failover requires admin abort when forwarder stuck |
+| 22 | `SafetyUnderZKFailure` | Safety | Iter 13 | Mutual exclusion holds under arbitrary ZK failures (session expiry, disconnection, retry exhaustion) |
 
 Additional invariants will be discovered and added during the modeling process.
 
@@ -1452,12 +1484,13 @@ Additional invariants will be discovered and added during the modeling process.
 | §3.5 Reactive Transitions | `IMPL_CROSS_REFERENCE.md` §2.5; `HAGroupStoreManager.java` L104-150 | FailoverManagementListener + peer/local resolvers |
 | §3.6 Anti-Flapping | `state-machines.md` §6; `IMPL_CROSS_REFERENCE.md` §5; `HAGroupStoreClient.java` L1027-1046 | Protocol rules + timing + ANISTS gate |
 | §4.1 Safety Properties | `TLA_INDEX.md` §7; `architecture.md` §Key Safety Arguments | Invariants |
-| §4.2 Liveness Properties | `TLA_INDEX.md` §8 | Temporal properties; quirk-conditioned liveness |
+| §4.2 Liveness Properties | `TLA_INDEX.md` §8 | Temporal properties |
 | §4.3 Scenario 2 | Source: `ReplicationLogDiscoveryForwarder.java` L133-184; `PhoenixHAAdminTool.java` L509-605 | Forwarder stuck (no timeout); see `UseForwarderStuckQuirk` |
 | §4.3 Scenario 3 | Source: `ReplicationShardDirectoryManager.java` L116-136; `StoreAndForwardModeImpl.java` L116-123 | RS crash: shared shards, unclosed leases |
-| §4.3 Scenario 6 | Source: `HAGroupStoreManager.java` L653-704; `HAGroupStoreClient.java` L1104-1110 | Retry exhaustion; see `UseRetryExhaustionQuirk` |
+| §4.3 Scenario 6 | Source: `HAGroupStoreManager.java` L653-704; `HAGroupStoreClient.java` L1104-1110 | Retry exhaustion; core ZK property modeled in Iteration 13 (see §2.4) |
 | §4.3 Scenario 7 | `HAGroupStoreRecord.java` L117; `HAGroupStoreManager.java` L109 | DS→STA resolved (transition added) |
 | §4.3 Scenario 8 | Source: `ClusterRoleRecord.java` L84; `ReplicationLogDiscoveryReplay.java` L309-317, L500-533 | HDFS fail during (ATS,STA); mutation blocking |
-| Phase 9 (Iter 21-22) | Source-verified implementation liveness gaps | `UseForwarderStuckQuirk`, `UseRetryExhaustionQuirk` |
+| Phase 9 (Iter 19) | Source-verified implementation liveness gap | `UseForwarderStuckQuirk` (retry exhaustion absorbed into Iteration 13 as core ZK property) |
 | §9 Source Code | `IMPL_CROSS_REFERENCE.md` §13; verified against source | File index with line numbers |
-| Appendix A | `IMPL_CROSS_REFERENCE.md` §11; source-verified | Divergences (14 items; A.2, A.3, A.6, A.11, A.12 resolved/updated) |
+| Appendix A | `IMPL_CROSS_REFERENCE.md` §11; source-verified | Divergences (16 items; A.2, A.3, A.6, A.11, A.12 resolved/updated) |
+| Appendix A.16 | `ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md`; ZK source code analysis | ZK watcher delivery is conditional, not guaranteed; 5 failure modes identified |

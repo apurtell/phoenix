@@ -25,16 +25,26 @@ VARIABLE clusterState
 (*
  * Admin initiates failover on the active cluster.
  *
- * Pre:  Cluster c is in AIS (ACTIVE_IN_SYNC).
+ * Pre:  Cluster c is in AIS (ACTIVE_IN_SYNC) and peer is in a
+ *       stable standby state (S or DS).
  * Post: Cluster c transitions to ATS (ACTIVE_IN_SYNC_TO_STANDBY),
  *       blocking mutations (isMutationBlocked()=true for the
  *       ACTIVE_TO_STANDBY role).
  *
+ * The peer-state guard prevents initiating a new failover during
+ * the non-atomic window of a previous failover (where the peer
+ * may still be in ATS). Without this guard, the admin could
+ * produce an irrecoverable (ATS, ATS) deadlock. See
+ * PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md and Appendix A.15.
+ *
  * Source: initiateFailoverOnActiveCluster() L375-400 checks current
  *         state and selects AIS -> ATS or ANIS -> ANISTS.
+ *         Peer-state guard: planned fix using
+ *         getHAGroupStoreRecordFromPeer() (HAGroupStoreClient L421).
  *)
 AdminStartFailover(c) ==
     /\ clusterState[c] = "AIS"
+    /\ clusterState[Peer(c)] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
 
 ---------------------------------------------------------------------------
