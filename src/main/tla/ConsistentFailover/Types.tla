@@ -16,6 +16,7 @@
  *   AllowedTransitions — set of valid (from, to) state pairs
  *   ClusterRole       — the 6 cluster roles visible to clients
  *   RoleOf(state)     — maps an HAGroupState to its ClusterRole
+ *   ActiveRoles       — the set of roles considered "active" (role-level)
  *   Peer(c)           — returns the other cluster in a 2-cluster model
  *
  * Implementation traceability:
@@ -98,6 +99,14 @@ StandbyStates == { "S", "DS", "AbTS" }
 \* Source: ClusterRoleRecord.java L84 — ACTIVE_TO_STANDBY role
 \*         has isMutationBlocked() = true.
 TransitionalActiveStates == { "ATS", "ANISTS" }
+
+\* The set of cluster roles considered "active" for role-level predicates.
+\* Distinguished from ActiveStates (which is the set of HA group *states*
+\* that map to ACTIVE): ActiveRoles operates at the role abstraction layer.
+\*
+\* Source: ClusterRoleRecord.java L59-67 — ACTIVE role has
+\*         isMutationBlocked()=false.
+ActiveRoles == {"ACTIVE"}
 
 ---------------------------------------------------------------------------
 

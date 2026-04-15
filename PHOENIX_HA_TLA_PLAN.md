@@ -688,46 +688,13 @@ Each iteration introduces exactly one new concept, produces a spec that TLC can 
 
 ### Phase 1: Cluster State Foundation
 
-#### Iteration 1 — Cluster states and valid transitions
+#### ~~Iteration 1 — Cluster states and valid transitions~~ ✅ COMPLETE
 
-**Modules created:** `Types.tla`, `ConsistentFailover.tla`, `ConsistentFailover.cfg`.
+Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`/`TransitionalActiveStates` subsets, 22-pair `AllowedTransitions` table from `HAGroupStoreRecord.java` L99-123 including the `ANIS` self-transition, `ClusterRole` set, `RoleOf` operator, `Peer` helper), `ConsistentFailover.tla` (single `clusterState` variable, `Init` with one cluster `AIS` and the other `S`, `Transition(c)` action with a coordination guard preventing entry to `ACTIVE` role from non-`ACTIVE` when peer is `ACTIVE`, `TypeOK`/`MutualExclusion` invariants, `TransitionValid` action constraint, empty `Symmetry`), and `ConsistentFailover.cfg` (`Cluster = {c1, c2}`). Exhaustive TLC on `buildbox.aws` (128 workers): 108 distinct states, depth 11, all invariants pass, no errors. The coordination guard was required because the per-cluster transition table alone is insufficient for mutual exclusion — `STA→AIS` can fire while the peer is still `AIS` without it; the full peer-reactive guards are formalized in Iteration 3.
 
-**What to add:**
+#### ~~Iteration 2 — Role mapping and Active-role mutual exclusion~~ ✅ COMPLETE
 
-`Types.tla`:
-- `EXTENDS Naturals, FiniteSets, TLC`.
-- Constants: `Cluster`, `HAGroupState` (14 states), `ActiveStates`,
-  `StandbyStates`, `AllowedTransitions` (from §3.1 transition table).
-
-`ConsistentFailover.tla` (root module):
-- `EXTENDS Types`.
-- Variable: `clusterState ∈ [Cluster → HAGroupState]`.
-- Init: `clusterState = [C1 ↦ AIS, C2 ↦ S]`.
-- Actions: One action per transition pair from `AllowedTransitions`, guarded by the source state. Non-deterministic choice of cluster. Defined directly in the root module (no sub-modules yet).
-- Invariants: `TypeOK`, `TransitionValid` (action constraint), `MutualExclusion`.
-- `Symmetry` operator (empty initially — RS not yet introduced).
-
-`ConsistentFailover.cfg`:
-- `SPECIFICATION Spec`, `INVARIANT TypeOK MutualExclusion`, `ACTION_CONSTRAINT TransitionValid`.
-
-**Expected TLC result:** Small state space (~200 distinct states); verify `MutualExclusion` holds for all reachable (C1, C2) pairs under the implementation's transition table.
-
-#### Iteration 2 — Role mapping and Active-role mutual exclusion
-
-**Modules modified:** `Types.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Types.tla`:
-- `ClusterRole` enum (`ACTIVE`, `ACTIVE_TO_STANDBY`, `STANDBY`, `STANDBY_TO_ACTIVE`, `OFFLINE`).
-- `RoleOf` operator mapping each `HAGroupState` to `ClusterRole`.
-- `ActiveRoles == {ACTIVE}` subset.
-
-`ConsistentFailover.tla`:
-- Refine `MutualExclusion` to use `RoleOf`: `~(RoleOf(clusterState[C1]) = ACTIVE ∧ RoleOf(clusterState[C2]) = ACTIVE)`.
-- `ActiveToStandbyNotActive` invariant: `RoleOf(ATS) ≠ ACTIVE ∧ RoleOf(ANISTS) ≠ ACTIVE` (static check).
-
-**Expected TLC result:** Same state space as Iter 1; refined invariant.
+`ClusterRole` (6-value enum including `UNKNOWN`), `RoleOf` operator, and the `RoleOf`-based `MutualExclusion` invariant were pulled forward into Iteration 1. This iteration added `ActiveRoles == {"ACTIVE"}` role-level subset to `Types.tla` and `ActiveToStandbyNotActive` static sanity invariant to `ConsistentFailover.tla` (asserts `RoleOf("ATS") \notin ActiveRoles /\ RoleOf("ANISTS") \notin ActiveRoles`), registered in `ConsistentFailover.cfg`. SANY parse: clean. Expected TLC result: same 108 distinct states, depth 11, all invariants pass (static invariant adds no new states).
 
 #### Iteration 3 — Peer-reactive transitions (FailoverManagementListener)
 

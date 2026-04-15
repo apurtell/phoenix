@@ -16,6 +16,10 @@
  *   - Safety invariants: TypeOK, MutualExclusion
  *   - Action constraint: TransitionValid
  *
+ * Iteration 2 scope (additive):
+ *   - ActiveRoles role-level subset (Types.tla)
+ *   - ActiveToStandbyNotActive static sanity invariant
+ *
  * Action logic is initially defined directly in this module.
  * Future iterations (3+) will factor actions into sub-modules:
  *   - HAGroupStore.tla: peer-reactive transitions, auto-complete
@@ -165,6 +169,25 @@ MutualExclusion ==
         \* ... both in the ACTIVE role.
         /\ RoleOf(clusterState[c1]) = "ACTIVE"
         /\ RoleOf(clusterState[c2]) = "ACTIVE")
+
+---------------------------------------------------------------------------
+
+(*
+ * Static sanity invariant: the transitional states ATS and ANISTS
+ * must not map to the ACTIVE role. This codifies the safety assumption
+ * that isMutationBlocked()=true for ACTIVE_TO_STANDBY, which is the
+ * mechanism preventing dual-active during the non-atomic failover window.
+ *
+ * This is trivially true given the current RoleOf definition (both map
+ * to ACTIVE_TO_STANDBY), but it guards against future regressions in
+ * the role-mapping table.
+ *
+ * Source: ClusterRoleRecord.java L84 — ACTIVE_TO_STANDBY role has
+ *         isMutationBlocked()=true.
+ *)
+ActiveToStandbyNotActive ==
+    /\ RoleOf("ATS") \notin ActiveRoles
+    /\ RoleOf("ANISTS") \notin ActiveRoles
 
 ---------------------------------------------------------------------------
 
