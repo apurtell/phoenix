@@ -9,7 +9,8 @@
  * Models the HA group state machine for two paired Phoenix/HBase
  * clusters. Each cluster maintains an HA group state in ZooKeeper.
  * State transitions are driven by admin actions, peer-reactive
- * listeners, and writer/reader state changes.
+ * listeners, writer/reader state changes, and HDFS availability
+ * incidents.
  *
  * ZK WATCHER DELIVERY: Peer-reactive transitions and auto-
  * completion transitions depend on ZooKeeper watcher notification
@@ -19,14 +20,12 @@
  * and Appendix A.16). In this model, peer-reactive actions fire
  * whenever their guard is satisfied. TLC's interleaving semantics
  * cover arbitrary delivery delay (safety verification is sound).
- * Iteration 13 adds explicit ZK connectivity guards and
- * UseZKSessionExpiryQuirk for liveness verification under watcher
- * delivery failure.
  *
  * Sub-modules:
  *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - Admin.tla: operator-initiated failover/abort
  *   - Writer.tla: per-RS replication writer mode state machine
+ *   - HDFS.tla: HDFS availability incident actions
  *
  * Implementation traceability:
  *
@@ -55,6 +54,14 @@
  *   AllowedTransitions      | HAGroupStoreRecord.java L99-123
  *   writerMode              | ReplicationLogGroup per-RS mode
  *                           |   (SYNC/STORE_AND_FWD/SYNC_AND_FWD)
+ *   outDirEmpty             | ReplicationLogDiscoveryForwarder
+ *                           |   .processNoMoreRoundsLeft() L155-184
+ *                           |   Boolean: OUT dir empty/non-empty
+ *   hdfsAvailable           | Abstract: NameNode availability per cluster
+ *                           |   (no explicit field in implementation;
+ *                           |   detected via IOException)
+ *   HDFSDown/HDFSUp         | NameNode crash/recovery incidents;
+ *                           |   SyncModeImpl.onFailure() L61-74
  *)
 EXTENDS Types
 
@@ -77,15 +84,29 @@ VARIABLE clusterState
 \*         StoreAndForwardModeImpl, SyncAndForwardModeImpl)
 VARIABLE writerMode
 
+\* outDirEmpty[c] is TRUE when the OUT directory on cluster c
+\* contains no buffered replication log files (all forwarded or
+\* never written). FALSE when writes are accumulating locally.
+\*
+\* Source: ReplicationLogDiscoveryForwarder.processNoMoreRoundsLeft()
+\*         L155-184 checks getInProgressFiles().isEmpty() &&
+\*         getNewFilesForRound(nextRound).isEmpty()
+VARIABLE outDirEmpty
+
+\* hdfsAvailable[c] is TRUE when cluster c's HDFS (NameNode) is
+\* accessible to its peer cluster's writers. FALSE after a NameNode
+\* crash. Not explicitly tracked in the implementation — detected
+\* reactively via IOException from HDFS write operations.
+VARIABLE hdfsAvailable
+
 \* Tuple of all variables for use in temporal formulas.
-vars == <<clusterState, writerMode>>
+vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
 (* Sub-module instances *)
 
 \* Peer-reactive transitions and auto-completion.
-\* No WITH clause — TLA+ matches the clusterState variable by name.
 haGroupStore == INSTANCE HAGroupStore
 
 \* Operator-initiated failover and abort.
@@ -93,6 +114,9 @@ admin == INSTANCE Admin
 
 \* Per-RS replication writer mode state machine.
 writer == INSTANCE Writer
+
+\* HDFS availability incident actions.
+hdfs == INSTANCE HDFS
 
 ---------------------------------------------------------------------------
 
@@ -111,6 +135,8 @@ Init ==
     IN /\ clusterState = [c \in Cluster |->
                             IF c = active THEN "AIS" ELSE "S"]
        /\ writerMode = [c \in Cluster |-> [rs \in RS |-> "INIT"]]
+       /\ outDirEmpty = [c \in Cluster |-> TRUE]
+       /\ hdfsAvailable = [c \in Cluster |-> TRUE]
 
 ---------------------------------------------------------------------------
 
@@ -125,6 +151,10 @@ Init ==
  *     delivery. See HAGroupStore.tla module header for details.
  *   - admin: operator-initiated failover and abort
  *     These are direct ZK writes (not watcher-dependent).
+ *   - hdfs: HDFS NameNode crash/recovery incidents
+ *     HDFSDown atomically degrades all affected RS on the peer.
+ *   - writer: per-RS writer mode transitions (startup, recovery,
+ *     drain complete)
  *
  * Each action encodes the precise guard (peer state or local state)
  * under which the transition fires, modeling the implementation's
@@ -144,20 +174,22 @@ Next ==
         \/ haGroupStore!StandbyBecomesActive(c)
         \* [ZK watcher] Peer-reactive: cluster detects peer AIS.
         \/ haGroupStore!PeerReactToAIS(c)
+        \* [Writer-driven] All RS synced + OUT empty: ANIS->AIS.
+        \/ haGroupStore!ANISToAIS(c)
         \* [Direct ZK write] Admin initiates failover: AIS->ATS.
         \/ admin!AdminStartFailover(c)
         \* [Direct ZK write] Admin aborts failover: STA->AbTS.
         \/ admin!AdminAbortFailover(c)
-        \* Per-RS writer mode transitions (independent of cluster
-        \* state in this iteration; coupling added in Iter 6-7).
+        \* HDFS NameNode crash/recovery incidents.
+        \/ hdfs!HDFSDown(c)
+        \/ hdfs!HDFSUp(c)
+        \* Per-RS writer mode transitions.
         \/ \E rs \in RS :
             \/ writer!WriterInit(c, rs)
             \/ writer!WriterInitToStoreFwd(c, rs)
-            \/ writer!WriterToStoreFwd(c, rs)
             \/ writer!WriterSyncToSyncFwd(c, rs)
             \/ writer!WriterStoreFwdToSyncFwd(c, rs)
             \/ writer!WriterSyncFwdToSync(c, rs)
-            \/ writer!WriterSyncFwdToStoreFwd(c, rs)
 
 ---------------------------------------------------------------------------
 
@@ -170,7 +202,7 @@ Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
 
-(* Type invariant *)
+(* Type invariants *)
 
 \* Every cluster's state is a valid HAGroupState.
 TypeOK ==
@@ -179,6 +211,14 @@ TypeOK ==
 \* Every RS on every cluster has a valid WriterMode.
 WriterTypeOK ==
     writerMode \in [Cluster -> [RS -> WriterMode]]
+
+\* OUT directory emptiness is a boolean per cluster.
+OutDirTypeOK ==
+    outDirEmpty \in [Cluster -> BOOLEAN]
+
+\* HDFS availability is a boolean per cluster.
+HDFSTypeOK ==
+    hdfsAvailable \in [Cluster -> BOOLEAN]
 
 ---------------------------------------------------------------------------
 
@@ -203,25 +243,6 @@ MutualExclusion ==
         \* ... both in the ACTIVE role.
         /\ RoleOf(clusterState[c1]) = "ACTIVE"
         /\ RoleOf(clusterState[c2]) = "ACTIVE")
-
----------------------------------------------------------------------------
-
-(*
- * Static sanity invariant: the transitional states ATS and ANISTS
- * must not map to the ACTIVE role. This codifies the safety assumption
- * that isMutationBlocked()=true for ACTIVE_TO_STANDBY, which is the
- * mechanism preventing dual-active during the non-atomic failover window.
- *
- * This is trivially true given the current RoleOf definition (both map
- * to ACTIVE_TO_STANDBY), but it guards against future regressions in
- * the role-mapping table.
- *
- * Source: ClusterRoleRecord.java L84 — ACTIVE_TO_STANDBY role has
- *         isMutationBlocked()=true.
- *)
-ActiveToStandbyNotActive ==
-    /\ RoleOf("ATS") \notin ActiveRoles
-    /\ RoleOf("ANISTS") \notin ActiveRoles
 
 ---------------------------------------------------------------------------
 
@@ -258,9 +279,14 @@ AbortSafety ==
  * is maintained because ATS maps to role ACTIVE_TO_STANDBY, which
  * is not an active role (isMutationBlocked()=true).
  *
- * This is a state-dependent specialization of the static
- * ActiveToStandbyNotActive invariant, expressed over reachable
- * states to explicitly name the non-atomic failover window.
+ * TAUTOLOGY NOTE (Iteration 7): This invariant is a definitional
+ * tautology. The antecedent fixes clusterState[c1] = "ATS", so
+ * RoleOf("ATS") = "ACTIVE_TO_STANDBY", and "ACTIVE_TO_STANDBY"
+ * \notin ActiveRoles is a constant-level truth. The consequent is
+ * always TRUE regardless of state. This is subsumed by
+ * MutualExclusion, which verifies role-level mutual exclusion over
+ * all reachable states. Kept for documentation of the safety
+ * argument.
  *
  * Source: Architecture safety argument; ClusterRoleRecord.java
  *         L84 — ACTIVE_TO_STANDBY has isMutationBlocked()=true.
@@ -317,6 +343,83 @@ WriterTransitionValid ==
 
 ---------------------------------------------------------------------------
 
+(*
+ * AIS-to-ATS precondition: failover can only begin from AIS when
+ * the OUT directory is empty and all RS are in SYNC mode.
+ *
+ * This precondition is implicit in the implementation because AIS
+ * implies all RS are in SYNC (enforced by the ANIS→AIS transition
+ * requiring outDirEmpty and the anti-flapping timeout). It is
+ * enforced here as a guard on AdminStartFailover and verified as
+ * an action constraint.
+ *
+ * Source: initiateFailoverOnActiveCluster() L375-400 (validates
+ *         current state is AIS or ANIS); the precondition holds
+ *         because AIS is only reachable when OUT dir is empty and
+ *         all writers have returned to SYNC.
+ *)
+AIStoATSPrecondition ==
+    \A c \in Cluster :
+        clusterState[c] = "AIS" /\ clusterState'[c] = "ATS"
+        => outDirEmpty[c] /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
+
+---------------------------------------------------------------------------
+
+(*
+ * AIS implies in-sync: whenever a cluster is in AIS, the OUT
+ * directory must be empty and all RS must be in SYNC or INIT.
+ *
+ * This is the non-tautological state-level version of the
+ * AIStoATSPrecondition action constraint (section 4.1 property 3:
+ * "a derived invariant, not an explicit guard on the admin action").
+ * Holds by construction after Iteration 7: every action that
+ * degrades writers or sets outDirEmpty=FALSE also transitions
+ * AIS → ANIS; every path back to AIS (ANISToAIS) requires
+ * outDirEmpty and all SYNC.
+ *)
+AISImpliesInSync ==
+    \A c \in Cluster :
+        clusterState[c] = "AIS" =>
+            /\ outDirEmpty[c]
+            /\ \A rs \in RS : writerMode[c][rs] \in {"INIT", "SYNC"}
+
+---------------------------------------------------------------------------
+
+(*
+ * No AIS with S&F writer: a cluster in AIS cannot have any RS in
+ * STORE_AND_FWD mode. Subsumed by AISImpliesInSync but retained
+ * for independent documentary value as the minimal statement of
+ * the critical safety property.
+ *
+ * Holds by construction: the only paths that create S&F writers
+ * (HDFSDown, WriterInitToStoreFwd) atomically transition AIS → ANIS.
+ *)
+NoAISWithSFWriter ==
+    \A c \in Cluster :
+        (\E rs \in RS : writerMode[c][rs] = "STORE_AND_FWD") =>
+            clusterState[c] # "AIS"
+
+---------------------------------------------------------------------------
+
+(*
+ * Writer-cluster consistency: degraded writer modes (S&F,
+ * SYNC_AND_FWD) can only appear on active clusters that are NOT
+ * in AIS, or on the ANISTS transitional state. Specifically,
+ * this excludes AIS (prevented by AIS→ANIS coupling) and all
+ * standby/transitional states (prevented by active-cluster guards).
+ *
+ * The allowed set includes AbTAIS and AWOP because HDFS can go
+ * down while the cluster is in these states; the AIS→ANIS
+ * coupling only fires for AIS, so other active states retain
+ * their state while writers degrade.
+ *)
+WriterClusterConsistency ==
+    \A c \in Cluster :
+        (\E rs \in RS : writerMode[c][rs] \in {"STORE_AND_FWD", "SYNC_AND_FWD"}) =>
+            clusterState[c] \in {"ANIS", "ANISTS", "ANISWOP", "AbTANIS", "AbTAIS", "AWOP"}
+
+---------------------------------------------------------------------------
+
 (* Symmetry *)
 
 \* RS identifiers are interchangeable (all start in INIT, identical
@@ -333,6 +436,12 @@ THEOREM Spec => []TypeOK
 \* Safety: every step preserves the writer type invariant.
 THEOREM Spec => []WriterTypeOK
 
+\* Safety: every step preserves the OUT dir type invariant.
+THEOREM Spec => []OutDirTypeOK
+
+\* Safety: every step preserves the HDFS type invariant.
+THEOREM Spec => []HDFSTypeOK
+
 \* Safety: mutual exclusion holds in every reachable state.
 THEOREM Spec => []MutualExclusion
 
@@ -341,5 +450,14 @@ THEOREM Spec => []AbortSafety
 
 \* Safety: non-atomic failover window preserves mutual exclusion.
 THEOREM Spec => []NonAtomicFailoverSafe
+
+\* Safety: AIS implies in-sync (derived invariant, section 4.1 property 3).
+THEOREM Spec => []AISImpliesInSync
+
+\* Safety: AIS clusters have no S&F writers.
+THEOREM Spec => []NoAISWithSFWriter
+
+\* Safety: degraded writer modes only on degraded-active clusters.
+THEOREM Spec => []WriterClusterConsistency
 
 ============================================================================

@@ -18,7 +18,7 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable
 
 ---------------------------------------------------------------------------
 
@@ -27,6 +27,11 @@ VARIABLE clusterState, writerMode
  *
  * Pre:  Cluster c is in AIS (ACTIVE_IN_SYNC) and peer is in a
  *       stable standby state (S or DS).
+ *       The OUT directory must be empty and all RS must be in
+ *       SYNC mode — this precondition is implicit in the
+ *       implementation because AIS implies all RS are in SYNC
+ *       (enforced by the ANIS→AIS transition requiring outDirEmpty
+ *       and anti-flapping timeout).
  * Post: Cluster c transitions to ATS (ACTIVE_IN_SYNC_TO_STANDBY),
  *       blocking mutations (isMutationBlocked()=true for the
  *       ACTIVE_TO_STANDBY role).
@@ -45,8 +50,10 @@ VARIABLE clusterState, writerMode
 AdminStartFailover(c) ==
     /\ clusterState[c] = "AIS"
     /\ clusterState[Peer(c)] \in {"S", "DS"}
+    /\ outDirEmpty[c]
+    /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
-    /\ UNCHANGED writerMode
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
@@ -67,6 +74,6 @@ AdminStartFailover(c) ==
 AdminAbortFailover(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTS"]
-    /\ UNCHANGED writerMode
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ============================================================================

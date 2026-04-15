@@ -395,7 +395,10 @@ HAGroupStore.tla                (cluster state transitions: peer-reactive, auto-
 Admin.tla                       (operator-initiated actions: start/abort failover)
 Writer.tla                      (replication writer mode state machine, per-RS)
 Reader.tla                      (replication reader/replay state machine)
-Environment.tla                 (external non-determinism: HDFS availability, clock tick)
+HDFS.tla                        (HDFS availability incident actions: HDFSDown, HDFSUp)
+Clock.tla                       (logical clock: ClockTick)
+RS.tla                          (RegionServer lifecycle: RSCrash, RSRestart)
+ZK.tla                          (ZooKeeper coordination: ZKDisconnect, ZKReconnect, ZKSessionExpiry, ZKSessionRecover, ZKDisconnectRS)
 ConsistentFailover.tla          (root orchestrator: variables, Init, Next, Fairness, invariants, Symmetry)
 ConsistentFailover.cfg          (primary TLC config — exhaustive BFS, symmetry reduction, every iteration)
 ConsistentFailover-sim.cfg      (simulation TLC config — no symmetry, deep random traces)
@@ -411,7 +414,10 @@ ConsistentFailover-liveness.cfg (liveness TLC config — no symmetry, ad hoc)
 | `HAGroupStore.tla` | Iteration 3 | `PeerReact`, `AutoComplete` actions |
 | `Admin.tla` | Iteration 3 | `AdminStartFailover`, `AdminAbortFailover` |
 | `Writer.tla` | Iteration 5 | Writer mode actions (`WriterInit`, `WriterToStoreFwd`, etc.) |
-| `Environment.tla` | Iteration 6 | `HDFSFail`, `HDFSRecover` |
+| `HDFS.tla` | Iteration 6 | `HDFSDown`, `HDFSUp` |
+| `Clock.tla` | Iteration 8 | `ClockTick` |
+| `RS.tla` | Iteration 12 | `RSCrash`, `RSRestart` |
+| `ZK.tla` | Iteration 13 | `ZKDisconnect`, `ZKReconnect`, `ZKSessionExpiry`, `ZKSessionRecover`, `ZKDisconnectRS` |
 | `Reader.tla` | Iteration 10 | Replay state machine actions |
 
 ### 5.2 Model Verification
@@ -720,6 +726,27 @@ All simulation durations are wall-clock time. On the 128-core remote server, `-w
 
 Each iteration introduces exactly one new concept, produces a spec that TLC can verify, and is small enough to review and debug in isolation. Iterations are grouped into phases for readability, but the unit of work is the individual iteration.
 
+### Process: Handling design/implementation bugs found by TLC
+
+When TLC finds an invariant violation that traces to a design or implementation bug (as opposed to a modeling error), the following process applies:
+
+1. **Do not fix the model first.** The model's purpose is to faithfully represent the design/implementation. Silently "fixing" the model to pass invariants conflates modeling with design work and obscures the finding.
+
+2. **Produce a bug report** as a standalone markdown file in the project root directory, named `PHOENIX_HA_BUG_<SHORT_DESCRIPTION>.md`. The report must include:
+   - TLC counterexample trace (the exact state sequence)
+   - Root cause analysis citing implementation source lines
+   - Impact assessment (safety, correctness, liveness, operational)
+   - Recommended fix with proposed code changes
+   - Statement of how the TLA+ model will treat the fix (assumed-fixed, quirk flag, etc.)
+
+3. **Update the model assuming the recommended fix.** The model represents the *intended* design, not the current buggy implementation. Each modeling change that assumes a fix must cite the bug report in a comment (e.g., "per recommended fix in `PHOENIX_HA_BUG_FOO.md`").
+
+4. **Add an entry to Appendix A** (Design-vs-Implementation Divergences) documenting the divergence and its resolution.
+
+5. **Reference the bug report** in the iteration's completion notes.
+
+This process was established during Iteration 7 when TLC found the AbTAIS + HDFS failure gap (see `PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md`).
+
 ---
 
 ### Phase 1: Cluster State Foundation
@@ -730,7 +757,7 @@ Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`
 
 #### ~~Iteration 2 — Role mapping and Active-role mutual exclusion~~ ✅ COMPLETE
 
-`ClusterRole` (6-value enum including `UNKNOWN`), `RoleOf` operator, and the `RoleOf`-based `MutualExclusion` invariant were pulled forward into Iteration 1. This iteration added `ActiveRoles == {"ACTIVE"}` role-level subset to `Types.tla` and `ActiveToStandbyNotActive` static sanity invariant to `ConsistentFailover.tla` (asserts `RoleOf("ATS") \notin ActiveRoles /\ RoleOf("ANISTS") \notin ActiveRoles`), registered in `ConsistentFailover.cfg`. SANY parse: clean. Expected TLC result: same 108 distinct states, depth 11, all invariants pass (static invariant adds no new states).
+`ClusterRole` (6-value enum including `UNKNOWN`), `RoleOf` operator, and the `RoleOf`-based `MutualExclusion` invariant were pulled forward into Iteration 1. This iteration added `ActiveRoles == {"ACTIVE"}` role-level subset to `Types.tla`. The `ActiveToStandbyNotActive` static sanity invariant (asserts `RoleOf("ATS") \notin ActiveRoles /\ RoleOf("ANISTS") \notin ActiveRoles`) was initially added but later dropped as a constant-level tautology — `RoleOf` is defined purely over constants, so TLC correctly flags it as redundant. The safety argument it encodes (ATS/ANISTS map to ACTIVE_TO_STANDBY, not ACTIVE) is already exercised by `MutualExclusion` and `NonAtomicFailoverSafe` over reachable states. SANY parse: clean. Expected TLC result: same 108 distinct states, depth 11, all invariants pass.
 
 #### ~~Iteration 3 — Peer-reactive transitions (FailoverManagementListener)~~ ✅ COMPLETE
 
@@ -738,84 +765,23 @@ Created `HAGroupStore.tla` (peer-reactive actions for ATS/ANIS/AbTS plus auto-co
 
 #### ~~Iteration 4 — Non-atomic failover: two-step final transition~~ ✅ COMPLETE
 
-Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-deterministic placeholder; full reader guards deferred to Iteration 11) and peer-reactive `PeerReactToAIS(c)` (ATS→S, DS→S). Add `NonAtomicFailoverSafe` invariant: during the AIS/ATS window, `RoleOf(ATS) ∉ ActiveRoles`. TLC found a bug: admin can re-failover during the window producing irrecoverable (ATS,ATS); fix is a peer-state guard on `AdminStartFailover` (see Appendix A.15, `PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md`). With fix: 17 states, depth 10, all invariants pass.
+Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-deterministic placeholder; full reader guards deferred to Iteration 11) and peer-reactive `PeerReactToAIS(c)` (ATS→S, DS→S). Add `NonAtomicFailoverSafe` invariant: during the AIS/ATS window, `RoleOf(ATS) ∉ ActiveRoles`. TLC found a bug: admin can re-failover during the window producing irrecoverable (ATS,ATS); fix is a peer-state guard on `AdminStartFailover` (see Appendix A.15, `PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md`). With fix: 17 states, depth 10, all invariants pass. **Tautology note (Iteration 7):** `NonAtomicFailoverSafe` was identified as a definitional tautology — its antecedent fixes `clusterState[c1] = "ATS"`, making `RoleOf("ATS") = "ACTIVE_TO_STANDBY" ∉ ActiveRoles` a constant-level truth. The safety argument is already verified by `MutualExclusion`. Kept for documentation; annotated in `ConsistentFailover.tla`.
 
 ---
 
 ### Phase 2: Replication Writer and HDFS
 
-#### Iteration 5 — Writer mode state machine (per-RS)
+#### ~~Iteration 5 — Writer mode state machine (per-RS)~~ ✅ COMPLETE
 
-**Modules created:** `Writer.tla`.
-**Modules modified:** `Types.tla`, `ConsistentFailover.tla`.
+Created `Writer.tla` (7 per-RS actions for the 4-mode writer state machine from §3.2; all leave `clusterState` unchanged — coupling deferred to Iterations 6-7). Added `RS` constant and `WriterMode` to `Types.tla`. Wired into `ConsistentFailover.tla` (`writerMode` variable, `writer == INSTANCE Writer`, `WriterTypeOK`/`WriterTransitionValid`, `Symmetry == Permutations(RS)`). Added `UNCHANGED writerMode` to all `HAGroupStore.tla`/`Admin.tla` actions. TLC exhaustive: 2,176 distinct states, depth 18, all invariants pass.
 
-**What to add:**
+#### ~~Iteration 6 — HDFS directory predicates and writer-cluster coupling~~ ✅ COMPLETE
 
-`Types.tla`:
-- Constants: `RS` (set of region servers per cluster, e.g., `{rs1, rs2}`), `WriterMode == {INIT, SYNC, STORE_AND_FWD, SYNC_AND_FWD}`.
+Created `HDFS.tla` (`HDFSDown`/`HDFSUp`; atomic RS degradation via `CanDegradeToStoreFwd`). Added `outDirEmpty`/`hdfsAvailable` variables, `AIStoATSPrecondition` action constraint. TLC: 3,337 states, depth 24, all pass. Note: `AIStoATSPrecondition` is tautological (re-verifies guards); Iter 7 adds `AISImpliesInSync` as the non-tautological state-level replacement.
 
-`Writer.tla`:
-- `EXTENDS Types`.
-- Declares all shared variables as `VARIABLE`.
-- Actions: `WriterInit(c, rs)`, `WriterToStoreFwd(c, rs)`, `WriterStoreFwdToSyncFwd(c, rs)`, `WriterSyncFwdToSync(c, rs)`, `WriterSyncFwdToStoreFwd(c, rs)`, `WriterSyncToSyncFwd(c, rs)`.
-- UNCHANGED for `clusterState` in all writer actions (no coupling yet).
+#### ~~Iteration 7 — Writer triggers cluster state change~~ ✅ COMPLETE
 
-`ConsistentFailover.tla`:
-- Variable: `writerMode ∈ [Cluster → [RS → WriterMode]]`.
-- Init: `∀ c, rs: writerMode[c][rs] = INIT`.
-- `writer == INSTANCE Writer`.
-- Add writer action disjuncts to `Next`.
-- `Symmetry == Permutations(RS)` (RS are now introduced).
-- Invariants: `WriterTypeOK`, `WriterTransitionValid`.
-
-**Expected TLC result:** State space grows by `|WriterMode|^(|Cluster|×|RS|)`. Writer actions fire independently of cluster state.
-
-#### Iteration 6 — HDFS directory predicates and writer-cluster coupling
-
-**Modules created:** `Environment.tla`.
-**Modules modified:** `Writer.tla`, `Admin.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Environment.tla`:
-- `EXTENDS Types`.
-- Declares all shared variables as `VARIABLE`.
-- `HDFSFail(c)`, `HDFSRecover(c)` toggle `hdfsAvailable[c]`.
-
-`Writer.tla`:
-- Couple writer mode to HDFS availability:
-  - `WriterToStoreFwd(c, rs)` guard: `hdfsAvailable[peer(c)] = FALSE`.
-  - `WriterToStoreFwd` effect: sets `outDirEmpty[c] = FALSE` (writes accumulate).
-  - `WriterSyncFwdToSync` effect: sets `outDirEmpty[c] = TRUE` (drain complete).
-
-`Admin.tla`:
-- `AIStoATSPrecondition` guard on `AdminStartFailover`: requires `outDirEmpty[c] ∧ ∀ rs: writerMode[c][rs] = SYNC`.
-
-`ConsistentFailover.tla`:
-- Variables: `outDirEmpty ∈ [Cluster → BOOLEAN]`, `hdfsAvailable ∈ [Cluster → BOOLEAN]`.
-- Init: `∀ c: outDirEmpty[c] = TRUE, hdfsAvailable[c] = TRUE`.
-- `environment == INSTANCE Environment`.
-- Add environment action disjuncts to `Next`.
-- Invariants: `AIStoATSPrecondition`, `WriterClusterConsistency`.
-
-**Expected TLC result:** Writer and cluster state machines now interleave with HDFS failures. State space grows substantially.
-
-#### Iteration 7 — Writer triggers cluster state change
-
-**Modules modified:** `Writer.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Writer.tla`:
-- When `WriterToStoreFwd(c, rs)` fires and cluster is AIS, atomically transition cluster to ANIS (modeling the implementation where the RS calls `setHAGroupStatusToStoreAndForward()` which updates cluster state).
-
-`HAGroupStore.tla`:
-- When `WriterSyncFwdToSync` fires (last RS returns to SYNC) and `outDirEmpty[c]`, mark cluster eligible for `ANIS → AIS` (subject to anti-flapping, modeled in Phase 3).
-
-`ConsistentFailover.tla`:
-- Invariant: `NoAISWithSFWriter` — if any RS is in S&F, cluster cannot be AIS.
-
-**Expected TLC result:** Writer actions now drive cluster state transitions.
+Active-cluster guards on all writer actions, AIS→ANIS coupling on `HDFSDown`/`WriterInitToStoreFwd`, `ANISToAIS(c)` recovery (anti-flapping deferred to Iter 8), conditional `AutoComplete(AbTAIS)`. New invariants: `AISImpliesInSync`, `NoAISWithSFWriter`, `WriterClusterConsistency`. TLC: 225 states (−93%), depth 24, all pass. Found implementation bug: missing `AbTAIS→ANIS` transition (Appendix A.17); model assumes fix.
 
 ---
 
@@ -823,7 +789,8 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 
 #### Iteration 8 — Logical clock and anti-flapping gate
 
-**Modules modified:** `Types.tla`, `Environment.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
+**Modules created:** `Clock.tla`.
+**Modules modified:** `Types.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
 
 **What to add:**
 
@@ -831,7 +798,7 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 - Constant: `WaitTimeForSync ∈ Nat` (models `1.1 × ZK_SESSION_TIMEOUT`).
 - Constant: `MaxClock ∈ Nat` (bound for TLC tractability).
 
-`Environment.tla`:
+`Clock.tla`:
 - `ClockTick` action: non-deterministically increments `clock`.
 
 `HAGroupStore.tla`:
@@ -844,6 +811,8 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 - State constraint: `clock ≤ MaxClock`.
 
 **Expected TLC result:** Anti-flapping mechanism prevents rapid ANIS↔AIS oscillation. State space grows with clock dimension.
+
+**Iteration 7 forward note:** `ANISToAIS` (added in Iteration 7) uses guard `\A rs \in RS : writerMode[c][rs] = "SYNC"` as a sound over-approximation. When the anti-flapping gate is added in this iteration, the guard may be relaxed to `\A rs \in RS : writerMode[c][rs] \in {"SYNC", "SYNC_AND_FWD"}` because the S&F heartbeat (which blocks the anti-flapping gate) stops when the RS exits S&F, not when it exits SYNC_AND_FWD. If relaxed, `ANISToAIS` should atomically transition remaining SYNC_AND_FWD RS to SYNC (modeling the `ACTIVE_IN_SYNC` ZK event at `ReplicationLogDiscoveryForwarder.init()` L113-123). `AISImpliesInSync` (added in Iteration 7) verifies that AIS is only reached with all RS in SYNC/INIT, so it will catch any mismatch.
 
 #### Iteration 9 — RS-level ZK races (optimistic locking)
 
@@ -902,6 +871,7 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 
 `Reader.tla`:
 - `TriggerFailover(c)`: guard requires all three conditions: `failoverPending[c] ∧ inProgressDirEmpty[c] ∧ lastRoundProcessed[c] ≥ lastRoundInSync[c]`. Effect: `clusterState[c]' = AIS` (from STA).
+- **HDFS guard on STA→AIS (from HDFS side-tracking audit):** Add `hdfsAvailable[c] = TRUE` as a fourth guard on `TriggerFailover(c)`. The STA cluster needs its own HDFS accessible to replay replication logs. Without this guard, the model over-approximates liveness by allowing `STA→AIS` even when HDFS is down. In the implementation, `shouldTriggerFailover()` (`ReplicationLogDiscoveryReplay.java` L500-533) reads from HDFS and throws IOException if unavailable, blocking the failover trigger. See Scenario 8 (§4.3): "HDFS failure during STA stalls replay and blocks shouldTriggerFailover()."
 
 `ConsistentFailover.tla`:
 - `FailoverTriggerCorrectness` invariant (§4.1 property 9).
@@ -915,13 +885,15 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 
 #### Iteration 12 — RS crash (writer fail-stop)
 
-**Modules modified:** `Environment.tla`, `Writer.tla`, `ConsistentFailover.tla`.
+**Modules created:** `RS.tla`.
+**Modules modified:** `Writer.tla`, `ConsistentFailover.tla`.
 
 **What to add:**
 
-`Environment.tla`:
+`RS.tla`:
 - `RSCrash(c, rs)` action: sets `rsAlive[c][rs] = FALSE`, models writer fail-stop in S&F mode (`StoreAndForwardModeImpl.onFailure()`
   → `logGroup.abort()`). Source: `StoreAndForwardModeImpl.java` L116-123.
+- **`RSAbortOnLocalHDFSFailure(c, rs)` action (from HDFS side-tracking audit):** fires when `writerMode[c][rs] = "STORE_AND_FWD" ∧ hdfsAvailable[c] = FALSE`. In STORE_AND_FWD mode, the writer targets the active cluster's own (local/fallback) HDFS. If that HDFS fails, `StoreAndForwardModeImpl.onFailure()` treats the error as fatal and calls `logGroup.abort()`, aborting the RS. This is distinct from `HDFSDown(c)` (which models the *peer's* HDFS failing and degrades writers on the active side): `RSAbortOnLocalHDFSFailure` models the active cluster's *own* HDFS failing while the RS is already in fallback mode. Note: RS in SYNC or SYNC_AND_FWD are not affected by their own cluster's HDFS failure because those modes write to the peer's HDFS. Source: `StoreAndForwardModeImpl.java` L116-123.
 - `RSRestart(c, rs)` action: sets `rsAlive[c][rs] = TRUE`, `writerMode[c][rs] = INIT`. Forwarder resumes draining via `initializeLastRoundProcessed()` which scans existing files.
 
 `Writer.tla`:
@@ -936,7 +908,8 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 
 #### Iteration 13 — ZK coordination model (session lifecycle, watcher delivery, retry exhaustion)
 
-**Modules modified:** `Types.tla`, `Environment.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
+**Modules created:** `ZK.tla`.
+**Modules modified:** `Types.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
 
 **What to add:**
 
@@ -948,7 +921,7 @@ This iteration introduces the full ZK coordination model as a core part of the p
 
 3. **Reactive transition retry exhaustion:** The `FailoverManagementListener` retries each reactive transition exactly 2 times. After exhaustion, the transition is permanently lost (`HAGroupStoreManager.java` L653-704). This is a direct consequence of ZK's at-most-once watcher delivery combined with the application's bounded retry policy. Recovery requires a different peer state change, a ZK reconnect (PathChildrenCache re-delivery), or manual intervention.
 
-`Environment.tla`:
+`ZK.tla`:
 - `ZKDisconnect(c)`: Cluster c's peer ZK connection drops → peer-reactive transitions for c are suppressed (guard `zkPeerConnected[c] = TRUE` on `PeerReact*` actions). Models the peerPathChildrenCache disconnection from the peer ZK cluster. Note: this is at the cluster level (one PathChildrenCache per cluster), not per-RS.
 - `ZKReconnect(c)`: Cluster c's peer ZK connection is re-established. Curator re-syncs PathChildrenCache, generating synthetic events. Modeled by re-enabling peer-reactive transitions (set `zkPeerConnected[c] = TRUE`).
 - `ZKSessionExpiry(c)`: Non-deterministically expires cluster c's peer ZK session → `zkPeerSessionAlive[c] = FALSE`. All peer-reactive transitions for c are permanently disabled until `ZKSessionRecover(c)`.
@@ -1013,6 +986,11 @@ This iteration introduces the full ZK coordination model as a core part of the p
 - **Key scenario**: Verify that `(ANIS, DS) → (ANISTS, DS) → (ATS, DS) → (ATS, STA) → (ATS, AIS) → (S, AIS)` completes successfully. With `DS → STA` in the `allowedTransitions` table, the standby can enter `STA` from `DEGRADED_STANDBY` when it detects peer `ATS`.
 
 **Expected TLC result:** Both AIS and ANIS failover paths verified. ANIS failover from `(ANIS, DS)` completes end-to-end with mutual exclusion and no data loss preserved.
+
+**Iteration 7 forward note:** Writer action guards (added in Iteration 7) restrict writer actions to `ActiveStates`. When `ANISTS` is introduced in this iteration, the following guards may need expansion to include `TransitionalActiveStates`:
+- `WriterStoreFwdToSyncFwd`: forwarder runs during ANISTS (draining OUT before ANISTS→ATS).
+- `WriterSyncFwdToSync`: forwarder drain completes during ANISTS.
+- `WriterSyncToSyncFwd`: the `ACTIVE_NOT_IN_SYNC` event may need to include `{"ANIS", "ANISTS"}` since ANISTS is also a degraded-active state.
 
 ---
 
@@ -1084,14 +1062,14 @@ This phase models implementation-specific behaviors that can prevent liveness. T
 
 #### Iteration 19 — UseForwarderStuckQuirk
 
-**Modules modified:** `Types.tla`, `Environment.tla`, `Writer.tla`, `ConsistentFailover.tla`.
+**Modules modified:** `Types.tla`, `Writer.tla`, `ConsistentFailover.tla`.
 
 **What to add:**
 
 `Types.tla`:
 - `UseForwarderStuckQuirk ∈ BOOLEAN` constant with `ASSUME`.
 
-`Environment.tla`:
+`Writer.tla`:
 - `ForwarderStuck(c)` action: when `UseForwarderStuckQuirk = TRUE`, non-deterministically sets `forwarderStuck[c] = TRUE`, permanently preventing the OUT directory from draining. Models the implementation's lack of timeout on `FileUtil.copy()` and the indefinite retry loop in `ReplicationLogDiscoveryForwarder`. Source: `processFile()` L133-152.
 - `ForwarderUnstuck(c)` is NOT available — stuck is permanent (models the implementation where admin must abort).
 
@@ -1135,20 +1113,20 @@ This phase models implementation-specific behaviors that can prevent liveness. T
 | Replay SYNC → DEGRADED (peer ANIS detected) | `ReplayDetectDegraded(c)` | `Reader.tla` | 10 | ⏳ |
 | Replay DEGRADED → SYNCED_RECOVERY (peer AIS detected) | `ReplayDetectRecovery(c)` | `Reader.tla` | 10 | ⏳ |
 | SYNCED_RECOVERY rewind | `ReplayRewind(c)` | `Reader.tla` | 10 | ⏳ |
-| RS abort (fail-stop in S&F) | `RSCrash(c, rs)` | `Environment.tla` | 12 | ⏳ |
-| RS restart | `RSRestart(c, rs)` | `Environment.tla` | 12 | ⏳ |
-| Peer ZK connection lost (PathChildrenCache) | `ZKDisconnect(c)` | `Environment.tla` | 13 | ⏳ |
-| Peer ZK connection re-established | `ZKReconnect(c)` | `Environment.tla` | 13 | ⏳ |
-| ZK session expiry (all watches lost) | `ZKSessionExpiry(c)` | `Environment.tla` | 13 | ⏳ |
-| ZK session re-established | `ZKSessionRecover(c)` | `Environment.tla` | 13 | ⏳ |
-| ZK DISCONNECTED event → RS abort | `ZKDisconnectRS(c, rs)` | `Environment.tla` | 13 | ⏳ |
-| HDFS becomes unavailable | `HDFSFail(c)` | `Environment.tla` | 6 | ⏳ |
-| HDFS recovers | `HDFSRecover(c)` | `Environment.tla` | 6 | ⏳ |
+| RS abort (fail-stop in S&F) | `RSCrash(c, rs)` | `RS.tla` | 12 | ⏳ |
+| RS restart | `RSRestart(c, rs)` | `RS.tla` | 12 | ⏳ |
+| Peer ZK connection lost (PathChildrenCache) | `ZKDisconnect(c)` | `ZK.tla` | 13 | ⏳ |
+| Peer ZK connection re-established | `ZKReconnect(c)` | `ZK.tla` | 13 | ⏳ |
+| ZK session expiry (all watches lost) | `ZKSessionExpiry(c)` | `ZK.tla` | 13 | ⏳ |
+| ZK session re-established | `ZKSessionRecover(c)` | `ZK.tla` | 13 | ⏳ |
+| ZK DISCONNECTED event → RS abort | `ZKDisconnectRS(c, rs)` | `ZK.tla` | 13 | ⏳ |
+| HDFS NameNode crash | `HDFSDown(c)` | `HDFS.tla` | 6 | ⏳ |
+| HDFS NameNode recovery | `HDFSUp(c)` | `HDFS.tla` | 6 | ⏳ |
 | `PhoenixHAAdminTool update --force` | `AdminForceFailover(c)` | `Admin.tla` | 17 | ⏳ |
 | Peer goes OFFLINE | `AdminGoOffline(c)` | `Admin.tla` | 16 | ⏳ |
 | `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE recovery) | `AdminForceRecoverFromOffline(c)` | `Admin.tla` | 16 | ⏳ |
 | `setData().withVersion()` (ZK optimistic locking) | `ZKUpdate(c, rs, newState)` | `HAGroupStore.tla` | 9 | ⏳ |
-| Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Environment.tla` | 19 | ⏳ |
+| Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Writer.tla` | 19 | ⏳ |
 | `FailoverManagementListener` retry exhaustion (2 retries, then lost) | `ReactiveTransitionFail(c)` | `HAGroupStore.tla` | 13 | ⏳ |
 
 ---
@@ -1418,6 +1396,16 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 
 **Formal modeling implications**: ZK's conditional watcher delivery is modeled as a core protocol property. For **safety**, TLC's interleaving semantics already cover the case where peer-reactive actions are enabled but not taken — TLC explores all orderings, including paths where another action fires first. Safety (mutual exclusion, no data loss) holds regardless of watcher delivery delay because ATS/ANISTS map to `ACTIVE_TO_STANDBY` with `isMutationBlocked()=true`. For **liveness**, ZK session lifecycle (disconnect, expiry, recovery) and retry exhaustion are always part of the model (Iteration 13). Liveness properties are explicitly predicated on the ZK Liveness Assumption (ZLA, §4.2): ZK sessions are eventually alive and connected. Without ZLA, peer-reactive transitions are permanently disabled and the protocol stalls — this is a defined boundary of the protocol's operational envelope.
 
+### A.17 Missing AbTAIS→ANIS Transition (TLC Finding — Iteration 7)
+
+**Finding**: TLC model checking (Iteration 7) discovered that HDFS failure during the abort window produces a transient `ACTIVE_IN_SYNC` state with degraded writers. When the active cluster is in `AbTAIS` and HDFS goes down, writers degrade to `STORE_AND_FWD`. The S&F heartbeat attempts `AbTAIS→ANIS` via `setHAGroupStatusToStoreAndForward()`, but `isTransitionAllowed()` rejects this because `AbTAIS→ANIS` is not in the `allowedTransitions` table (`HAGroupStoreRecord.java` L115). When `AbTAIS` auto-completes to `AIS` (`createLocalStateTransitions()` L145), the cluster is briefly `ACTIVE_IN_SYNC` with `STORE_AND_FWD` writers — misrepresenting its sync status for up to one heartbeat period (~63s) until the S&F heartbeat fires `AIS→ANIS`.
+
+**Impact**: Low severity. No safety violation (failover guards independently check writer state). Transient correctness issue: cluster state misrepresents sync status. Self-corrects within one heartbeat period.
+
+**Planned fix**: Add `ACTIVE_NOT_IN_SYNC` to `ABORT_TO_ACTIVE_IN_SYNC.allowedTransitions`. Optionally, make the auto-completion resolver conditional on writer state. Full analysis in [`PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md`](PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md).
+
+**TLA+ model treatment**: The model assumes the fix: `<<"AbTAIS","ANIS">>` is added to `AllowedTransitions` and `AutoComplete(AbTAIS)` is conditional (→`AIS` when clean, →`ANIS` when degraded). This is a sound abstraction that collapses the implementation's two-step self-correction path into a single atomic step.
+
 ---
 
 ## Appendix B: Invariant Summary Table
@@ -1431,9 +1419,12 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 | 5 | `NonAtomicFailoverSafe` | Safety | Iter 4 | Safety during non-atomic failover window |
 | 6 | `WriterTypeOK` | Safety | Iter 5 | Writer modes have valid types |
 | 7 | `WriterTransitionValid` | Action constraint | Iter 5 | Writer transitions follow allowed set |
-| 8 | `AIStoATSPrecondition` | Safety | Iter 6 | OUT empty + all SYNC before AIS→ATS |
-| 9 | `WriterClusterConsistency` | Safety | Iter 6 | Writer mode ↔ cluster state consistency |
-| 10 | `NoAISWithSFWriter` | Safety | Iter 7 | AIS ⇒ all writers in SYNC |
+| 8 | `AIStoATSPrecondition` | Action constraint | Iter 6 | OUT empty + all SYNC before AIS→ATS |
+| 8a | `OutDirTypeOK` | Safety | Iter 6 | `outDirEmpty ∈ [Cluster → BOOLEAN]` |
+| 8b | `HDFSTypeOK` | Safety | Iter 6 | `hdfsAvailable ∈ [Cluster → BOOLEAN]` |
+| 9 | `WriterClusterConsistency` | Safety | Iter 7 | Degraded writer modes ⇒ cluster in `ActiveStates \ {"AIS"} ∪ {"ANISTS"}` |
+| 10 | `NoAISWithSFWriter` | Safety | Iter 7 | AIS ⇒ no S&F writers |
+| 10a | `AISImpliesInSync` | Safety | Iter 7 | AIS ⇒ outDirEmpty ∧ all RS in SYNC/INIT (derived invariant, §4.1 property 3) |
 | 11 | `AntiFlapGate` | Action constraint | Iter 8 | ANIS→AIS and ANISTS→ATS only after timeout elapsed |
 | 12 | `ZKVersionMonotonic` | Safety | Iter 9 | ZK versions only increase |
 | 13 | `FailoverTriggerCorrectness` | Safety | Iter 11 | STA→AIS requires 3 conditions |

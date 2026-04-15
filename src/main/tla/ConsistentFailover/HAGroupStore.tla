@@ -15,15 +15,10 @@
  * established TCP connection (see ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md
  * and PHOENIX_HA_TLA_PLAN.md Appendix A.16).
  *
- * In the current model (Iteration 4), PeerReact* and AutoComplete
- * actions fire whenever their guard is satisfied. TLC's interleaving
- * semantics already cover arbitrary delivery delay (another action
- * can always fire first), so safety verification is sound. Liveness
- * verification requires additional modeling: Iteration 13 adds ZK
- * connectivity guards (zkPeerConnected, zkPeerSessionAlive) and
- * UseZKSessionExpiryQuirk to model permanent watcher loss on
- * session expiry. Iteration 22 adds UseRetryExhaustionQuirk to
- * model application-level retry exhaustion after delivery.
+ * PeerReact* and AutoComplete actions fire whenever their guard is
+ * satisfied. TLC's interleaving semantics already cover arbitrary
+ * delivery delay (another action can always fire first), so safety
+ * verification is sound.
  *
  * Notification chain (peer-reactive transitions):
  *   Peer ZK znode change
@@ -50,11 +45,11 @@
  *   PeerReactToAIS(c)    | createPeerStateTransitions() L112-120
  *   AutoComplete(c)      | createLocalStateTransitions() L144, L145, L147
  *   StandbyBecomesActive | triggerFailover() L535 → setHAGroupStatusToSync()
- *                        |   L341-355 (placeholder; see Reader.tla Iter 11)
+ *                        |   L341-355
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable
 
 ---------------------------------------------------------------------------
 
@@ -79,7 +74,7 @@ PeerReactToATS(c) ==
     /\ clusterState[Peer(c)] = "ATS"
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "STA"]
-    /\ UNCHANGED writerMode
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
@@ -101,11 +96,11 @@ PeerReactToANIS(c) ==
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "S"
        /\ clusterState' = [clusterState EXCEPT ![c] = "DS"]
-       /\ UNCHANGED writerMode
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED writerMode
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
@@ -126,7 +121,7 @@ PeerReactToAbTS(c) ==
     /\ clusterState[Peer(c)] = "AbTS"
     /\ clusterState[c] = "ATS"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
-    /\ UNCHANGED writerMode
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
@@ -146,21 +141,31 @@ PeerReactToAbTS(c) ==
  * session expiry), the cluster remains in the AbTS/AbTAIS/AbTANIS
  * state indefinitely.
  *
+ * AbTAIS auto-completion: the current implementation (L145) is
+ * unconditional (always → AIS). This creates a transient window
+ * where AIS coexists with degraded writers if HDFS failed during
+ * the abort window. The model assumes the recommended fix from
+ * PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md: conditional completion
+ * to AIS (clean) or ANIS (degraded).
+ *
  * Source: createLocalStateTransitions() L140-150
  *   AbTS   -> S    (L144)
- *   AbTAIS -> AIS  (L145)
+ *   AbTAIS -> AIS  (L145) — conditional per bug report fix
  *   AbTANIS -> ANIS (L147)
  *)
 AutoComplete(c) ==
     \/ /\ clusterState[c] = "AbTS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED writerMode
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
     \/ /\ clusterState[c] = "AbTAIS"
-       /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
-       /\ UNCHANGED writerMode
+       /\ clusterState' = [clusterState EXCEPT ![c] =
+              IF outDirEmpty[c] /\ \A rs \in RS : writerMode[c][rs] \in {"INIT", "SYNC"}
+              THEN "AIS"
+              ELSE "ANIS"]
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
     \/ /\ clusterState[c] = "AbTANIS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
-       /\ UNCHANGED writerMode
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
@@ -171,10 +176,8 @@ AutoComplete(c) ==
  * replication log reader determines replay is complete. This is NOT
  * a peer-reactive transition — it is driven by the reader component.
  *
- * In this iteration (4), modeled as a non-deterministic action with
- * the sole guard that the cluster is in STA. The full reader guards
- * (failoverPending, inProgressDirEmpty, no new files) are deferred
- * to TriggerFailover(c) in Reader.tla (Iteration 11).
+ * Modeled as a non-deterministic action with the sole guard that
+ * the cluster is in STA.
  *
  * Source: ReplicationLogDiscoveryReplay.triggerFailover() L535-548
  *         → setHAGroupStatusToSync() L341-355
@@ -182,7 +185,7 @@ AutoComplete(c) ==
 StandbyBecomesActive(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
-    /\ UNCHANGED writerMode
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
@@ -193,7 +196,7 @@ StandbyBecomesActive(c) ==
  *   1. Local ATS → S: old active completes failover to standby
  *      when peer (the new active) enters AIS.
  *   2. Local DS → S: standby recovers from degraded when peer
- *      returns to AIS (not reachable until Iteration 5+).
+ *      returns to AIS.
  *
  * ZK watcher dependency: Delivered via peerPathChildrenCache.
  * This is the critical transition that resolves the non-atomic
@@ -211,10 +214,35 @@ PeerReactToAIS(c) ==
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED writerMode
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "DS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED writerMode
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+
+---------------------------------------------------------------------------
+
+(*
+ * Recovery: ANIS → AIS.
+ *
+ * When all RS on the cluster have returned to SYNC and the OUT
+ * directory is empty, the cluster recovers from ANIS to AIS.
+ *
+ * The guard `\A rs \in RS : writerMode[c][rs] = "SYNC"` is a sound
+ * over-approximation for Iteration 7. In the implementation, the
+ * anti-flapping gate (Iteration 8) implicitly ensures all RS have
+ * left S&F. When the anti-flapping gate is added, the guard may
+ * be relaxed to include SYNC_AND_FWD with an atomic transition of
+ * remaining SYNC_AND_FWD RS to SYNC (modeling the ACTIVE_IN_SYNC
+ * ZK event).
+ *
+ * Source: setHAGroupStatusToSync() L341-355, after forwarder drain.
+ *)
+ANISToAIS(c) ==
+    /\ clusterState[c] = "ANIS"
+    /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
+    /\ outDirEmpty[c]
+    /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ============================================================================

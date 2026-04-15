@@ -194,6 +194,12 @@ AllowedTransitions ==
       \* Abort auto-completion transitions.
       \* Source: L115, L119, L121
       <<"AbTAIS", "AIS">>,
+      \* AbTAIS -> ANIS: NOT in the current implementation's transition
+      \* table. Added per the recommended fix in
+      \* PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md (HDFS failure during
+      \* abort produces S&F writers that cannot self-correct while in
+      \* AbTAIS because AbTAIS->ANIS is rejected by isTransitionAllowed).
+      <<"AbTAIS", "ANIS">>,
       <<"AbTANIS", "ANIS">>,
       <<"AbTS", "S">>,
       \* ANISWOP returns to ANIS when peer comes back.
