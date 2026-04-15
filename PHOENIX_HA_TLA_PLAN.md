@@ -410,7 +410,7 @@ ConsistentFailover-liveness.cfg (liveness TLC config — no symmetry, ad hoc)
 | `ConsistentFailover.tla` | Iteration 1 | Variables, `Init`, `Next` (direct actions), invariants, `Symmetry` |
 | `HAGroupStore.tla` | Iteration 3 | `PeerReact`, `AutoComplete` actions |
 | `Admin.tla` | Iteration 3 | `AdminStartFailover`, `AdminAbortFailover` |
-| `Writer.tla` | Iteration 5 | Writer mode actions (`WriterInit`, `WriterToSF`, etc.) |
+| `Writer.tla` | Iteration 5 | Writer mode actions (`WriterInit`, `WriterToStoreFwd`, etc.) |
 | `Environment.tla` | Iteration 6 | `HDFSFail`, `HDFSRecover` |
 | `Reader.tla` | Iteration 10 | Replay state machine actions |
 
@@ -734,32 +734,11 @@ Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`
 
 #### ~~Iteration 3 — Peer-reactive transitions (FailoverManagementListener)~~ ✅ COMPLETE
 
-Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS` covering §3.5 table rows for peer ATS/ANIS/AbTS, plus `AutoComplete` for AbTS→S, AbTAIS→AIS, AbTANIS→ANIS) and `Admin.tla` (`AdminStartFailover` with guard `clusterState[c] = "AIS"` for AIS→ATS, `AdminAbortFailover` with guard `clusterState[c] = "STA"` for STA→AbTS). Refactored `ConsistentFailover.tla`: removed non-deterministic `Transition(c)`, added `haGroupStore == INSTANCE HAGroupStore` and `admin == INSTANCE Admin`, replaced `Next` with actor-driven disjuncts, added `AbortSafety` invariant (if cluster is AbTAIS then peer must be in {AbTS, S}), registered in `ConsistentFailover.cfg`. PeerReactToAIS (peer AIS → local ATS→S) deferred to Iteration 4 (non-atomic failover decomposition). Exhaustive TLC: 7 distinct states, depth 6, all invariants pass, no errors. State space is smaller than Iteration 1-2's 108 states because actor-driven actions restrict reachable transitions to the failover-initiation-and-abort cycle; states requiring writer/reader/environment actions (ANIS, DS, ANISTS) are not yet reachable.
+Created `HAGroupStore.tla` (peer-reactive actions for ATS/ANIS/AbTS plus auto-complete actions AbTS→S, AbTAIS→AIS, AbTANIS→ANIS) and `Admin.tla` (AIS→ATS, STA→AbTS with appropriate guards). Refactored `ConsistentFailover.tla` to use actor-driven disjuncts via `INSTANCE` instead of non-deterministic `Transition(c)`; added `AbortSafety` invariant. `PeerReactToAIS` deferred to Iteration 4. TLC: 7 states, depth 6, all invariants pass (smaller than Iteration 1-2's 108 states since only the failover-initiation-and-abort cycle is reachable).
 
 #### ~~Iteration 4 — Non-atomic failover: two-step final transition~~ ✅ COMPLETE
 
-**Modules modified:** `HAGroupStore.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`HAGroupStore.tla`:
-- Decompose the final failover step `(ATS, AIS) → (S, AIS)` into two separate actions:
-  1. `StandbyBecomesActive(c)`: `STA → AIS` (standby writes its own ZK). This is a **local action** driven by the reader (`ReplicationLogDiscoveryReplay.triggerFailover()` L535-548 → `setHAGroupStatusToSync()` L341-355), not a peer-reactive action. For Iteration 4, modeled as a non-deterministic action with the sole guard `clusterState[c] = "STA"`. Full reader guards (failoverPending, inProgressDirEmpty, no new files) are deferred to `TriggerFailover(c)` in `Reader.tla` (Iteration 11), at which point this placeholder action will be replaced.
-  2. `PeerReactToAIS(c)`: peer enters AIS, two local-state cases (source: `createPeerStateTransitions()` L112-120):
-     - `ATS → S`: old active completes failover when peer enters AIS (L113-114).
-     - `DS → S`: standby recovers from degraded when peer returns to AIS (L116-117). Not reachable until Writer/Environment actions make DS reachable (Iteration 5+), but modeled now for completeness.
-- These are two separate actions (one local, one peer-reactive), not one atomic step.
-
-`ConsistentFailover.tla`:
-- `NonAtomicFailoverSafe` invariant: During the window where one cluster is AIS and the other is ATS, `RoleOf(ATS) ∉ ActiveRoles`. This is a state-dependent specialization of the static `ActiveToStandbyNotActive` invariant, expressed as a conditional over reachable states to explicitly name the non-atomic failover window scenario.
-
-**Expected TLC result:** TLC explores the interleaving between steps 1 and 2. `MutualExclusion` must pass, verifying the implementation's safety argument. State space should grow significantly from the Iteration 3 baseline (7 states, depth 6) because the full failover cycle is now completable and round-trip failover is explorable.
-
-**Note:** The failover tool has a built-in timeout that bounds the duration of the non-atomic window. If the old active does not react within the timeout, admin intervention is required. The TLA+ model does not explicitly model this timeout but verifies that safety holds regardless of window duration.
-
-**TLC finding — (ATS, ATS) deadlock**: Initial TLC run discovered that an admin can initiate a new failover on the newly-active cluster during the non-atomic window, producing an irrecoverable `(ATS, ATS)` state. The fix is a peer-state guard on `AdminStartFailover`: `clusterState[Peer(c)] ∈ {"S", "DS"}`. With this guard, TLC verifies deadlock freedom. See Appendix A.15 and `PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md`.
-
-**TLC result (with fix):** 17 distinct states, depth 10, all invariants pass, no deadlocks.
+Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-deterministic placeholder; full reader guards deferred to Iteration 11) and peer-reactive `PeerReactToAIS(c)` (ATS→S, DS→S). Add `NonAtomicFailoverSafe` invariant: during the AIS/ATS window, `RoleOf(ATS) ∉ ActiveRoles`. TLC found a bug: admin can re-failover during the window producing irrecoverable (ATS,ATS); fix is a peer-state guard on `AdminStartFailover` (see Appendix A.15, `PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md`). With fix: 17 states, depth 10, all invariants pass.
 
 ---
 
@@ -773,12 +752,12 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 **What to add:**
 
 `Types.tla`:
-- Constants: `RS` (set of region servers per cluster, e.g., `{rs1, rs2}`), `WriterMode == {INIT, SYNC, S_AND_F, SYNC_AND_FWD}`.
+- Constants: `RS` (set of region servers per cluster, e.g., `{rs1, rs2}`), `WriterMode == {INIT, SYNC, STORE_AND_FWD, SYNC_AND_FWD}`.
 
 `Writer.tla`:
 - `EXTENDS Types`.
 - Declares all shared variables as `VARIABLE`.
-- Actions: `WriterInit(c, rs)`, `WriterToSF(c, rs)`, `WriterSFToSyncFwd(c, rs)`, `WriterSyncFwdToSync(c, rs)`, `WriterSyncFwdToSF(c, rs)`, `WriterSyncToSyncFwd(c, rs)`.
+- Actions: `WriterInit(c, rs)`, `WriterToStoreFwd(c, rs)`, `WriterStoreFwdToSyncFwd(c, rs)`, `WriterSyncFwdToSync(c, rs)`, `WriterSyncFwdToStoreFwd(c, rs)`, `WriterSyncToSyncFwd(c, rs)`.
 - UNCHANGED for `clusterState` in all writer actions (no coupling yet).
 
 `ConsistentFailover.tla`:
@@ -805,8 +784,8 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 
 `Writer.tla`:
 - Couple writer mode to HDFS availability:
-  - `WriterToSF(c, rs)` guard: `hdfsAvailable[peer(c)] = FALSE`.
-  - `WriterToSF` effect: sets `outDirEmpty[c] = FALSE` (writes accumulate).
+  - `WriterToStoreFwd(c, rs)` guard: `hdfsAvailable[peer(c)] = FALSE`.
+  - `WriterToStoreFwd` effect: sets `outDirEmpty[c] = FALSE` (writes accumulate).
   - `WriterSyncFwdToSync` effect: sets `outDirEmpty[c] = TRUE` (drain complete).
 
 `Admin.tla`:
@@ -828,7 +807,7 @@ Created `HAGroupStore.tla` (peer-reactive actions `PeerReactToATS`, `PeerReactTo
 **What to add:**
 
 `Writer.tla`:
-- When `WriterToSF(c, rs)` fires and cluster is AIS, atomically transition cluster to ANIS (modeling the implementation where the RS calls `setHAGroupStatusToStoreAndForward()` which updates cluster state).
+- When `WriterToStoreFwd(c, rs)` fires and cluster is AIS, atomically transition cluster to ANIS (modeling the implementation where the RS calls `setHAGroupStatusToStoreAndForward()` which updates cluster state).
 
 `HAGroupStore.tla`:
 - When `WriterSyncFwdToSync` fires (last RS returns to SYNC) and `outDirEmpty[c]`, mark cluster eligible for `ANIS → AIS` (subject to anti-flapping, modeled in Phase 3).
@@ -1143,9 +1122,9 @@ This phase models implementation-specific behaviors that can prevent liveness. T
 | Auto-completion: AbTS → S | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
 | Auto-completion: AbTAIS → AIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
 | Auto-completion: AbTANIS → ANIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
-| `SyncModeImpl.onFailure()` (L61-77) → `setHAGroupStatusToStoreAndForward()` | `WriterToSF(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `SyncAndForwardModeImpl.onFailure()` (L66-82) → `STORE_AND_FORWARD` | `WriterSyncFwdToSF(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `ReplicationLogDiscoveryForwarder.processFile()` (L133-152) throughput check → `S&F→S&FWD` | `WriterSFToSyncFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
+| `SyncModeImpl.onFailure()` (L61-77) → `setHAGroupStatusToStoreAndForward()` | `WriterToStoreFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
+| `SyncAndForwardModeImpl.onFailure()` (L66-82) → `STORE_AND_FORWARD` | `WriterSyncFwdToStoreFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
+| `ReplicationLogDiscoveryForwarder.processFile()` (L133-152) throughput check → `S&F→S&FWD` | `WriterStoreFwdToSyncFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
 | `ReplicationLogDiscoveryForwarder.processNoMoreRoundsLeft()` (L155-184) → `setHAGroupStatusToSync()` | `WriterSyncFwdToSync(c, rs)` | `Writer.tla` | 5 | ⏳ |
 | `ReplicationLogDiscoveryForwarder.init()` ANIS listener (L98-108) → `SYNC→S&FWD` on other RS | `WriterSyncToSyncFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
 | `StoreAndForwardModeImpl.startHAGroupStoreUpdateTask()` (L71-87) | `ANISHeartbeat(c)` | `HAGroupStore.tla` | 8 | ⏳ |

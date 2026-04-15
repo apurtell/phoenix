@@ -54,7 +54,7 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState
+VARIABLE clusterState, writerMode
 
 ---------------------------------------------------------------------------
 
@@ -79,6 +79,7 @@ PeerReactToATS(c) ==
     /\ clusterState[Peer(c)] = "ATS"
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "STA"]
+    /\ UNCHANGED writerMode
 
 ---------------------------------------------------------------------------
 
@@ -100,9 +101,11 @@ PeerReactToANIS(c) ==
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "S"
        /\ clusterState' = [clusterState EXCEPT ![c] = "DS"]
+       /\ UNCHANGED writerMode
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
+       /\ UNCHANGED writerMode
 
 ---------------------------------------------------------------------------
 
@@ -123,6 +126,7 @@ PeerReactToAbTS(c) ==
     /\ clusterState[Peer(c)] = "AbTS"
     /\ clusterState[c] = "ATS"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
+    /\ UNCHANGED writerMode
 
 ---------------------------------------------------------------------------
 
@@ -150,10 +154,13 @@ PeerReactToAbTS(c) ==
 AutoComplete(c) ==
     \/ /\ clusterState[c] = "AbTS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
+       /\ UNCHANGED writerMode
     \/ /\ clusterState[c] = "AbTAIS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
+       /\ UNCHANGED writerMode
     \/ /\ clusterState[c] = "AbTANIS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
+       /\ UNCHANGED writerMode
 
 ---------------------------------------------------------------------------
 
@@ -175,6 +182,7 @@ AutoComplete(c) ==
 StandbyBecomesActive(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
+    /\ UNCHANGED writerMode
 
 ---------------------------------------------------------------------------
 
@@ -203,8 +211,10 @@ PeerReactToAIS(c) ==
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
+       /\ UNCHANGED writerMode
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "DS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
+       /\ UNCHANGED writerMode
 
 ============================================================================

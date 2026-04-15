@@ -18,6 +18,7 @@
  *   RoleOf(state)     — maps an HAGroupState to its ClusterRole
  *   ActiveRoles       — the set of roles considered "active" (role-level)
  *   Peer(c)           — returns the other cluster in a 2-cluster model
+ *   WriterMode        — the 4 replication writer modes (per-RS)
  *
  * Implementation traceability:
  *
@@ -28,6 +29,7 @@
  *   ClusterRole            | ClusterRoleRecord.ClusterRole enum (L59-107)
  *   RoleOf                 | HAGroupState.getClusterRole() (L73-97)
  *   ANIS self-transition   | HAGroupStoreRecord L101 (heartbeat support)
+ *   WriterMode             | ReplicationLogGroup mode (SYNC/S&F/S&FWD)
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -44,6 +46,13 @@ ASSUME Cluster # {}
 
 \* Exactly two clusters in the HA pair.
 ASSUME Cardinality(Cluster) = 2
+
+\* The finite set of region server identifiers per cluster.
+\* Each cluster runs the same set of RS; writer mode is tracked per (cluster, RS).
+CONSTANTS RS
+
+\* RS set must be non-empty.
+ASSUME RS # {}
 
 ---------------------------------------------------------------------------
 
@@ -107,6 +116,24 @@ TransitionalActiveStates == { "ATS", "ANISTS" }
 \* Source: ClusterRoleRecord.java L59-67 — ACTIVE role has
 \*         isMutationBlocked()=false.
 ActiveRoles == {"ACTIVE"}
+
+---------------------------------------------------------------------------
+
+(* Replication writer mode definitions *)
+
+\* The 4 replication writer modes from ReplicationLogGroup.java.
+\* Each RegionServer on the active cluster maintains one of these modes.
+\*
+\*   Modeled value      | Java class
+\*   -------------------+----------------------------------------------
+\*   "INIT"             | Pre-initialization
+\*   "SYNC"             | SyncModeImpl — writing directly to standby HDFS
+\*   "STORE_AND_FWD"    | StoreAndForwardModeImpl — writing locally
+\*   "SYNC_AND_FWD"     | SyncAndForwardModeImpl — draining local queue
+\*                      |   while also writing synchronously
+\*
+\* Source: ReplicationLogGroup.java mode classes
+WriterMode == {"INIT", "SYNC", "STORE_AND_FWD", "SYNC_AND_FWD"}
 
 ---------------------------------------------------------------------------
 

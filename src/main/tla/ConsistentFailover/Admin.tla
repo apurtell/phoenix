@@ -18,7 +18,7 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState
+VARIABLE clusterState, writerMode
 
 ---------------------------------------------------------------------------
 
@@ -46,6 +46,7 @@ AdminStartFailover(c) ==
     /\ clusterState[c] = "AIS"
     /\ clusterState[Peer(c)] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
+    /\ UNCHANGED writerMode
 
 ---------------------------------------------------------------------------
 
@@ -66,5 +67,6 @@ AdminStartFailover(c) ==
 AdminAbortFailover(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTS"]
+    /\ UNCHANGED writerMode
 
 ============================================================================

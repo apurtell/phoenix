@@ -26,6 +26,7 @@
  * Sub-modules:
  *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - Admin.tla: operator-initiated failover/abort
+ *   - Writer.tla: per-RS replication writer mode state machine
  *
  * Implementation traceability:
  *
@@ -52,6 +53,8 @@
  *   AbortSafety             | Abort originates from STA side; AbTAIS
  *                           |   only reachable via peer AbTS detection
  *   AllowedTransitions      | HAGroupStoreRecord.java L99-123
+ *   writerMode              | ReplicationLogGroup per-RS mode
+ *                           |   (SYNC/STORE_AND_FWD/SYNC_AND_FWD)
  *)
 EXTENDS Types
 
@@ -67,8 +70,15 @@ EXTENDS Types
 \*         phoenix/consistentHA/<group>
 VARIABLE clusterState
 
+\* writerMode[c][rs] is the current replication writer mode of
+\* region server rs on cluster c.
+\*
+\* Source: ReplicationLogGroup per-RS mode (SyncModeImpl,
+\*         StoreAndForwardModeImpl, SyncAndForwardModeImpl)
+VARIABLE writerMode
+
 \* Tuple of all variables for use in temporal formulas.
-vars == <<clusterState>>
+vars == <<clusterState, writerMode>>
 
 ---------------------------------------------------------------------------
 
@@ -80,6 +90,9 @@ haGroupStore == INSTANCE HAGroupStore
 
 \* Operator-initiated failover and abort.
 admin == INSTANCE Admin
+
+\* Per-RS replication writer mode state machine.
+writer == INSTANCE Writer
 
 ---------------------------------------------------------------------------
 
@@ -95,8 +108,9 @@ Init ==
     \* Deterministically assign one cluster to AIS and the other to S.
     \* CHOOSE x \in Cluster : TRUE picks an arbitrary fixed cluster.
     LET active == CHOOSE x \in Cluster : TRUE
-    IN clusterState = [c \in Cluster |->
-                         IF c = active THEN "AIS" ELSE "S"]
+    IN /\ clusterState = [c \in Cluster |->
+                            IF c = active THEN "AIS" ELSE "S"]
+       /\ writerMode = [c \in Cluster |-> [rs \in RS |-> "INIT"]]
 
 ---------------------------------------------------------------------------
 
@@ -134,6 +148,16 @@ Next ==
         \/ admin!AdminStartFailover(c)
         \* [Direct ZK write] Admin aborts failover: STA->AbTS.
         \/ admin!AdminAbortFailover(c)
+        \* Per-RS writer mode transitions (independent of cluster
+        \* state in this iteration; coupling added in Iter 6-7).
+        \/ \E rs \in RS :
+            \/ writer!WriterInit(c, rs)
+            \/ writer!WriterInitToStoreFwd(c, rs)
+            \/ writer!WriterToStoreFwd(c, rs)
+            \/ writer!WriterSyncToSyncFwd(c, rs)
+            \/ writer!WriterStoreFwdToSyncFwd(c, rs)
+            \/ writer!WriterSyncFwdToSync(c, rs)
+            \/ writer!WriterSyncFwdToStoreFwd(c, rs)
 
 ---------------------------------------------------------------------------
 
@@ -151,6 +175,10 @@ Spec == Init /\ [][Next]_vars
 \* Every cluster's state is a valid HAGroupState.
 TypeOK ==
     clusterState \in [Cluster -> HAGroupState]
+
+\* Every RS on every cluster has a valid WriterMode.
+WriterTypeOK ==
+    writerMode \in [Cluster -> [RS -> WriterMode]]
 
 ---------------------------------------------------------------------------
 
@@ -264,19 +292,46 @@ TransitionValid ==
 
 ---------------------------------------------------------------------------
 
+(*
+ * Every writer mode change follows the allowed writer transitions.
+ * Action constraint checked by TLC analogous to TransitionValid.
+ *
+ * Source: ReplicationLogGroup.java mode transitions (see §3.2).
+ *)
+AllowedWriterTransitions ==
+    {
+      <<"INIT", "SYNC">>,
+      <<"INIT", "STORE_AND_FWD">>,
+      <<"SYNC", "STORE_AND_FWD">>,
+      <<"SYNC", "SYNC_AND_FWD">>,
+      <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
+      <<"SYNC_AND_FWD", "SYNC">>,
+      <<"SYNC_AND_FWD", "STORE_AND_FWD">>
+    }
+
+WriterTransitionValid ==
+    \A c \in Cluster :
+        \A rs \in RS :
+            writerMode'[c][rs] # writerMode[c][rs] =>
+                <<writerMode[c][rs], writerMode'[c][rs]>> \in AllowedWriterTransitions
+
+---------------------------------------------------------------------------
+
 (* Symmetry *)
 
-\* Placeholder for symmetry reduction. Cluster members have
-\* asymmetric initial roles (AIS vs S) so they are not
-\* interchangeable.
-Symmetry == {}
+\* RS identifiers are interchangeable (all start in INIT, identical
+\* action sets). Cluster identifiers remain asymmetric (AIS vs S).
+Symmetry == Permutations(RS)
 
 ---------------------------------------------------------------------------
 
 (* Theorems *)
 
-\* Safety: every step preserves the type invariant.
+\* Safety: every step preserves the cluster type invariant.
 THEOREM Spec => []TypeOK
+
+\* Safety: every step preserves the writer type invariant.
+THEOREM Spec => []WriterTypeOK
 
 \* Safety: mutual exclusion holds in every reachable state.
 THEOREM Spec => []MutualExclusion
