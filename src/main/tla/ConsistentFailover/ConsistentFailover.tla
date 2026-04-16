@@ -26,6 +26,7 @@
  *   - Clock.tla: anti-flapping countdown timer (Tick action)
  *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - HDFS.tla: HDFS availability incident actions
+ *   - RS.tla: RS lifecycle (restart after abort)
  *   - Writer.tla: per-RS replication writer mode state machine
  *
  * Implementation traceability:
@@ -138,6 +139,9 @@ writer == INSTANCE Writer
 \* HDFS availability incident actions.
 hdfs == INSTANCE HDFS
 
+\* RS lifecycle (restart after abort).
+rs == INSTANCE RS
+
 \* Anti-flapping countdown timer.
 clk == INSTANCE Clock
 
@@ -157,7 +161,7 @@ Init ==
     LET active == CHOOSE x \in Cluster : TRUE
     IN /\ clusterState = [c \in Cluster |->
                             IF c = active THEN "AIS" ELSE "S"]
-       /\ writerMode = [c \in Cluster |-> [rs \in RS |-> "INIT"]]
+       /\ writerMode = [c \in Cluster |-> [r \in RS |-> "INIT"]]
        /\ outDirEmpty = [c \in Cluster |-> TRUE]
        /\ hdfsAvailable = [c \in Cluster |-> TRUE]
        /\ antiFlapTimer = [c \in Cluster |-> 0]
@@ -176,9 +180,11 @@ Init ==
  *   - admin: operator-initiated failover and abort
  *     These are direct ZK writes (not watcher-dependent).
  *   - hdfs: HDFS NameNode crash/recovery incidents
- *     HDFSDown atomically degrades all affected RS on the peer.
+ *     HDFSDown sets the availability flag; per-RS degradation
+ *     is handled by writer actions with CAS success/failure.
  *   - writer: per-RS writer mode transitions (startup, recovery,
- *     drain complete)
+ *     drain complete, HDFS failure degradation, CAS failure)
+ *   - rs: RS lifecycle (restart after abort)
  *
  * Each action encodes the precise guard (peer state or local state)
  * under which the transition fires, modeling the implementation's
@@ -211,13 +217,24 @@ Next ==
         \* HDFS NameNode crash/recovery incidents.
         \/ hdfs!HDFSDown(c)
         \/ hdfs!HDFSUp(c)
-        \* Per-RS writer mode transitions.
-        \/ \E rs \in RS :
-            \/ writer!WriterInit(c, rs)
-            \/ writer!WriterInitToStoreFwd(c, rs)
-            \/ writer!WriterSyncToSyncFwd(c, rs)
-            \/ writer!WriterStoreFwdToSyncFwd(c, rs)
-            \/ writer!WriterSyncFwdToSync(c, rs)
+        \* Per-RS writer mode transitions and RS lifecycle.
+        \/ \E r \in RS :
+            \* Writer startup.
+            \/ writer!WriterInit(c, r)
+            \/ writer!WriterInitToStoreFwd(c, r)
+            \/ writer!WriterInitToStoreFwdFail(c, r)
+            \* Writer mode transitions (recovery, drain, forwarder).
+            \/ writer!WriterSyncToSyncFwd(c, r)
+            \/ writer!WriterStoreFwdToSyncFwd(c, r)
+            \/ writer!WriterSyncFwdToSync(c, r)
+            \* Per-RS HDFS failure degradation (CAS success).
+            \/ writer!WriterToStoreFwd(c, r)
+            \/ writer!WriterSyncFwdToStoreFwd(c, r)
+            \* Per-RS HDFS failure degradation (CAS failure → DEAD).
+            \/ writer!WriterToStoreFwdFail(c, r)
+            \/ writer!WriterSyncFwdToStoreFwdFail(c, r)
+            \* RS lifecycle: process supervisor restarts dead RS.
+            \/ rs!RSRestart(c, r)
 
 ---------------------------------------------------------------------------
 
@@ -313,18 +330,13 @@ AbortSafety ==
  * is maintained because ATS maps to role ACTIVE_TO_STANDBY, which
  * is not an active role (isMutationBlocked()=true).
  *
- * TAUTOLOGY NOTE (Iteration 7): This invariant is a definitional
- * tautology. The antecedent fixes clusterState[c1] = "ATS", so
- * RoleOf("ATS") = "ACTIVE_TO_STANDBY", and "ACTIVE_TO_STANDBY"
- * \notin ActiveRoles is a constant-level truth. The consequent is
- * always TRUE regardless of state. This is subsumed by
- * MutualExclusion, which verifies role-level mutual exclusion over
- * all reachable states. Kept for documentation of the safety
- * argument.
+ * This invariant is subsumed by MutualExclusion (which verifies
+ * role-level mutual exclusion over all reachable states) but is
+ * retained for explicit documentation of the non-atomic window
+ * safety argument.
  *
- * Source: Architecture safety argument; ClusterRoleRecord.java
- *         L84 — ACTIVE_TO_STANDBY has isMutationBlocked()=true.
- *         IMPL_CROSS_REFERENCE.md §11.3.
+ * Source: ClusterRoleRecord.java L84 —
+ *         ACTIVE_TO_STANDBY has isMutationBlocked()=true.
  *)
 NonAtomicFailoverSafe ==
     \A c1, c2 \in Cluster :
@@ -362,18 +374,22 @@ AllowedWriterTransitions ==
     {
       <<"INIT", "SYNC">>,
       <<"INIT", "STORE_AND_FWD">>,
+      <<"INIT", "DEAD">>,
       <<"SYNC", "STORE_AND_FWD">>,
       <<"SYNC", "SYNC_AND_FWD">>,
+      <<"SYNC", "DEAD">>,
       <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
       <<"SYNC_AND_FWD", "SYNC">>,
-      <<"SYNC_AND_FWD", "STORE_AND_FWD">>
+      <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
+      <<"SYNC_AND_FWD", "DEAD">>,
+      <<"DEAD", "INIT">>
     }
 
 WriterTransitionValid ==
     \A c \in Cluster :
-        \A rs \in RS :
-            writerMode'[c][rs] # writerMode[c][rs] =>
-                <<writerMode[c][rs], writerMode'[c][rs]>> \in AllowedWriterTransitions
+        \A r \in RS :
+            writerMode'[c][r] # writerMode[c][r] =>
+                <<writerMode[c][r], writerMode'[c][r]>> \in AllowedWriterTransitions
 
 ---------------------------------------------------------------------------
 
@@ -395,7 +411,7 @@ WriterTransitionValid ==
 AIStoATSPrecondition ==
     \A c \in Cluster :
         clusterState[c] = "AIS" /\ clusterState'[c] = "ATS"
-        => outDirEmpty[c] /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
+        => outDirEmpty[c] /\ \A r \in RS : writerMode[c][r] = "SYNC"
 
 ---------------------------------------------------------------------------
 
@@ -419,19 +435,15 @@ AntiFlapGate ==
  * AIS implies in-sync: whenever a cluster is in AIS, the OUT
  * directory must be empty and all RS must be in SYNC or INIT.
  *
- * This is the non-tautological state-level version of the
- * AIStoATSPrecondition action constraint (section 4.1 property 3:
- * "a derived invariant, not an explicit guard on the admin action").
- * Holds by construction after Iteration 7: every action that
- * degrades writers or sets outDirEmpty=FALSE also transitions
- * AIS → ANIS; every path back to AIS (ANISToAIS) requires
- * outDirEmpty and all SYNC.
+ * Holds by construction: every action that degrades writers or
+ * sets outDirEmpty=FALSE also transitions AIS → ANIS; every
+ * path back to AIS (ANISToAIS) requires outDirEmpty and all SYNC.
  *)
 AISImpliesInSync ==
     \A c \in Cluster :
         clusterState[c] = "AIS" =>
             /\ outDirEmpty[c]
-            /\ \A rs \in RS : writerMode[c][rs] \in {"INIT", "SYNC"}
+            /\ \A r \in RS : writerMode[c][r] \in {"INIT", "SYNC"}
 
 ---------------------------------------------------------------------------
 
@@ -442,30 +454,35 @@ AISImpliesInSync ==
  * the critical safety property.
  *
  * Holds by construction: the only paths that create S&F writers
- * (HDFSDown, WriterInitToStoreFwd) atomically transition AIS → ANIS.
+ * (WriterToStoreFwd, WriterInitToStoreFwd) atomically transition
+ * AIS → ANIS.
  *)
 NoAISWithSFWriter ==
     \A c \in Cluster :
-        (\E rs \in RS : writerMode[c][rs] = "STORE_AND_FWD") =>
+        (\E r \in RS : writerMode[c][r] = "STORE_AND_FWD") =>
             clusterState[c] # "AIS"
 
 ---------------------------------------------------------------------------
 
 (*
  * Writer-cluster consistency: degraded writer modes (S&F,
- * SYNC_AND_FWD) can only appear on active clusters that are NOT
- * in AIS, or on the ANISTS transitional state. Specifically,
- * this excludes AIS (prevented by AIS→ANIS coupling) and all
- * standby/transitional states (prevented by active-cluster guards).
+ * SYNC_AND_FWD, DEAD) can only appear on active clusters that
+ * are NOT in AIS, or on the ANISTS transitional state.
+ * Specifically, this excludes AIS (prevented by AIS→ANIS
+ * coupling and CAS failure guard clusterState /= "AIS") and
+ * all standby/transitional states (prevented by active-cluster
+ * guards).
  *
  * The allowed set includes AbTAIS and AWOP because HDFS can go
  * down while the cluster is in these states; the AIS→ANIS
  * coupling only fires for AIS, so other active states retain
- * their state while writers degrade.
+ * their state while writers degrade. DEAD writers arise from
+ * CAS failure during degradation, which is only possible when
+ * the cluster is already not in AIS.
  *)
 WriterClusterConsistency ==
     \A c \in Cluster :
-        (\E rs \in RS : writerMode[c][rs] \in {"STORE_AND_FWD", "SYNC_AND_FWD"}) =>
+        (\E r \in RS : writerMode[c][r] \in {"STORE_AND_FWD", "SYNC_AND_FWD", "DEAD"}) =>
             clusterState[c] \in {"ANIS", "ANISTS", "ANISWOP", "AbTANIS", "AbTAIS", "AWOP"}
 
 ---------------------------------------------------------------------------
@@ -501,7 +518,7 @@ THEOREM Spec => []AbortSafety
 \* Safety: non-atomic failover window preserves mutual exclusion.
 THEOREM Spec => []NonAtomicFailoverSafe
 
-\* Safety: AIS implies in-sync (derived invariant, section 4.1 property 3).
+\* Safety: AIS implies in-sync (derived invariant).
 THEOREM Spec => []AISImpliesInSync
 
 \* Safety: AIS clusters have no S&F writers.

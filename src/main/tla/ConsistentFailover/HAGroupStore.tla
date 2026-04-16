@@ -141,12 +141,10 @@ PeerReactToAbTS(c) ==
  * session expiry), the cluster remains in the AbTS/AbTAIS/AbTANIS
  * state indefinitely.
  *
- * AbTAIS auto-completion: the current implementation (L145) is
- * unconditional (always → AIS). This creates a transient window
- * where AIS coexists with degraded writers if HDFS failed during
- * the abort window. The model assumes the recommended fix from
- * PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md: conditional completion
- * to AIS (clean) or ANIS (degraded).
+ * AbTAIS auto-completion: conditional — completes to AIS if all
+ * writers are clean (INIT or SYNC) and OUT dir is empty, otherwise
+ * completes to ANIS. This prevents AIS from coexisting with
+ * degraded writers when HDFS fails during the abort window.
  *
  * Source: createLocalStateTransitions() L140-150
  *   AbTS   -> S    (L144)
@@ -254,9 +252,8 @@ ANISHeartbeat(c) ==
  * directory is empty, and the anti-flapping gate has opened
  * (countdown timer reached 0), the cluster recovers from ANIS to AIS.
  *
- * The writer guard is relaxed from the Iteration 7 strict
- * `\A rs : writerMode[c][rs] = "SYNC"` to include SYNC_AND_FWD.
- * This is safe because the anti-flapping gate ensures all RS have
+ * The writer guard includes SYNC_AND_FWD (not just SYNC) because
+ * the anti-flapping gate ensures all RS have
  * exited S&F (the heartbeat stops, and WaitTimeForSync ticks must
  * elapse) before this action fires. Any remaining SYNC_AND_FWD RS
  * are atomically transitioned to SYNC, modeling the ACTIVE_IN_SYNC

@@ -724,23 +724,21 @@ Active-cluster guards on all writer actions, AIS→ANIS coupling on `HDFSDown`/`
 
 Per-cluster `antiFlapTimer` countdown variable (Lamport, "Real Time is Really Simple", CHARME 2005 §2) with `WaitTimeForSync` constant and four named helpers in `Types.tla`. Created `Clock.tla` (`Tick`). `ANISHeartbeat(c)` resets timer while any RS in S&F; `ANISToAIS(c)` guarded by `AntiFlapGateOpen`, writer guard relaxed to `{"SYNC","SYNC_AND_FWD"}` with atomic SYNC_AND_FWD→SYNC. Timer initialized on every ANIS entry (`AutoComplete`, `WriterInitToStoreFwd`, `HDFSDown`). New `AntiFlapTimerTypeOK` invariant, `AntiFlapGate` action constraint.
 
-#### Iteration 9 — RS-level ZK races (optimistic locking)
+#### Iteration 9 — RS-level ZK CAS races (observable failure modeling)
 
-**Modules modified:** `HAGroupStore.tla`, `ConsistentFailover.tla`.
+**Modules modified:** `Types.tla`, `Writer.tla`, `HDFS.tla`, `ConsistentFailover.tla`.
+**Modules created:** `RS.tla`.
 
-**What to add:**
+Code inspection of the five `setData().withVersion()` CAS write sites confirmed that `BadVersionException` is fatal only in `SyncModeImpl.onFailure()` (L61-74) and `SyncAndForwardModeImpl.onFailure()` (L66-78), where CAS failure calls `logGroup.abort()` and the RS dies. All other CAS sites (S&F heartbeat, `FailoverManagementListener`, `processNoMoreRoundsLeft`) handle failure benignly.
 
-`HAGroupStore.tla`:
-- Model multiple RS on the same cluster racing to update ZK state:
-  - Two RS may both see cluster in ANIS and both attempt `ANIS → AIS`.
-  - Only one succeeds (non-deterministic choice); the other sees `BadVersionException` and retries.
-- `ZKUpdate(c, rs, newState)` action with version check.
+**What changed:**
 
-`ConsistentFailover.tla`:
-- Variable: `zkVersion ∈ [Cluster → Nat]` for optimistic locking.
-- Invariant: `ZKVersionMonotonic` — versions only increase.
+- Decomposed atomic `HDFSDown` into per-RS writer degradation actions. `HDFSDown(c)` now only sets `hdfsAvailable[c] = FALSE`. Per-RS degradation is handled by `WriterToStoreFwd(c, rs)` and `WriterSyncFwdToStoreFwd(c, rs)` (previously documented but not wired into Next), now wired as individual per-RS actions that each perform their own ZK CAS write.
+- Added `DEAD` to `WriterMode` in `Types.tla`. Three CAS failure actions (`WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwdFail`, `WriterInitToStoreFwdFail`) non-deterministically transition the writer to `DEAD` instead of `STORE_AND_FWD`, modeling RS abort on `BadVersionException`. CAS failure is guarded on `clusterState[c] /= "AIS"` — the first RS to write always succeeds (no concurrent version bump); failure is only possible after another RS has already bumped the ZK version.
+- Created `RS.tla` with `RSRestart(c, rs)`: `DEAD → INIT`, modeling the process supervisor (Kubernetes/YARN) creating a new RS pod after abort. Closes the abort lifecycle and prevents deadlock. Iteration 12 will extend this with arbitrary crash modeling, `rsAlive` tracking, and local HDFS failure aborts.
+- Updated `AllowedWriterTransitions` with `DEAD` transitions, `WriterClusterConsistency` to allow `DEAD` on degraded clusters.
 
-**Expected TLC result:** Optimistic locking ensures serialized updates. State space may grow; the `SYMMETRY` declaration on RS in the exhaustive config (`ConsistentFailover.cfg`) keeps this tractable.
+**Expected TLC result:** Per-RS decomposition increases state space (each RS transitions independently). Safety invariants (`MutualExclusion`, `AISImpliesInSync`, etc.) hold with CAS failure + RS abort + restart modeled.
 
 ---
 

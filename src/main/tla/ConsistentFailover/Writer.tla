@@ -6,34 +6,50 @@
  * Each RegionServer on the active cluster maintains a writer mode
  * that determines how mutations are replicated: directly to standby
  * HDFS (SYNC), locally buffered (STORE_AND_FWD), or draining local
- * queue while also writing synchronously (SYNC_AND_FWD).
+ * queue while also writing synchronously (SYNC_AND_FWD). An RS that
+ * aborts due to a ZK CAS failure enters DEAD mode.
  *
  * HDFS-failure-driven degradation (SYNC → S&F, SYNC_AND_FWD → S&F)
- * is modeled as an atomic incident in HDFS.tla rather than as
- * individual per-RS actions in Next. The per-RS action definitions
- * (WriterToStoreFwd, WriterSyncFwdToStoreFwd) are retained here as
- * documentation of individual transition semantics and share the
- * CanDegradeToStoreFwd predicate with HDFS.tla.
+ * is modeled as individual per-RS actions that each perform their
+ * own ZK CAS write. HDFSDown in HDFS.tla only sets the availability
+ * flag; per-RS degradation and CAS failure are handled here.
+ *
+ * CAS FAILURE SEMANTICS: When an RS detects HDFS unavailability via
+ * IOException, it attempts a ZK CAS write (setData().withVersion())
+ * to transition AIS→ANIS (or ANIS→ANIS self-transition). If another
+ * RS has already bumped the ZK version (stale PathChildrenCache),
+ * BadVersionException is thrown. SyncModeImpl.onFailure() and
+ * SyncAndForwardModeImpl.onFailure() treat this as fatal: abort()
+ * throws RuntimeException, halting the Disruptor — the RS is dead.
+ * CAS failure is only possible when clusterState /= "AIS" because
+ * the first RS to write faces no concurrent version bump.
  *
  * Implementation traceability:
  *
- *   TLA+ action                    | Java source
- *   -------------------------------+------------------------------------------
- *   WriterInit(c, rs)              | Normal startup → SyncModeImpl
- *   WriterInitToStoreFwd(c, rs)    | Startup with peer unavailable →
- *                                  |   StoreAndForwardModeImpl
- *   WriterToStoreFwd(c, rs)        | SyncModeImpl.onFailure() L61-77 →
- *                                  |   setHAGroupStatusToStoreAndForward()
- *   WriterSyncToSyncFwd(c, rs)     | Forwarder ACTIVE_NOT_IN_SYNC event
- *                                  |   L98-108 while RS in SYNC
- *   WriterStoreFwdToSyncFwd(c, rs) | Forwarder processFile() L133-152
- *                                  |   throughput threshold or drain start
- *   WriterSyncFwdToSync(c, rs)     | Forwarder drain complete; queue empty
- *                                  |   → setHAGroupStatusToSync() L171
- *   WriterSyncFwdToStoreFwd(c, rs) | Re-degradation during drain
- *   CanDegradeToStoreFwd(c, rs)    | Guard predicate: RS is in a mode that
- *                                  |   writes to standby HDFS (SYNC or
- *                                  |   SYNC_AND_FWD)
+ *   TLA+ action                      | Java source
+ *   ---------------------------------+----------------------------------------
+ *   WriterInit(c, rs)                | Normal startup → SyncModeImpl
+ *   WriterInitToStoreFwd(c, rs)      | Startup with peer unavailable →
+ *                                    |   StoreAndForwardModeImpl; CAS
+ *                                    |   success path
+ *   WriterInitToStoreFwdFail(c, rs)  | Startup CAS failure → abort
+ *   WriterToStoreFwd(c, rs)          | SyncModeImpl.onFailure() L61-74 →
+ *                                    |   setHAGroupStatusToStoreAndForward();
+ *                                    |   CAS success path
+ *   WriterToStoreFwdFail(c, rs)      | SyncModeImpl.onFailure() CAS
+ *                                    |   failure → abort
+ *   WriterSyncToSyncFwd(c, rs)       | Forwarder ACTIVE_NOT_IN_SYNC event
+ *                                    |   L98-108 while RS in SYNC
+ *   WriterStoreFwdToSyncFwd(c, rs)   | Forwarder processFile() L133-152
+ *                                    |   throughput threshold or drain start
+ *   WriterSyncFwdToSync(c, rs)       | Forwarder drain complete; queue empty
+ *                                    |   → setHAGroupStatusToSync() L171
+ *   WriterSyncFwdToStoreFwd(c, rs)   | SyncAndForwardModeImpl.onFailure()
+ *                                    |   L66-78; CAS success path
+ *   WriterSyncFwdToStoreFwdFail(c,rs)| SyncAndForwardModeImpl.onFailure()
+ *                                    |   CAS failure → abort
+ *   CanDegradeToStoreFwd(c, rs)      | Guard predicate: RS is in a mode
+ *                                    |   that writes to standby HDFS
  *)
 EXTENDS Types
 
@@ -47,9 +63,8 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
  * Guard predicate: RS is in a mode that writes to standby HDFS
  * and would degrade to STORE_AND_FWD on an HDFS failure.
  *
- * Used by HDFS.tla (HDFSDown) to determine which RS on a cluster
- * are affected by a NameNode crash, and by the documented per-RS
- * action definitions below.
+ * Used by the per-RS degradation actions (WriterToStoreFwd,
+ * WriterSyncFwdToStoreFwd) and their CAS failure variants.
  *)
 CanDegradeToStoreFwd(c, rs) ==
     writerMode[c][rs] \in {"SYNC", "SYNC_AND_FWD"}
@@ -160,19 +175,19 @@ WriterSyncFwdToSync(c, rs) ==
 
 ---------------------------------------------------------------------------
 
-(* Documented action definitions — not wired into Next *)
+(* Per-RS HDFS failure degradation — CAS success paths *)
 
 (*
- * Per-RS HDFS failure degradation: SYNC → STORE_AND_FWD.
+ * Per-RS HDFS failure degradation: SYNC → STORE_AND_FWD (CAS success).
  *
  * Models a single RS detecting standby HDFS unavailability via
- * IOException and transitioning to local buffering. In the
- * composite model, this transition is driven atomically for all
- * affected RS by HDFSDown in HDFS.tla. Also transitions
- * cluster AIS → ANIS (setHAGroupStatusToStoreAndForward).
- * Writers only run on the active cluster.
+ * IOException and successfully CAS-writing the ZK state. The ZK
+ * CAS write is synchronous and happens BEFORE the mode change
+ * (SyncModeImpl.onFailure() L61-74). On success, the writer
+ * transitions to STORE_AND_FWD and the cluster transitions
+ * AIS → ANIS (if still AIS). Writers only run on the active cluster.
  *
- * Source: SyncModeImpl.onFailure() L61-77 →
+ * Source: SyncModeImpl.onFailure() L61-74 →
  *         setHAGroupStatusToStoreAndForward()
  *)
 WriterToStoreFwd(c, rs) ==
@@ -184,22 +199,25 @@ WriterToStoreFwd(c, rs) ==
     /\ clusterState' = IF clusterState[c] = "AIS"
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ UNCHANGED <<hdfsAvailable, antiFlapTimer>>
+    /\ antiFlapTimer' = IF clusterState[c] = "AIS"
+                         THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
+                         ELSE antiFlapTimer
+    /\ UNCHANGED hdfsAvailable
 
 ---------------------------------------------------------------------------
 
 (*
- * Re-degradation during drain: SYNC_AND_FWD → STORE_AND_FWD.
+ * Re-degradation during drain: SYNC_AND_FWD → STORE_AND_FWD
+ * (CAS success).
  *
  * Models standby HDFS becoming unavailable again while the
  * forwarder is draining the local queue. The RS falls back to
- * pure local buffering. In the composite model, this transition
- * is driven atomically for all affected RS by HDFSDown in
- * HDFS.tla. Writers only run on the active cluster. No AIS → ANIS
- * coupling needed: if RS is in SYNC_AND_FWD, cluster is already
- * ANIS (cannot be AIS).
+ * pure local buffering. Writers only run on the active cluster.
+ * No AIS → ANIS coupling needed: if RS is in SYNC_AND_FWD,
+ * cluster is already ANIS (cannot be AIS).
  *
- * Source: SyncAndForwardModeImpl.onFailure() L66-82
+ * Source: SyncAndForwardModeImpl.onFailure() L66-78 →
+ *         setHAGroupStatusToStoreAndForward()
  *)
 WriterSyncFwdToStoreFwd(c, rs) ==
     /\ clusterState[c] \in ActiveStates
@@ -208,5 +226,75 @@ WriterSyncFwdToStoreFwd(c, rs) ==
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer>>
+
+---------------------------------------------------------------------------
+
+(* Per-RS HDFS failure degradation — CAS failure paths (RS abort) *)
+
+(*
+ * CAS failure during SYNC degradation: SYNC → DEAD.
+ *
+ * RS detects IOException, reads stale AIS/version N from
+ * PathChildrenCache, attempts CAS write AIS→ANIS with version N,
+ * but another RS already bumped the version to N+1. ZK throws
+ * BadVersionException → StaleHAGroupStoreRecordVersionException →
+ * abort() → RuntimeException → Disruptor halts → RS dead.
+ *
+ * Guard: clusterState[c] /= "AIS" — CAS failure is only possible
+ * when another RS has already changed the cluster state, meaning
+ * the ZK version has been bumped beyond the cached value.
+ *
+ * Source: SyncModeImpl.onFailure() L61-74 catch block → abort()
+ *)
+WriterToStoreFwdFail(c, rs) ==
+    /\ clusterState[c] \in ActiveStates \ {"AIS"}
+    /\ writerMode[c][rs] = "SYNC"
+    /\ hdfsAvailable[Peer(c)] = FALSE
+    /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+
+---------------------------------------------------------------------------
+
+(*
+ * CAS failure during SYNC_AND_FWD re-degradation:
+ * SYNC_AND_FWD → DEAD.
+ *
+ * Same CAS failure pattern as WriterToStoreFwdFail but from
+ * SYNC_AND_FWD mode. If RS is in SYNC_AND_FWD, the cluster is
+ * already ANIS (not AIS), so another RS or the S&F heartbeat
+ * may have bumped the ZK version.
+ *
+ * Source: SyncAndForwardModeImpl.onFailure() L66-78 catch block
+ *         → abort()
+ *)
+WriterSyncFwdToStoreFwdFail(c, rs) ==
+    /\ clusterState[c] \in ActiveStates
+    /\ writerMode[c][rs] = "SYNC_AND_FWD"
+    /\ hdfsAvailable[Peer(c)] = FALSE
+    /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+
+---------------------------------------------------------------------------
+
+(*
+ * CAS failure during init degradation: INIT → DEAD.
+ *
+ * RS starts up, SyncModeImpl.onEnter() fails (HDFS unavailable),
+ * updateModeOnFailure → SyncModeImpl.onFailure() → CAS write
+ * fails → abort(). Same CAS race as WriterToStoreFwdFail but
+ * from the INIT state during startup.
+ *
+ * Guard: clusterState[c] /= "AIS" — same rationale: another RS
+ * must have already bumped the version for CAS to fail.
+ *
+ * Source: SyncModeImpl.onFailure() L61-74 via
+ *         LogEventHandler.initializeMode() failure path
+ *)
+WriterInitToStoreFwdFail(c, rs) ==
+    /\ clusterState[c] \in ActiveStates \ {"AIS"}
+    /\ writerMode[c][rs] = "INIT"
+    /\ hdfsAvailable[Peer(c)] = FALSE
+    /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ============================================================================

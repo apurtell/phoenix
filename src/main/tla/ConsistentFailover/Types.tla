@@ -18,7 +18,7 @@
  *   RoleOf(state)     — maps an HAGroupState to its ClusterRole
  *   ActiveRoles       — the set of roles considered "active" (role-level)
  *   Peer(c)           — returns the other cluster in a 2-cluster model
- *   WriterMode        — the 4 replication writer modes (per-RS)
+ *   WriterMode        — the 5 replication writer modes (per-RS)
  *   AntiFlapGateOpen  — countdown timer helper: wait elapsed
  *   AntiFlapGateClosed — countdown timer helper: wait in progress
  *   DecrementTimer    — countdown timer helper: advance one tick
@@ -138,7 +138,7 @@ ActiveRoles == {"ACTIVE"}
 
 (* Replication writer mode definitions *)
 
-\* The 4 replication writer modes from ReplicationLogGroup.java.
+\* The 5 replication writer modes from ReplicationLogGroup.java.
 \* Each RegionServer on the active cluster maintains one of these modes.
 \*
 \*   Modeled value      | Java class
@@ -148,9 +148,12 @@ ActiveRoles == {"ACTIVE"}
 \*   "STORE_AND_FWD"    | StoreAndForwardModeImpl — writing locally
 \*   "SYNC_AND_FWD"     | SyncAndForwardModeImpl — draining local queue
 \*                      |   while also writing synchronously
+\*   "DEAD"             | RS aborted (logGroup.abort()) — writer halted,
+\*                      |   awaiting process supervisor restart
 \*
-\* Source: ReplicationLogGroup.java mode classes
-WriterMode == {"INIT", "SYNC", "STORE_AND_FWD", "SYNC_AND_FWD"}
+\* Source: ReplicationLogGroup.java mode classes;
+\*         SyncModeImpl.onFailure() L61-74 (CAS failure → abort)
+WriterMode == {"INIT", "SYNC", "STORE_AND_FWD", "SYNC_AND_FWD", "DEAD"}
 
 ---------------------------------------------------------------------------
 
@@ -210,11 +213,9 @@ AllowedTransitions ==
       \* Abort auto-completion transitions.
       \* Source: L115, L119, L121
       <<"AbTAIS", "AIS">>,
-      \* AbTAIS -> ANIS: NOT in the current implementation's transition
-      \* table. Added per the recommended fix in
-      \* PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md (HDFS failure during
-      \* abort produces S&F writers that cannot self-correct while in
-      \* AbTAIS because AbTAIS->ANIS is rejected by isTransitionAllowed).
+      \* AbTAIS -> ANIS: needed so HDFS failure during abort can
+      \* route to ANIS (S&F writers cannot self-correct while in
+      \* AbTAIS without this transition).
       <<"AbTAIS", "ANIS">>,
       <<"AbTANIS", "ANIS">>,
       <<"AbTS", "S">>,

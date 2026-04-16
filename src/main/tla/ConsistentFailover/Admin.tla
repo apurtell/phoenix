@@ -44,8 +44,8 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
  *
  * Source: initiateFailoverOnActiveCluster() L375-400 checks current
  *         state and selects AIS -> ATS or ANIS -> ANISTS.
- *         Peer-state guard: planned fix using
- *         getHAGroupStoreRecordFromPeer() (HAGroupStoreClient L421).
+ *         Peer-state guard: getHAGroupStoreRecordFromPeer()
+ *         (HAGroupStoreClient L421).
  *)
 AdminStartFailover(c) ==
     /\ clusterState[c] = "AIS"
