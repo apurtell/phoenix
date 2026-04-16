@@ -49,7 +49,7 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
 
 ---------------------------------------------------------------------------
 
@@ -74,7 +74,7 @@ PeerReactToATS(c) ==
     /\ clusterState[Peer(c)] = "ATS"
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "STA"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ---------------------------------------------------------------------------
 
@@ -96,11 +96,11 @@ PeerReactToANIS(c) ==
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "S"
        /\ clusterState' = [clusterState EXCEPT ![c] = "DS"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ---------------------------------------------------------------------------
 
@@ -121,7 +121,7 @@ PeerReactToAbTS(c) ==
     /\ clusterState[Peer(c)] = "AbTS"
     /\ clusterState[c] = "ATS"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ---------------------------------------------------------------------------
 
@@ -156,15 +156,16 @@ PeerReactToAbTS(c) ==
 AutoComplete(c) ==
     \/ /\ clusterState[c] = "AbTS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
     \/ /\ clusterState[c] = "AbTAIS"
        /\ clusterState' = [clusterState EXCEPT ![c] =
               IF outDirEmpty[c] /\ \A rs \in RS : writerMode[c][rs] \in {"INIT", "SYNC"}
               THEN "AIS"
               ELSE "ANIS"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
     \/ /\ clusterState[c] = "AbTANIS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
+       /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
        /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
@@ -185,7 +186,7 @@ AutoComplete(c) ==
 StandbyBecomesActive(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ---------------------------------------------------------------------------
 
@@ -214,35 +215,68 @@ PeerReactToAIS(c) ==
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "DS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+
+---------------------------------------------------------------------------
+
+(*
+ * ANIS self-transition (heartbeat): refreshes the anti-flapping
+ * countdown timer without changing cluster state.
+ *
+ * The S&F heartbeat runs while at least one RS is in STORE_AND_FWD
+ * mode. It periodically re-writes ANIS to the ZK znode, which
+ * refreshes mtime. In the countdown timer model, this resets the
+ * timer to StartAntiFlapWait, keeping the anti-flapping gate closed.
+ *
+ * The heartbeat stops when the last RS exits STORE_AND_FWD (enters
+ * SYNC_AND_FWD). At that point the timer begins counting down via
+ * Tick, and the gate opens when it reaches 0.
+ *
+ * Source: StoreAndForwardModeImpl.startHAGroupStoreUpdateTask()
+ *         L71-87; HAGroupStoreRecord.java L101 (ANIS self-transition).
+ *)
+ANISHeartbeat(c) ==
+    /\ clusterState[c] = "ANIS"
+    /\ \E rs \in RS : writerMode[c][rs] = "STORE_AND_FWD"
+    /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable>>
 
 ---------------------------------------------------------------------------
 
 (*
  * Recovery: ANIS → AIS.
  *
- * When all RS on the cluster have returned to SYNC and the OUT
- * directory is empty, the cluster recovers from ANIS to AIS.
+ * When all RS on the cluster are in SYNC or SYNC_AND_FWD, the OUT
+ * directory is empty, and the anti-flapping gate has opened
+ * (countdown timer reached 0), the cluster recovers from ANIS to AIS.
  *
- * The guard `\A rs \in RS : writerMode[c][rs] = "SYNC"` is a sound
- * over-approximation for Iteration 7. In the implementation, the
- * anti-flapping gate (Iteration 8) implicitly ensures all RS have
- * left S&F. When the anti-flapping gate is added, the guard may
- * be relaxed to include SYNC_AND_FWD with an atomic transition of
- * remaining SYNC_AND_FWD RS to SYNC (modeling the ACTIVE_IN_SYNC
- * ZK event).
+ * The writer guard is relaxed from the Iteration 7 strict
+ * `\A rs : writerMode[c][rs] = "SYNC"` to include SYNC_AND_FWD.
+ * This is safe because the anti-flapping gate ensures all RS have
+ * exited S&F (the heartbeat stops, and WaitTimeForSync ticks must
+ * elapse) before this action fires. Any remaining SYNC_AND_FWD RS
+ * are atomically transitioned to SYNC, modeling the ACTIVE_IN_SYNC
+ * ZK event at ReplicationLogDiscoveryForwarder.init() L113-123.
+ *
+ * The AISImpliesInSync invariant verifies that AIS is only reached
+ * with all RS in SYNC or INIT.
  *
  * Source: setHAGroupStatusToSync() L341-355, after forwarder drain.
  *)
 ANISToAIS(c) ==
     /\ clusterState[c] = "ANIS"
-    /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
+    /\ AntiFlapGateOpen(antiFlapTimer[c])
+    /\ \A rs \in RS : writerMode[c][rs] \in {"SYNC", "SYNC_AND_FWD"}
     /\ outDirEmpty[c]
     /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+    /\ writerMode' = [writerMode EXCEPT ![c] =
+            [rs \in RS |-> IF writerMode[c][rs] = "SYNC_AND_FWD"
+                           THEN "SYNC"
+                           ELSE writerMode[c][rs]]]
+    /\ UNCHANGED <<outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ============================================================================

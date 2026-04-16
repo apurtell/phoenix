@@ -34,7 +34,7 @@ The plan is organized as an iterative series of increasingly detailed TLA+ modul
 | `lastRoundInSync` | Standby in-memory | Frozen during degraded periods |
 | `lastRoundProcessed` | Standby in-memory | Advances continuously during replay |
 | `failoverPending` | Standby in-memory | Set by `STANDBY_TO_ACTIVE` listener |
-| `zkMtime` | ZK znode metadata | Last modification time; used for anti-flapping gate |
+| `antiFlapTimer` | Per-cluster in-memory | Countdown timer (Lamport CHARME 2005); gate opens at 0 |
 
 ### 2.3 Communication Channels
 
@@ -396,7 +396,7 @@ Admin.tla                       (operator-initiated actions: start/abort failove
 Writer.tla                      (replication writer mode state machine, per-RS)
 Reader.tla                      (replication reader/replay state machine)
 HDFS.tla                        (HDFS availability incident actions: HDFSDown, HDFSUp)
-Clock.tla                       (logical clock: ClockTick)
+Clock.tla                       (countdown timer: Tick — Lamport CHARME 2005)
 RS.tla                          (RegionServer lifecycle: RSCrash, RSRestart)
 ZK.tla                          (ZooKeeper coordination: ZKDisconnect, ZKReconnect, ZKSessionExpiry, ZKSessionRecover, ZKDisconnectRS)
 ConsistentFailover.tla          (root orchestrator: variables, Init, Next, Fairness, invariants, Symmetry)
@@ -415,20 +415,20 @@ ConsistentFailover-liveness.cfg (liveness TLC config — no symmetry, ad hoc)
 | `Admin.tla` | Iteration 3 | `AdminStartFailover`, `AdminAbortFailover` |
 | `Writer.tla` | Iteration 5 | Writer mode actions (`WriterInit`, `WriterToStoreFwd`, etc.) |
 | `HDFS.tla` | Iteration 6 | `HDFSDown`, `HDFSUp` |
-| `Clock.tla` | Iteration 8 | `ClockTick` |
+| `Clock.tla` | Iteration 8 | `Tick` (countdown timer) |
 | `RS.tla` | Iteration 12 | `RSCrash`, `RSRestart` |
 | `ZK.tla` | Iteration 13 | `ZKDisconnect`, `ZKReconnect`, `ZKSessionExpiry`, `ZKSessionRecover`, `ZKDisconnectRS` |
 | `Reader.tla` | Iteration 10 | Replay state machine actions |
 
 ### 5.2 Model Verification
 
-TLC runs are executed on `buildbox.aws` (128 cores). In the early phases, exhaustive model checking is used exclusively — it provides complete coverage and the state spaces are small enough for timely completion. Simulation mode will be introduced later once state spaces grow too large for exhaustive search within a reasonable time budget.
+TLC runs are executed locally. In the early phases, exhaustive model checking is used exclusively — it provides complete coverage and the state spaces are small enough for timely completion. Simulation mode will be introduced later once state spaces grow too large for exhaustive search within a reasonable time budget.
 
-| Config | Mode | Symmetry | Model | Where | Role | Time |
-|--------|------|----------|-------|-------|------|------|
-| `ConsistentFailover.cfg` | Exhaustive BFS | Yes | 2c/2rs | `buildbox.aws` | Every iteration | target ≤1 hr |
-| `ConsistentFailover-liveness.cfg` | Exhaustive BFS | No | 2c/2rs | `buildbox.aws` | Ad hoc | 1 hr |
-| `ConsistentFailover-sim.cfg` | Simulation | No | 2c/3rs | `buildbox.aws` | When needed | varies |
+| Config | Mode | Symmetry | Model | Role | Time |
+|--------|------|----------|-------|------|------|
+| `ConsistentFailover.cfg` | Exhaustive BFS | Yes | 2c/2rs | Every iteration | target ≤1 hr |
+| `ConsistentFailover-liveness.cfg` | Exhaustive BFS | No | 2c/2rs | Ad hoc | 1 hr |
+| `ConsistentFailover-sim.cfg` | Simulation | No | 2c/3rs | When needed | varies |
 
 where `c` = clusters, `rs` = region servers per cluster.
 
@@ -436,7 +436,7 @@ where `c` = clusters, `rs` = region servers per cluster.
 
 The simulation config is reserved for later phases when exhaustive search becomes intractable. It will not be used in the early phases unless exhaustive runs exceed the 1-hour time budget.
 
-SANY syntax checking is performed locally in the Cursor environment before staging files to the remote server (see §6 for the full procedure).
+SANY syntax checking is performed locally in the Cursor environment before running TLC (see §6 for the full procedure).
 
 ### 5.3 Abstraction Decisions
 
@@ -448,7 +448,7 @@ SANY syntax checking is performed locally in the Cursor environment before stagi
 | Auto-completion transitions | **Concrete** | AbTS→S, AbTAIS→AIS, AbTANIS→ANIS are part of the protocol |
 | Writer mode state machine | **Concrete** | SYNC/S&F/SYNC&FWD mode changes drive cluster state transitions |
 | Replay state machine (SM6) | **Concrete** | Implementation-only but critical for NoDataLoss verification |
-| Anti-flapping protocol | **Concrete** (abstract timing) | Modeled via logical clock + threshold guard; no real-time |
+| Anti-flapping protocol | **Concrete** (abstract timing) | Modeled via Lamport countdown timer (CHARME 2005); no absolute clock or real-time |
 | ZK session lifecycle | **Core Protocol** | ZK sessions can disconnect, expire, and recover. Session state (`zkPeerConnected`, `zkPeerSessionAlive`) is always part of the model. Peer-reactive transitions are guarded on session liveness. See §2.4. |
 | ZK watcher delivery | **Core Protocol** | Conditional delivery modeled via TLC interleaving (arbitrary delay) plus three permanent failure modes always in the model: (1) retry exhaustion (2 retries, then lost), (2) session expiry (all watches lost), (3) disconnection (transient). No polling fallback exists. Curator PathChildrenCache provides eventual delivery on reconnection only. |
 | ZK optimistic locking | **Core Protocol** | Version-based CAS (`setData().withVersion()`) modeled as non-deterministic choice among concurrent updaters; version numbers introduced in Iteration 9. |
@@ -468,7 +468,7 @@ SANY syntax checking is performed locally in the Cursor environment before stagi
 | Number of RS per cluster | **Parameterized** | 2 for exhaustive (with RS symmetry reduction), 3 for simulation (no symmetry); races between RS matter |
 | Degraded standby sub-states | **Implementation** (single DS) | Follow implementation's collapsed `DEGRADED_STANDBY`; design's DSFW/DSFR/DS intentionally removed for simplicity |
 | Non-atomic failover | **Concrete** | Critical modeling point: two separate ZK writes, not one atomic step |
-| ANIS self-transition | **Concrete** | Heartbeat that refreshes `zkMtime`; essential for anti-flapping |
+| ANIS self-transition | **Concrete** | Heartbeat that resets `antiFlapTimer` to `StartAntiFlapWait`; essential for anti-flapping |
 | Failover time measurement | **Assumption** | Failover time = client I/O loss to standby active, not admin command to completion. Anti-flapping waits on ANISTS→ATS do not add to client downtime. |
 
 ### 5.4 TLA+ Style Guide
@@ -538,39 +538,22 @@ All local `java` commands in this document (SANY syntax checks, etc.) must use t
 JAVA17=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java
 ```
 
-The remote server (`buildbox.aws`) has Java 17 as its default `java`, so no path override is needed there.
-
 ### Tool Locations
 
-TLA+ tool jars are available in the workspace root:
-
-```
-/Users/apurtell/src/phoenix/tla2tools.jar
-/Users/apurtell/src/phoenix/CommunityModules-deps.jar
-/Users/apurtell/src/phoenix/tlaplus-formatter.jar
-```
-
-Canonical copies also exist in the Cursor extension directory:
+TLA+ tool jars are available in the Cursor extension directory:
 
 ```
 ~/.cursor/extensions/tlaplus.vscode-ide-2026.4.61936-universal/tools/tla2tools.jar
 ~/.cursor/extensions/tlaplus.vscode-ide-2026.4.61936-universal/tools/CommunityModules-deps.jar
 ```
 
-### Execution Environments
+### Execution Environment
 
-Two execution environments are available:
+All TLC model checking is performed locally on the Cursor host (macOS). Use `-workers auto` to take advantage of all available cores.
 
-| Environment | Machine | Cores | Use For |
-|-------------|---------|-------|---------|
-| **Local** | Cursor host (macOS) | varies | SANY syntax checking, small exhaustive runs (Phase 1) |
-| **Remote** | `buildbox.aws` | 128 | All exhaustive and simulation TLC runs |
+### Local: SANY Syntax Check
 
-The `apurtell` principal has passwordless SSH access to `buildbox.aws`. All TLC model checking beyond trivial syntax checks should be executed on the remote server to take advantage of 128-core parallelism.
-
-### Local: SANY Syntax Check Only
-
-Use the local environment for fast syntax checking during iterative development (Step 3 of the per-iteration workflow). SANY parses the spec and reports errors without running the model checker.
+Use SANY for fast syntax checking during iterative development (Step 3 of the per-iteration workflow). SANY parses the spec and reports errors without running the model checker.
 
 ```bash
 cd /Users/apurtell/src/phoenix
@@ -578,41 +561,25 @@ JAVA17=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java
 $JAVA17 -cp tla2tools.jar tla2sany.SANY ConsistentFailover.tla
 ```
 
-This completes in under a second and catches all parse errors before committing to a remote TLC run.
+This completes in under a second and catches all parse errors before running TLC.
 
-### Remote: TLC Execution on buildbox.aws
+### Local: TLC Execution
 
-All TLC runs (exhaustive, simulation, liveness) are executed on the 128-core remote server. The workflow is: stage files → run TLC → retrieve results.
-
-#### Step 1: Stage spec and tools to remote server
-
-Create a per-iteration working directory on the remote server and copy everything needed:
-
-```bash
-ITER="iter01"
-REMOTE_DIR="/tmp/tla-phoenix/$ITER"
-
-ssh buildbox.aws "mkdir -p $REMOTE_DIR"
-
-rsync -az *.tla *.cfg \
-  tla2tools.jar CommunityModules-deps.jar \
-  buildbox.aws:$REMOTE_DIR/
-```
-
-The wildcard `*.tla` picks up all modules (`Types.tla`, `ConsistentFailover.tla`, and any sub-modules like `HAGroupStore.tla`, `Admin.tla`, etc.).
-
-#### Step 2: Run TLC on the remote server
-
-Launch TLC via SSH. Output is captured to a log file on the remote server. Use `nohup` to survive SSH disconnects on long runs.
+All TLC runs (exhaustive, simulation, liveness) are executed locally. Output is captured to a log file for later analysis.
 
 **Exhaustive check** (with symmetry reduction, per-iteration — run to completion):
 
 ```bash
-ssh buildbox.aws "cd $REMOTE_DIR && nohup java -XX:+UseParallelGC \
+cd /Users/apurtell/src/phoenix
+JAVA17=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java
+ITER="iter01"
+mkdir -p results/$ITER
+
+$JAVA17 -XX:+UseParallelGC \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover.cfg \
   -workers auto -cleanup \
-  > tlc-exhaustive.log 2>&1 &"
+  2>&1 | tee results/$ITER/tlc-exhaustive.log
 ```
 
 The `ConsistentFailover.cfg` includes a `SYMMETRY` declaration for RS permutations, which significantly reduces the state space for exhaustive BFS.
@@ -620,12 +587,12 @@ The `ConsistentFailover.cfg` includes a `SYMMETRY` declaration for RS permutatio
 **Simulation** (no symmetry, for later phases when exhaustive is intractable):
 
 ```bash
-ssh buildbox.aws "cd $REMOTE_DIR && nohup java -XX:+UseParallelGC \
+$JAVA17 -XX:+UseParallelGC \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   -Dtlc2.TLC.stopAfter=300 \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-sim.cfg \
   -simulate -workers auto \
-  > tlc-sim-300s.log 2>&1 &"
+  2>&1 | tee results/$ITER/tlc-sim-300s.log
 ```
 
 Adjust `-Dtlc2.TLC.stopAfter` for longer runs (900s, 14400s, 86400s). No `SYMMETRY` in the simulation config — it provides no benefit for random trace sampling.
@@ -633,42 +600,14 @@ Adjust `-Dtlc2.TLC.stopAfter` for longer runs (900s, 14400s, 86400s). No `SYMMET
 **Liveness check** (no symmetry — incompatible with `SYMMETRY` in TLC):
 
 ```bash
-ssh buildbox.aws "cd $REMOTE_DIR && nohup java -XX:+UseParallelGC \
+$JAVA17 -XX:+UseParallelGC \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-liveness.cfg \
   -workers auto -cleanup \
-  > tlc-liveness.log 2>&1 &"
+  2>&1 | tee results/$ITER/tlc-liveness.log
 ```
 
-#### Step 3: Monitor progress
-
-Check whether TLC is still running and tail the log:
-
-```bash
-ssh buildbox.aws "ps aux | grep '[t]lc2.TLC' | head -5"
-ssh buildbox.aws "tail -20 $REMOTE_DIR/tlc-exhaustive.log"
-```
-
-For long-running checks, look for the completion summary:
-
-```bash
-ssh buildbox.aws "grep -E '(No error|Invariant .* is violated|distinct states)' $REMOTE_DIR/tlc-exhaustive.log"
-```
-
-#### Step 4: Retrieve results
-
-After TLC completes, retrieve the log and any counterexample traces:
-
-```bash
-mkdir -p results/$ITER
-scp "buildbox.aws:$REMOTE_DIR/tlc-*.log" results/$ITER/
-scp "buildbox.aws:$REMOTE_DIR/MC*.out" results/$ITER/ 2>/dev/null
-scp "buildbox.aws:$REMOTE_DIR/*.dump" results/$ITER/ 2>/dev/null
-```
-
-TLC writes counterexample traces to files named `MC.out` or `MC_TE_*.out` in the working directory. These are plain-text files containing the step-by-step state trace that violated an invariant.
-
-#### Step 5: Analyze results
+### Analyze Results
 
 Check the log for the outcome:
 
@@ -688,22 +627,16 @@ Each iteration's Step 4 (RUN TLC) from §10.2 follows this sequence:
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│ LOCAL: Edit spec in Cursor                                            │
+│ Edit spec in Cursor                                                   │
 ├───────────────────────────────────────────────────────────────────────┤
-│ LOCAL: SANY syntax check ($JAVA17 -cp tla2tools.jar tla2sany.SANY ...)│
-│        Fix parse errors. Repeat until clean.                          │
+│ SANY syntax check ($JAVA17 -cp tla2tools.jar tla2sany.SANY ...)      │
+│ Fix parse errors. Repeat until clean.                                 │
 ├───────────────────────────────────────────────────────────────────────┤
-│ REMOTE: rsync spec + tools to buildbox.aws:/tmp/tla-phoenix/$ITER     │
+│ Run TLC locally (-workers auto, tee to results/$ITER/ log file)       │
+│ Exhaustive in early phases; simulation when needed                    │
 ├───────────────────────────────────────────────────────────────────────┤
-│ REMOTE: ssh buildbox.aws — run TLC (nohup, -workers auto, log file)   │
-│         Exhaustive in early phases; simulation when needed            │
-├───────────────────────────────────────────────────────────────────────┤
-│ REMOTE: Monitor progress (tail log, check process)                    │
-├───────────────────────────────────────────────────────────────────────┤
-│ LOCAL: scp log + counterexample traces back to results/$ITER/         │
-├───────────────────────────────────────────────────────────────────────┤
-│ LOCAL: Analyze results. If violation → triage → fix → repeat.         │
-│        If clean → record stats → update plan → git commit.            │
+│ Analyze results. If violation → triage → fix → repeat.                │
+│ If clean → record stats → update plan → git commit.                   │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -718,7 +651,7 @@ In the early phases, exhaustive model checking runs to completion (no `-Dtlc2.TL
 | Deep | 14400s (4 hr) | `14400` | Milestone verification |
 | Overnight | 86400s (24 hr) | `86400` | High-confidence sweep for rare interleavings |
 
-All simulation durations are wall-clock time. On the 128-core remote server, `-workers auto` will use all available cores, providing ~64× the throughput of a typical developer machine.
+All simulation durations are wall-clock time. `-workers auto` will use all available cores on the local machine.
 
 ---
 
@@ -753,19 +686,19 @@ This process was established during Iteration 7 when TLC found the AbTAIS + HDFS
 
 #### ~~Iteration 1 — Cluster states and valid transitions~~ ✅ COMPLETE
 
-Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`/`TransitionalActiveStates` subsets, 22-pair `AllowedTransitions` table from `HAGroupStoreRecord.java` L99-123 including the `ANIS` self-transition, `ClusterRole` set, `RoleOf` operator, `Peer` helper), `ConsistentFailover.tla` (single `clusterState` variable, `Init` with one cluster `AIS` and the other `S`, `Transition(c)` action with a coordination guard preventing entry to `ACTIVE` role from non-`ACTIVE` when peer is `ACTIVE`, `TypeOK`/`MutualExclusion` invariants, `TransitionValid` action constraint, empty `Symmetry`), and `ConsistentFailover.cfg` (`Cluster = {c1, c2}`). Exhaustive TLC on `buildbox.aws` (128 workers): 108 distinct states, depth 11, all invariants pass, no errors. The coordination guard was required because the per-cluster transition table alone is insufficient for mutual exclusion — `STA→AIS` can fire while the peer is still `AIS` without it; the full peer-reactive guards are formalized in Iteration 3.
+Created `Types.tla` (14-state `HAGroupState` set, `ActiveStates`/`StandbyStates`/`TransitionalActiveStates` subsets, 22-pair `AllowedTransitions` table from `HAGroupStoreRecord.java` L99-123 including the `ANIS` self-transition, `ClusterRole` set, `RoleOf` operator, `Peer` helper), `ConsistentFailover.tla` (single `clusterState` variable, `Init` with one cluster `AIS` and the other `S`, `Transition(c)` action with a coordination guard preventing entry to `ACTIVE` role from non-`ACTIVE` when peer is `ACTIVE`, `TypeOK`/`MutualExclusion` invariants, `TransitionValid` action constraint, empty `Symmetry`), and `ConsistentFailover.cfg` (`Cluster = {c1, c2}`).
 
 #### ~~Iteration 2 — Role mapping and Active-role mutual exclusion~~ ✅ COMPLETE
 
-`ClusterRole` (6-value enum including `UNKNOWN`), `RoleOf` operator, and the `RoleOf`-based `MutualExclusion` invariant were pulled forward into Iteration 1. This iteration added `ActiveRoles == {"ACTIVE"}` role-level subset to `Types.tla`. The `ActiveToStandbyNotActive` static sanity invariant (asserts `RoleOf("ATS") \notin ActiveRoles /\ RoleOf("ANISTS") \notin ActiveRoles`) was initially added but later dropped as a constant-level tautology — `RoleOf` is defined purely over constants, so TLC correctly flags it as redundant. The safety argument it encodes (ATS/ANISTS map to ACTIVE_TO_STANDBY, not ACTIVE) is already exercised by `MutualExclusion` and `NonAtomicFailoverSafe` over reachable states. SANY parse: clean. Expected TLC result: same 108 distinct states, depth 11, all invariants pass.
+`ClusterRole` (6-value enum including `UNKNOWN`), `RoleOf` operator, and the `RoleOf`-based `MutualExclusion` invariant were pulled forward into Iteration 1. This iteration added `ActiveRoles == {"ACTIVE"}` role-level subset to `Types.tla`. The `ActiveToStandbyNotActive` static sanity invariant (asserts `RoleOf("ATS") \notin ActiveRoles /\ RoleOf("ANISTS") \notin ActiveRoles`) was initially added but later dropped as a constant-level tautology — `RoleOf` is defined purely over constants, so TLC correctly flags it as redundant. The safety argument it encodes (ATS/ANISTS map to ACTIVE_TO_STANDBY, not ACTIVE) is already exercised by `MutualExclusion` and `NonAtomicFailoverSafe` over reachable states.
 
 #### ~~Iteration 3 — Peer-reactive transitions (FailoverManagementListener)~~ ✅ COMPLETE
 
-Created `HAGroupStore.tla` (peer-reactive actions for ATS/ANIS/AbTS plus auto-complete actions AbTS→S, AbTAIS→AIS, AbTANIS→ANIS) and `Admin.tla` (AIS→ATS, STA→AbTS with appropriate guards). Refactored `ConsistentFailover.tla` to use actor-driven disjuncts via `INSTANCE` instead of non-deterministic `Transition(c)`; added `AbortSafety` invariant. `PeerReactToAIS` deferred to Iteration 4. TLC: 7 states, depth 6, all invariants pass (smaller than Iteration 1-2's 108 states since only the failover-initiation-and-abort cycle is reachable).
+Created `HAGroupStore.tla` (peer-reactive actions for ATS/ANIS/AbTS plus auto-complete actions AbTS→S, AbTAIS→AIS, AbTANIS→ANIS) and `Admin.tla` (AIS→ATS, STA→AbTS with appropriate guards). Refactored `ConsistentFailover.tla` to use actor-driven disjuncts via `INSTANCE` instead of non-deterministic `Transition(c)`; added `AbortSafety` invariant.
 
 #### ~~Iteration 4 — Non-atomic failover: two-step final transition~~ ✅ COMPLETE
 
-Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-deterministic placeholder; full reader guards deferred to Iteration 11) and peer-reactive `PeerReactToAIS(c)` (ATS→S, DS→S). Add `NonAtomicFailoverSafe` invariant: during the AIS/ATS window, `RoleOf(ATS) ∉ ActiveRoles`. TLC found a bug: admin can re-failover during the window producing irrecoverable (ATS,ATS); fix is a peer-state guard on `AdminStartFailover` (see Appendix A.15, `PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md`). With fix: 17 states, depth 10, all invariants pass. **Tautology note (Iteration 7):** `NonAtomicFailoverSafe` was identified as a definitional tautology — its antecedent fixes `clusterState[c1] = "ATS"`, making `RoleOf("ATS") = "ACTIVE_TO_STANDBY" ∉ ActiveRoles` a constant-level truth. The safety argument is already verified by `MutualExclusion`. Kept for documentation; annotated in `ConsistentFailover.tla`.
+Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-deterministic placeholder; full reader guards deferred to Iteration 11) and peer-reactive `PeerReactToAIS(c)` (ATS→S, DS→S). Add `NonAtomicFailoverSafe` invariant: during the AIS/ATS window, `RoleOf(ATS) ∉ ActiveRoles`. TLC found a bug: admin can re-failover during the window producing irrecoverable (ATS,ATS); fix is a peer-state guard on `AdminStartFailover` (see Appendix A.15).
 
 ---
 
@@ -773,46 +706,23 @@ Decompose failover into local `StandbyBecomesActive(c)` (STA→AIS, non-determin
 
 #### ~~Iteration 5 — Writer mode state machine (per-RS)~~ ✅ COMPLETE
 
-Created `Writer.tla` (7 per-RS actions for the 4-mode writer state machine from §3.2; all leave `clusterState` unchanged — coupling deferred to Iterations 6-7). Added `RS` constant and `WriterMode` to `Types.tla`. Wired into `ConsistentFailover.tla` (`writerMode` variable, `writer == INSTANCE Writer`, `WriterTypeOK`/`WriterTransitionValid`, `Symmetry == Permutations(RS)`). Added `UNCHANGED writerMode` to all `HAGroupStore.tla`/`Admin.tla` actions. TLC exhaustive: 2,176 distinct states, depth 18, all invariants pass.
+Created `Writer.tla` (7 per-RS actions for the 4-mode writer state machine from §3.2; all leave `clusterState` unchanged — coupling deferred to Iterations 6-7). Added `RS` constant and `WriterMode` to `Types.tla`. Wired into `ConsistentFailover.tla` (`writerMode` variable, `writer == INSTANCE Writer`, `WriterTypeOK`/`WriterTransitionValid`, `Symmetry == Permutations(RS)`). Added `UNCHANGED writerMode` to all `HAGroupStore.tla`/`Admin.tla` actions.
 
 #### ~~Iteration 6 — HDFS directory predicates and writer-cluster coupling~~ ✅ COMPLETE
 
-Created `HDFS.tla` (`HDFSDown`/`HDFSUp`; atomic RS degradation via `CanDegradeToStoreFwd`). Added `outDirEmpty`/`hdfsAvailable` variables, `AIStoATSPrecondition` action constraint. TLC: 3,337 states, depth 24, all pass. Note: `AIStoATSPrecondition` is tautological (re-verifies guards); Iter 7 adds `AISImpliesInSync` as the non-tautological state-level replacement.
+Created `HDFS.tla` (`HDFSDown`/`HDFSUp`; atomic RS degradation via `CanDegradeToStoreFwd`). Added `outDirEmpty`/`hdfsAvailable` variables, `AIStoATSPrecondition` action constraint. TLC: 3,337 states, depth 24, all pass.
 
 #### ~~Iteration 7 — Writer triggers cluster state change~~ ✅ COMPLETE
 
-Active-cluster guards on all writer actions, AIS→ANIS coupling on `HDFSDown`/`WriterInitToStoreFwd`, `ANISToAIS(c)` recovery (anti-flapping deferred to Iter 8), conditional `AutoComplete(AbTAIS)`. New invariants: `AISImpliesInSync`, `NoAISWithSFWriter`, `WriterClusterConsistency`. TLC: 225 states (−93%), depth 24, all pass. Found implementation bug: missing `AbTAIS→ANIS` transition (Appendix A.17); model assumes fix.
+Active-cluster guards on all writer actions, AIS→ANIS coupling on `HDFSDown`/`WriterInitToStoreFwd`, `ANISToAIS(c)` recovery (anti-flapping deferred to Iter 8), conditional `AutoComplete(AbTAIS)`. New invariants: `AISImpliesInSync`, `NoAISWithSFWriter`, `WriterClusterConsistency`. Found implementation bug: missing `AbTAIS→ANIS` transition (Appendix A.17); model assumes fix.
 
 ---
 
 ### Phase 3: Anti-Flapping and Timing
 
-#### Iteration 8 — Logical clock and anti-flapping gate
+#### ~~Iteration 8 — Anti-flapping gate (countdown timer)~~ ✅ COMPLETE
 
-**Modules created:** `Clock.tla`.
-**Modules modified:** `Types.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Types.tla`:
-- Constant: `WaitTimeForSync ∈ Nat` (models `1.1 × ZK_SESSION_TIMEOUT`).
-- Constant: `MaxClock ∈ Nat` (bound for TLC tractability).
-
-`Clock.tla`:
-- `ClockTick` action: non-deterministically increments `clock`.
-
-`HAGroupStore.tla`:
-- ANIS self-transition (heartbeat): `ANISHeartbeat(c)` refreshes `zkMtime[c] = clock` without changing `clusterState[c]`.
-- Guard on `ANIS → AIS`: `clock - zkMtime[c] ≥ WaitTimeForSync`.
-
-`ConsistentFailover.tla`:
-- Variables: `clock ∈ Nat`, `zkMtime ∈ [Cluster → Nat]`.
-- `AntiFlapGate` action constraint: `ANIS → AIS` transition never fires when `clock - zkMtime[c] < WaitTimeForSync`.
-- State constraint: `clock ≤ MaxClock`.
-
-**Expected TLC result:** Anti-flapping mechanism prevents rapid ANIS↔AIS oscillation. State space grows with clock dimension.
-
-**Iteration 7 forward note:** `ANISToAIS` (added in Iteration 7) uses guard `\A rs \in RS : writerMode[c][rs] = "SYNC"` as a sound over-approximation. When the anti-flapping gate is added in this iteration, the guard may be relaxed to `\A rs \in RS : writerMode[c][rs] \in {"SYNC", "SYNC_AND_FWD"}` because the S&F heartbeat (which blocks the anti-flapping gate) stops when the RS exits S&F, not when it exits SYNC_AND_FWD. If relaxed, `ANISToAIS` should atomically transition remaining SYNC_AND_FWD RS to SYNC (modeling the `ACTIVE_IN_SYNC` ZK event at `ReplicationLogDiscoveryForwarder.init()` L113-123). `AISImpliesInSync` (added in Iteration 7) verifies that AIS is only reached with all RS in SYNC/INIT, so it will catch any mismatch.
+Per-cluster `antiFlapTimer` countdown variable (Lamport, "Real Time is Really Simple", CHARME 2005 §2) with `WaitTimeForSync` constant and four named helpers in `Types.tla`. Created `Clock.tla` (`Tick`). `ANISHeartbeat(c)` resets timer while any RS in S&F; `ANISToAIS(c)` guarded by `AntiFlapGateOpen`, writer guard relaxed to `{"SYNC","SYNC_AND_FWD"}` with atomic SYNC_AND_FWD→SYNC. Timer initialized on every ANIS entry (`AutoComplete`, `WriterInitToStoreFwd`, `HDFSDown`). New `AntiFlapTimerTypeOK` invariant, `AntiFlapGate` action constraint.
 
 #### Iteration 9 — RS-level ZK races (optimistic locking)
 
@@ -1197,21 +1107,17 @@ Each iteration follows a fixed loop:
 
 1. **CODE ANALYSIS** — Before writing TLA+, analyze the relevant implementation code paths for this iteration's scope. Ground the model in the actual implementation behavior. At the end of each iteration, compare the model against the implementation to identify gaps where the code diverges from the correct protocol. These gaps are the findings.
 2. **WRITE / EDIT** — Add or modify spec per the iteration's scope (see Section 7 for iteration descriptions). All editing is done locally in Cursor.
-3. **SYNTAX CHECK (local)** — Parse with SANY on the local machine. Fix all parse errors before proceeding to remote execution.
+3. **SYNTAX CHECK** — Parse with SANY on the local machine. Fix all parse errors before running TLC.
    ```
    cd /Users/apurtell/src/phoenix
    JAVA17=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java
    $JAVA17 -cp tla2tools.jar tla2sany.SANY ConsistentFailover.tla
    ```
    This completes in under a second. Repeat steps 2–3 until clean.
-4. **RUN TLC (remote on buildbox.aws)** — Stage files and run TLC on the 128-core remote server. Follow the procedure in §6 "Remote: TLC Execution on buildbox.aws":
-   a. `rsync` spec files + tool jars to `buildbox.aws:/tmp/tla-phoenix/$ITER`.
-   b. `ssh buildbox.aws` — launch TLC with `nohup`, output to log file.
-   c. Monitor progress via `ssh` + `tail`.
-   d. `scp` log files and any counterexample traces back to `results/$ITER/`. In early phases, run exhaustive only (`ConsistentFailover.cfg`, 2c/2rs). Switch to simulation (`ConsistentFailover-sim.cfg`) once state spaces grow too large for exhaustive search to complete within ~1 hour.
-5. **TRIAGE** — If TLC reports violations, retrieve the counterexample trace from the remote log file, classify per §10.3. Repeat from step 2 or 4 as needed.
+4. **RUN TLC** — Run TLC locally. Follow the procedure in §6 "Local: TLC Execution". Output is captured to `results/$ITER/` via `tee`. In early phases, run exhaustive only (`ConsistentFailover.cfg`, 2c/2rs). Switch to simulation (`ConsistentFailover-sim.cfg`) once state spaces grow too large for exhaustive search to complete within ~1 hour.
+5. **TRIAGE** — If TLC reports violations, examine the counterexample trace in the log file, classify per §10.3. Repeat from step 2 or 4 as needed.
 6. **REGRESSION CHECK** — Re-verify all invariants and properties from prior iterations. A fix in iteration N must not break any invariant proven in iterations 1 through N-1. The primary and simulation configs provide this coverage automatically at every iteration.
-7. **RECORD** — Document the TLC result, configuration, state count, and any findings. Include the remote log file path for traceability.
+7. **RECORD** — Document the TLC result, configuration, state count, and any findings. Include the log file path for traceability.
 8. **UPDATE PLAN** — Mark the iteration complete in this plan document (Section 7). Append `✅ COMPLETE` to the iteration heading, convert the "What to add" description to past tense ("What was added"), and add TLC result stats.
 9. **GIT COMMIT** — Commit the successful spec files, configuration, updated plan document, and iteration record to version control. The commit message must identify the iteration number and summarize the outcome (clean pass or legitimate finding).
 
@@ -1275,7 +1181,7 @@ The design does not document any self-transition for the `ACTIVE_NOT_IN_SYNC` st
 
 The heartbeat is essential for the anti-flapping mechanism (§3.6): while the heartbeat keeps refreshing `mtime`, the `ANIS → AIS` gate (`mtime + 1.1 × ZK_SESSION_TIMEOUT ≤ current_time`) is never satisfied. The gate only opens after the heartbeat stops, i.e., after the RS exits `STORE_AND_FORWARD` mode.
 
-The TLA+ model includes this as a stuttering action `ANISHeartbeat(c)` in Iteration 8 that updates `zkMtime[c]` without changing `clusterState[c]`.
+The TLA+ model includes this as a stuttering action `ANISHeartbeat(c)` in Iteration 8 that resets `antiFlapTimer[c]` to `StartAntiFlapWait` without changing `clusterState[c]`.
 
 ### A.6 Default Initial States (Updated)
 
@@ -1313,7 +1219,7 @@ The design states that mutation capture occurs in pre-batch hooks "before any lo
 
 The design specifies a heartbeat interval of `N/2` (where `N = zookeeper.session.timeout × 1.1`) with a default ZK session timeout of 60 seconds, yielding a heartbeat of ~33 seconds and a wait gate of ~66 seconds (`state-machines.md` §6). The implementation uses different multipliers: the heartbeat interval is `0.7 × ZK_SESSION_TIMEOUT` (`StoreAndForwardModeImpl.java` L46: `HA_GROUP_STORE_UPDATE_MULTIPLIER = 0.7`) and the wait gate is `1.1 × ZK_SESSION_TIMEOUT` (`HAGroupStoreClient.java` L98: `ZK_SESSION_TIMEOUT_MULTIPLIER = 1.1`). The default ZK session timeout is also different: 90 seconds instead of 60 seconds. With the implementation defaults, the heartbeat fires every ~63 seconds and the wait gate requires ~99 seconds of silence.
 
-The TLA+ model abstracts both variants behind a logical clock with a `WaitTimeForSync` threshold constant, introduced in Iteration 8. The specific multiplier values do not affect protocol safety — only the relationship between the heartbeat interval and the wait threshold matters.
+The TLA+ model abstracts both variants behind a Lamport countdown timer ("Real Time is Really Simple", CHARME 2005) with a `WaitTimeForSync` constant, introduced in Iteration 8. The timer counts down from `WaitTimeForSync` to 0, and the anti-flapping gate opens when the timer reaches 0. The specific multiplier values do not affect protocol safety — only the relationship between the heartbeat interval and the wait threshold matters.
 
 ### A.11 DEGRADED_STANDBY → STANDBY_TO_ACTIVE (Resolved)
 

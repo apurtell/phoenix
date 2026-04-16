@@ -22,10 +22,11 @@
  * cover arbitrary delivery delay (safety verification is sound).
  *
  * Sub-modules:
- *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - Admin.tla: operator-initiated failover/abort
- *   - Writer.tla: per-RS replication writer mode state machine
+ *   - Clock.tla: anti-flapping countdown timer (Tick action)
+ *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - HDFS.tla: HDFS availability incident actions
+ *   - Writer.tla: per-RS replication writer mode state machine
  *
  * Implementation traceability:
  *
@@ -62,6 +63,12 @@
  *                           |   detected via IOException)
  *   HDFSDown/HDFSUp         | NameNode crash/recovery incidents;
  *                           |   SyncModeImpl.onFailure() L61-74
+ *   antiFlapTimer           | Countdown timer (Lamport CHARME 2005);
+ *                           |   models validateTransitionAndGetWait-
+ *                           |   Time() L1027-1046 anti-flapping gate
+ *   Tick                    | Passage of wall-clock time
+ *   ANISHeartbeat           | StoreAndForwardModeImpl
+ *                           |   .startHAGroupStoreUpdateTask() L71-87
  *)
 EXTENDS Types
 
@@ -99,8 +106,21 @@ VARIABLE outDirEmpty
 \* reactively via IOException from HDFS write operations.
 VARIABLE hdfsAvailable
 
+\* antiFlapTimer[c] is the per-cluster anti-flapping countdown timer.
+\* Counts down from WaitTimeForSync toward 0. The ANIS -> AIS
+\* transition is blocked while the timer is positive (gate closed).
+\* The S&F heartbeat resets the timer to WaitTimeForSync; the Tick
+\* action decrements it. See Types.tla for helper operator docs.
+\*
+\* Modeled via Lamport's countdown timer pattern from "Real Time
+\* is Really Simple" (CHARME 2005).
+\*
+\* Source: HAGroupStoreClient.validateTransitionAndGetWaitTime()
+\*         L1027-1046
+VARIABLE antiFlapTimer
+
 \* Tuple of all variables for use in temporal formulas.
-vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable>>
+vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ---------------------------------------------------------------------------
 
@@ -117,6 +137,9 @@ writer == INSTANCE Writer
 
 \* HDFS availability incident actions.
 hdfs == INSTANCE HDFS
+
+\* Anti-flapping countdown timer.
+clk == INSTANCE Clock
 
 ---------------------------------------------------------------------------
 
@@ -137,6 +160,7 @@ Init ==
        /\ writerMode = [c \in Cluster |-> [rs \in RS |-> "INIT"]]
        /\ outDirEmpty = [c \in Cluster |-> TRUE]
        /\ hdfsAvailable = [c \in Cluster |-> TRUE]
+       /\ antiFlapTimer = [c \in Cluster |-> 0]
 
 ---------------------------------------------------------------------------
 
@@ -161,7 +185,9 @@ Init ==
  * actual trigger conditions.
  *)
 Next ==
-    \E c \in Cluster :
+    \* [Timer] Anti-flapping countdown timer tick (global).
+    \/ clk!Tick
+    \/ \E c \in Cluster :
         \* [ZK watcher] Peer-reactive: standby detects peer ATS.
         \/ haGroupStore!PeerReactToATS(c)
         \* [ZK watcher] Peer-reactive: cluster detects peer ANIS.
@@ -174,7 +200,9 @@ Next ==
         \/ haGroupStore!StandbyBecomesActive(c)
         \* [ZK watcher] Peer-reactive: cluster detects peer AIS.
         \/ haGroupStore!PeerReactToAIS(c)
-        \* [Writer-driven] All RS synced + OUT empty: ANIS->AIS.
+        \* [S&F heartbeat] ANIS self-transition: resets anti-flap timer.
+        \/ haGroupStore!ANISHeartbeat(c)
+        \* [Writer-driven] All RS synced + OUT empty + gate open: ANIS->AIS.
         \/ haGroupStore!ANISToAIS(c)
         \* [Direct ZK write] Admin initiates failover: AIS->ATS.
         \/ admin!AdminStartFailover(c)
@@ -219,6 +247,12 @@ OutDirTypeOK ==
 \* HDFS availability is a boolean per cluster.
 HDFSTypeOK ==
     hdfsAvailable \in [Cluster -> BOOLEAN]
+
+\* Anti-flapping countdown timer is in 0..WaitTimeForSync per cluster.
+\* Bounded by construction: StartAntiFlapWait sets the max value,
+\* DecrementTimer floors at 0.
+AntiFlapTimerTypeOK ==
+    antiFlapTimer \in [Cluster -> 0..WaitTimeForSync]
 
 ---------------------------------------------------------------------------
 
@@ -366,6 +400,22 @@ AIStoATSPrecondition ==
 ---------------------------------------------------------------------------
 
 (*
+ * Anti-flapping gate: ANIS → AIS never fires while the countdown
+ * timer is still running. This is a cross-check on the ANISToAIS
+ * action's AntiFlapGateOpen guard, analogous to how AIStoATS-
+ * Precondition cross-checks AdminStartFailover.
+ *
+ * Source: HAGroupStoreClient.validateTransitionAndGetWaitTime()
+ *         L1027-1046
+ *)
+AntiFlapGate ==
+    \A c \in Cluster :
+        clusterState[c] = "ANIS" /\ clusterState'[c] = "AIS"
+        => AntiFlapGateOpen(antiFlapTimer[c])
+
+---------------------------------------------------------------------------
+
+(*
  * AIS implies in-sync: whenever a cluster is in AIS, the OUT
  * directory must be empty and all RS must be in SYNC or INIT.
  *
@@ -459,5 +509,8 @@ THEOREM Spec => []NoAISWithSFWriter
 
 \* Safety: degraded writer modes only on degraded-active clusters.
 THEOREM Spec => []WriterClusterConsistency
+
+\* Safety: anti-flapping timer is bounded by WaitTimeForSync.
+THEOREM Spec => []AntiFlapTimerTypeOK
 
 ============================================================================

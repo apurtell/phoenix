@@ -35,7 +35,7 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
 
 ---------------------------------------------------------------------------
 
@@ -80,6 +80,9 @@ HDFSDown(c) ==
     /\ clusterState' = IF clusterState[Peer(c)] = "AIS"
                         THEN [clusterState EXCEPT ![Peer(c)] = "ANIS"]
                         ELSE clusterState
+    /\ antiFlapTimer' = IF clusterState[Peer(c)] = "AIS"
+                         THEN [antiFlapTimer EXCEPT ![Peer(c)] = StartAntiFlapWait]
+                         ELSE antiFlapTimer
 
 ---------------------------------------------------------------------------
 
@@ -100,6 +103,6 @@ HDFSDown(c) ==
 HDFSUp(c) ==
     /\ hdfsAvailable[c] = FALSE
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty>>
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer>>
 
 ============================================================================

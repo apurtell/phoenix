@@ -19,6 +19,10 @@
  *   ActiveRoles       — the set of roles considered "active" (role-level)
  *   Peer(c)           — returns the other cluster in a 2-cluster model
  *   WriterMode        — the 4 replication writer modes (per-RS)
+ *   AntiFlapGateOpen  — countdown timer helper: wait elapsed
+ *   AntiFlapGateClosed — countdown timer helper: wait in progress
+ *   DecrementTimer    — countdown timer helper: advance one tick
+ *   StartAntiFlapWait — countdown timer helper: initial/reset value
  *
  * Implementation traceability:
  *
@@ -53,6 +57,19 @@ CONSTANTS RS
 
 \* RS set must be non-empty.
 ASSUME RS # {}
+
+\* The anti-flapping wait threshold in logical time ticks.
+\* Models 1.1 × ZK_SESSION_TIMEOUT (see Appendix A.10).
+\* The specific multiplier does not affect protocol safety — only the
+\* relationship between the heartbeat interval and the wait threshold
+\* matters.
+\*
+\* Source: HAGroupStoreClient.java L98 — ZK_SESSION_TIMEOUT_MULTIPLIER = 1.1
+CONSTANTS WaitTimeForSync
+
+\* WaitTimeForSync must be a positive natural number.
+ASSUME WaitTimeForSync \in Nat
+ASSUME WaitTimeForSync > 0
 
 ---------------------------------------------------------------------------
 
@@ -148,8 +165,7 @@ WriterMode == {"INIT", "SYNC", "STORE_AND_FWD", "SYNC_AND_FWD"}
 \* periodic heartbeat in StoreAndForwardModeImpl (L71-87) that
 \* refreshes zkMtime without changing the state value.
 \*
-\* Source: HAGroupStoreRecord.java L99-123 (verified against
-\*         PHOENIX-7562-feature-new branch HEAD 5a9e2d50c9)
+\* Source: HAGroupStoreRecord.java L99-123
 AllowedTransitions ==
     {
       \* ANIS can stay in ANIS (heartbeat), return to AIS (recovery),
@@ -242,5 +258,44 @@ RoleOf(state) ==
 \* Returns the peer cluster in a 2-cluster model.
 \* Precondition: c \in Cluster and |Cluster| = 2.
 Peer(c) == CHOOSE p \in Cluster : p # c
+
+---------------------------------------------------------------------------
+
+(* Anti-flapping countdown timer helpers *)
+
+\* The anti-flapping mechanism uses a per-cluster countdown timer
+\* following the pattern from Lamport, "Real Time is Really Simple"
+\* (CHARME 2005, Section 2). Each cluster's timer counts DOWN from
+\* WaitTimeForSync toward 0. The timer does NOT represent a clock
+\* running backwards — it represents a waiting period expiring:
+\*
+\*   WaitTimeForSync ... 2 ... 1 ... 0
+\*   |---- gate closed (waiting) ----|  gate open (transition allowed)
+\*
+\* The S&F heartbeat resets the timer to WaitTimeForSync, keeping the
+\* gate closed. When the heartbeat stops (all RS exit STORE_AND_FWD),
+\* the Tick action counts the timer down to 0, opening the gate and
+\* allowing ANIS -> AIS.
+\*
+\* Source: HAGroupStoreClient.validateTransitionAndGetWaitTime()
+\*         L1027-1046; StoreAndForwardModeImpl.startHAGroupStoreUpdate-
+\*         Task() L71-87.
+
+\* TRUE when the anti-flapping wait period has fully elapsed.
+\* The guarded transition (ANIS -> AIS) may proceed.
+AntiFlapGateOpen(t) == t = 0
+
+\* TRUE when the anti-flapping wait is still in progress.
+\* The guarded transition is blocked; time must elapse before
+\* the gate opens.
+AntiFlapGateClosed(t) == t > 0
+
+\* Advance the countdown timer one tick toward 0 (floor at 0).
+\* Used by the Tick action to model the passage of time.
+DecrementTimer(t) == IF t > 0 THEN t - 1 ELSE 0
+
+\* The value that starts (or restarts) the anti-flapping wait.
+\* Used when a cluster enters ANIS or when the S&F heartbeat fires.
+StartAntiFlapWait == WaitTimeForSync
 
 ============================================================================

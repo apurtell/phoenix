@@ -18,7 +18,7 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
 
 ---------------------------------------------------------------------------
 
@@ -53,7 +53,7 @@ AdminStartFailover(c) ==
     /\ outDirEmpty[c]
     /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ---------------------------------------------------------------------------
 
@@ -74,6 +74,6 @@ AdminStartFailover(c) ==
 AdminAbortFailover(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
 
 ============================================================================
