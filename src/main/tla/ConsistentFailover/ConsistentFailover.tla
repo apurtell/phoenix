@@ -16,8 +16,7 @@
  * completion transitions depend on ZooKeeper watcher notification
  * chains (peerPathChildrenCache for peer detection, pathChildrenCache
  * for local auto-completion). ZK does NOT formally guarantee
- * unconditional delivery (see ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md
- * and Appendix A.16). In this model, peer-reactive actions fire
+ * unconditional delivery. In this model, peer-reactive actions fire
  * whenever their guard is satisfied. TLC's interleaving semantics
  * cover arbitrary delivery delay (safety verification is sound).
  *
@@ -26,6 +25,7 @@
  *   - Clock.tla: anti-flapping countdown timer (Tick action)
  *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - HDFS.tla: HDFS availability incident actions
+ *   - Reader.tla: standby-side replication replay state machine
  *   - RS.tla: RS lifecycle (restart after abort)
  *   - Writer.tla: per-RS replication writer mode state machine
  *
@@ -70,6 +70,17 @@
  *   Tick                    | Passage of wall-clock time
  *   ANISHeartbeat           | StoreAndForwardModeImpl
  *                           |   .startHAGroupStoreUpdateTask() L71-87
+ *   replayState             | ReplicationLogDiscoveryReplay replay state
+ *                           |   (NOT_INITIALIZED/SYNC/DEGRADED/
+ *                           |   SYNCED_RECOVERY)
+ *   lastRoundInSync         | ReplicationLogDiscoveryReplay L336-343
+ *   lastRoundProcessed      | ReplicationLogDiscoveryReplay L336-351
+ *   failoverPending         | ReplicationLogDiscoveryReplay L159-171
+ *   inProgressDirEmpty      | ReplicationLogDiscoveryReplay L500-533
+ *   ReplayAdvance           | replay() L336-343 (SYNC round processing)
+ *   ReplayDetectDegraded    | degradedListener L136-145
+ *   ReplayDetectRecovery    | recoveryListener L147-157
+ *   ReplayRewind            | replay() L323-333 (CAS to SYNC)
  *)
 EXTENDS Types
 
@@ -120,8 +131,51 @@ VARIABLE hdfsAvailable
 \*         L1027-1046
 VARIABLE antiFlapTimer
 
+\* replayState[c] is the current replication replay state of
+\* cluster c's reader. Tracks the standby-side replay progress
+\* through four states: NOT_INITIALIZED, SYNC, DEGRADED,
+\* SYNCED_RECOVERY.
+\*
+\* Source: ReplicationLogDiscoveryReplay.java L550-555
+VARIABLE replayState
+
+\* lastRoundInSync[c] is the last replication round number that
+\* was processed while the reader was in SYNC state. Frozen during
+\* DEGRADED periods; used as the rewind target during recovery.
+\*
+\* Source: ReplicationLogDiscoveryReplay.java L336-343 (advance),
+\*         L389 (rewind target via getFirstRoundToProcess())
+VARIABLE lastRoundInSync
+
+\* lastRoundProcessed[c] is the last replication round number
+\* processed by the reader, regardless of replay state. Advances
+\* in both SYNC and DEGRADED states; rewinds to lastRoundInSync
+\* during SYNCED_RECOVERY.
+\*
+\* Source: ReplicationLogDiscoveryReplay.java L336-351
+VARIABLE lastRoundProcessed
+
+\* failoverPending[c] is TRUE when the standby cluster has received
+\* a STANDBY_TO_ACTIVE notification and is waiting for replay to
+\* complete before triggering failover. Set by the STA listener;
+\* cleared by ABORT_TO_STANDBY listener.
+\*
+\* Source: ReplicationLogDiscoveryReplay.java L159-171 (set true),
+\*         L173-185 (set false)
+VARIABLE failoverPending
+
+\* inProgressDirEmpty[c] is TRUE when the IN-PROGRESS directory on
+\* cluster c contains no partially-processed replication log files.
+\* Required for failover trigger completeness.
+\*
+\* Source: ReplicationLogDiscoveryReplay.shouldTriggerFailover()
+\*         L500-533
+VARIABLE inProgressDirEmpty
+
 \* Tuple of all variables for use in temporal formulas.
-vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+          replayState, lastRoundInSync, lastRoundProcessed,
+          failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -145,6 +199,9 @@ rs == INSTANCE RS
 \* Anti-flapping countdown timer.
 clk == INSTANCE Clock
 
+\* Replication replay state machine (standby-side reader).
+reader == INSTANCE Reader
+
 ---------------------------------------------------------------------------
 
 (* Initial state *)
@@ -153,8 +210,6 @@ clk == INSTANCE Clock
 \* and the other in standby (S). The choice of which cluster is
 \* active is deterministic: CHOOSE picks an arbitrary but fixed
 \* element of Cluster as the initial active.
-\*
-\* Source: PHOENIX_HA_TLA_PLAN.md Appendix A.6.
 Init ==
     \* Deterministically assign one cluster to AIS and the other to S.
     \* CHOOSE x \in Cluster : TRUE picks an arbitrary fixed cluster.
@@ -165,6 +220,11 @@ Init ==
        /\ outDirEmpty = [c \in Cluster |-> TRUE]
        /\ hdfsAvailable = [c \in Cluster |-> TRUE]
        /\ antiFlapTimer = [c \in Cluster |-> 0]
+       /\ replayState = [c \in Cluster |-> "NOT_INITIALIZED"]
+       /\ lastRoundInSync = [c \in Cluster |-> 0]
+       /\ lastRoundProcessed = [c \in Cluster |-> 0]
+       /\ failoverPending = [c \in Cluster |-> FALSE]
+       /\ inProgressDirEmpty = [c \in Cluster |-> TRUE]
 
 ---------------------------------------------------------------------------
 
@@ -217,6 +277,11 @@ Next ==
         \* HDFS NameNode crash/recovery incidents.
         \/ hdfs!HDFSDown(c)
         \/ hdfs!HDFSUp(c)
+        \* Standby-side replay state machine (reader).
+        \/ reader!ReplayAdvance(c)
+        \/ reader!ReplayDetectDegraded(c)
+        \/ reader!ReplayDetectRecovery(c)
+        \/ reader!ReplayRewind(c)
         \* Per-RS writer mode transitions and RS lifecycle.
         \/ \E r \in RS :
             \* Writer startup.
@@ -241,8 +306,7 @@ Next ==
 (* Specification *)
 
 \* Safety specification: initial state, followed by zero or more
-\* Next steps (or stuttering). No fairness yet — this is a
-\* safety-only model.
+\* Next steps (or stuttering). Safety-only model (no fairness).
 Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
@@ -270,6 +334,15 @@ HDFSTypeOK ==
 \* DecrementTimer floors at 0.
 AntiFlapTimerTypeOK ==
     antiFlapTimer \in [Cluster -> 0..WaitTimeForSync]
+
+\* Replay state, round counters, and failover/IN-progress flags are
+\* well-typed per cluster.
+ReplayTypeOK ==
+    /\ replayState \in [Cluster -> ReplayStateSet]
+    /\ lastRoundInSync \in [Cluster -> Nat]
+    /\ lastRoundProcessed \in [Cluster -> Nat]
+    /\ failoverPending \in [Cluster -> BOOLEAN]
+    /\ inProgressDirEmpty \in [Cluster -> BOOLEAN]
 
 ---------------------------------------------------------------------------
 
@@ -368,7 +441,7 @@ TransitionValid ==
  * Every writer mode change follows the allowed writer transitions.
  * Action constraint checked by TLC analogous to TransitionValid.
  *
- * Source: ReplicationLogGroup.java mode transitions (see §3.2).
+ * Source: ReplicationLogGroup.java mode transitions.
  *)
 AllowedWriterTransitions ==
     {
@@ -432,6 +505,31 @@ AntiFlapGate ==
 ---------------------------------------------------------------------------
 
 (*
+ * Every replay state change follows the allowed replay transitions.
+ * Action constraint checked by TLC analogous to TransitionValid
+ * and WriterTransitionValid.
+ *
+ * Source: ReplicationLogDiscoveryReplay.java L131-206 (listeners),
+ *         L323-333 (CAS), L336-351 (replay loop)
+ *)
+AllowedReplayTransitions ==
+    {
+      <<"NOT_INITIALIZED", "SYNCED_RECOVERY">>,
+      <<"NOT_INITIALIZED", "DEGRADED">>,
+      <<"SYNC", "DEGRADED">>,
+      <<"DEGRADED", "SYNCED_RECOVERY">>,
+      <<"SYNCED_RECOVERY", "SYNC">>,
+      <<"SYNCED_RECOVERY", "DEGRADED">>
+    }
+
+ReplayTransitionValid ==
+    \A c \in Cluster :
+        replayState'[c] # replayState[c] =>
+            <<replayState[c], replayState'[c]>> \in AllowedReplayTransitions
+
+---------------------------------------------------------------------------
+
+(*
  * AIS implies in-sync: whenever a cluster is in AIS, the OUT
  * directory must be empty and all RS must be in SYNC or INIT.
  *
@@ -487,6 +585,16 @@ WriterClusterConsistency ==
 
 ---------------------------------------------------------------------------
 
+(* State constraint *)
+
+\* Bound replay counters for exhaustive search tractability.
+\* The abstract counter values only matter relationally
+\* (lastRoundProcessed >= lastRoundInSync), so small bounds suffice.
+ReplayCounterBound ==
+    \A c \in Cluster : lastRoundProcessed[c] <= 3
+
+---------------------------------------------------------------------------
+
 (* Symmetry *)
 
 \* RS identifiers are interchangeable (all start in INIT, identical
@@ -529,5 +637,8 @@ THEOREM Spec => []WriterClusterConsistency
 
 \* Safety: anti-flapping timer is bounded by WaitTimeForSync.
 THEOREM Spec => []AntiFlapTimerTypeOK
+
+\* Safety: replay state, counters, and flags are well-typed.
+THEOREM Spec => []ReplayTypeOK
 
 ============================================================================

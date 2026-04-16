@@ -53,7 +53,9 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+         replayState, lastRoundInSync, lastRoundProcessed,
+         failoverPending, inProgressDirEmpty
 
 ---------------------------------------------------------------------------
 
@@ -85,7 +87,9 @@ WriterInit(c, rs) ==
     /\ clusterState[c] \in ActiveStates
     /\ writerMode[c][rs] = "INIT"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -111,7 +115,8 @@ WriterInitToStoreFwd(c, rs) ==
     /\ antiFlapTimer' = IF clusterState[c] = "AIS"
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
-    /\ UNCHANGED hdfsAvailable
+    /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
+                   lastRoundProcessed, failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -129,7 +134,9 @@ WriterSyncToSyncFwd(c, rs) ==
     /\ clusterState[c] = "ANIS"
     /\ writerMode[c][rs] = "SYNC"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC_AND_FWD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -151,7 +158,9 @@ WriterStoreFwdToSyncFwd(c, rs) ==
     /\ writerMode[c][rs] = "STORE_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = TRUE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC_AND_FWD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -171,7 +180,9 @@ WriterSyncFwdToSync(c, rs) ==
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -202,7 +213,8 @@ WriterToStoreFwd(c, rs) ==
     /\ antiFlapTimer' = IF clusterState[c] = "AIS"
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
-    /\ UNCHANGED hdfsAvailable
+    /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
+                   lastRoundProcessed, failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -225,7 +237,9 @@ WriterSyncFwdToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -251,7 +265,9 @@ WriterToStoreFwdFail(c, rs) ==
     /\ writerMode[c][rs] = "SYNC"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -272,7 +288,9 @@ WriterSyncFwdToStoreFwdFail(c, rs) ==
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -295,6 +313,8 @@ WriterInitToStoreFwdFail(c, rs) ==
     /\ writerMode[c][rs] = "INIT"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================

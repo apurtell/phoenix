@@ -19,6 +19,7 @@
  *   ActiveRoles       — the set of roles considered "active" (role-level)
  *   Peer(c)           — returns the other cluster in a 2-cluster model
  *   WriterMode        — the 5 replication writer modes (per-RS)
+ *   ReplayStateSet    — the 4 replication replay states (standby reader)
  *   AntiFlapGateOpen  — countdown timer helper: wait elapsed
  *   AntiFlapGateClosed — countdown timer helper: wait in progress
  *   DecrementTimer    — countdown timer helper: advance one tick
@@ -34,6 +35,7 @@
  *   RoleOf                 | HAGroupState.getClusterRole() (L73-97)
  *   ANIS self-transition   | HAGroupStoreRecord L101 (heartbeat support)
  *   WriterMode             | ReplicationLogGroup mode (SYNC/S&F/S&FWD)
+ *   ReplayStateSet         | ReplicationLogDiscoveryReplay replay state
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -59,11 +61,6 @@ CONSTANTS RS
 ASSUME RS # {}
 
 \* The anti-flapping wait threshold in logical time ticks.
-\* Models 1.1 × ZK_SESSION_TIMEOUT (see Appendix A.10).
-\* The specific multiplier does not affect protocol safety — only the
-\* relationship between the heartbeat interval and the wait threshold
-\* matters.
-\*
 \* Source: HAGroupStoreClient.java L98 — ZK_SESSION_TIMEOUT_MULTIPLIER = 1.1
 CONSTANTS WaitTimeForSync
 
@@ -157,6 +154,26 @@ WriterMode == {"INIT", "SYNC", "STORE_AND_FWD", "SYNC_AND_FWD", "DEAD"}
 
 ---------------------------------------------------------------------------
 
+(* Replication replay state definitions *)
+
+\* The 4 replication replay states from ReplicationLogDiscoveryReplay.java.
+\* The standby cluster's reader maintains one of these states per HA group.
+\*
+\*   Modeled value        | Meaning
+\*   --------------------+----------------------------------------------
+\*   "NOT_INITIALIZED"   | Pre-init; reader has not started
+\*   "SYNC"              | Fully in sync; lastRoundProcessed and
+\*                       |   lastRoundInSync advance together
+\*   "DEGRADED"          | Active peer in ANIS; lastRoundProcessed
+\*                       |   advances, lastRoundInSync frozen
+\*   "SYNCED_RECOVERY"   | Active returned to AIS; replay rewinds
+\*                       |   lastRoundProcessed to lastRoundInSync
+\*
+\* Source: ReplicationLogDiscoveryReplay.java L550-555
+ReplayStateSet == {"NOT_INITIALIZED", "SYNC", "DEGRADED", "SYNCED_RECOVERY"}
+
+---------------------------------------------------------------------------
+
 (* Allowed transitions *)
 
 \* The set of valid (from, to) state transition pairs.
@@ -202,9 +219,9 @@ AllowedTransitions ==
       <<"STA", "AbTS">>,
       <<"STA", "AIS">>,
       \* DS can recover to S or begin failover (STA).
-      \* DS -> STA was added to support ANIS failover path where
+      \* DS -> STA supports the ANIS failover path where the
       \* standby is in DEGRADED_STANDBY when failover proceeds.
-      \* Source: L117 (updated per Appendix A.11)
+      \* Source: L117
       <<"DS", "S">>,
       <<"DS", "STA">>,
       \* AWOP returns to ANIS when peer comes back.

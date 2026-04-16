@@ -21,7 +21,9 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+         replayState, lastRoundInSync, lastRoundProcessed,
+         failoverPending, inProgressDirEmpty
 
 ---------------------------------------------------------------------------
 
@@ -41,6 +43,8 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
 RSRestart(c, rs) ==
     /\ writerMode[c][rs] = "DEAD"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "INIT"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================

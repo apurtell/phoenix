@@ -732,29 +732,9 @@ Decomposed atomic `HDFSDown` into per-RS degradation: `HDFSDown(c)` now only set
 
 ### Phase 4: Replication Reader and Replay
 
-#### Iteration 10 — Replay state machine
+#### ~~Iteration 10 — Replay state machine~~ ✅ COMPLETE
 
-**Modules created:** `Reader.tla`.
-**Modules modified:** `Types.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Types.tla`:
-- `ReplayStateSet == {NOT_INITIALIZED, SYNC, DEGRADED, SYNCED_RECOVERY}`.
-
-`Reader.tla`:
-- `EXTENDS Types`.
-- Declares all shared variables as `VARIABLE`.
-- Actions: `ReplayAdvance(c)`, `ReplayDetectDegraded(c)`, `ReplayDetectRecovery(c)`, `ReplayRewind(c)`.
-- Key behavior: In SYNCED_RECOVERY, `lastRoundProcessed` resets to `lastRoundInSync` before transitioning to SYNC.
-
-`ConsistentFailover.tla`:
-- Variables: `replayState ∈ [Cluster → ReplayStateSet]`, `lastRoundInSync ∈ [Cluster → Nat]`, `lastRoundProcessed ∈ [Cluster → Nat]`, `failoverPending ∈ [Cluster → BOOLEAN]`, `inProgressDirEmpty ∈ [Cluster → BOOLEAN]`.
-- Init: `∀ c: replayState[c] = NOT_INITIALIZED`.
-- `reader == INSTANCE Reader`.
-- Add reader action disjuncts to `Next`.
-
-**Expected TLC result:** Replay state machine runs independently of cluster state (coupling added in next iteration).
+Created `Reader.tla` (4 per-cluster replay actions: `ReplayAdvance`, `ReplayDetectDegraded`, `ReplayDetectRecovery`, `ReplayRewind`; standby-side guards on `StandbyStates`/`"S"`/`"DS"`; CAS semantics for `SYNCED_RECOVERY→SYNC` modeled via TLC interleaving with concurrent `ReplayDetectDegraded`). Added `ReplayStateSet` to `Types.tla`. Added 5 variables to `ConsistentFailover.tla` (`replayState`, `lastRoundInSync`, `lastRoundProcessed`, `failoverPending`, `inProgressDirEmpty`), `reader == INSTANCE Reader`, `ReplayTypeOK` invariant, `AllowedReplayTransitions`/`ReplayTransitionValid` action constraint, `ReplayCounterBound` state constraint (counters ≤ 3).
 
 #### Iteration 11 — Failover trigger and replay-cluster coupling
 

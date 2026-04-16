@@ -25,7 +25,9 @@
  *)
 EXTENDS Types
 
-VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable
+VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable,
+         replayState, lastRoundInSync, lastRoundProcessed,
+         failoverPending, inProgressDirEmpty
 
 ---------------------------------------------------------------------------
 
@@ -40,6 +42,8 @@ VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable
 Tick ==
     /\ \E c \in Cluster : AntiFlapGateClosed(antiFlapTimer[c])
     /\ antiFlapTimer' = [c \in Cluster |-> DecrementTimer(antiFlapTimer[c])]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================

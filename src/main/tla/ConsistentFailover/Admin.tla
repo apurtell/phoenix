@@ -18,7 +18,9 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+         replayState, lastRoundInSync, lastRoundProcessed,
+         failoverPending, inProgressDirEmpty
 
 ---------------------------------------------------------------------------
 
@@ -39,8 +41,7 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
  * The peer-state guard prevents initiating a new failover during
  * the non-atomic window of a previous failover (where the peer
  * may still be in ATS). Without this guard, the admin could
- * produce an irrecoverable (ATS, ATS) deadlock. See
- * PHOENIX_HA_BUG_DUAL_ATS_DEADLOCK.md and Appendix A.15.
+ * produce an irrecoverable (ATS, ATS) deadlock.
  *
  * Source: initiateFailoverOnActiveCluster() L375-400 checks current
  *         state and selects AIS -> ATS or ANIS -> ANISTS.
@@ -53,7 +54,9 @@ AdminStartFailover(c) ==
     /\ outDirEmpty[c]
     /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -74,6 +77,8 @@ AdminStartFailover(c) ==
 AdminAbortFailover(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================

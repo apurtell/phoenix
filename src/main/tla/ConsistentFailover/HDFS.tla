@@ -27,7 +27,9 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+         replayState, lastRoundInSync, lastRoundProcessed,
+         failoverPending, inProgressDirEmpty
 
 ---------------------------------------------------------------------------
 
@@ -57,7 +59,9 @@ HDFSDown(c) ==
     /\ hdfsAvailable[c] = TRUE
     /\ clusterState[Peer(c)] \in ActiveStates
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -78,6 +82,8 @@ HDFSDown(c) ==
 HDFSUp(c) ==
     /\ hdfsAvailable[c] = FALSE
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer>>
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================

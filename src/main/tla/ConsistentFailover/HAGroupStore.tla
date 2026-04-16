@@ -12,8 +12,7 @@
  * AutoComplete actions depend on ZooKeeper watcher notification
  * chains for delivery. ZK does NOT formally guarantee unconditional
  * delivery — delivery requires an active ZK session and an
- * established TCP connection (see ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md
- * and PHOENIX_HA_TLA_PLAN.md Appendix A.16).
+ * established TCP connection.
  *
  * PeerReact* and AutoComplete actions fire whenever their guard is
  * satisfied. TLC's interleaving semantics already cover arbitrary
@@ -49,7 +48,9 @@
  *)
 EXTENDS Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer
+VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+         replayState, lastRoundInSync, lastRoundProcessed,
+         failoverPending, inProgressDirEmpty
 
 ---------------------------------------------------------------------------
 
@@ -74,7 +75,9 @@ PeerReactToATS(c) ==
     /\ clusterState[Peer(c)] = "ATS"
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "STA"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -96,11 +99,15 @@ PeerReactToANIS(c) ==
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "S"
        /\ clusterState' = [clusterState EXCEPT ![c] = "DS"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
     \/ /\ clusterState[Peer(c)] = "ANIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -121,7 +128,9 @@ PeerReactToAbTS(c) ==
     /\ clusterState[Peer(c)] = "AbTS"
     /\ clusterState[c] = "ATS"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -148,23 +157,29 @@ PeerReactToAbTS(c) ==
  *
  * Source: createLocalStateTransitions() L140-150
  *   AbTS   -> S    (L144)
- *   AbTAIS -> AIS  (L145) — conditional per bug report fix
+ *   AbTAIS -> AIS or ANIS  (L145) — conditional on writer/outDir state
  *   AbTANIS -> ANIS (L147)
  *)
 AutoComplete(c) ==
     \/ /\ clusterState[c] = "AbTS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
     \/ /\ clusterState[c] = "AbTAIS"
        /\ clusterState' = [clusterState EXCEPT ![c] =
               IF outDirEmpty[c] /\ \A rs \in RS : writerMode[c][rs] \in {"INIT", "SYNC"}
               THEN "AIS"
               ELSE "ANIS"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
     \/ /\ clusterState[c] = "AbTANIS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
        /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -184,7 +199,9 @@ AutoComplete(c) ==
 StandbyBecomesActive(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -213,11 +230,15 @@ PeerReactToAIS(c) ==
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "ATS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
     \/ /\ clusterState[Peer(c)] = "AIS"
        /\ clusterState[c] = "DS"
        /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer>>
+       /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                      replayState, lastRoundInSync, lastRoundProcessed,
+                      failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -241,7 +262,9 @@ ANISHeartbeat(c) ==
     /\ clusterState[c] = "ANIS"
     /\ \E rs \in RS : writerMode[c][rs] = "STORE_AND_FWD"
     /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable>>
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -274,6 +297,8 @@ ANISToAIS(c) ==
             [rs \in RS |-> IF writerMode[c][rs] = "SYNC_AND_FWD"
                            THEN "SYNC"
                            ELSE writerMode[c][rs]]]
-    /\ UNCHANGED <<outDirEmpty, hdfsAvailable, antiFlapTimer>>
+    /\ UNCHANGED <<outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================
