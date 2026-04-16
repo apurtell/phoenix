@@ -416,7 +416,7 @@ ConsistentFailover-liveness.cfg (liveness TLC config — no symmetry, ad hoc)
 | `Writer.tla` | Iteration 5 | Writer mode actions (`WriterInit`, `WriterToStoreFwd`, etc.) |
 | `HDFS.tla` | Iteration 6 | `HDFSDown`, `HDFSUp` |
 | `Clock.tla` | Iteration 8 | `Tick` (countdown timer) |
-| `RS.tla` | Iteration 12 | `RSCrash`, `RSRestart` |
+| `RS.tla` | Iteration 9 | `RSRestart` (Iteration 9); `RSCrash`, `RSAbortOnLocalHDFSFailure`, `rsAlive` (Iteration 12) |
 | `ZK.tla` | Iteration 13 | `ZKDisconnect`, `ZKReconnect`, `ZKSessionExpiry`, `ZKSessionRecover`, `ZKDisconnectRS` |
 | `Reader.tla` | Iteration 10 | Replay state machine actions |
 
@@ -462,7 +462,7 @@ SANY syntax checking is performed locally in the Cursor environment before runni
 | Client-side connections | **Omitted** | Focus on server-side protocol; client role detection is a consequence |
 | Metrics | **Omitted** | Observability, not correctness |
 | Reader lag (DSFR) | **Deferred** (Iteration 8+) | Design sub-state collapsed in implementation; add if needed |
-| Forced failover | **Deferred** (Iteration 17) | Operator escape hatch; model after normal path verified |
+| Forced failover | **Deferred** (Iteration 18) | Operator escape hatch; model after normal path verified |
 | OFFLINE state | **Deferred** (Iteration 16) | Intentional sink state; `--force` bypass modeled as separate action |
 | RS crash/abort | **Concrete** (Phase 3) | Writer fail-stop in S&F is a protocol-relevant failure mode |
 | Number of RS per cluster | **Parameterized** | 2 for exhaustive (with RS symmetry reduction), 3 for simulation (no symmetry); races between RS matter |
@@ -724,21 +724,9 @@ Active-cluster guards on all writer actions, AIS→ANIS coupling on `HDFSDown`/`
 
 Per-cluster `antiFlapTimer` countdown variable (Lamport, "Real Time is Really Simple", CHARME 2005 §2) with `WaitTimeForSync` constant and four named helpers in `Types.tla`. Created `Clock.tla` (`Tick`). `ANISHeartbeat(c)` resets timer while any RS in S&F; `ANISToAIS(c)` guarded by `AntiFlapGateOpen`, writer guard relaxed to `{"SYNC","SYNC_AND_FWD"}` with atomic SYNC_AND_FWD→SYNC. Timer initialized on every ANIS entry (`AutoComplete`, `WriterInitToStoreFwd`, `HDFSDown`). New `AntiFlapTimerTypeOK` invariant, `AntiFlapGate` action constraint.
 
-#### Iteration 9 — RS-level ZK CAS races (observable failure modeling)
+#### ~~Iteration 9 — RS-level ZK CAS races (observable failure modeling)~~ ✅ COMPLETE
 
-**Modules modified:** `Types.tla`, `Writer.tla`, `HDFS.tla`, `ConsistentFailover.tla`.
-**Modules created:** `RS.tla`.
-
-Code inspection of the five `setData().withVersion()` CAS write sites confirmed that `BadVersionException` is fatal only in `SyncModeImpl.onFailure()` (L61-74) and `SyncAndForwardModeImpl.onFailure()` (L66-78), where CAS failure calls `logGroup.abort()` and the RS dies. All other CAS sites (S&F heartbeat, `FailoverManagementListener`, `processNoMoreRoundsLeft`) handle failure benignly.
-
-**What changed:**
-
-- Decomposed atomic `HDFSDown` into per-RS writer degradation actions. `HDFSDown(c)` now only sets `hdfsAvailable[c] = FALSE`. Per-RS degradation is handled by `WriterToStoreFwd(c, rs)` and `WriterSyncFwdToStoreFwd(c, rs)` (previously documented but not wired into Next), now wired as individual per-RS actions that each perform their own ZK CAS write.
-- Added `DEAD` to `WriterMode` in `Types.tla`. Three CAS failure actions (`WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwdFail`, `WriterInitToStoreFwdFail`) non-deterministically transition the writer to `DEAD` instead of `STORE_AND_FWD`, modeling RS abort on `BadVersionException`. CAS failure is guarded on `clusterState[c] /= "AIS"` — the first RS to write always succeeds (no concurrent version bump); failure is only possible after another RS has already bumped the ZK version.
-- Created `RS.tla` with `RSRestart(c, rs)`: `DEAD → INIT`, modeling the process supervisor (Kubernetes/YARN) creating a new RS pod after abort. Closes the abort lifecycle and prevents deadlock. Iteration 12 will extend this with arbitrary crash modeling, `rsAlive` tracking, and local HDFS failure aborts.
-- Updated `AllowedWriterTransitions` with `DEAD` transitions, `WriterClusterConsistency` to allow `DEAD` on degraded clusters.
-
-**Expected TLC result:** Per-RS decomposition increases state space (each RS transitions independently). Safety invariants (`MutualExclusion`, `AISImpliesInSync`, etc.) hold with CAS failure + RS abort + restart modeled.
+Decomposed atomic `HDFSDown` into per-RS degradation: `HDFSDown(c)` now only sets `hdfsAvailable[c] = FALSE`; `WriterToStoreFwd`/`WriterSyncFwdToStoreFwd` wired into `Next` as individual disjuncts with CAS writes; AIS→ANIS coupling moved to `WriterToStoreFwd`. Added `DEAD` to `WriterMode` with three CAS failure actions (→ `DEAD`) modeling RS abort on `BadVersionException`; `WriterToStoreFwdFail`/`WriterInitToStoreFwdFail` guard on `ActiveStates \ {"AIS"}`; `WriterSyncFwdToStoreFwdFail` omits AIS exclusion per `AISImpliesInSync`. Created `RS.tla` (`RSRestart`: `DEAD → INIT`). Updated `AllowedWriterTransitions` and `WriterClusterConsistency` for `DEAD`.
 
 ---
 
@@ -793,8 +781,9 @@ Code inspection of the five `setData().withVersion()` CAS write sites confirmed 
 
 #### Iteration 12 — RS crash (writer fail-stop)
 
-**Modules created:** `RS.tla`.
-**Modules modified:** `Writer.tla`, `ConsistentFailover.tla`.
+**Modules modified:** `RS.tla`, `Writer.tla`, `ConsistentFailover.tla`.
+
+Note: `RS.tla` was created in Iteration 9 with `RSRestart(c, rs)` (`DEAD → INIT`). This iteration extends it with crash modeling and `rsAlive` tracking.
 
 **What to add:**
 
@@ -802,7 +791,7 @@ Code inspection of the five `setData().withVersion()` CAS write sites confirmed 
 - `RSCrash(c, rs)` action: sets `rsAlive[c][rs] = FALSE`, models writer fail-stop in S&F mode (`StoreAndForwardModeImpl.onFailure()`
   → `logGroup.abort()`). Source: `StoreAndForwardModeImpl.java` L116-123.
 - **`RSAbortOnLocalHDFSFailure(c, rs)` action (from HDFS side-tracking audit):** fires when `writerMode[c][rs] = "STORE_AND_FWD" ∧ hdfsAvailable[c] = FALSE`. In STORE_AND_FWD mode, the writer targets the active cluster's own (local/fallback) HDFS. If that HDFS fails, `StoreAndForwardModeImpl.onFailure()` treats the error as fatal and calls `logGroup.abort()`, aborting the RS. This is distinct from `HDFSDown(c)` (which models the *peer's* HDFS failing and degrades writers on the active side): `RSAbortOnLocalHDFSFailure` models the active cluster's *own* HDFS failing while the RS is already in fallback mode. Note: RS in SYNC or SYNC_AND_FWD are not affected by their own cluster's HDFS failure because those modes write to the peer's HDFS. Source: `StoreAndForwardModeImpl.java` L116-123.
-- `RSRestart(c, rs)` action: sets `rsAlive[c][rs] = TRUE`, `writerMode[c][rs] = INIT`. Forwarder resumes draining via `initializeLastRoundProcessed()` which scans existing files.
+- Extend `RSRestart(c, rs)` (already implemented in Iteration 9) to also set `rsAlive[c][rs] = TRUE`. Forwarder resumes draining via `initializeLastRoundProcessed()` which scans existing files.
 
 `Writer.tla`:
 - Guard all writer actions on `rsAlive[c][rs] = TRUE`.
@@ -900,6 +889,12 @@ This iteration introduces the full ZK coordination model as a core part of the p
 - `WriterSyncFwdToSync`: forwarder drain completes during ANISTS.
 - `WriterSyncToSyncFwd`: the `ACTIVE_NOT_IN_SYNC` event may need to include `{"ANIS", "ANISTS"}` since ANISTS is also a degraded-active state.
 
+**WriterSyncFwdToSync refinements (from post-Iteration 9 review):** Two improvements to `WriterSyncFwdToSync(c, rs)` in `Writer.tla`:
+
+1. **Tighten per-RS vs per-cluster semantics.** The current action is parameterized per-RS but sets `outDirEmpty[c] = TRUE` unconditionally, even when another RS on the same cluster is still in `STORE_AND_FWD`. In the implementation, `processNoMoreRoundsLeft()` (`ReplicationLogDiscoveryForwarder.java` L155-184) is a per-cluster forwarder check that examines the global OUT directory — it only fires when the entire OUT directory is empty, not when a single RS finishes. Add a guard: `\A rs2 \in RS : writerMode[c][rs2] \notin {"STORE_AND_FWD"}` to prevent setting `outDirEmpty = TRUE` while any RS is still actively writing to the OUT directory. This is a safe-but-imprecise over-approximation in the current model (no invariant violations possible because `ANISToAIS` independently guards on all RS modes), but tightening it makes the model more faithful to the implementation's forwarder semantics and prevents confusing transient states in counterexample traces.
+
+2. **Add missing HDFS guard.** The current action does not guard on `hdfsAvailable[Peer(c)]`. In the implementation, `processNoMoreRoundsLeft()` can only fire after `processFile()` has successfully copied all remaining files from OUT to the peer's IN directory, which requires the peer's HDFS to be accessible. If the peer's HDFS is down, `processFile()` throws IOException and the forwarder retries — it never reaches `processNoMoreRoundsLeft()`. Add `hdfsAvailable[Peer(c)] = TRUE` as a guard on `WriterSyncFwdToSync`. Source: `ReplicationLogDiscoveryForwarder.processFile()` L133-152 copies to peer HDFS; `processNoMoreRoundsLeft()` L155-184 only fires after all files are forwarded.
+
 ---
 
 ### Phase 7: Implementation Quirk Flags and Design Exploration
@@ -929,7 +924,48 @@ This phase introduces toggle flags for two distinct purposes: (1) **implementati
 
 **Expected TLC result:** With `UseForceQuirk = FALSE`, OFFLINE is a terminal state and `OFFLINESink` holds. With `UseForceQuirk = TRUE`, recovery from OFFLINE is possible and `MutualExclusion` must still hold.
 
-#### Iteration 17 — Forced failover
+#### Iteration 17 — AWOP/ANISWOP peer-reactive modeling (OFFLINE peer detection)
+
+**Modules modified:** `HAGroupStore.tla`, `ConsistentFailover.tla`.
+
+**Implementation status of AWOP/ANISWOP:**
+
+The `ACTIVE_WITH_OFFLINE_PEER` (AWOP) and `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER` (ANISWOP) states exist in the implementation at three levels:
+
+1. **Enum declaration:** Both are declared in `HAGroupStoreRecord.HAGroupState` (L51-65) and map to `ClusterRole.ACTIVE` via `getClusterRole()` (L73-97), meaning `isMutationBlocked()=false` — the active cluster continues serving mutations while its peer is OFFLINE.
+
+2. **Transition table:** The following transitions are in `allowedTransitions` (`HAGroupStoreRecord.java` L99-123):
+   - `AIS → AWOP` (L104: `ACTIVE_IN_SYNC.allowedTransitions` includes `ACTIVE_WITH_OFFLINE_PEER`)
+   - `ANIS → ANISWOP` (L101: `ACTIVE_NOT_IN_SYNC.allowedTransitions` includes `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER`)
+   - `AWOP → ANIS` (L118: `ACTIVE_WITH_OFFLINE_PEER.allowedTransitions = ImmutableSet.of(ACTIVE_NOT_IN_SYNC)`)
+   - `ANISWOP → ANIS` (L122: `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER.allowedTransitions = ImmutableSet.of(ACTIVE_NOT_IN_SYNC)`)
+
+3. **No peer-reactive trigger in FailoverManagementListener:** The `createPeerStateTransitions()` method (`HAGroupStoreManager.java` L104-138) has peer state entries for ATS, AIS, ANIS, and AbTS — but **no entry for OFFLINE**. There is no automatic reactive transition that fires when the active cluster detects its peer has entered OFFLINE. The transitions `AIS → AWOP` and `ANIS → ANISWOP` are in the `allowedTransitions` table but are not triggered by any code path in the current implementation.
+
+**Implication:** AWOP and ANISWOP are currently **unreachable states** in the implementation. The enum values and transition table entries exist as infrastructure for a future feature (detecting and reacting to peer OFFLINE), but no mechanism currently drives the transition. The `HAGroupStoreClient.setHAGroupStatusIfNeeded()` method (L325-394) would accept these transitions (they pass `isTransitionAllowed()`), but nothing calls it with AWOP or ANISWOP as the target state in response to peer OFFLINE detection.
+
+**What to add:**
+
+`HAGroupStore.tla`:
+- `PeerReactToOFFLINE(c)` action: when `clusterState[Peer(c)] = "OFFLINE"`, the active cluster transitions to AWOP or ANISWOP depending on its current state. Two sub-cases:
+  - `clusterState[c] = "AIS"` → `clusterState'[c] = "AWOP"` (peer went OFFLINE while active is in sync).
+  - `clusterState[c] = "ANIS"` → `clusterState'[c] = "ANISWOP"` (peer went OFFLINE while active is not in sync).
+  - Guard: `clusterState[c] \in {"AIS", "ANIS"}` — only fires from stable active states.
+- `PeerRecoverFromOFFLINE(c)` action: when `clusterState[Peer(c)] \notin {"OFFLINE"}` (peer re-enters a non-OFFLINE state via `--force` recovery, modeled in Iteration 16), the active cluster returns from AWOP/ANISWOP. Two sub-cases:
+  - `clusterState[c] = "AWOP"` → `clusterState'[c] = "ANIS"` (per `AWOP.allowedTransitions = {ANIS}`; peer recovery is treated as a new peer entering sync — the active must first synchronize, so it enters ANIS not AIS).
+  - `clusterState[c] = "ANISWOP"` → `clusterState'[c] = "ANIS"` (per `ANISWOP.allowedTransitions = {ANIS}`).
+  - Resets `antiFlapTimer[c]` to `StartAntiFlapWait` on ANIS entry.
+- Note: Both actions model the *intended* protocol behavior since no FailoverManagementListener entry currently implements peer OFFLINE detection. The TLA+ model documents this as a design-ahead verification — verifying that the AWOP/ANISWOP states preserve mutual exclusion and writer-cluster consistency if/when the implementation adds the trigger. This follows the plan's precedent for assumed fixes (A.11, A.17) where the model verifies the intended design rather than the current incomplete implementation.
+
+`ConsistentFailover.tla`:
+- Wire `PeerReactToOFFLINE(c)` and `PeerRecoverFromOFFLINE(c)` into `Next`.
+- Verify `MutualExclusion` holds with AWOP/ANISWOP reachable: both states are in `ActiveStates` (map to `ACTIVE` role), so only one cluster can be in an active state including AWOP/ANISWOP. The peer is in OFFLINE (maps to `OFFLINE` role, not `ACTIVE`), so no dual-active.
+- Verify `WriterClusterConsistency` holds: AWOP and ANISWOP are already in the allowed set (added in Iteration 7). AWOP with degraded writers should be impossible (AIS→AWOP requires AIS which implies all writers SYNC); ANISWOP with degraded writers is expected.
+- Verify `AISImpliesInSync` is not violated: AWOP is not AIS, so the invariant is not directly affected.
+
+**Expected TLC result:** AWOP and ANISWOP become reachable states for the first time. All existing invariants hold with these states in the reachable state space. AWOP/ANISWOP do not introduce dual-active because the peer is in OFFLINE. The transitions AWOP→ANIS and ANISWOP→ANIS correctly return the cluster to its degraded-active state when the peer recovers.
+
+#### Iteration 18 — Forced failover
 
 **Modules modified:** `Types.tla`, `Admin.tla`, `ConsistentFailover.tla`.
 
@@ -947,7 +983,7 @@ This phase introduces toggle flags for two distinct purposes: (1) **implementati
 
 **Expected TLC result:** `MutualExclusion` passes; `NoDataLoss` fails (expected, by design).
 
-#### Iteration 18 — Replay rewind verification
+#### Iteration 19 — Replay rewind verification
 
 **Modules modified:** `Reader.tla`, `ConsistentFailover.tla`.
 
@@ -968,7 +1004,7 @@ This phase introduces toggle flags for two distinct purposes: (1) **implementati
 
 This phase models implementation-specific behaviors that can prevent liveness. These are genuine implementation gaps (not ZK substrate properties), modeled as quirk flags. ZK-related liveness constraints (session expiry, retry exhaustion) are part of the core protocol model introduced in Iteration 13 — they are not deferred to this phase because they are properties of the coordination substrate, not application-level gaps.
 
-#### Iteration 19 — UseForwarderStuckQuirk
+#### Iteration 20 — UseForwarderStuckQuirk
 
 **Modules modified:** `Types.tla`, `Writer.tla`, `ConsistentFailover.tla`.
 
@@ -1006,35 +1042,45 @@ This phase models implementation-specific behaviors that can prevent liveness. T
 | `FailoverManagementListener` peer ANIS detected (standby → DS) | `PeerReactToANIS(c)` | `HAGroupStore.tla` | 3 | ✅ |
 | `FailoverManagementListener` peer AbTS detected (active → AbTAIS) | `PeerReactToAbTS(c)` | `HAGroupStore.tla` | 3 | ✅ |
 | Auto-completion: AbTS → S | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
-| Auto-completion: AbTAIS → AIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
+| Auto-completion: AbTAIS → AIS/ANIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3/7 | ✅ |
 | Auto-completion: AbTANIS → ANIS | `AutoComplete(c)` | `HAGroupStore.tla` | 3 | ✅ |
-| `SyncModeImpl.onFailure()` (L61-77) → `setHAGroupStatusToStoreAndForward()` | `WriterToStoreFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `SyncAndForwardModeImpl.onFailure()` (L66-82) → `STORE_AND_FORWARD` | `WriterSyncFwdToStoreFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `ReplicationLogDiscoveryForwarder.processFile()` (L133-152) throughput check → `S&F→S&FWD` | `WriterStoreFwdToSyncFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `ReplicationLogDiscoveryForwarder.processNoMoreRoundsLeft()` (L155-184) → `setHAGroupStatusToSync()` | `WriterSyncFwdToSync(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `ReplicationLogDiscoveryForwarder.init()` ANIS listener (L98-108) → `SYNC→S&FWD` on other RS | `WriterSyncToSyncFwd(c, rs)` | `Writer.tla` | 5 | ⏳ |
-| `StoreAndForwardModeImpl.startHAGroupStoreUpdateTask()` (L71-87) | `ANISHeartbeat(c)` | `HAGroupStore.tla` | 8 | ⏳ |
-| `HAGroupStoreClient.validateTransitionAndGetWaitTime()` (L1027-1046) | Guard on `ANIS → AIS` and `ANISTS → ATS` | `HAGroupStore.tla` | 8 | ⏳ |
-| `HAGroupStoreManager.setHAGroupStatusToSync()` (L341-355) — dual target: `ANISTS→ATS` if current is ANISTS, else `→AIS` | `ANISTSToATS(c)` + `ANISToAIS(c)` | `HAGroupStore.tla` | 8/15 | ⏳ |
+| `SyncModeImpl.onFailure()` (L61-77) → `setHAGroupStatusToStoreAndForward()` | `WriterToStoreFwd(c, rs)` | `Writer.tla` | 6-7 | ✅ |
+| `SyncAndForwardModeImpl.onFailure()` (L66-82) → `STORE_AND_FORWARD` | `WriterSyncFwdToStoreFwd(c, rs)` | `Writer.tla` | 9 | ✅ |
+| `ReplicationLogDiscoveryForwarder.processFile()` (L133-152) throughput check → `S&F→S&FWD` | `WriterStoreFwdToSyncFwd(c, rs)` | `Writer.tla` | 5 | ✅ |
+| `ReplicationLogDiscoveryForwarder.processNoMoreRoundsLeft()` (L155-184) → `setHAGroupStatusToSync()` | `WriterSyncFwdToSync(c, rs)` | `Writer.tla` | 5 | ✅ |
+| `ReplicationLogDiscoveryForwarder.init()` ANIS listener (L98-108) → `SYNC→S&FWD` on other RS | `WriterSyncToSyncFwd(c, rs)` | `Writer.tla` | 5 | ✅ |
+| Normal startup: INIT → SYNC | `WriterInit(c, rs)` | `Writer.tla` | 5 | ✅ |
+| Startup with peer unavailable: INIT → S&F (CAS success) | `WriterInitToStoreFwd(c, rs)` | `Writer.tla` | 7 | ✅ |
+| Startup CAS failure: INIT → DEAD | `WriterInitToStoreFwdFail(c, rs)` | `Writer.tla` | 9 | ✅ |
+| CAS failure: SYNC → DEAD | `WriterToStoreFwdFail(c, rs)` | `Writer.tla` | 9 | ✅ |
+| CAS failure: SYNC_AND_FWD → DEAD | `WriterSyncFwdToStoreFwdFail(c, rs)` | `Writer.tla` | 9 | ✅ |
+| `StoreAndForwardModeImpl.startHAGroupStoreUpdateTask()` (L71-87) | `ANISHeartbeat(c)` | `HAGroupStore.tla` | 8 | ✅ |
+| `HAGroupStoreClient.validateTransitionAndGetWaitTime()` (L1027-1046) | Guard on `ANIS → AIS` and `ANISTS → ATS` | `HAGroupStore.tla` | 8 | ✅ |
+| `HAGroupStoreManager.setHAGroupStatusToSync()` (L341-355) — ANIS→AIS path | `ANISToAIS(c)` | `HAGroupStore.tla` | 8 | ✅ |
+| HDFS NameNode crash | `HDFSDown(c)` | `HDFS.tla` | 6 | ✅ |
+| HDFS NameNode recovery | `HDFSUp(c)` | `HDFS.tla` | 6 | ✅ |
+| RS restart (process supervisor) | `RSRestart(c, rs)` | `RS.tla` | 9 | ✅ |
+| STA → AIS (non-deterministic placeholder; reader guards in Iteration 11) | `StandbyBecomesActive(c)` | `HAGroupStore.tla` | 4 | ✅ |
+| Peer AIS detected (DS → S recovery) | `PeerReactToAIS(c)` (DS disjunct) | `HAGroupStore.tla` | 4 | ✅ |
+| `HAGroupStoreManager.setHAGroupStatusToSync()` (L341-355) — dual target: `ANISTS→ATS` if current is ANISTS | `ANISTSToATS(c)` | `HAGroupStore.tla` | 15 | ⏳ |
 | `ReplicationLogDiscoveryReplay.shouldTriggerFailover()` | `TriggerFailover(c)` | `Reader.tla` | 11 | ⏳ |
 | `ReplicationLogDiscoveryReplay.replay()` | `ReplayAdvance(c)` | `Reader.tla` | 10 | ⏳ |
 | Replay SYNC → DEGRADED (peer ANIS detected) | `ReplayDetectDegraded(c)` | `Reader.tla` | 10 | ⏳ |
 | Replay DEGRADED → SYNCED_RECOVERY (peer AIS detected) | `ReplayDetectRecovery(c)` | `Reader.tla` | 10 | ⏳ |
 | SYNCED_RECOVERY rewind | `ReplayRewind(c)` | `Reader.tla` | 10 | ⏳ |
 | RS abort (fail-stop in S&F) | `RSCrash(c, rs)` | `RS.tla` | 12 | ⏳ |
-| RS restart | `RSRestart(c, rs)` | `RS.tla` | 12 | ⏳ |
 | Peer ZK connection lost (PathChildrenCache) | `ZKDisconnect(c)` | `ZK.tla` | 13 | ⏳ |
 | Peer ZK connection re-established | `ZKReconnect(c)` | `ZK.tla` | 13 | ⏳ |
 | ZK session expiry (all watches lost) | `ZKSessionExpiry(c)` | `ZK.tla` | 13 | ⏳ |
 | ZK session re-established | `ZKSessionRecover(c)` | `ZK.tla` | 13 | ⏳ |
 | ZK DISCONNECTED event → RS abort | `ZKDisconnectRS(c, rs)` | `ZK.tla` | 13 | ⏳ |
-| HDFS NameNode crash | `HDFSDown(c)` | `HDFS.tla` | 6 | ⏳ |
-| HDFS NameNode recovery | `HDFSUp(c)` | `HDFS.tla` | 6 | ⏳ |
-| `PhoenixHAAdminTool update --force` | `AdminForceFailover(c)` | `Admin.tla` | 17 | ⏳ |
+| `PhoenixHAAdminTool update --force` | `AdminForceFailover(c)` | `Admin.tla` | 18 | ⏳ |
 | Peer goes OFFLINE | `AdminGoOffline(c)` | `Admin.tla` | 16 | ⏳ |
 | `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE recovery) | `AdminForceRecoverFromOffline(c)` | `Admin.tla` | 16 | ⏳ |
-| `setData().withVersion()` (ZK optimistic locking) | `ZKUpdate(c, rs, newState)` | `HAGroupStore.tla` | 9 | ⏳ |
-| Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Writer.tla` | 19 | ⏳ |
+| Active detects peer OFFLINE → AWOP/ANISWOP | `PeerReactToOFFLINE(c)` | `HAGroupStore.tla` | 17 | ⏳ |
+| Peer recovers from OFFLINE → AWOP/ANISWOP → ANIS | `PeerRecoverFromOFFLINE(c)` | `HAGroupStore.tla` | 17 | ⏳ |
+| `setData().withVersion()` (ZK optimistic locking) | CAS semantics in Writer/HAGroupStore actions | various | 9 | ✅ |
+| Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Writer.tla` | 20 | ⏳ |
 | `FailoverManagementListener` retry exhaustion (2 retries, then lost) | `ReactiveTransitionFail(c)` | `HAGroupStore.tla` | 13 | ⏳ |
 
 ---
@@ -1337,9 +1383,9 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 | 16 | `DegradationRecovery` | Liveness | Iter 14 | ANIS eventually recovers to AIS |
 | 17 | `AbortCompletion` | Liveness | Iter 14 | Initiated abort eventually completes |
 | 18 | `OFFLINESink` | Safety | Iter 16 | OFFLINE is terminal unless `UseForceQuirk` |
-| 19 | `ForcedFailoverSafety` | Safety | Iter 17 | Mutual exclusion under forced failover |
-| 20 | `ReplayRewindCorrectness` | Safety | Iter 18 | Rewind resets `lastRoundProcessed` correctly |
-| 21 | `FailoverCompletionWithStuck` | Liveness | Iter 19 | With `UseForwarderStuckQuirk`, failover requires admin abort when forwarder stuck |
+| 19 | `ForcedFailoverSafety` | Safety | Iter 18 | Mutual exclusion under forced failover |
+| 20 | `ReplayRewindCorrectness` | Safety | Iter 19 | Rewind resets `lastRoundProcessed` correctly |
+| 21 | `FailoverCompletionWithStuck` | Liveness | Iter 20 | With `UseForwarderStuckQuirk`, failover requires admin abort when forwarder stuck |
 | 22 | `SafetyUnderZKFailure` | Safety | Iter 13 | Mutual exclusion holds under arbitrary ZK failures (session expiry, disconnection, retry exhaustion) |
 
 Additional invariants will be discovered and added during the modeling process.
@@ -1364,7 +1410,7 @@ Additional invariants will be discovered and added during the modeling process.
 | §4.3 Scenario 6 | Source: `HAGroupStoreManager.java` L653-704; `HAGroupStoreClient.java` L1104-1110 | Retry exhaustion; core ZK property modeled in Iteration 13 (see §2.4) |
 | §4.3 Scenario 7 | `HAGroupStoreRecord.java` L117; `HAGroupStoreManager.java` L109 | DS→STA resolved (transition added) |
 | §4.3 Scenario 8 | Source: `ClusterRoleRecord.java` L84; `ReplicationLogDiscoveryReplay.java` L309-317, L500-533 | HDFS fail during (ATS,STA); mutation blocking |
-| Phase 9 (Iter 19) | Source-verified implementation liveness gap | `UseForwarderStuckQuirk` (retry exhaustion absorbed into Iteration 13 as core ZK property) |
+| Phase 9 (Iter 20) | Source-verified implementation liveness gap | `UseForwarderStuckQuirk` (retry exhaustion absorbed into Iteration 13 as core ZK property) |
 | §9 Source Code | `IMPL_CROSS_REFERENCE.md` §13; verified against source | File index with line numbers |
 | Appendix A | `IMPL_CROSS_REFERENCE.md` §11; source-verified | Divergences (16 items; A.2, A.3, A.6, A.11, A.12 resolved/updated) |
 | Appendix A.16 | `ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md`; ZK source code analysis | ZK watcher delivery is conditional, not guaranteed; 5 failure modes identified |
