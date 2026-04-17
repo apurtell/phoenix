@@ -9,21 +9,21 @@
  * via EXTENDS.
  *
  * Definitions provided:
- *   HAGroupState      — the 14 HA group states
- *   ActiveStates      — states that map to the ACTIVE cluster role
- *   StandbyStates     — states that map to the STANDBY cluster role
- *   TransitionalActiveStates — ATS, ANISTS (ACTIVE_TO_STANDBY role)
- *   AllowedTransitions — set of valid (from, to) state pairs
- *   ClusterRole       — the 6 cluster roles visible to clients
- *   RoleOf(state)     — maps an HAGroupState to its ClusterRole
- *   ActiveRoles       — the set of roles considered "active" (role-level)
- *   Peer(c)           — returns the other cluster in a 2-cluster model
- *   WriterMode        — the 5 replication writer modes (per-RS)
- *   ReplayStateSet    — the 4 replication replay states (standby reader)
- *   AntiFlapGateOpen  — countdown timer helper: wait elapsed
- *   AntiFlapGateClosed — countdown timer helper: wait in progress
- *   DecrementTimer    — countdown timer helper: advance one tick
- *   StartAntiFlapWait — countdown timer helper: initial/reset value
+ *   HAGroupState      -- the 14 HA group states
+ *   ActiveStates      -- states that map to the ACTIVE cluster role
+ *   StandbyStates     -- states that map to the STANDBY cluster role
+ *   TransitionalActiveStates -- ATS, ANISTS (ACTIVE_TO_STANDBY role)
+ *   AllowedTransitions -- set of valid (from, to) state pairs
+ *   ClusterRole       -- the 6 cluster roles visible to clients
+ *   RoleOf(state)     -- maps an HAGroupState to its ClusterRole
+ *   ActiveRoles       -- the set of roles considered "active" (role-level)
+ *   Peer(c)           -- returns the other cluster in a 2-cluster model
+ *   WriterMode        -- the 5 replication writer modes (per-RS)
+ *   ReplayStateSet    -- the 4 replication replay states (standby reader)
+ *   AntiFlapGateOpen  -- countdown timer helper: wait elapsed
+ *   AntiFlapGateClosed -- countdown timer helper: wait in progress
+ *   DecrementTimer    -- countdown timer helper: advance one tick
+ *   StartAntiFlapWait -- countdown timer helper: initial/reset value
  *
  * Implementation traceability:
  *
@@ -61,7 +61,7 @@ CONSTANTS RS
 ASSUME RS # {}
 
 \* The anti-flapping wait threshold in logical time ticks.
-\* Source: HAGroupStoreClient.java L98 — ZK_SESSION_TIMEOUT_MULTIPLIER = 1.1
+\* Source: HAGroupStoreClient.java L98 -- ZK_SESSION_TIMEOUT_MULTIPLIER = 1.1
 CONSTANTS WaitTimeForSync
 
 \* WaitTimeForSync must be a positive natural number.
@@ -103,7 +103,7 @@ HAGroupState ==
 \* mutations. Mutual exclusion requires at most one cluster in an
 \* ActiveState at any time.
 \*
-\* Source: HAGroupState.getClusterRole() L73-97 — these states
+\* Source: HAGroupState.getClusterRole() L73-97 -- these states
 \*         return ClusterRole.ACTIVE.
 ActiveStates == { "AIS", "ANIS", "AbTAIS", "AbTANIS", "AWOP", "ANISWOP" }
 
@@ -111,7 +111,7 @@ ActiveStates == { "AIS", "ANIS", "AbTAIS", "AbTANIS", "AWOP", "ANISWOP" }
 \* A cluster in any of these states is receiving and replaying
 \* replication logs from the active peer.
 \*
-\* Source: HAGroupState.getClusterRole() L73-97 — these states
+\* Source: HAGroupState.getClusterRole() L73-97 -- these states
 \*         return ClusterRole.STANDBY.
 StandbyStates == { "S", "DS", "AbTS" }
 
@@ -119,7 +119,7 @@ StandbyStates == { "S", "DS", "AbTS" }
 \* A cluster in these states is transitioning from active to standby
 \* during a failover. Mutations are blocked (isMutationBlocked()=true).
 \*
-\* Source: ClusterRoleRecord.java L84 — ACTIVE_TO_STANDBY role
+\* Source: ClusterRoleRecord.java L84 -- ACTIVE_TO_STANDBY role
 \*         has isMutationBlocked() = true.
 TransitionalActiveStates == { "ATS", "ANISTS" }
 
@@ -127,7 +127,7 @@ TransitionalActiveStates == { "ATS", "ANISTS" }
 \* Distinguished from ActiveStates (which is the set of HA group *states*
 \* that map to ACTIVE): ActiveRoles operates at the role abstraction layer.
 \*
-\* Source: ClusterRoleRecord.java L59-67 — ACTIVE role has
+\* Source: ClusterRoleRecord.java L59-67 -- ACTIVE role has
 \*         isMutationBlocked()=false.
 ActiveRoles == {"ACTIVE"}
 
@@ -141,15 +141,15 @@ ActiveRoles == {"ACTIVE"}
 \*   Modeled value      | Java class
 \*   -------------------+----------------------------------------------
 \*   "INIT"             | Pre-initialization
-\*   "SYNC"             | SyncModeImpl — writing directly to standby HDFS
-\*   "STORE_AND_FWD"    | StoreAndForwardModeImpl — writing locally
-\*   "SYNC_AND_FWD"     | SyncAndForwardModeImpl — draining local queue
+\*   "SYNC"             | SyncModeImpl -- writing directly to standby HDFS
+\*   "STORE_AND_FWD"    | StoreAndForwardModeImpl -- writing locally
+\*   "SYNC_AND_FWD"     | SyncAndForwardModeImpl -- draining local queue
 \*                      |   while also writing synchronously
-\*   "DEAD"             | RS aborted (logGroup.abort()) — writer halted,
+\*   "DEAD"             | RS aborted (logGroup.abort()) -- writer halted,
 \*                      |   awaiting process supervisor restart
 \*
 \* Source: ReplicationLogGroup.java mode classes;
-\*         SyncModeImpl.onFailure() L61-74 (CAS failure → abort)
+\*         SyncModeImpl.onFailure() L61-74 (CAS failure -> abort)
 WriterMode == {"INIT", "SYNC", "STORE_AND_FWD", "SYNC_AND_FWD", "DEAD"}
 
 ---------------------------------------------------------------------------
@@ -285,7 +285,7 @@ Peer(c) == CHOOSE p \in Cluster : p # c
 \* following the pattern from Lamport, "Real Time is Really Simple"
 \* (CHARME 2005, Section 2). Each cluster's timer counts DOWN from
 \* WaitTimeForSync toward 0. The timer does NOT represent a clock
-\* running backwards — it represents a waiting period expiring:
+\* running backwards -- it represents a waiting period expiring:
 \*
 \*   WaitTimeForSync ... 2 ... 1 ... 0
 \*   |---- gate closed (waiting) ----|  gate open (transition allowed)

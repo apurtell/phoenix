@@ -9,7 +9,7 @@
  * WriterToStoreFwd / WriterSyncFwdToStoreFwd in Writer.tla.
  * This decomposition enables modeling of the ZK CAS race where
  * multiple RS on the same cluster race to update the ZK state
- * and the loser gets BadVersionException → abort.
+ * and the loser gets BadVersionException -> abort.
  *
  * Recovery is asymmetric: HDFSUp(c) only sets the availability
  * flag. Per-RS recovery happens gradually via the forwarder path
@@ -29,7 +29,8 @@ EXTENDS Types
 
 VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
          replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty
+         failoverPending, inProgressDirEmpty,
+         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
 
 ---------------------------------------------------------------------------
 
@@ -37,22 +38,22 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  * NameNode of cluster c crashes.
  *
  * Sets the HDFS availability flag to FALSE. Per-RS writer
- * degradation (SYNC → S&F, SYNC_AND_FWD → S&F) is handled
+ * degradation (SYNC -> S&F, SYNC_AND_FWD -> S&F) is handled
  * individually by WriterToStoreFwd and WriterSyncFwdToStoreFwd
  * in Writer.tla, which are guarded on hdfsAvailable[Peer(c)]
- * = FALSE. Those actions also handle the AIS → ANIS cluster
- * state transition and CAS failure (→ DEAD).
+ * = FALSE. Those actions also handle the AIS -> ANIS cluster
+ * state transition and CAS failure (-> DEAD).
  *
  * Any cluster's HDFS can fail at any time. Two consequences:
- *   1. HDFSDown(c_standby): standby HDFS fails → active writers
- *      detect via IOException and degrade (SYNC → S&F).
- *   2. HDFSDown(c_active): active cluster's own HDFS fails →
+ *   1. HDFSDown(c_standby): standby HDFS fails -> active writers
+ *      detect via IOException and degrade (SYNC -> S&F).
+ *   2. HDFSDown(c_active): active cluster's own HDFS fails ->
  *      S&F writers on the active cluster abort (modeled by
  *      RSAbortOnLocalHDFSFailure in RS.tla).
  *
  * Pre:  c's HDFS is currently available.
  * Post: hdfsAvailable[c] = FALSE.
- *       All other variables unchanged — per-RS effects deferred
+ *       All other variables unchanged -- per-RS effects deferred
  *       to writer actions (case 1) or RS.tla (case 2).
  *
  * Source: NameNode crash (environment event)
@@ -62,18 +63,19 @@ HDFSDown(c) ==
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
 (*
  * NameNode of cluster c recovers.
  *
- * Sets hdfsAvailable[c] = TRUE. No immediate writer effect —
+ * Sets hdfsAvailable[c] = TRUE. No immediate writer effect --
  * recovery is per-RS via the forwarder path. The forwarder
  * detects connectivity by successfully copying a file from
  * OUT to the peer's IN directory; if throughput exceeds the
- * threshold, it transitions the writer S&F → SYNC_AND_FWD.
+ * threshold, it transitions the writer S&F -> SYNC_AND_FWD.
  *
  * Pre:  c's HDFS is currently unavailable.
  * Post: hdfsAvailable[c] = TRUE. Writer modes unchanged.
@@ -85,6 +87,7 @@ HDFSUp(c) ==
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = TRUE]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ============================================================================

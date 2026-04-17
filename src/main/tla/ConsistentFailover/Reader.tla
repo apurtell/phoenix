@@ -36,20 +36,20 @@
  *   TLA+ action                | Java source
  *   --------------------------+--------------------------------------------
  *   ReplayAdvance(c)          | replay() L336-343 (SYNC) and L345-351
- *                             |   (DEGRADED) — round processing loop
- *   ReplayDetectDegraded(c)   | degradedListener L136-145 —
+ *                             |   (DEGRADED) -- round processing loop
+ *   ReplayDetectDegraded(c)   | degradedListener L136-145 --
  *                             |   replicationReplayState.set(DEGRADED)
- *   ReplayDetectRecovery(c)   | recoveryListener L147-157 —
+ *   ReplayDetectRecovery(c)   | recoveryListener L147-157 --
  *                             |   replicationReplayState.set(
  *                             |   SYNCED_RECOVERY)
- *   ReplayRewind(c)           | replay() L323-333 —
+ *   ReplayRewind(c)           | replay() L323-333 --
  *                             |   compareAndSet(SYNCED_RECOVERY, SYNC);
  *                             |   getFirstRoundToProcess() rewinds to
  *                             |   lastRoundInSync (L389)
- *   ReplayBeginProcessing(c)  | replay() round processing start —
+ *   ReplayBeginProcessing(c)  | replay() round processing start --
  *                             |   in-progress files created when a
  *                             |   round is picked up for processing
- *   ReplayFinishProcessing(c) | replay() round processing end —
+ *   ReplayFinishProcessing(c) | replay() round processing end --
  *                             |   in-progress files cleaned up after
  *                             |   round is fully processed
  *   TriggerFailover(c)        | shouldTriggerFailover() L500-533 (guards);
@@ -61,7 +61,8 @@ EXTENDS Types
 
 VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
          replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty
+         failoverPending, inProgressDirEmpty,
+         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
 
 ---------------------------------------------------------------------------
 
@@ -78,16 +79,14 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  * Source: replay() L336-343
  *)
 ReplayAdvance(c) ==
-    \* STA included: replay() loop continues during failover pending.
-    \* Without STA, TriggerFailover's inProgressDirEmpty guard is
-    \* over-approximated.
     /\ clusterState[c] \in StandbyStates \union {"STA"}
     /\ replayState[c] = "SYNC"
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = @ + 1]
     /\ lastRoundInSync' = [lastRoundInSync EXCEPT ![c] = @ + 1]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, failoverPending,
-                   inProgressDirEmpty>>
+                   inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -96,7 +95,7 @@ ReplayAdvance(c) ==
  *
  * When the cluster enters DEGRADED_STANDBY (reacting to peer ANIS),
  * the degradedListener fires replicationReplayState.set(DEGRADED).
- * This is an unconditional set() — it overwrites any prior replay
+ * This is an unconditional set() -- it overwrites any prior replay
  * state, including SYNCED_RECOVERY (modeling the re-degradation
  * interleaving at L141).
  *
@@ -106,7 +105,7 @@ ReplayAdvance(c) ==
  *
  * Guard: cluster is in DS and replay is in a state that can degrade.
  *
- * Source: degradedListener L136-145 —
+ * Source: degradedListener L136-145 --
  *         replicationReplayState.set(DEGRADED)
  *)
 ReplayDetectDegraded(c) ==
@@ -116,7 +115,8 @@ ReplayDetectDegraded(c) ==
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = @ + 1]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, lastRoundInSync, failoverPending,
-                   inProgressDirEmpty>>
+                   inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -125,14 +125,14 @@ ReplayDetectDegraded(c) ==
  *
  * When the cluster returns to STANDBY (peer recovered to AIS), the
  * recoveryListener fires replicationReplayState.set(SYNCED_RECOVERY).
- * This is an unconditional set() — it overwrites any prior state.
+ * This is an unconditional set() -- it overwrites any prior state.
  *
- * No counter changes occur at this point — the rewind happens in
+ * No counter changes occur at this point -- the rewind happens in
  * ReplayRewind when replay() processes the SYNCED_RECOVERY state.
  *
  * Guard: cluster is in S and replay is in a state that can recover.
  *
- * Source: recoveryListener L147-157 —
+ * Source: recoveryListener L147-157 --
  *         replicationReplayState.set(SYNCED_RECOVERY)
  *)
 ReplayDetectRecovery(c) ==
@@ -141,7 +141,8 @@ ReplayDetectRecovery(c) ==
     /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, lastRoundProcessed, lastRoundInSync,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -159,8 +160,8 @@ ReplayDetectRecovery(c) ==
  * ReplayDetectDegraded fires first (state becomes DEGRADED,
  * this action is no longer enabled).
  *
- * Source: replay() L323-333 — compareAndSet(SYNCED_RECOVERY, SYNC);
- *         getFirstRoundToProcess() L389 — rewinds to lastRoundInSync
+ * Source: replay() L323-333 -- compareAndSet(SYNCED_RECOVERY, SYNC);
+ *         getFirstRoundToProcess() L389 -- rewinds to lastRoundInSync
  *)
 ReplayRewind(c) ==
     /\ replayState[c] = "SYNCED_RECOVERY"
@@ -168,7 +169,8 @@ ReplayRewind(c) ==
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = lastRoundInSync[c]]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, lastRoundInSync, failoverPending,
-                   inProgressDirEmpty>>
+                   inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -181,23 +183,21 @@ ReplayRewind(c) ==
  * processing completes.
  *
  * Guard: cluster is in a standby state or STA (replay continues
- * during failover pending — the replay() loop does not stop when
+ * during failover pending -- the replay() loop does not stop when
  * the cluster enters STA) and the in-progress directory is
  * currently empty.
  *
- * Source: replay() L307-310 — getFirstRoundToProcess() returns a
+ * Source: replay() L307-310 -- getFirstRoundToProcess() returns a
  *         round; processing begins, creating in-progress files.
  *)
 ReplayBeginProcessing(c) ==
-    \* STA included: replay() loop continues during failover pending,
-    \* so new rounds can begin processing in STA, temporarily setting
-    \* inProgressDirEmpty = FALSE and blocking TriggerFailover.
     /\ clusterState[c] \in StandbyStates \union {"STA"}
     /\ inProgressDirEmpty[c] = TRUE
     /\ inProgressDirEmpty' = [inProgressDirEmpty EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending>>
+                   lastRoundProcessed, failoverPending,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -210,7 +210,7 @@ ReplayBeginProcessing(c) ==
  *
  * Guard: in-progress directory is currently non-empty.
  *
- * Source: replay() L336-351 — round processing completes,
+ * Source: replay() L336-351 -- round processing completes,
  *         in-progress files are cleaned up.
  *)
 ReplayFinishProcessing(c) ==
@@ -218,12 +218,13 @@ ReplayFinishProcessing(c) ==
     /\ inProgressDirEmpty' = [inProgressDirEmpty EXCEPT ![c] = TRUE]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending>>
+                   lastRoundProcessed, failoverPending,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
 (*
- * Failover trigger: STA → AIS when replay is complete.
+ * Failover trigger: STA -> AIS when replay is complete.
  *
  * The standby cluster writes ACTIVE_IN_SYNC to its own ZK znode
  * after the replication log reader determines replay is complete.
@@ -231,17 +232,20 @@ ReplayFinishProcessing(c) ==
  * transition.
  *
  * Four guards model the conditions under which failover is safe:
- *   1. failoverPending[c] — set by triggerFailoverListener (L159-171)
+ *   1. failoverPending[c] -- set by triggerFailoverListener (L159-171)
  *      when the local cluster enters STA.
- *   2. inProgressDirEmpty[c] — no partially-processed replication
+ *   2. inProgressDirEmpty[c] -- no partially-processed replication
  *      log files (getInProgressFiles().isEmpty() at L508).
- *   3. replayState[c] = "SYNC" — the SYNCED_RECOVERY rewind must
+ *   3. replayState[c] = "SYNC" -- the SYNCED_RECOVERY rewind must
  *      have completed. Without this guard, failover could proceed
  *      with degraded rounds not re-processed from the sync point.
- *   4. hdfsAvailable[c] = TRUE — the standby's own HDFS must be
+ *   4. hdfsAvailable[c] = TRUE -- the standby's own HDFS must be
  *      accessible; shouldTriggerFailover() performs HDFS reads
  *      (getInProgressFiles, getNewFiles) that throw IOException
  *      if HDFS is unavailable, blocking the trigger.
+ *
+ * Guarded on zkLocalConnected[c] because triggerFailover() calls
+ * setHAGroupStatusToSync() which requires isHealthy = true.
  *
  * The effect also clears failoverPending, modeling triggerFailover()
  * L538 (failoverPending.set(false)).
@@ -251,6 +255,7 @@ ReplayFinishProcessing(c) ==
  *         setHAGroupStatusToSync() L341-355 (ZK write)
  *)
 TriggerFailover(c) ==
+    /\ zkLocalConnected[c] = TRUE
     /\ clusterState[c] = "STA"
     /\ failoverPending[c]
     /\ inProgressDirEmpty[c]
@@ -260,6 +265,7 @@ TriggerFailover(c) ==
     /\ failoverPending' = [failoverPending EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   inProgressDirEmpty>>
+                   inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ============================================================================

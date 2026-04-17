@@ -27,7 +27,8 @@ EXTENDS Types
 
 VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable,
          replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty
+         failoverPending, inProgressDirEmpty,
+         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
 
 ---------------------------------------------------------------------------
 
@@ -44,6 +45,7 @@ Tick ==
     /\ antiFlapTimer' = [c \in Cluster |-> DecrementTimer(antiFlapTimer[c])]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ============================================================================

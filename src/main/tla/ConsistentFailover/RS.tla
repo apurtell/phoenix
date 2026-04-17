@@ -7,7 +7,7 @@
  *
  * Crash modeling: An RS can crash at any time (JVM crash, OOM, kill
  * signal, process supervisor termination). The crash sets writerMode
- * to DEAD but does not change clusterState — the HA group state in
+ * to DEAD but does not change clusterState -- the HA group state in
  * ZK is independent of RS process lifecycle. A special-case crash,
  * RSAbortOnLocalHDFSFailure, models the abort triggered when the
  * active cluster's own HDFS fails while the writer is in
@@ -26,25 +26,26 @@
  *   RSCrash(c, rs)                  | JVM crash, OOM, kill signal,
  *                                   |   process supervisor termination
  *   RSAbortOnLocalHDFSFailure(c,rs) | StoreAndForwardModeImpl
- *                                   |   .onFailure() L115-123 →
+ *                                   |   .onFailure() L115-123 ->
  *                                   |   logGroup.abort()
- *   RSRestart(c, rs)                | Kubernetes/YARN pod restart →
- *                                   |   HBase RS startup →
+ *   RSRestart(c, rs)                | Kubernetes/YARN pod restart ->
+ *                                   |   HBase RS startup ->
  *                                   |   ReplicationLogGroup
  *                                   |   .initializeReplicationMode()
- *                                   |   → setMode(SYNC) or
+ *                                   |   -> setMode(SYNC) or
  *                                   |   setMode(STORE_AND_FORWARD)
  *)
 EXTENDS Types
 
 VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
          replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty
+         failoverPending, inProgressDirEmpty,
+         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
 
 ---------------------------------------------------------------------------
 
 (*
- * Process supervisor restarts a dead RS: DEAD → INIT.
+ * Process supervisor restarts a dead RS: DEAD -> INIT.
  *
  * The restarted RS enters INIT mode. Subsequent writer actions
  * (WriterInit or WriterInitToStoreFwd) handle the actual mode
@@ -53,7 +54,7 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  * Pre:  writerMode[c][rs] = "DEAD".
  * Post: writerMode[c][rs] = "INIT".
  *
- * Source: Kubernetes/YARN pod restart → HBase RS startup →
+ * Source: Kubernetes/YARN pod restart -> HBase RS startup ->
  *         ReplicationLogGroup.initializeReplicationMode()
  *)
 RSRestart(c, rs) ==
@@ -61,35 +62,37 @@ RSRestart(c, rs) ==
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "INIT"]
     /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
 (*
- * Non-deterministic RS crash: any mode → DEAD.
+ * Non-deterministic RS crash: any mode -> DEAD.
  *
  * Models general RS failure (JVM crash, OOM, killed by process
  * supervisor, etc.). The RS can crash at any time regardless of
- * writer mode. The crash does not change clusterState — the HA
+ * writer mode. The crash does not change clusterState -- the HA
  * group state in ZK is independent of RS process lifecycle.
  *
  * Pre:  writerMode[c][rs] /= "DEAD" (RS is alive).
  * Post: writerMode[c][rs] = "DEAD".
  *
  * Source: JVM crash, OOM, kill signal, process supervisor
- *         termination — environment event.
+ *         termination -- environment event.
  *)
 RSCrash(c, rs) ==
     /\ writerMode[c][rs] /= "DEAD"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
     /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
 (*
- * RS abort on local HDFS failure: STORE_AND_FWD → DEAD.
+ * RS abort on local HDFS failure: STORE_AND_FWD -> DEAD.
  *
  * In STORE_AND_FWD mode, the writer targets the active cluster's
  * own (local/fallback) HDFS. If that HDFS fails,
@@ -113,7 +116,7 @@ RSCrash(c, rs) ==
  *       hdfsAvailable[c] = FALSE (own HDFS is down).
  * Post: writerMode[c][rs] = "DEAD".
  *
- * Source: StoreAndForwardModeImpl.onFailure() L115-123 →
+ * Source: StoreAndForwardModeImpl.onFailure() L115-123 ->
  *         logGroup.abort()
  *)
 RSAbortOnLocalHDFSFailure(c, rs) ==
@@ -122,6 +125,7 @@ RSAbortOnLocalHDFSFailure(c, rs) ==
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
     /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ============================================================================

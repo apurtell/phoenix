@@ -9,26 +9,28 @@
  * Models the HA group state machine for two paired Phoenix/HBase
  * clusters. Each cluster maintains an HA group state in ZooKeeper.
  * State transitions are driven by admin actions, peer-reactive
- * listeners, writer/reader state changes, and HDFS availability
- * incidents.
+ * listeners, writer/reader state changes, HDFS availability
+ * incidents, and ZK coordination failures.
  *
- * ZK WATCHER DELIVERY: Peer-reactive transitions and auto-
- * completion transitions depend on ZooKeeper watcher notification
- * chains (peerPathChildrenCache for peer detection, pathChildrenCache
- * for local auto-completion). ZK does NOT formally guarantee
- * unconditional delivery. In this model, peer-reactive actions fire
- * whenever their guard is satisfied. TLC's interleaving semantics
- * cover arbitrary delivery delay (safety verification is sound).
+ * ZK COORDINATION MODEL (Iteration 13): ZK connection and session
+ * lifecycle are modeled explicitly. Peer-reactive transitions
+ * (PeerReact actions) are guarded on zkPeerConnected[c] and
+ * zkPeerSessionAlive[c]. Auto-completion, heartbeat, writer ZK
+ * writes, and failover trigger are guarded on zkLocalConnected[c].
+ * Retry exhaustion of the FailoverManagementListener (2-retry
+ * limit) is modeled as ReactiveTransitionFail(c).
  *
  * Sub-modules:
  *   - Admin.tla: operator-initiated failover/abort
  *   - Clock.tla: anti-flapping countdown timer (Tick action)
- *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
+ *   - HAGroupStore.tla: peer-reactive transitions, auto-completion,
+ *                       retry exhaustion
  *   - HDFS.tla: HDFS availability incident actions
  *   - Reader.tla: standby-side replication replay state machine
  *   - RS.tla: RS lifecycle (crash, abort on local HDFS failure,
  *             restart after abort)
  *   - Writer.tla: per-RS replication writer mode state machine
+ *   - ZK.tla: ZK connection/session lifecycle environment actions
  *
  * Implementation traceability:
  *
@@ -38,13 +40,16 @@
  *   PeerReact* actions      | FailoverManagementListener
  *                           |   (HAGroupStoreManager.java L633-706)
  *                           |   Delivered via peerPathChildrenCache
- *                           |   (ZK watcher — conditional delivery)
- *   TriggerFailover          | Reader.TriggerFailover — guarded
- *                           |   STA→AIS via shouldTriggerFailover()
+ *                           |   (ZK watcher -- conditional delivery)
+ *   ReactiveTransitionFail  | FailoverManagementListener 2-retry
+ *                           |   exhaustion (L653-704); method returns
+ *                           |   silently, transition permanently lost
+ *   TriggerFailover          | Reader.TriggerFailover -- guarded
+ *                           |   STA->AIS via shouldTriggerFailover()
  *                           |   L500-533 + triggerFailover() L535-548
  *   AutoComplete            | createLocalStateTransitions() L140-150
  *                           |   Delivered via local pathChildrenCache
- *                           |   (ZK watcher — conditional delivery)
+ *                           |   (ZK watcher -- conditional delivery)
  *   AdminStartFailover      | initiateFailoverOnActiveCluster() L375-400
  *   AdminAbortFailover      | setHAGroupStatusToAbortToStandby() L419-425
  *   Init (AIS, S)           | Default initial states per team confirmation
@@ -66,7 +71,7 @@
  *                           |   detected via IOException)
  *   RSCrash                 | JVM crash, OOM, kill signal
  *   RSAbortOnLocalHDFS-     | StoreAndForwardModeImpl.onFailure()
- *     Failure               |   L115-123 → logGroup.abort()
+ *     Failure               |   L115-123 -> logGroup.abort()
  *   HDFSDown/HDFSUp         | NameNode crash/recovery incidents;
  *                           |   SyncModeImpl.onFailure() L61-74
  *   antiFlapTimer           | Countdown timer (Lamport CHARME 2005);
@@ -88,12 +93,24 @@
  *   ReplayRewind            | replay() L323-333 (CAS to SYNC)
  *   TriggerFailover         | shouldTriggerFailover() L500-533 +
  *                           |   triggerFailover() L535-548
- *   FailoverTriggerCorrectness | Action constraint: STA→AIS requires
- *                           |   failoverPending ∧ inProgressDirEmpty
- *                           |   ∧ replayState = SYNC
+ *   FailoverTriggerCorrectness | Action constraint: STA->AIS requires
+ *                           |   failoverPending /\ inProgressDirEmpty
+ *                           |   /\ replayState = SYNC
  *   NoDataLoss              | Action constraint: zero RPO property
  *                           |   (currently logically equivalent to
  *                           |   FailoverTriggerCorrectness)
+ *   zkPeerConnected         | peerPathChildrenCache TCP connection
+ *                           |   state (HAGroupStoreClient L110-112)
+ *   zkPeerSessionAlive      | Peer ZK session state (Curator internal)
+ *   zkLocalConnected        | pathChildrenCache TCP connection state;
+ *                           |   maps to HAGroupStoreClient.isHealthy
+ *                           |   (L878-911)
+ *   ZKPeerDisconnect        | peerPathChildrenCache CONNECTION_LOST
+ *   ZKPeerReconnect         | peerPathChildrenCache CONNECTION_RECONNECTED
+ *   ZKPeerSessionExpiry     | Curator session expiry -> CONNECTION_LOST
+ *   ZKPeerSessionRecover    | Curator retry -> new session
+ *   ZKLocalDisconnect       | pathChildrenCache CONNECTION_LOST
+ *   ZKLocalReconnect        | pathChildrenCache CONNECTION_RECONNECTED
  *
  * failoverPending lifecycle:
  *   Set TRUE:  PeerReactToATS (HAGroupStore.tla)
@@ -132,7 +149,7 @@ VARIABLE outDirEmpty
 
 \* hdfsAvailable[c] is TRUE when cluster c's HDFS (NameNode) is
 \* accessible to its peer cluster's writers. FALSE after a NameNode
-\* crash. Not explicitly tracked in the implementation — detected
+\* crash. Not explicitly tracked in the implementation -- detected
 \* reactively via IOException from HDFS write operations.
 VARIABLE hdfsAvailable
 
@@ -190,10 +207,39 @@ VARIABLE failoverPending
 \*         L500-533
 VARIABLE inProgressDirEmpty
 
+\* zkPeerConnected[c] is TRUE when cluster c's peerPathChildrenCache
+\* has a live TCP connection to the peer ZK quorum. When FALSE, no
+\* watcher notifications from the peer are delivered, suppressing
+\* all PeerReact* transitions.
+\*
+\* Source: HAGroupStoreClient.createCacheListener() L894-906
+\*         (peerPathChildrenCache CONNECTION_LOST/CONNECTION_RECONNECTED)
+VARIABLE zkPeerConnected
+
+\* zkPeerSessionAlive[c] is TRUE when cluster c's peer ZK session is
+\* alive (not expired). Session expiry permanently loses all watches
+\* until a new session is established. Session expiry implies
+\* disconnection (zkPeerSessionAlive = FALSE => zkPeerConnected = FALSE).
+\*
+\* Source: Curator internal session management; no explicit Phoenix
+\*         SESSION_EXPIRED handler
+VARIABLE zkPeerSessionAlive
+
+\* zkLocalConnected[c] is TRUE when cluster c's pathChildrenCache
+\* (local) has a live connection to the local ZK quorum. When FALSE,
+\* isHealthy = false, blocking all setHAGroupStatusIfNeeded() calls
+\* and suppressing auto-completion, heartbeat, writer ZK writes, and
+\* failover trigger.
+\*
+\* Source: HAGroupStoreClient.createCacheListener() L894-906
+\*         (pathChildrenCache CONNECTION_LOST/CONNECTION_RECONNECTED)
+VARIABLE zkLocalConnected
+
 \* Tuple of all variables for use in temporal formulas.
 vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
           replayState, lastRoundInSync, lastRoundProcessed,
-          failoverPending, inProgressDirEmpty>>
+          failoverPending, inProgressDirEmpty,
+          zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -220,6 +266,9 @@ clk == INSTANCE Clock
 \* Replication replay state machine (standby-side reader).
 reader == INSTANCE Reader
 
+\* ZK connection/session lifecycle environment actions.
+zk == INSTANCE ZK
+
 ---------------------------------------------------------------------------
 
 (* Initial state *)
@@ -243,6 +292,9 @@ Init ==
        /\ lastRoundProcessed = [c \in Cluster |-> 0]
        /\ failoverPending = [c \in Cluster |-> FALSE]
        /\ inProgressDirEmpty = [c \in Cluster |-> TRUE]
+       /\ zkPeerConnected = [c \in Cluster |-> TRUE]
+       /\ zkPeerSessionAlive = [c \in Cluster |-> TRUE]
+       /\ zkLocalConnected = [c \in Cluster |-> TRUE]
 
 ---------------------------------------------------------------------------
 
@@ -290,6 +342,8 @@ Next ==
         \/ haGroupStore!ANISHeartbeat(c)
         \* [Writer-driven] All RS synced + OUT empty + gate open: ANIS->AIS.
         \/ haGroupStore!ANISToAIS(c)
+        \* [Retry exhaustion] PeerReact retry failure: transition lost.
+        \/ haGroupStore!ReactiveTransitionFail(c)
         \* [Direct ZK write] Admin initiates failover: AIS->ATS.
         \/ admin!AdminStartFailover(c)
         \* [Direct ZK write] Admin aborts failover: STA->AbTS.
@@ -297,6 +351,13 @@ Next ==
         \* HDFS NameNode crash/recovery incidents.
         \/ hdfs!HDFSDown(c)
         \/ hdfs!HDFSUp(c)
+        \* ZK connection/session lifecycle (environment actions).
+        \/ zk!ZKPeerDisconnect(c)
+        \/ zk!ZKPeerReconnect(c)
+        \/ zk!ZKPeerSessionExpiry(c)
+        \/ zk!ZKPeerSessionRecover(c)
+        \/ zk!ZKLocalDisconnect(c)
+        \/ zk!ZKLocalReconnect(c)
         \* Standby-side replay state machine (reader).
         \/ reader!ReplayAdvance(c)
         \/ reader!ReplayDetectDegraded(c)
@@ -318,7 +379,7 @@ Next ==
             \* Per-RS HDFS failure degradation (CAS success).
             \/ writer!WriterToStoreFwd(c, r)
             \/ writer!WriterSyncFwdToStoreFwd(c, r)
-            \* Per-RS HDFS failure degradation (CAS failure → DEAD).
+            \* Per-RS HDFS failure degradation (CAS failure -> DEAD).
             \/ writer!WriterToStoreFwdFail(c, r)
             \/ writer!WriterSyncFwdToStoreFwdFail(c, r)
             \* RS lifecycle: crash, local HDFS abort, restart.
@@ -336,42 +397,42 @@ Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
 
-(* Type invariants *)
+(* Type invariant *)
 
-\* Every cluster's state is a valid HAGroupState.
+\* All specification variables have valid types.
 TypeOK ==
-    clusterState \in [Cluster -> HAGroupState]
-
-\* Every RS on every cluster has a valid WriterMode.
-WriterTypeOK ==
-    writerMode \in [Cluster -> [RS -> WriterMode]]
-
-\* OUT directory emptiness is a boolean per cluster.
-OutDirTypeOK ==
-    outDirEmpty \in [Cluster -> BOOLEAN]
-
-\* HDFS availability is a boolean per cluster.
-HDFSTypeOK ==
-    hdfsAvailable \in [Cluster -> BOOLEAN]
-
-\* Anti-flapping countdown timer is in 0..WaitTimeForSync per cluster.
-\* Bounded by construction: StartAntiFlapWait sets the max value,
-\* DecrementTimer floors at 0.
-AntiFlapTimerTypeOK ==
-    antiFlapTimer \in [Cluster -> 0..WaitTimeForSync]
-
-\* Replay state, round counters, and failover/IN-progress flags are
-\* well-typed per cluster.
-ReplayTypeOK ==
+    /\ clusterState \in [Cluster -> HAGroupState]
+    /\ writerMode \in [Cluster -> [RS -> WriterMode]]
+    /\ outDirEmpty \in [Cluster -> BOOLEAN]
+    /\ hdfsAvailable \in [Cluster -> BOOLEAN]
+    /\ antiFlapTimer \in [Cluster -> 0..WaitTimeForSync]
     /\ replayState \in [Cluster -> ReplayStateSet]
     /\ lastRoundInSync \in [Cluster -> Nat]
     /\ lastRoundProcessed \in [Cluster -> Nat]
     /\ failoverPending \in [Cluster -> BOOLEAN]
     /\ inProgressDirEmpty \in [Cluster -> BOOLEAN]
+    /\ zkPeerConnected \in [Cluster -> BOOLEAN]
+    /\ zkPeerSessionAlive \in [Cluster -> BOOLEAN]
+    /\ zkLocalConnected \in [Cluster -> BOOLEAN]
 
 ---------------------------------------------------------------------------
 
 (* Safety invariants *)
+
+(*
+ * ZK session/connection structural consistency: if the peer ZK
+ * session is expired, the peer connection must also be dead.
+ * Session expiry implies disconnection -- the ZKPeerSessionExpiry
+ * action sets both zkPeerSessionAlive and zkPeerConnected to FALSE.
+ * ZKPeerReconnect requires zkPeerSessionAlive = TRUE, so a
+ * reconnect cannot happen without a live session.
+ *
+ * This invariant verifies that the ZK actions correctly maintain
+ * the session/connection relationship across all reachable states.
+ *)
+ZKSessionConsistency ==
+    \A c \in Cluster :
+        zkPeerSessionAlive[c] = FALSE => zkPeerConnected[c] = FALSE
 
 \* Mutual exclusion: two clusters never both in the ACTIVE role
 \* simultaneously. This is the primary safety property of the
@@ -381,10 +442,10 @@ ReplayTypeOK ==
 \* ANISWOP. Transitional states ATS and ANISTS map to the
 \* ACTIVE_TO_STANDBY role (not ACTIVE), which is the mechanism
 \* by which safety is maintained during the non-atomic failover
-\* window — isMutationBlocked()=true for ACTIVE_TO_STANDBY.
+\* window -- isMutationBlocked()=true for ACTIVE_TO_STANDBY.
 \*
 \* Source: Architecture safety argument; ClusterRoleRecord.java
-\*         L84 — ACTIVE_TO_STANDBY has isMutationBlocked()=true.
+\*         L84 -- ACTIVE_TO_STANDBY has isMutationBlocked()=true.
 MutualExclusion ==
     ~(\E c1, c2 \in Cluster :
         \* Two distinct clusters ...
@@ -433,7 +494,7 @@ AbortSafety ==
  * retained for explicit documentation of the non-atomic window
  * safety argument.
  *
- * Source: ClusterRoleRecord.java L84 —
+ * Source: ClusterRoleRecord.java L84 --
  *         ACTIVE_TO_STANDBY has isMutationBlocked()=true.
  *)
 NonAtomicFailoverSafe ==
@@ -515,7 +576,7 @@ AIStoATSPrecondition ==
 ---------------------------------------------------------------------------
 
 (*
- * Anti-flapping gate: ANIS → AIS never fires while the countdown
+ * Anti-flapping gate: ANIS -> AIS never fires while the countdown
  * timer is still running. This is a cross-check on the ANISToAIS
  * action's AntiFlapGateOpen guard, analogous to how AIStoATS-
  * Precondition cross-checks AdminStartFailover.
@@ -531,9 +592,9 @@ AntiFlapGate ==
 ---------------------------------------------------------------------------
 
 (*
- * Failover trigger correctness: STA → AIS requires replay-
+ * Failover trigger correctness: STA -> AIS requires replay-
  * completeness conditions. Cross-checks the TriggerFailover
- * action's guards — if TLC finds a step where STA→AIS happens
+ * action's guards -- if TLC finds a step where STA->AIS happens
  * without the required conditions, the action constraint fires.
  *
  * hdfsAvailable is excluded: it is an environmental/liveness
@@ -553,7 +614,7 @@ FailoverTriggerCorrectness ==
 
 (*
  * No data loss (zero RPO): the high-level safety property for
- * failover. When the standby completes STA → AIS, replay must
+ * failover. When the standby completes STA -> AIS, replay must
  * have been in SYNC (no pending SYNCED_RECOVERY rewind), the
  * in-progress directory must be empty, and the failover must
  * have been properly initiated.
@@ -608,7 +669,7 @@ ReplayTransitionValid ==
  * process lifecycle.
  *
  * Holds by construction: every action that degrades writers or
- * sets outDirEmpty=FALSE also transitions AIS → ANIS; every
+ * sets outDirEmpty=FALSE also transitions AIS -> ANIS; every
  * path back to AIS (ANISToAIS) requires outDirEmpty and all SYNC.
  * RSCrash leaves clusterState unchanged.
  *)
@@ -628,7 +689,7 @@ AISImpliesInSync ==
  *
  * Holds by construction: the only paths that create S&F writers
  * (WriterToStoreFwd, WriterInitToStoreFwd) atomically transition
- * AIS → ANIS.
+ * AIS -> ANIS.
  *)
 NoAISWithSFWriter ==
     \A c \in Cluster :
@@ -641,7 +702,7 @@ NoAISWithSFWriter ==
  * Writer-cluster consistency: degraded writer modes (S&F,
  * SYNC_AND_FWD) can only appear on active clusters that are
  * NOT in AIS, or on the ANISTS transitional state.
- * Specifically, this excludes AIS (prevented by AIS→ANIS
+ * Specifically, this excludes AIS (prevented by AIS->ANIS
  * coupling) and all standby/transitional states (prevented
  * by active-cluster guards).
  *
@@ -651,7 +712,7 @@ NoAISWithSFWriter ==
  * only on non-AIS active states, but RSCrash is unconstrained.
  *
  * The allowed set includes AbTAIS and AWOP because HDFS can go
- * down while the cluster is in these states; the AIS→ANIS
+ * down while the cluster is in these states; the AIS->ANIS
  * coupling only fires for AIS, so other active states retain
  * their state while writers degrade.
  *)
@@ -682,17 +743,8 @@ Symmetry == Permutations(RS)
 
 (* Theorems *)
 
-\* Safety: every step preserves the cluster type invariant.
+\* Safety: all variables have valid types.
 THEOREM Spec => []TypeOK
-
-\* Safety: every step preserves the writer type invariant.
-THEOREM Spec => []WriterTypeOK
-
-\* Safety: every step preserves the OUT dir type invariant.
-THEOREM Spec => []OutDirTypeOK
-
-\* Safety: every step preserves the HDFS type invariant.
-THEOREM Spec => []HDFSTypeOK
 
 \* Safety: mutual exclusion holds in every reachable state.
 THEOREM Spec => []MutualExclusion
@@ -712,16 +764,13 @@ THEOREM Spec => []NoAISWithSFWriter
 \* Safety: degraded writer modes only on degraded-active clusters.
 THEOREM Spec => []WriterClusterConsistency
 
-\* Safety: anti-flapping timer is bounded by WaitTimeForSync.
-THEOREM Spec => []AntiFlapTimerTypeOK
+\* Safety: ZK session/connection consistency (session expiry implies disconnection).
+THEOREM Spec => []ZKSessionConsistency
 
-\* Safety: replay state, counters, and flags are well-typed.
-THEOREM Spec => []ReplayTypeOK
-
-\* Safety: STA→AIS requires replay-completeness conditions (action property).
+\* Safety: STA->AIS requires replay-completeness conditions (action property).
 THEOREM Spec => [][FailoverTriggerCorrectness]_vars
 
-\* Safety: zero RPO — no data loss on failover (action property).
+\* Safety: zero RPO -- no data loss on failover (action property).
 THEOREM Spec => [][NoDataLoss]_vars
 
 ============================================================================
