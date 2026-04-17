@@ -745,30 +745,9 @@ Created `Reader.tla` (4 per-cluster replay actions: `ReplayAdvance`, `ReplayDete
 
 ### Phase 5: Crash and Recovery
 
-#### Iteration 12 — RS crash (writer fail-stop)
+#### ~~Iteration 12 — RS crash (writer fail-stop)~~ ✅ COMPLETE
 
-**Modules modified:** `RS.tla`, `Writer.tla`, `HDFS.tla`, `ConsistentFailover.tla`.
-
-Note: `RS.tla` was created in Iteration 9 with `RSRestart(c, rs)` (`DEAD → INIT`). This iteration extends it with crash modeling and `rsAlive` tracking.
-
-**What to add:**
-
-`RS.tla`:
-- `RSCrash(c, rs)` action: general non-deterministic RS crash (JVM crash, OOM, killed by process supervisor, etc.). Sets `rsAlive[c][rs] = FALSE` and `writerMode[c][rs]' = "DEAD"` regardless of current writer mode. No mode guard — an RS can crash at any time.
-- **`RSAbortOnLocalHDFSFailure(c, rs)` action (from HDFS side-tracking audit):** fires when `writerMode[c][rs] = "STORE_AND_FWD" ∧ hdfsAvailable[c] = FALSE`. In STORE_AND_FWD mode, the writer targets the active cluster's own (local/fallback) HDFS. If that HDFS fails, `StoreAndForwardModeImpl.onFailure()` treats the error as fatal and calls `logGroup.abort()`, aborting the RS. This is distinct from `HDFSDown(c)` (which models the *peer's* HDFS failing and degrades writers on the active side): `RSAbortOnLocalHDFSFailure` models the active cluster's *own* HDFS failing while the RS is already in fallback mode. Note: RS in SYNC or SYNC_AND_FWD are not affected by their own cluster's HDFS failure because those modes write to the peer's HDFS. **Prerequisite:** requires the `HDFSDown` guard relaxation in `HDFS.tla` (see below) so that the active cluster's own HDFS can fail. Source: `StoreAndForwardModeImpl.java` L115-123.
-- Extend `RSRestart(c, rs)` (already implemented in Iteration 9) to also set `rsAlive[c][rs] = TRUE`. Forwarder resumes draining via `initializeLastRoundProcessed()` which scans existing files.
-
-`Writer.tla`:
-- Guard all writer actions on `rsAlive[c][rs] = TRUE`.
-- OUT directory shards are time-based (not per-RS), so surviving RS forwarders can drain a crashed RS's fully-written files from the shared shard directories. Mid-write files with unclosed HDFS leases are actively recovered: when a forwarder or replay processor encounters such a file, `ReplicationLogProcessor.createLogFileReader()` calls `RecoverLeaseFSUtils.recoverFileLease()` *before* attempting to read, which invokes `DistributedFileSystem.recoverLease(Path)` (or `LeaseRecoverable.recoverLease(Path)` on Hadoop ≥3.3.6) with retry and backoff — 4 s first pause, then linear backoff from a 64 s base, up to a 15-minute timeout (`REPLICATION_REPLAY_LEASE_RECOVERY_TIMEOUT_MILLISECOND`). Once the lease is recovered and HDFS closes the file, the reader tolerates the missing trailer via `setValidateTrailer(false)` and reads all valid records. Modeled as a bounded-delay lease recovery step gating file processing (not a passive wait for lease expiry). Source: `RecoverLeaseFSUtils.java` L125-284, `ReplicationLogProcessor.java` L296-340.
-
-`HDFS.tla`:
-- Relax the `HDFSDown(c)` guard: remove the `clusterState[Peer(c)] ∈ ActiveStates` constraint so that any cluster's HDFS can fail, not only the standby's. Currently `HDFSDown(c)` can only fire when `Peer(c)` is active (i.e., only the standby cluster's HDFS can go down). With this relaxation, `HDFSDown(c_active)` can fire, setting `hdfsAvailable[active] = FALSE`, which enables `RSAbortOnLocalHDFSFailure` for S&F writers on the active cluster.
-
-`ConsistentFailover.tla`:
-- Variable: `rsAlive ∈ [Cluster → [RS → BOOLEAN]]`.
-- Impact on cluster state: if all RS crash, cluster becomes unreachable.
-
+Added `RSCrash(c, rs)` (any non-DEAD mode → DEAD, no mode guard) and `RSAbortOnLocalHDFSFailure(c, rs)` (STORE_AND_FWD → DEAD when own HDFS down; source: `StoreAndForwardModeImpl.onFailure()` L115-123) to `RS.tla`. Relaxed `HDFSDown(c)` guard in `HDFS.tla`: removed `clusterState[Peer(c)] ∈ ActiveStates` so any cluster's HDFS can fail, enabling `RSAbortOnLocalHDFSFailure` for S&F writers on the active cluster. Wired both into `Next`; added `<<"STORE_AND_FWD","DEAD">>` to `AllowedWriterTransitions`. Relaxed `AISImpliesInSync` (allow DEAD), `WriterClusterConsistency` (removed DEAD from degraded-mode check — RSCrash can fire on any cluster state), `AIStoATSPrecondition` and `AdminStartFailover` guard (allow DEAD RSes alongside SYNC). `rsAlive` variable eliminated — `writerMode = "DEAD"` is the sole death indicator; all three RS death paths (CAS failure, JVM crash, local HDFS abort) end identically in the implementation (`abort()` → `RuntimeException` → JVM exit → supervisor restart).
 
 #### Iteration 13 — ZK coordination model (session lifecycle, watcher delivery, retry exhaustion)
 

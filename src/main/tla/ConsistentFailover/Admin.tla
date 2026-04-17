@@ -31,11 +31,12 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  *
  * Pre:  Cluster c is in AIS (ACTIVE_IN_SYNC) and peer is in a
  *       stable standby state (S or DS).
- *       The OUT directory must be empty and all RS must be in
- *       SYNC mode — this precondition is implicit in the
- *       implementation because AIS implies all RS are in SYNC
- *       (enforced by the ANIS→AIS transition requiring outDirEmpty
- *       and anti-flapping timeout).
+ *       The OUT directory must be empty and all live RS must be
+ *       in SYNC mode. DEAD RSes are allowed — an RS can crash
+ *       while the cluster is AIS without changing the HA group
+ *       state. The implementation checks clusterState = AIS, not
+ *       per-RS modes; a DEAD RS is not writing, so the remaining
+ *       SYNC RSes and empty OUT dir ensure safety.
  * Post: Cluster c transitions to ATS (ACTIVE_IN_SYNC_TO_STANDBY),
  *       blocking mutations (isMutationBlocked()=true for the
  *       ACTIVE_TO_STANDBY role).
@@ -54,7 +55,7 @@ AdminStartFailover(c) ==
     /\ clusterState[c] = "AIS"
     /\ clusterState[Peer(c)] \in {"S", "DS"}
     /\ outDirEmpty[c]
-    /\ \A rs \in RS : writerMode[c][rs] = "SYNC"
+    /\ \A rs \in RS : writerMode[c][rs] \in {"SYNC", "DEAD"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
     /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,

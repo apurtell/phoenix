@@ -26,7 +26,8 @@
  *   - HAGroupStore.tla: peer-reactive transitions, auto-completion
  *   - HDFS.tla: HDFS availability incident actions
  *   - Reader.tla: standby-side replication replay state machine
- *   - RS.tla: RS lifecycle (restart after abort)
+ *   - RS.tla: RS lifecycle (crash, abort on local HDFS failure,
+ *             restart after abort)
  *   - Writer.tla: per-RS replication writer mode state machine
  *
  * Implementation traceability:
@@ -63,6 +64,9 @@
  *   hdfsAvailable           | Abstract: NameNode availability per cluster
  *                           |   (no explicit field in implementation;
  *                           |   detected via IOException)
+ *   RSCrash                 | JVM crash, OOM, kill signal
+ *   RSAbortOnLocalHDFS-     | StoreAndForwardModeImpl.onFailure()
+ *     Failure               |   L115-123 → logGroup.abort()
  *   HDFSDown/HDFSUp         | NameNode crash/recovery incidents;
  *                           |   SyncModeImpl.onFailure() L61-74
  *   antiFlapTimer           | Countdown timer (Lamport CHARME 2005);
@@ -88,8 +92,8 @@
  *                           |   failoverPending ∧ inProgressDirEmpty
  *                           |   ∧ replayState = SYNC
  *   NoDataLoss              | Action constraint: zero RPO property
- *                           |   (logically equivalent to Failover-
- *                           |   TriggerCorrectness in Iteration 11)
+ *                           |   (currently logically equivalent to
+ *                           |   FailoverTriggerCorrectness)
  *
  * failoverPending lifecycle:
  *   Set TRUE:  PeerReactToATS (HAGroupStore.tla)
@@ -207,7 +211,7 @@ writer == INSTANCE Writer
 \* HDFS availability incident actions.
 hdfs == INSTANCE HDFS
 
-\* RS lifecycle (restart after abort).
+\* RS lifecycle (crash, local HDFS abort, restart).
 rs == INSTANCE RS
 
 \* Anti-flapping countdown timer.
@@ -254,11 +258,13 @@ Init ==
  *   - admin: operator-initiated failover and abort
  *     These are direct ZK writes (not watcher-dependent).
  *   - hdfs: HDFS NameNode crash/recovery incidents
- *     HDFSDown sets the availability flag; per-RS degradation
- *     is handled by writer actions with CAS success/failure.
+ *     HDFSDown sets the availability flag for any cluster's HDFS;
+ *     per-RS degradation is handled by writer actions with CAS
+ *     success/failure. Local HDFS failure with S&F writers
+ *     triggers RS abort (RS.tla).
  *   - writer: per-RS writer mode transitions (startup, recovery,
  *     drain complete, HDFS failure degradation, CAS failure)
- *   - rs: RS lifecycle (restart after abort)
+ *   - rs: RS lifecycle (crash, local HDFS abort, restart)
  *
  * Each action encodes the precise guard (peer state or local state)
  * under which the transition fires, modeling the implementation's
@@ -315,8 +321,10 @@ Next ==
             \* Per-RS HDFS failure degradation (CAS failure → DEAD).
             \/ writer!WriterToStoreFwdFail(c, r)
             \/ writer!WriterSyncFwdToStoreFwdFail(c, r)
-            \* RS lifecycle: process supervisor restarts dead RS.
+            \* RS lifecycle: crash, local HDFS abort, restart.
             \/ rs!RSRestart(c, r)
+            \/ rs!RSCrash(c, r)
+            \/ rs!RSAbortOnLocalHDFSFailure(c, r)
 
 ---------------------------------------------------------------------------
 
@@ -469,6 +477,7 @@ AllowedWriterTransitions ==
       <<"SYNC", "SYNC_AND_FWD">>,
       <<"SYNC", "DEAD">>,
       <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
+      <<"STORE_AND_FWD", "DEAD">>,
       <<"SYNC_AND_FWD", "SYNC">>,
       <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
       <<"SYNC_AND_FWD", "DEAD">>,
@@ -485,23 +494,23 @@ WriterTransitionValid ==
 
 (*
  * AIS-to-ATS precondition: failover can only begin from AIS when
- * the OUT directory is empty and all RS are in SYNC mode.
+ * the OUT directory is empty and all live RS are in SYNC mode.
  *
- * This precondition is implicit in the implementation because AIS
- * implies all RS are in SYNC (enforced by the ANIS→AIS transition
- * requiring outDirEmpty and the anti-flapping timeout). It is
- * enforced here as a guard on AdminStartFailover and verified as
- * an action constraint.
+ * DEAD RSes are allowed: an RS can crash while the cluster is AIS
+ * without changing the HA group state. A DEAD RS is not writing,
+ * so the remaining SYNC RSes and empty OUT dir ensure safety.
+ * The implementation checks clusterState = AIS, not per-RS modes.
  *
  * Source: initiateFailoverOnActiveCluster() L375-400 (validates
  *         current state is AIS or ANIS); the precondition holds
  *         because AIS is only reachable when OUT dir is empty and
- *         all writers have returned to SYNC.
+ *         all writers have returned to SYNC. RS crash does not
+ *         change clusterState.
  *)
 AIStoATSPrecondition ==
     \A c \in Cluster :
         clusterState[c] = "AIS" /\ clusterState'[c] = "ATS"
-        => outDirEmpty[c] /\ \A r \in RS : writerMode[c][r] = "SYNC"
+        => outDirEmpty[c] /\ \A r \in RS : writerMode[c][r] \in {"SYNC", "DEAD"}
 
 ---------------------------------------------------------------------------
 
@@ -549,12 +558,10 @@ FailoverTriggerCorrectness ==
  * in-progress directory must be empty, and the failover must
  * have been properly initiated.
  *
- * Logically equivalent to FailoverTriggerCorrectness in this
- * iteration but serves a different documentary purpose: this
- * states the safety property; FailoverTriggerCorrectness validates
- * the implementation mechanism. They will diverge in Iteration 18
- * (forced failover) where NoDataLoss is expected to fail when
- * UseForceFailover = TRUE.
+ * Currently logically equivalent to FailoverTriggerCorrectness
+ * but serves a different documentary purpose: this states the
+ * safety property; FailoverTriggerCorrectness validates the
+ * implementation mechanism.
  *)
 NoDataLoss ==
     \A c \in Cluster :
@@ -592,17 +599,24 @@ ReplayTransitionValid ==
 
 (*
  * AIS implies in-sync: whenever a cluster is in AIS, the OUT
- * directory must be empty and all RS must be in SYNC or INIT.
+ * directory must be empty and all RS must be in SYNC, INIT, or
+ * DEAD.
+ *
+ * DEAD is allowed because an RS can crash while the cluster is
+ * AIS. RSCrash sets writerMode to DEAD but does not change
+ * clusterState. The HA group state in ZK is independent of RS
+ * process lifecycle.
  *
  * Holds by construction: every action that degrades writers or
  * sets outDirEmpty=FALSE also transitions AIS → ANIS; every
  * path back to AIS (ANISToAIS) requires outDirEmpty and all SYNC.
+ * RSCrash leaves clusterState unchanged.
  *)
 AISImpliesInSync ==
     \A c \in Cluster :
         clusterState[c] = "AIS" =>
             /\ outDirEmpty[c]
-            /\ \A r \in RS : writerMode[c][r] \in {"INIT", "SYNC"}
+            /\ \A r \in RS : writerMode[c][r] \in {"INIT", "SYNC", "DEAD"}
 
 ---------------------------------------------------------------------------
 
@@ -625,23 +639,25 @@ NoAISWithSFWriter ==
 
 (*
  * Writer-cluster consistency: degraded writer modes (S&F,
- * SYNC_AND_FWD, DEAD) can only appear on active clusters that
- * are NOT in AIS, or on the ANISTS transitional state.
+ * SYNC_AND_FWD) can only appear on active clusters that are
+ * NOT in AIS, or on the ANISTS transitional state.
  * Specifically, this excludes AIS (prevented by AIS→ANIS
- * coupling and CAS failure guard clusterState /= "AIS") and
- * all standby/transitional states (prevented by active-cluster
- * guards).
+ * coupling) and all standby/transitional states (prevented
+ * by active-cluster guards).
+ *
+ * DEAD is excluded from this check because RSCrash can set
+ * writerMode to DEAD on any cluster state (an RS can crash
+ * at any time). DEAD writers from CAS failure also appear
+ * only on non-AIS active states, but RSCrash is unconstrained.
  *
  * The allowed set includes AbTAIS and AWOP because HDFS can go
  * down while the cluster is in these states; the AIS→ANIS
  * coupling only fires for AIS, so other active states retain
- * their state while writers degrade. DEAD writers arise from
- * CAS failure during degradation, which is only possible when
- * the cluster is already not in AIS.
+ * their state while writers degrade.
  *)
 WriterClusterConsistency ==
     \A c \in Cluster :
-        (\E r \in RS : writerMode[c][r] \in {"STORE_AND_FWD", "SYNC_AND_FWD", "DEAD"}) =>
+        (\E r \in RS : writerMode[c][r] \in {"STORE_AND_FWD", "SYNC_AND_FWD"}) =>
             clusterState[c] \in {"ANIS", "ANISTS", "ANISWOP", "AbTANIS", "AbTAIS", "AWOP"}
 
 ---------------------------------------------------------------------------

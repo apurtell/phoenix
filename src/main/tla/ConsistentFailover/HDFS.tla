@@ -43,21 +43,22 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  * = FALSE. Those actions also handle the AIS → ANIS cluster
  * state transition and CAS failure (→ DEAD).
  *
- * Only fires when Peer(c) is an active cluster (has writers).
- * HDFSDown(c_standby): Peer = active — guard satisfied, correct.
- * HDFSDown(c_active): Peer = standby — guard fails, no effect.
+ * Any cluster's HDFS can fail at any time. Two consequences:
+ *   1. HDFSDown(c_standby): standby HDFS fails → active writers
+ *      detect via IOException and degrade (SYNC → S&F).
+ *   2. HDFSDown(c_active): active cluster's own HDFS fails →
+ *      S&F writers on the active cluster abort (modeled by
+ *      RSAbortOnLocalHDFSFailure in RS.tla).
  *
  * Pre:  c's HDFS is currently available.
- *       Peer(c) is in an active state.
  * Post: hdfsAvailable[c] = FALSE.
  *       All other variables unchanged — per-RS effects deferred
- *       to writer actions.
+ *       to writer actions (case 1) or RS.tla (case 2).
  *
  * Source: NameNode crash (environment event)
  *)
 HDFSDown(c) ==
     /\ hdfsAvailable[c] = TRUE
-    /\ clusterState[Peer(c)] \in ActiveStates
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
