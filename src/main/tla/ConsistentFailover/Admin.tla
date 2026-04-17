@@ -30,22 +30,37 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
 (*
  * Admin initiates failover on the active cluster.
  *
- * Pre:  Cluster c is in AIS (ACTIVE_IN_SYNC) and peer is in a
- *       stable standby state (S or DS).
- *       The OUT directory must be empty and all live RS must be
- *       in SYNC mode. DEAD RSes are allowed -- an RS can crash
- *       while the cluster is AIS without changing the HA group
- *       state. The implementation checks clusterState = AIS, not
- *       per-RS modes; a DEAD RS is not writing, so the remaining
- *       SYNC RSes and empty OUT dir ensure safety.
- * Post: Cluster c transitions to ATS (ACTIVE_IN_SYNC_TO_STANDBY),
- *       blocking mutations (isMutationBlocked()=true for the
- *       ACTIVE_TO_STANDBY role).
+ * Two paths depending on current state:
  *
- * The peer-state guard prevents initiating a new failover during
- * the non-atomic window of a previous failover (where the peer
- * may still be in ATS). Without this guard, the admin could
- * produce an irrecoverable (ATS, ATS) deadlock.
+ *   AIS path:  AIS -> ATS   (in-sync, ready to hand off immediately)
+ *   ANIS path: ANIS -> ANISTS (not-in-sync, forwarder must drain OUT
+ *              before ANISTS can advance to ATS)
+ *
+ * AIS path guards:
+ *   The OUT directory must be empty and all live RS must be in SYNC
+ *   mode. DEAD RSes are allowed -- an RS can crash while the cluster
+ *   is AIS without changing the HA group state. The implementation
+ *   checks clusterState = AIS, not per-RS modes; a DEAD RS is not
+ *   writing, so the remaining SYNC RSes and empty OUT dir ensure
+ *   safety.
+ *
+ * ANIS path guards:
+ *   The implementation only validates the current state (ANIS) and
+ *   peer state. No outDirEmpty or writer-mode guards -- the
+ *   forwarder will drain OUT after the transition. The ANISTS ->
+ *   ATS transition (ANISTSToATS in HAGroupStore.tla) guards on
+ *   outDirEmpty and the anti-flapping gate.
+ *
+ * Both paths:
+ *   Peer must be in a stable standby state (S or DS) to prevent
+ *   initiating a new failover during the non-atomic window of a
+ *   previous failover (where the peer may still be in ATS).
+ *   Without this guard, the admin could produce an irrecoverable
+ *   (ATS, ATS) or (ANISTS, ATS) deadlock.
+ *
+ * Post: Cluster c transitions to ATS or ANISTS, both of which
+ *       map to the ACTIVE_TO_STANDBY role, blocking mutations
+ *       (isMutationBlocked()=true).
  *
  * Source: initiateFailoverOnActiveCluster() L375-400 checks current
  *         state and selects AIS -> ATS or ANIS -> ANISTS.
@@ -53,11 +68,13 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  *         (HAGroupStoreClient L421).
  *)
 AdminStartFailover(c) ==
-    /\ clusterState[c] = "AIS"
     /\ clusterState[Peer(c)] \in {"S", "DS"}
-    /\ outDirEmpty[c]
-    /\ \A rs \in RS : writerMode[c][rs] \in {"SYNC", "DEAD"}
-    /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
+    /\ \/ /\ clusterState[c] = "AIS"
+          /\ outDirEmpty[c]
+          /\ \A rs \in RS : writerMode[c][rs] \in {"SYNC", "DEAD"}
+          /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
+       \/ /\ clusterState[c] = "ANIS"
+          /\ clusterState' = [clusterState EXCEPT ![c] = "ANISTS"]
     /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
                    failoverPending, inProgressDirEmpty,

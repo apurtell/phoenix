@@ -751,41 +751,15 @@ Added `RSCrash(c, rs)` (any non-DEAD mode → DEAD, no mode guard) and `RSAbortO
 
 #### ~~Iteration 13 — ZK coordination model (session lifecycle, watcher delivery, retry exhaustion)~~ ✅ COMPLETE
 
-Created `ZK.tla` (6 per-cluster actions: peer disconnect/reconnect, peer session expiry/recover, local disconnect/reconnect). Added `zkPeerConnected`, `zkPeerSessionAlive`, `zkLocalConnected` (`[Cluster → BOOLEAN]`, init TRUE). Dropped per-RS `ZKDisconnectRS` — `isHealthy` is per-cluster; added `zkLocalConnected` (not in original sketch) for `isHealthy`-dependent paths. Guarded `PeerReact*` on `zkPeerConnected ∧ zkPeerSessionAlive`; guarded all ZK-write actions (`AutoComplete`, `ANISHeartbeat`, `ANISToAIS`, `TriggerFailover`, writer S&F/Sync writes and CAS failures) on `zkLocalConnected`. Added `ReactiveTransitionFail(c)` stuttering action — models listener retry exhaustion (L653-704); non-deterministic with `PeerReact*` success paths. `ZKTypeOK`, `ZKSessionConsistency` (`¬zkPeerSessionAlive ⇒ ¬zkPeerConnected`) invariants. All existing safety invariants hold over 64× expanded state space; liveness predicated on ZLA (§4.2).
+Created `ZK.tla`. Added `zkPeerConnected`, `zkPeerSessionAlive`, `zkLocalConnected` (`[Cluster → BOOLEAN]`, init TRUE). Dropped per-RS `ZKDisconnectRS` — `isHealthy` is per-cluster; added `zkLocalConnected` for `isHealthy`-dependent paths. Guarded `PeerReact*` on `zkPeerConnected ∧ zkPeerSessionAlive`; guarded all ZK-write actions (`AutoComplete`, `ANISHeartbeat`, `ANISToAIS`, `TriggerFailover`, writer S&F/Sync writes and CAS failures) on `zkLocalConnected`. Added `ReactiveTransitionFail(c)` stuttering action — models listener retry exhaustion (L653-704); non-deterministic with `PeerReact*` success paths. `ZKSessionConsistency` (`¬zkPeerSessionAlive ⇒ ¬zkPeerConnected`) invariants.
 
 ---
 
 ### Phase 6: Liveness and Refinement
 
-#### Iteration 14 — ANISTS failover path
+#### ~~Iteration 14 — ANISTS failover path~~ ✅ COMPLETE
 
-**Modules modified:** `Admin.tla`, `HAGroupStore.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`Admin.tla`:
-- Refine `AdminStartFailover` to handle ANIS case: transitions to ANISTS (not ATS). Source: `HAGroupStoreManager.initiateFailoverOnActiveCluster()` L389-397 checks current state and selects `AIS → ATS` or `ANIS → ANISTS`.
-
-`HAGroupStore.tla`:
-- `ANISTSToATS(c)` action: when `outDirEmpty[c]` becomes TRUE, ANISTS → ATS. Source: `setHAGroupStatusToSync()` L341-355 — if current state is `ANISTS`, target is `ATS` (= `ACTIVE_IN_SYNC_TO_STANDBY`).
-- Guard: `ANISTSToATS` is subject to anti-flapping wait gate (see §3.6).
-
-`ConsistentFailover.tla`:
-- Verify that the ANIS failover path also satisfies mutual exclusion and no data loss.
-- **Key scenario**: Verify that `(ANIS, DS) → (ANISTS, DS) → (ATS, DS) → (ATS, STA) → (ATS, AIS) → (S, AIS)` completes successfully. With `DS → STA` in the `allowedTransitions` table, the standby can enter `STA` from `DEGRADED_STANDBY` when it detects peer `ATS`.
-
-**Expected TLC result:** Both AIS and ANIS failover paths verified. ANIS failover from `(ANIS, DS)` completes end-to-end with mutual exclusion and no data loss preserved.
-
-**Iteration 7 forward note:** Writer action guards (added in Iteration 7) restrict writer actions to `ActiveStates`. When `ANISTS` is introduced in this iteration, the following guards may need expansion to include `TransitionalActiveStates`:
-- `WriterStoreFwdToSyncFwd`: forwarder runs during ANISTS (draining OUT before ANISTS→ATS).
-- `WriterSyncFwdToSync`: forwarder drain completes during ANISTS.
-- `WriterSyncToSyncFwd`: the `ACTIVE_NOT_IN_SYNC` event may need to include `{"ANIS", "ANISTS"}` since ANISTS is also a degraded-active state.
-
-**WriterSyncFwdToSync refinements (from post-Iteration 9 review):** Two improvements to `WriterSyncFwdToSync(c, rs)` in `Writer.tla`:
-
-1. **Tighten per-RS vs per-cluster semantics.** The current action is parameterized per-RS but sets `outDirEmpty[c] = TRUE` unconditionally, even when another RS on the same cluster is still in `STORE_AND_FWD`. In the implementation, `processNoMoreRoundsLeft()` (`ReplicationLogDiscoveryForwarder.java` L155-184) is a per-cluster forwarder check that examines the global OUT directory — it only fires when the entire OUT directory is empty, not when a single RS finishes. Add a guard: `\A rs2 \in RS : writerMode[c][rs2] \notin {"STORE_AND_FWD"}` to prevent setting `outDirEmpty = TRUE` while any RS is still actively writing to the OUT directory. This is a safe-but-imprecise over-approximation in the current model (no invariant violations possible because `ANISToAIS` independently guards on all RS modes), but tightening it makes the model more faithful to the implementation's forwarder semantics and prevents confusing transient states in counterexample traces.
-
-2. **Add missing HDFS guard.** The current action does not guard on `hdfsAvailable[Peer(c)]`. In the implementation, `processNoMoreRoundsLeft()` can only fire after `processFile()` has successfully copied all remaining files from OUT to the peer's IN directory, which requires the peer's HDFS to be accessible. If the peer's HDFS is down, `processFile()` throws IOException and the forwarder retries — it never reaches `processNoMoreRoundsLeft()`. Add `hdfsAvailable[Peer(c)] = TRUE` as a guard on `WriterSyncFwdToSync`. Source: `ReplicationLogDiscoveryForwarder.processFile()` L133-152 copies to peer HDFS; `processNoMoreRoundsLeft()` L155-184 only fires after all files are forwarded.
+Second disjunct in `AdminStartFailover` (ANIS→ANISTS). `ANISTSToATS(c)` action in `HAGroupStore.tla` with `outDirEmpty` and `AntiFlapGateOpen` guards, wired into `Next`. Writer guards expanded: `WriterStoreFwdToSyncFwd`, `WriterSyncFwdToSync`, `WriterSyncFwdToStoreFwd`, `WriterSyncFwdToStoreFwdFail` include `TransitionalActiveStates`. `WriterSyncFwdToSync` tightened: per-cluster `\A rs2 : writerMode[c][rs2] ∉ {"STORE_AND_FWD"}` guard and `hdfsAvailable[Peer(c)]` guard added. `ANISTStoATSPrecondition` action constraint. Writer lifecycle reset on ATS→S: `PeerReactToAIS` and `PeerReactToANIS` ATS→S disjuncts reset live writers to INIT and `outDirEmpty` to TRUE (DEAD preserved for `RSRestart`); models replication subsystem restart on standby entry. `WriterClusterConsistency` expanded to include ATS (S&FWD writers persist through ANISTS→ATS). `AllowedWriterTransitions` expanded with SYNC→INIT, S&F→INIT, S&FWD→INIT (lifecycle reset transitions).
 
 #### Iteration 15 — Fairness and liveness properties
 

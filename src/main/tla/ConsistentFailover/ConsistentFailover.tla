@@ -50,7 +50,11 @@
  *   AutoComplete            | createLocalStateTransitions() L140-150
  *                           |   Delivered via local pathChildrenCache
  *                           |   (ZK watcher -- conditional delivery)
+ *   ANISTSToATS             | HAGroupStoreManager
+ *                           |   .setHAGroupStatusToSync() L341-355
+ *                           |   ANISTS -> ATS (drain completion)
  *   AdminStartFailover      | initiateFailoverOnActiveCluster() L375-400
+ *                           |   AIS -> ATS or ANIS -> ANISTS
  *   AdminAbortFailover      | setHAGroupStatusToAbortToStandby() L419-425
  *   Init (AIS, S)           | Default initial states per team confirmation
  *                           |   (see PHOENIX_HA_TLA_PLAN.md Appendix A.6)
@@ -342,9 +346,11 @@ Next ==
         \/ haGroupStore!ANISHeartbeat(c)
         \* [Writer-driven] All RS synced + OUT empty + gate open: ANIS->AIS.
         \/ haGroupStore!ANISToAIS(c)
+        \* [Writer-driven] OUT drained + anti-flap gate open: ANISTS->ATS.
+        \/ haGroupStore!ANISTSToATS(c)
         \* [Retry exhaustion] PeerReact retry failure: transition lost.
         \/ haGroupStore!ReactiveTransitionFail(c)
-        \* [Direct ZK write] Admin initiates failover: AIS->ATS.
+        \* [Direct ZK write] Admin initiates failover: AIS->ATS or ANIS->ANISTS.
         \/ admin!AdminStartFailover(c)
         \* [Direct ZK write] Admin aborts failover: STA->AbTS.
         \/ admin!AdminAbortFailover(c)
@@ -527,7 +533,14 @@ TransitionValid ==
  * Every writer mode change follows the allowed writer transitions.
  * Action constraint checked by TLC analogous to TransitionValid.
  *
- * Source: ReplicationLogGroup.java mode transitions.
+ * The X -> INIT transitions (SYNC, STORE_AND_FWD, SYNC_AND_FWD)
+ * model the replication subsystem restart on ATS -> S (standby
+ * entry). These are lifecycle resets, not ReplicationLogGroup
+ * mode CAS transitions: the entire ReplicationLogGroup is
+ * destroyed when the cluster becomes standby.
+ *
+ * Source: ReplicationLogGroup.java mode transitions;
+ *         FailoverManagementListener replication subsystem restart.
  *)
 AllowedWriterTransitions ==
     {
@@ -537,11 +550,14 @@ AllowedWriterTransitions ==
       <<"SYNC", "STORE_AND_FWD">>,
       <<"SYNC", "SYNC_AND_FWD">>,
       <<"SYNC", "DEAD">>,
+      <<"SYNC", "INIT">>,
       <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
       <<"STORE_AND_FWD", "DEAD">>,
+      <<"STORE_AND_FWD", "INIT">>,
       <<"SYNC_AND_FWD", "SYNC">>,
       <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
       <<"SYNC_AND_FWD", "DEAD">>,
+      <<"SYNC_AND_FWD", "INIT">>,
       <<"DEAD", "INIT">>
     }
 
@@ -588,6 +604,26 @@ AntiFlapGate ==
     \A c \in Cluster :
         clusterState[c] = "ANIS" /\ clusterState'[c] = "AIS"
         => AntiFlapGateOpen(antiFlapTimer[c])
+
+---------------------------------------------------------------------------
+
+(*
+ * ANISTS-to-ATS precondition: the ANISTS -> ATS transition
+ * (forwarder drain completion during ANIS failover) can only
+ * proceed when the OUT directory is empty and the anti-flapping
+ * gate is open. Cross-checks the ANISTSToATS action's guards,
+ * analogous to how AIStoATSPrecondition cross-checks
+ * AdminStartFailover and AntiFlapGate cross-checks ANISToAIS.
+ *
+ * Source: HAGroupStoreManager.setHAGroupStatusToSync() L341-355;
+ *         HAGroupStoreClient.validateTransitionAndGetWaitTime()
+ *         L1027-1046.
+ *)
+ANISTStoATSPrecondition ==
+    \A c \in Cluster :
+        clusterState[c] = "ANISTS" /\ clusterState'[c] = "ATS"
+        => /\ outDirEmpty[c]
+           /\ AntiFlapGateOpen(antiFlapTimer[c])
 
 ---------------------------------------------------------------------------
 
@@ -701,10 +737,26 @@ NoAISWithSFWriter ==
 (*
  * Writer-cluster consistency: degraded writer modes (S&F,
  * SYNC_AND_FWD) can only appear on active clusters that are
- * NOT in AIS, or on the ANISTS transitional state.
- * Specifically, this excludes AIS (prevented by AIS->ANIS
- * coupling) and all standby/transitional states (prevented
- * by active-cluster guards).
+ * NOT in AIS, on the ANISTS/ATS transitional states, or on
+ * abort states where HDFS failure can degrade writers.
+ *
+ * AIS is excluded: prevented by the AIS->ANIS coupling
+ * (WriterToStoreFwd, WriterInitToStoreFwd atomically transition
+ * AIS -> ANIS when a writer degrades).
+ *
+ * ATS is included: the AIS failover path enters ATS with all
+ * writers in SYNC/DEAD (AdminStartFailover guard), but the ANIS
+ * failover path enters ATS via ANISTSToATS which does NOT snap
+ * writer modes -- SYNC_AND_FWD writers persist into ATS. Also,
+ * if HDFS goes down during ATS, WriterSyncFwdToStoreFwd can
+ * re-degrade S&FWD writers to S&F. These degraded writers are
+ * cleaned up on ATS -> S (replication subsystem restart).
+ *
+ * Standby states (S, DS, AbTS) are excluded: live writer modes
+ * are reset to INIT on ATS -> S entry (PeerReactToAIS,
+ * PeerReactToANIS lifecycle reset). DEAD writers are preserved
+ * through ATS -> S (crashed RSes cannot process state change
+ * notifications) and handled by RSRestart independently.
  *
  * DEAD is excluded from this check because RSCrash can set
  * writerMode to DEAD on any cluster state (an RS can crash
@@ -719,7 +771,7 @@ NoAISWithSFWriter ==
 WriterClusterConsistency ==
     \A c \in Cluster :
         (\E r \in RS : writerMode[c][r] \in {"STORE_AND_FWD", "SYNC_AND_FWD"}) =>
-            clusterState[c] \in {"ANIS", "ANISTS", "ANISWOP", "AbTANIS", "AbTAIS", "AWOP"}
+            clusterState[c] \in {"ANIS", "ANISTS", "ATS", "ANISWOP", "AbTANIS", "AbTAIS", "AWOP"}
 
 ---------------------------------------------------------------------------
 
@@ -766,6 +818,9 @@ THEOREM Spec => []WriterClusterConsistency
 
 \* Safety: ZK session/connection consistency (session expiry implies disconnection).
 THEOREM Spec => []ZKSessionConsistency
+
+\* Safety: ANISTS->ATS requires outDirEmpty and anti-flapping gate open (action property).
+THEOREM Spec => [][ANISTStoATSPrecondition]_vars
 
 \* Safety: STA->AIS requires replay-completeness conditions (action property).
 THEOREM Spec => [][FailoverTriggerCorrectness]_vars

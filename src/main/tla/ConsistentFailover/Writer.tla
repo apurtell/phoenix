@@ -140,9 +140,14 @@ WriterInitToStoreFwd(c, rs) ==
  * Forwarder started while in sync: SYNC -> SYNC_AND_FWD.
  *
  * On an ACTIVE_NOT_IN_SYNC event (L98-108), region servers
- * currently in SYNC learn that a peer has entered S&F and
- * transition to SYNC_AND_FWD. This event only fires when
- * the cluster enters ANIS.
+ * currently in SYNC learn that the cluster has entered ANIS
+ * and transition to SYNC_AND_FWD. This event fires once when
+ * the cluster enters ANIS. ANISTS does not produce a new
+ * ACTIVE_NOT_IN_SYNC event -- it is a different ZK state
+ * change (ACTIVE_NOT_IN_SYNC_TO_STANDBY). A SYNC writer that
+ * has not yet received the event when ANIS -> ANISTS fires
+ * will remain in SYNC (harmlessly: SYNC writers write directly
+ * to standby HDFS, not to the OUT directory).
  * No ZK write -- mode transition driven by forwarder event.
  *
  * Source: ReplicationLogDiscoveryForwarder.init() L98-108
@@ -166,14 +171,15 @@ WriterSyncToSyncFwd(c, rs) ==
  * to the standby's IN directory. If throughput exceeds the
  * threshold, the writer transitions to SYNC_AND_FWD to begin
  * draining the queue while also writing synchronously.
- * The forwarder only runs on the active cluster.
+ * The forwarder runs on active clusters and during the ANISTS
+ * transitional state (draining OUT before ANISTS->ATS).
  * No ZK write -- mode transition driven by forwarder file copy.
  *
  * Source: ReplicationLogDiscoveryForwarder.processFile() L133-152
  *         throughput threshold or drain start.
  *)
 WriterStoreFwdToSyncFwd(c, rs) ==
-    /\ clusterState[c] \in ActiveStates
+    /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "STORE_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = TRUE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC_AND_FWD"]
@@ -190,18 +196,39 @@ WriterStoreFwdToSyncFwd(c, rs) ==
  *
  * The forwarder has drained all buffered files from the OUT
  * directory. The OUT directory is now empty.
- * The forwarder only runs on the active cluster.
+ * The forwarder runs on active clusters and during the ANISTS
+ * transitional state (draining OUT before ANISTS->ATS).
+ *
+ * Per-RS vs per-cluster semantics: processNoMoreRoundsLeft()
+ * (ReplicationLogDiscoveryForwarder.java L155-184) is a per-
+ * cluster forwarder check that examines the global OUT directory
+ * -- it only fires when the entire OUT directory is empty, not
+ * when a single RS finishes. The guard
+ * \A rs2 \in RS : writerMode[c][rs2] \notin {"STORE_AND_FWD"}
+ * prevents setting outDirEmpty = TRUE while any RS is still
+ * actively writing to the OUT directory.
+ *
+ * HDFS guard: processNoMoreRoundsLeft() can only fire after
+ * processFile() has successfully copied all remaining files from
+ * OUT to the peer's IN directory, which requires the peer's HDFS
+ * to be accessible. If the peer's HDFS is down, processFile()
+ * throws IOException and the forwarder retries -- it never
+ * reaches processNoMoreRoundsLeft().
  *
  * Guarded on zkLocalConnected[c] because this calls
  * setHAGroupStatusToSync() which requires isHealthy = true.
  *
- * Source: ReplicationLogDiscoveryForwarder.processNoMoreRoundsLeft()
- *         L155-184 -> setHAGroupStatusToSync() L171
+ * Source: ReplicationLogDiscoveryForwarder.processFile() L133-152
+ *         copies to peer HDFS; processNoMoreRoundsLeft() L155-184
+ *         only fires after all files are forwarded.
+ *         setHAGroupStatusToSync() L171
  *)
 WriterSyncFwdToSync(c, rs) ==
     /\ zkLocalConnected[c] = TRUE
-    /\ clusterState[c] \in ActiveStates
+    /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
+    /\ hdfsAvailable[Peer(c)] = TRUE
+    /\ \A rs2 \in RS : writerMode[c][rs2] \notin {"STORE_AND_FWD"}
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
     /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer,
@@ -254,9 +281,10 @@ WriterToStoreFwd(c, rs) ==
  *
  * Models standby HDFS becoming unavailable again while the
  * forwarder is draining the local queue. The RS falls back to
- * pure local buffering. Writers only run on the active cluster.
+ * pure local buffering. The forwarder runs on active clusters
+ * and during the ANISTS transitional state.
  * No AIS -> ANIS coupling needed: if RS is in SYNC_AND_FWD,
- * cluster is already ANIS (cannot be AIS).
+ * cluster is already ANIS or ANISTS (cannot be AIS).
  *
  * Guarded on zkLocalConnected[c] because the CAS write goes through
  * setHAGroupStatusIfNeeded() which requires isHealthy = true.
@@ -266,7 +294,7 @@ WriterToStoreFwd(c, rs) ==
  *)
 WriterSyncFwdToStoreFwd(c, rs) ==
     /\ zkLocalConnected[c] = TRUE
-    /\ clusterState[c] \in ActiveStates
+    /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
@@ -317,8 +345,8 @@ WriterToStoreFwdFail(c, rs) ==
  *
  * Same CAS failure pattern as WriterToStoreFwdFail but from
  * SYNC_AND_FWD mode. If RS is in SYNC_AND_FWD, the cluster is
- * already ANIS (not AIS), so another RS or the S&F heartbeat
- * may have bumped the ZK version.
+ * already ANIS or ANISTS (not AIS), so another RS or the S&F
+ * heartbeat may have bumped the ZK version.
  *
  * Guarded on zkLocalConnected[c] because the CAS write requires
  * a live ZK connection (isHealthy = true).
@@ -328,7 +356,7 @@ WriterToStoreFwdFail(c, rs) ==
  *)
 WriterSyncFwdToStoreFwdFail(c, rs) ==
     /\ zkLocalConnected[c] = TRUE
-    /\ clusterState[c] \in ActiveStates
+    /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]

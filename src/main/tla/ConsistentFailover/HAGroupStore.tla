@@ -46,6 +46,8 @@
  *   PeerReactToAbTS(c)        | createPeerStateTransitions() L132
  *   PeerReactToAIS(c)         | createPeerStateTransitions() L112-120
  *   AutoComplete(c)           | createLocalStateTransitions() L144, L145, L147
+ *   ANISTSToATS(c)            | HAGroupStoreManager.setHAGroupStatusToSync()
+ *                             |   L341-355 (ANISTS -> ATS drain completion)
  *   ReactiveTransitionFail(c) | FailoverManagementListener.onStateChange()
  *                             |   L653-704 (2 retries exhausted, returns
  *                             |   silently)
@@ -128,7 +130,12 @@ PeerReactToANIS(c) ==
                          zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
        \/ /\ clusterState[c] = "ATS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+          /\ writerMode' = [writerMode EXCEPT ![c] =
+                  [rs \in RS |-> IF writerMode[c][rs] = "DEAD"
+                                  THEN "DEAD"
+                                  ELSE "INIT"]]
+          /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
+          /\ UNCHANGED <<hdfsAvailable, antiFlapTimer,
                          replayState, lastRoundInSync, lastRoundProcessed,
                          failoverPending, inProgressDirEmpty,
                          zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
@@ -221,6 +228,19 @@ AutoComplete(c) ==
  *   2. Local DS -> S: standby recovers from degraded when peer
  *      returns to AIS.
  *
+ * WRITER LIFECYCLE RESET (ATS -> S): When the old active enters
+ * standby, the FailoverManagementListener triggers a replication
+ * subsystem restart on each live RS. Live writer modes reset to
+ * INIT (the ReplicationLogGroup is destroyed and will be
+ * recreated when the cluster next becomes active). The OUT
+ * directory is cleared (outDirEmpty = TRUE). DEAD writers are
+ * preserved: a crashed RS (JVM dead) cannot process the state
+ * change notification; the process supervisor restart (RSRestart)
+ * handles DEAD -> INIT independently. This is critical for the
+ * ANIS failover path where SYNC_AND_FWD or STORE_AND_FWD writers
+ * may persist through ANISTS -> ATS (ANISTSToATS does not snap
+ * writer modes).
+ *
  * ZK watcher dependency: Delivered via peerPathChildrenCache.
  * Guarded on zkPeerConnected[c] and zkPeerSessionAlive[c].
  * This is the critical transition that resolves the non-atomic
@@ -240,7 +260,12 @@ PeerReactToAIS(c) ==
     /\ clusterState[Peer(c)] = "AIS"
     /\ \/ /\ clusterState[c] = "ATS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+          /\ writerMode' = [writerMode EXCEPT ![c] =
+                  [rs \in RS |-> IF writerMode[c][rs] = "DEAD"
+                                  THEN "DEAD"
+                                  ELSE "INIT"]]
+          /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
+          /\ UNCHANGED <<hdfsAvailable, antiFlapTimer,
                          replayState, lastRoundInSync, lastRoundProcessed,
                          failoverPending, inProgressDirEmpty,
                          zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
@@ -319,6 +344,52 @@ ANISToAIS(c) ==
                            THEN "SYNC"
                            ELSE writerMode[c][rs]]]
     /\ UNCHANGED <<outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+
+---------------------------------------------------------------------------
+
+(*
+ * Drain completion: ANISTS -> ATS.
+ *
+ * When the forwarder has drained the OUT directory and the anti-
+ * flapping gate has opened, the cluster advances from ANISTS
+ * (ACTIVE_NOT_IN_SYNC_TO_STANDBY) to ATS
+ * (ACTIVE_IN_SYNC_TO_STANDBY), joining the normal AIS failover
+ * path. The standby reacts to ATS (not ANISTS), so this
+ * transition is the bridge that lets the ANIS failover path
+ * converge with the AIS failover path.
+ *
+ * Writer modes are NOT snapped here. In the implementation,
+ * setHAGroupStatusToSync() only writes the cluster-level ZK
+ * znode (ANISTS -> ATS); it does not modify per-RS writer modes.
+ * SYNC_AND_FWD writers may persist into ATS. They are cleaned
+ * up when the cluster transitions ATS -> S (replication subsystem
+ * restart on standby entry -- see PeerReactToAIS, PeerReactToANIS).
+ *
+ * Anti-flapping gate: confirmed by implementation --
+ * validateTransitionAndGetWaitTime() L1035-1036 applies the same
+ * waitTimeForSyncModeInMs to ANISTS -> ATS as to ANIS -> AIS.
+ * The forwarder handles the wait via syncUpdateTS deferral
+ * (processNoMoreRoundsLeft() L169-172).
+ *
+ * Guarded on zkLocalConnected[c] because this calls
+ * setHAGroupStatusToSync() -> setHAGroupStatusIfNeeded() which
+ * requires isHealthy = true.
+ *
+ * Source: HAGroupStoreManager.setHAGroupStatusToSync() L341-355 --
+ *         if current state is ANISTS, target is ATS.
+ *         HAGroupStoreClient.validateTransitionAndGetWaitTime()
+ *         L1027-1046 (anti-flapping gate).
+ *)
+ANISTSToATS(c) ==
+    /\ zkLocalConnected[c] = TRUE
+    /\ clusterState[c] = "ANISTS"
+    /\ AntiFlapGateOpen(antiFlapTimer[c])
+    /\ outDirEmpty[c]
+    /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
                    failoverPending, inProgressDirEmpty,
                    zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>

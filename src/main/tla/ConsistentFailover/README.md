@@ -63,7 +63,7 @@ Each cluster's lifecycle: `ACTIVE_IN_SYNC`, `ACTIVE_NOT_IN_SYNC`, `ACTIVE_IN_SYN
 `NOT_INITIALIZED`, `SYNC` (fully in sync), `DEGRADED` (active peer in `ANIS`; `lastRoundInSync` frozen), `SYNCED_RECOVERY` (active returned to `AIS`; replay rewinds to `lastRoundInSync`).
 
 **Combined Product State.**
-The (ActiveClusterState, StandbyClusterState) pair progresses through a well-defined sequence during failover: `(AIS,S)` -> `(ATS,S)` -> `(ATS,STA)` -> `(ATS,AIS)` -> `(S,AIS)`.
+The (ActiveClusterState, StandbyClusterState) pair progresses through a well-defined sequence during failover. AIS path: `(AIS,S)` -> `(ATS,S)` -> `(ATS,STA)` -> `(ATS,AIS)` -> `(S,AIS)`. ANIS path: `(ANIS,DS)` -> `(ANISTS,DS)` -> `(ATS,DS)` -> `(ATS,STA)` -> `(ATS,AIS)` -> `(S,AIS)`.
 
 **Anti-Flapping Timer.**
 A countdown timer (Lamport CHARME 2005) gates the `ANIS` -> `AIS` transition: the OUT directory must remain empty and all RS must be in SYNC for a configurable number of ticks before the cluster may return to `ACTIVE_IN_SYNC`.
@@ -79,9 +79,9 @@ The final failover step is two independent ZK writes. The new active writes `ACT
 
 ### Failover Sequence
 
-1. **Initiation.** Admin transitions the active cluster from `AIS` to `ATS` (or `ANIS` to `ANISTS`). The `ACTIVE_TO_STANDBY` role blocks all mutations.
+1. **Initiation.** Admin transitions the active cluster from `AIS` to `ATS` (AIS failover path) or from `ANIS` to `ANISTS` (ANIS failover path). The `ACTIVE_TO_STANDBY` role blocks all mutations. On the ANIS path, the forwarder must drain the OUT directory and the anti-flapping gate must open before `ANISTS` advances to `ATS`.
 
-2. **Standby detection.** The standby's `FailoverManagementListener` detects the peer's ATS via a ZK watcher and reactively transitions the standby from `S` to `STA`. This sets `failoverPending = true`.
+2. **Standby detection.** The standby's `FailoverManagementListener` detects the peer's ATS via a ZK watcher and reactively transitions the standby from `S` (or `DS` on the ANIS path) to `STA`. This sets `failoverPending = true`.
 
 3. **Log replay.** The standby replays all outstanding replication logs. The failover trigger requires: `failoverPending`, in-progress directory empty, and no new files in the time window (`lastRoundProcessed >= lastRoundInSync`).
 
@@ -105,7 +105,7 @@ The exhaustive model check verifies the following over the full reachable state 
 | `NonAtomicFailoverSafe` | ATS maps to ACTIVE_TO_STANDBY (mutations blocked) during failover window |
 | `AISImpliesInSync` | AIS implies outDirEmpty and all RS in SYNC/INIT/DEAD |
 | `NoAISWithSFWriter` | No STORE_AND_FWD writers when cluster is AIS |
-| `WriterClusterConsistency` | Degraded writer modes only on non-AIS active states |
+| `WriterClusterConsistency` | Degraded writer modes only on non-AIS active or transitional states |
 | `ZKSessionConsistency` | Peer session expiry implies peer disconnection |
 
 **Action constraints** (hold on every state transition):
@@ -117,6 +117,7 @@ The exhaustive model check verifies the following over the full reachable state 
 | `ReplayTransitionValid` | Every replay state change follows `AllowedReplayTransitions` |
 | `AIStoATSPrecondition` | AIS->ATS requires outDirEmpty and all RS in SYNC/DEAD |
 | `AntiFlapGate` | ANIS->AIS blocked while anti-flapping timer is positive |
+| `ANISTStoATSPrecondition` | ANISTS->ATS requires outDirEmpty and anti-flapping gate open |
 | `FailoverTriggerCorrectness` | STA->AIS requires failoverPending, inProgressDirEmpty, replayState=SYNC |
 | `NoDataLoss` | Zero RPO: STA->AIS only when replay is complete |
 
@@ -145,8 +146,8 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 |--------|-------------|
 | `Types.tla` | Pure definitions: 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, anti-flapping timer helpers. No variables. |
 | `ConsistentFailover.tla` | Root orchestrator. Declares 13 variables, defines Init/Next/Spec, instances sub-modules, defines all invariants and action constraints. |
-| `HAGroupStore.tla` | Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), retry exhaustion (`ReactiveTransitionFail`). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`. Auto-completion, heartbeat, and recovery guarded on `zkLocalConnected`. |
-| `Admin.tla` | `AdminStartFailover` (AIS->ATS with peer-state guard) and `AdminAbortFailover` (STA->AbTS, clears failoverPending). |
+| `HAGroupStore.tla` | Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), ANISTS drain completion (`ANISTSToATS`), retry exhaustion (`ReactiveTransitionFail`). ATS->S transitions include writer lifecycle reset (live writers reset to INIT, OUT directory cleared; DEAD writers preserved for RSRestart). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`. Auto-completion, heartbeat, recovery, and drain completion guarded on `zkLocalConnected`. |
+| `Admin.tla` | `AdminStartFailover` (AIS->ATS or ANIS->ANISTS with peer-state guard) and `AdminAbortFailover` (STA->AbTS, clears failoverPending). |
 | `Writer.tla` | Per-RS writer mode transitions: startup (`WriterInit`, `WriterInitToStoreFwd`, `WriterInitToStoreFwdFail`), degradation (`WriterToStoreFwd`, `WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwd`, `WriterSyncFwdToStoreFwdFail`), recovery (`WriterSyncToSyncFwd`, `WriterStoreFwdToSyncFwd`), drain complete (`WriterSyncFwdToSync`). ZK-writing actions guarded on `zkLocalConnected`. |
 | `Reader.tla` | Replay advance, degradation/recovery detection, rewind, in-progress directory dynamics, failover trigger (`TriggerFailover` guarded on `zkLocalConnected`). |
 | `HDFS.tla` | `HDFSDown` and `HDFSUp` -- environment actions for NameNode crash/recovery. |
@@ -154,7 +155,7 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 | `Clock.tla` | `Tick` -- advances all per-cluster anti-flapping countdown timers by one tick toward zero. Guarded: only fires when at least one timer is positive. |
 | `ZK.tla` | Peer ZK lifecycle (`ZKPeerDisconnect`, `ZKPeerReconnect`, `ZKPeerSessionExpiry`, `ZKPeerSessionRecover`) and local ZK lifecycle (`ZKLocalDisconnect`, `ZKLocalReconnect`). |
 
-**Total: 39 action schemas** (some parameterized over cluster and RS).
+**Total: 40 action schemas** (some parameterized over cluster and RS).
 
 ## Variables
 
@@ -211,10 +212,10 @@ java -XX:+UseParallelGC  -cp tla2tools.jar \
 |--------|-------|
 | Configuration | 2 clusters, 2 RS, WaitTimeForSync=2 |
 | Workers | 16 |
-| States generated | 1,975,197,169 |
-| Distinct states | 122,644,800 |
-| Depth | 79 |
-| Duration | 17 min 21 sec |
+| States generated | 1,587,574,945 |
+| Distinct states | 101,326,464 |
+| Depth | 75 |
+| Duration | 13 min 05 sec |
 | Result | Success |
 
-All 8 state invariants and 7 action constraints verified.  No violations.
+All 8 state invariants and 8 action constraints verified.  No violations.
