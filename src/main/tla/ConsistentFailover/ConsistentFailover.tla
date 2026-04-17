@@ -38,8 +38,9 @@
  *                           |   (HAGroupStoreManager.java L633-706)
  *                           |   Delivered via peerPathChildrenCache
  *                           |   (ZK watcher — conditional delivery)
- *   StandbyBecomesActive    | triggerFailover() L535-548 →
- *                           |   setHAGroupStatusToSync() L341-355
+ *   TriggerFailover          | Reader.TriggerFailover — guarded
+ *                           |   STA→AIS via shouldTriggerFailover()
+ *                           |   L500-533 + triggerFailover() L535-548
  *   AutoComplete            | createLocalStateTransitions() L140-150
  *                           |   Delivered via local pathChildrenCache
  *                           |   (ZK watcher — conditional delivery)
@@ -81,6 +82,19 @@
  *   ReplayDetectDegraded    | degradedListener L136-145
  *   ReplayDetectRecovery    | recoveryListener L147-157
  *   ReplayRewind            | replay() L323-333 (CAS to SYNC)
+ *   TriggerFailover         | shouldTriggerFailover() L500-533 +
+ *                           |   triggerFailover() L535-548
+ *   FailoverTriggerCorrectness | Action constraint: STA→AIS requires
+ *                           |   failoverPending ∧ inProgressDirEmpty
+ *                           |   ∧ replayState = SYNC
+ *   NoDataLoss              | Action constraint: zero RPO property
+ *                           |   (logically equivalent to Failover-
+ *                           |   TriggerCorrectness in Iteration 11)
+ *
+ * failoverPending lifecycle:
+ *   Set TRUE:  PeerReactToATS (HAGroupStore.tla)
+ *   Set FALSE: TriggerFailover (Reader.tla)
+ *   Set FALSE: AdminAbortFailover (Admin.tla)
  *)
 EXTENDS Types
 
@@ -262,8 +276,8 @@ Next ==
         \/ haGroupStore!PeerReactToAbTS(c)
         \* [ZK watcher] Local auto-completion: AbTS->S, etc.
         \/ haGroupStore!AutoComplete(c)
-        \* [ZK watcher] Local: standby completes failover: STA->AIS.
-        \/ haGroupStore!StandbyBecomesActive(c)
+        \* [Reader-driven] Standby completes failover: STA->AIS (guarded).
+        \/ reader!TriggerFailover(c)
         \* [ZK watcher] Peer-reactive: cluster detects peer AIS.
         \/ haGroupStore!PeerReactToAIS(c)
         \* [S&F heartbeat] ANIS self-transition: resets anti-flap timer.
@@ -282,6 +296,9 @@ Next ==
         \/ reader!ReplayDetectDegraded(c)
         \/ reader!ReplayDetectRecovery(c)
         \/ reader!ReplayRewind(c)
+        \* In-progress directory dynamics (reader round processing).
+        \/ reader!ReplayBeginProcessing(c)
+        \/ reader!ReplayFinishProcessing(c)
         \* Per-RS writer mode transitions and RS lifecycle.
         \/ \E r \in RS :
             \* Writer startup.
@@ -505,6 +522,50 @@ AntiFlapGate ==
 ---------------------------------------------------------------------------
 
 (*
+ * Failover trigger correctness: STA → AIS requires replay-
+ * completeness conditions. Cross-checks the TriggerFailover
+ * action's guards — if TLC finds a step where STA→AIS happens
+ * without the required conditions, the action constraint fires.
+ *
+ * hdfsAvailable is excluded: it is an environmental/liveness
+ * guard (without HDFS, the action cannot fire), not a replay-
+ * completeness condition.
+ *
+ * Source: shouldTriggerFailover() L500-533 (implementation guards)
+ *)
+FailoverTriggerCorrectness ==
+    \A c \in Cluster :
+        clusterState[c] = "STA" /\ clusterState'[c] = "AIS"
+        => /\ failoverPending[c]
+           /\ inProgressDirEmpty[c]
+           /\ replayState[c] = "SYNC"
+
+---------------------------------------------------------------------------
+
+(*
+ * No data loss (zero RPO): the high-level safety property for
+ * failover. When the standby completes STA → AIS, replay must
+ * have been in SYNC (no pending SYNCED_RECOVERY rewind), the
+ * in-progress directory must be empty, and the failover must
+ * have been properly initiated.
+ *
+ * Logically equivalent to FailoverTriggerCorrectness in this
+ * iteration but serves a different documentary purpose: this
+ * states the safety property; FailoverTriggerCorrectness validates
+ * the implementation mechanism. They will diverge in Iteration 18
+ * (forced failover) where NoDataLoss is expected to fail when
+ * UseForceFailover = TRUE.
+ *)
+NoDataLoss ==
+    \A c \in Cluster :
+        clusterState[c] = "STA" /\ clusterState'[c] = "AIS"
+        => /\ failoverPending[c]
+           /\ inProgressDirEmpty[c]
+           /\ replayState[c] = "SYNC"
+
+---------------------------------------------------------------------------
+
+(*
  * Every replay state change follows the allowed replay transitions.
  * Action constraint checked by TLC analogous to TransitionValid
  * and WriterTransitionValid.
@@ -640,5 +701,11 @@ THEOREM Spec => []AntiFlapTimerTypeOK
 
 \* Safety: replay state, counters, and flags are well-typed.
 THEOREM Spec => []ReplayTypeOK
+
+\* Safety: STA→AIS requires replay-completeness conditions (action property).
+THEOREM Spec => [][FailoverTriggerCorrectness]_vars
+
+\* Safety: zero RPO — no data loss on failover (action property).
+THEOREM Spec => [][NoDataLoss]_vars
 
 ============================================================================

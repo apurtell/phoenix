@@ -43,8 +43,9 @@
  *   PeerReactToAbTS(c)   | createPeerStateTransitions() L132
  *   PeerReactToAIS(c)    | createPeerStateTransitions() L112-120
  *   AutoComplete(c)      | createLocalStateTransitions() L144, L145, L147
- *   StandbyBecomesActive | triggerFailover() L535 → setHAGroupStatusToSync()
- *                        |   L341-355
+ *
+ * Failover completion (STA → AIS) is modeled in Reader.tla
+ * (TriggerFailover action), not in this module.
  *)
 EXTENDS Types
 
@@ -70,14 +71,22 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  *
  * Source: createPeerStateTransitions() L109 — resolver is
  *         unconditional: currentLocal -> STANDBY_TO_ACTIVE.
+ *
+ * Also sets failoverPending[c] = TRUE, modeling the
+ * triggerFailoverListener (ReplicationLogDiscoveryReplay.java
+ * L159-171) which fires on LOCAL STANDBY_TO_ACTIVE. Folded
+ * into PeerReactToATS because the listener fires
+ * deterministically on every STA entry and PeerReactToATS is
+ * the sole producer of STA.
  *)
 PeerReactToATS(c) ==
     /\ clusterState[Peer(c)] = "ATS"
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "STA"]
+    /\ failoverPending' = [failoverPending EXCEPT ![c] = TRUE]
     /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -180,28 +189,6 @@ AutoComplete(c) ==
        /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
                       replayState, lastRoundInSync, lastRoundProcessed,
                       failoverPending, inProgressDirEmpty>>
-
----------------------------------------------------------------------------
-
-(*
- * Standby completes failover: STA → AIS (local, reader-driven).
- *
- * The standby cluster writes ACTIVE_IN_SYNC to its own ZK after the
- * replication log reader determines replay is complete. This is NOT
- * a peer-reactive transition — it is driven by the reader component.
- *
- * Modeled as a non-deterministic action with the sole guard that
- * the cluster is in STA.
- *
- * Source: ReplicationLogDiscoveryReplay.triggerFailover() L535-548
- *         → setHAGroupStatusToSync() L341-355
- *)
-StandbyBecomesActive(c) ==
-    /\ clusterState[c] = "STA"
-    /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 

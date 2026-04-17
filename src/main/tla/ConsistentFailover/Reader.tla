@@ -46,6 +46,16 @@
  *                             |   compareAndSet(SYNCED_RECOVERY, SYNC);
  *                             |   getFirstRoundToProcess() rewinds to
  *                             |   lastRoundInSync (L389)
+ *   ReplayBeginProcessing(c)  | replay() round processing start —
+ *                             |   in-progress files created when a
+ *                             |   round is picked up for processing
+ *   ReplayFinishProcessing(c) | replay() round processing end —
+ *                             |   in-progress files cleaned up after
+ *                             |   round is fully processed
+ *   TriggerFailover(c)        | shouldTriggerFailover() L500-533 (guards);
+ *                             |   triggerFailover() L535-548 (effect);
+ *                             |   setHAGroupStatusToSync() L341-355
+ *                             |   (ZK write)
  *)
 EXTENDS Types
 
@@ -62,12 +72,16 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  * state, both lastRoundProcessed and lastRoundInSync advance,
  * maintaining the invariant that they are equal.
  *
- * Guard: cluster is in a standby state and replay is in SYNC.
+ * Guard: cluster is in a standby state or STA (replay continues
+ * during failover pending) and replay is in SYNC.
  *
  * Source: replay() L336-343
  *)
 ReplayAdvance(c) ==
-    /\ clusterState[c] \in StandbyStates
+    \* STA included: replay() loop continues during failover pending.
+    \* Without STA, TriggerFailover's inProgressDirEmpty guard is
+    \* over-approximated.
+    /\ clusterState[c] \in StandbyStates \union {"STA"}
     /\ replayState[c] = "SYNC"
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = @ + 1]
     /\ lastRoundInSync' = [lastRoundInSync EXCEPT ![c] = @ + 1]
@@ -154,6 +168,98 @@ ReplayRewind(c) ==
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = lastRoundInSync[c]]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, lastRoundInSync, failoverPending,
+                   inProgressDirEmpty>>
+
+---------------------------------------------------------------------------
+
+(*
+ * Begin round processing: in-progress directory becomes non-empty.
+ *
+ * When the reader picks up a new round for processing, it creates
+ * in-progress files in the IN-PROGRESS directory. This makes the
+ * directory non-empty, blocking the failover trigger until
+ * processing completes.
+ *
+ * Guard: cluster is in a standby state or STA (replay continues
+ * during failover pending — the replay() loop does not stop when
+ * the cluster enters STA) and the in-progress directory is
+ * currently empty.
+ *
+ * Source: replay() L307-310 — getFirstRoundToProcess() returns a
+ *         round; processing begins, creating in-progress files.
+ *)
+ReplayBeginProcessing(c) ==
+    \* STA included: replay() loop continues during failover pending,
+    \* so new rounds can begin processing in STA, temporarily setting
+    \* inProgressDirEmpty = FALSE and blocking TriggerFailover.
+    /\ clusterState[c] \in StandbyStates \union {"STA"}
+    /\ inProgressDirEmpty[c] = TRUE
+    /\ inProgressDirEmpty' = [inProgressDirEmpty EXCEPT ![c] = FALSE]
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
+                   antiFlapTimer, replayState, lastRoundInSync,
+                   lastRoundProcessed, failoverPending>>
+
+---------------------------------------------------------------------------
+
+(*
+ * Finish round processing: in-progress directory becomes empty.
+ *
+ * When the reader finishes processing a round, it cleans up
+ * in-progress files. The directory becomes empty, allowing the
+ * failover trigger to proceed (if other guards are satisfied).
+ *
+ * Guard: in-progress directory is currently non-empty.
+ *
+ * Source: replay() L336-351 — round processing completes,
+ *         in-progress files are cleaned up.
+ *)
+ReplayFinishProcessing(c) ==
+    /\ inProgressDirEmpty[c] = FALSE
+    /\ inProgressDirEmpty' = [inProgressDirEmpty EXCEPT ![c] = TRUE]
+    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
+                   antiFlapTimer, replayState, lastRoundInSync,
+                   lastRoundProcessed, failoverPending>>
+
+---------------------------------------------------------------------------
+
+(*
+ * Failover trigger: STA → AIS when replay is complete.
+ *
+ * The standby cluster writes ACTIVE_IN_SYNC to its own ZK znode
+ * after the replication log reader determines replay is complete.
+ * This is driven by the reader component, not a peer-reactive
+ * transition.
+ *
+ * Four guards model the conditions under which failover is safe:
+ *   1. failoverPending[c] — set by triggerFailoverListener (L159-171)
+ *      when the local cluster enters STA.
+ *   2. inProgressDirEmpty[c] — no partially-processed replication
+ *      log files (getInProgressFiles().isEmpty() at L508).
+ *   3. replayState[c] = "SYNC" — the SYNCED_RECOVERY rewind must
+ *      have completed. Without this guard, failover could proceed
+ *      with degraded rounds not re-processed from the sync point.
+ *   4. hdfsAvailable[c] = TRUE — the standby's own HDFS must be
+ *      accessible; shouldTriggerFailover() performs HDFS reads
+ *      (getInProgressFiles, getNewFiles) that throw IOException
+ *      if HDFS is unavailable, blocking the trigger.
+ *
+ * The effect also clears failoverPending, modeling triggerFailover()
+ * L538 (failoverPending.set(false)).
+ *
+ * Source: shouldTriggerFailover() L500-533 (guards);
+ *         triggerFailover() L535-548 (effect);
+ *         setHAGroupStatusToSync() L341-355 (ZK write)
+ *)
+TriggerFailover(c) ==
+    /\ clusterState[c] = "STA"
+    /\ failoverPending[c]
+    /\ inProgressDirEmpty[c]
+    /\ replayState[c] = "SYNC"
+    /\ hdfsAvailable[c] = TRUE
+    /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
+    /\ failoverPending' = [failoverPending EXCEPT ![c] = FALSE]
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
                    inProgressDirEmpty>>
 
 ============================================================================

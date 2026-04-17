@@ -15,6 +15,8 @@
  *                            |   .initiateFailoverOnActiveCluster() L375-400
  *   AdminAbortFailover(c)    | HAGroupStoreManager
  *                            |   .setHAGroupStatusToAbortToStandby() L419-425
+ *                            |   Also clears failoverPending (models
+ *                            |   abortFailoverListener L173-185)
  *)
 EXTENDS Types
 
@@ -72,13 +74,18 @@ AdminStartFailover(c) ==
  * Abort must originate from the STA side to prevent dual-active
  * races — this is the AbortSafety property.
  *
+ * Also clears failoverPending[c], modeling the abortFailoverListener
+ * (ReplicationLogDiscoveryReplay.java L173-185) which fires on LOCAL
+ * ABORT_TO_STANDBY, calling failoverPending.set(false).
+ *
  * Source: setHAGroupStatusToAbortToStandby() L419-425.
  *)
 AdminAbortFailover(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTS"]
+    /\ failoverPending' = [failoverPending EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty>>
+                   inProgressDirEmpty>>
 
 ============================================================================

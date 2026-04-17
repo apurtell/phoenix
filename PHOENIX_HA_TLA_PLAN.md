@@ -334,10 +334,11 @@ This delay must be modeled in the TLA+ spec for the ANISTS failover path.
 8. **Replay State Consistency**: Replay state and peer cluster state must be consistent.
    - `(replayState[c] = SYNC ∧ c is standby) ⇒ peerState ∈ {AIS, ATS, ...}`
 
-9. **Failover Trigger Correctness** (⚠ IMPL): `STA → AIS` requires three conditions.
+9. **Failover Trigger Correctness** (✅ Iteration 11): `STA → AIS` requires replay-completeness conditions. Modeled as an action constraint (not a state invariant) because it references primed variables.
    - `(clusterState[c] = STA ∧ clusterState'[c] = AIS) ⇒
       (failoverPending[c] ∧ inProgressDirEmpty[c] ∧
-       lastRoundProcessed[c] ≥ lastRoundInSync[c])`
+       replayState[c] = SYNC)`
+   - The originally planned `lastRoundProcessed[c] ≥ lastRoundInSync[c]` guard was found tautological (no model transition violates it) and replaced with `replayState[c] = SYNC`, which is genuinely constraining. The team accepted adding `replicationReplayState == SYNC` to `shouldTriggerFailover()` in the implementation. A fourth guard, `hdfsAvailable[c] = TRUE`, is on `TriggerFailover` but excluded from the action constraint (environmental/liveness guard, not a replay-completeness condition).
 
 10. **OFFLINE Sink State**: Once a cluster enters OFFLINE, it cannot transition out via the normal state machine.
     - `clusterState[c] = OFFLINE ⇒ clusterState'[c] = OFFLINE`
@@ -736,24 +737,9 @@ Decomposed atomic `HDFSDown` into per-RS degradation: `HDFSDown(c)` now only set
 
 Created `Reader.tla` (4 per-cluster replay actions: `ReplayAdvance`, `ReplayDetectDegraded`, `ReplayDetectRecovery`, `ReplayRewind`; standby-side guards on `StandbyStates`/`"S"`/`"DS"`; CAS semantics for `SYNCED_RECOVERY→SYNC` modeled via TLC interleaving with concurrent `ReplayDetectDegraded`). Added `ReplayStateSet` to `Types.tla`. Added 5 variables to `ConsistentFailover.tla` (`replayState`, `lastRoundInSync`, `lastRoundProcessed`, `failoverPending`, `inProgressDirEmpty`), `reader == INSTANCE Reader`, `ReplayTypeOK` invariant, `AllowedReplayTransitions`/`ReplayTransitionValid` action constraint, `ReplayCounterBound` state constraint (counters ≤ 3).
 
-#### Iteration 11 — Failover trigger and replay-cluster coupling
+#### ~~Iteration 11 — Failover trigger and replay-cluster coupling~~ ✅ COMPLETE
 
-**Modules modified:** `HAGroupStore.tla`, `Reader.tla`, `ConsistentFailover.tla`.
-
-**What to add:**
-
-`HAGroupStore.tla`:
-- `SetFailoverPending(c)`: triggered by `PeerReact` when standby detects peer ATS, setting `failoverPending[c] = TRUE`.
-
-`Reader.tla`:
-- `TriggerFailover(c)`: guard requires all three conditions: `failoverPending[c] ∧ inProgressDirEmpty[c] ∧ lastRoundProcessed[c] ≥ lastRoundInSync[c]`. Effect: `clusterState[c]' = AIS` (from STA).
-- **HDFS guard on STA→AIS (from HDFS side-tracking audit):** Add `hdfsAvailable[c] = TRUE` as a fourth guard on `TriggerFailover(c)`. The STA cluster needs its own HDFS accessible to replay replication logs. Without this guard, the model over-approximates liveness by allowing `STA→AIS` even when HDFS is down. In the implementation, `shouldTriggerFailover()` (`ReplicationLogDiscoveryReplay.java` L500-533) reads from HDFS and throws IOException if unavailable, blocking the failover trigger. See Scenario 8 (§4.3): "HDFS failure during STA stalls replay and blocks shouldTriggerFailover()."
-
-`ConsistentFailover.tla`:
-- `FailoverTriggerCorrectness` invariant (§4.1 property 9).
-- `NoDataLoss` invariant: `STA → AIS` only when replay is complete.
-
-**Expected TLC result:** The full failover sequence is now verifiable end-to-end, including replay completeness.
+`replayState == SYNC` guard is added to `shouldTriggerFailover()` (team-accepted fix). `PeerReactToATS` now also sets `failoverPending` (triggerFailoverListener L159-171), superseding `StandbyBecomesActive`; `AdminAbortFailover` clears it (abortFailoverListener L173-185). `TriggerFailover(c)` in `Reader.tla` gates STA→AIS on `failoverPending`, `inProgressDirEmpty`, `replayState = "SYNC"` (replaces the tautological `lastRoundProcessed >= lastRoundInSync`), and `hdfsAvailable` (implicit IOException dep, §4.3 Scenario 8). `ReplayBegin/FinishProcessing` toggle `inProgressDirEmpty`. `FailoverTriggerCorrectness` and `NoDataLoss` action constraints (with theorems) verify all four guards on every STA→AIS step.
 
 ---
 
@@ -761,27 +747,28 @@ Created `Reader.tla` (4 per-cluster replay actions: `ReplayAdvance`, `ReplayDete
 
 #### Iteration 12 — RS crash (writer fail-stop)
 
-**Modules modified:** `RS.tla`, `Writer.tla`, `ConsistentFailover.tla`.
+**Modules modified:** `RS.tla`, `Writer.tla`, `HDFS.tla`, `ConsistentFailover.tla`.
 
 Note: `RS.tla` was created in Iteration 9 with `RSRestart(c, rs)` (`DEAD → INIT`). This iteration extends it with crash modeling and `rsAlive` tracking.
 
 **What to add:**
 
 `RS.tla`:
-- `RSCrash(c, rs)` action: sets `rsAlive[c][rs] = FALSE`, models writer fail-stop in S&F mode (`StoreAndForwardModeImpl.onFailure()`
-  → `logGroup.abort()`). Source: `StoreAndForwardModeImpl.java` L116-123.
-- **`RSAbortOnLocalHDFSFailure(c, rs)` action (from HDFS side-tracking audit):** fires when `writerMode[c][rs] = "STORE_AND_FWD" ∧ hdfsAvailable[c] = FALSE`. In STORE_AND_FWD mode, the writer targets the active cluster's own (local/fallback) HDFS. If that HDFS fails, `StoreAndForwardModeImpl.onFailure()` treats the error as fatal and calls `logGroup.abort()`, aborting the RS. This is distinct from `HDFSDown(c)` (which models the *peer's* HDFS failing and degrades writers on the active side): `RSAbortOnLocalHDFSFailure` models the active cluster's *own* HDFS failing while the RS is already in fallback mode. Note: RS in SYNC or SYNC_AND_FWD are not affected by their own cluster's HDFS failure because those modes write to the peer's HDFS. Source: `StoreAndForwardModeImpl.java` L116-123.
+- `RSCrash(c, rs)` action: general non-deterministic RS crash (JVM crash, OOM, killed by process supervisor, etc.). Sets `rsAlive[c][rs] = FALSE` and `writerMode[c][rs]' = "DEAD"` regardless of current writer mode. No mode guard — an RS can crash at any time.
+- **`RSAbortOnLocalHDFSFailure(c, rs)` action (from HDFS side-tracking audit):** fires when `writerMode[c][rs] = "STORE_AND_FWD" ∧ hdfsAvailable[c] = FALSE`. In STORE_AND_FWD mode, the writer targets the active cluster's own (local/fallback) HDFS. If that HDFS fails, `StoreAndForwardModeImpl.onFailure()` treats the error as fatal and calls `logGroup.abort()`, aborting the RS. This is distinct from `HDFSDown(c)` (which models the *peer's* HDFS failing and degrades writers on the active side): `RSAbortOnLocalHDFSFailure` models the active cluster's *own* HDFS failing while the RS is already in fallback mode. Note: RS in SYNC or SYNC_AND_FWD are not affected by their own cluster's HDFS failure because those modes write to the peer's HDFS. **Prerequisite:** requires the `HDFSDown` guard relaxation in `HDFS.tla` (see below) so that the active cluster's own HDFS can fail. Source: `StoreAndForwardModeImpl.java` L115-123.
 - Extend `RSRestart(c, rs)` (already implemented in Iteration 9) to also set `rsAlive[c][rs] = TRUE`. Forwarder resumes draining via `initializeLastRoundProcessed()` which scans existing files.
 
 `Writer.tla`:
 - Guard all writer actions on `rsAlive[c][rs] = TRUE`.
-- OUT directory shards are time-based (not per-RS), so surviving RS forwarders can drain a crashed RS's fully-written files from the shared shard directories. Mid-write files with unclosed HDFS leases are blocked until lease expiry (~10 min). Modeled as a transient delay on `outDirEmpty` (not a permanent block). Source: `ReplicationShardDirectoryManager.java` L116-136.
+- OUT directory shards are time-based (not per-RS), so surviving RS forwarders can drain a crashed RS's fully-written files from the shared shard directories. Mid-write files with unclosed HDFS leases are actively recovered: when a forwarder or replay processor encounters such a file, `ReplicationLogProcessor.createLogFileReader()` calls `RecoverLeaseFSUtils.recoverFileLease()` *before* attempting to read, which invokes `DistributedFileSystem.recoverLease(Path)` (or `LeaseRecoverable.recoverLease(Path)` on Hadoop ≥3.3.6) with retry and backoff — 4 s first pause, then linear backoff from a 64 s base, up to a 15-minute timeout (`REPLICATION_REPLAY_LEASE_RECOVERY_TIMEOUT_MILLISECOND`). Once the lease is recovered and HDFS closes the file, the reader tolerates the missing trailer via `setValidateTrailer(false)` and reads all valid records. Modeled as a bounded-delay lease recovery step gating file processing (not a passive wait for lease expiry). Source: `RecoverLeaseFSUtils.java` L125-284, `ReplicationLogProcessor.java` L296-340.
+
+`HDFS.tla`:
+- Relax the `HDFSDown(c)` guard: remove the `clusterState[Peer(c)] ∈ ActiveStates` constraint so that any cluster's HDFS can fail, not only the standby's. Currently `HDFSDown(c)` can only fire when `Peer(c)` is active (i.e., only the standby cluster's HDFS can go down). With this relaxation, `HDFSDown(c_active)` can fire, setting `hdfsAvailable[active] = FALSE`, which enables `RSAbortOnLocalHDFSFailure` for S&F writers on the active cluster.
 
 `ConsistentFailover.tla`:
 - Variable: `rsAlive ∈ [Cluster → [RS → BOOLEAN]]`.
 - Impact on cluster state: if all RS crash, cluster becomes unreachable.
 
-**Expected TLC result:** RS failures inject non-deterministic disruptions into the protocol. Verify mutual exclusion and no data loss under failures.
 
 #### Iteration 13 — ZK coordination model (session lifecycle, watcher delivery, retry exhaustion)
 
@@ -1040,14 +1027,16 @@ This phase models implementation-specific behaviors that can prevent liveness. T
 | HDFS NameNode crash | `HDFSDown(c)` | `HDFS.tla` | 6 | ✅ |
 | HDFS NameNode recovery | `HDFSUp(c)` | `HDFS.tla` | 6 | ✅ |
 | RS restart (process supervisor) | `RSRestart(c, rs)` | `RS.tla` | 9 | ✅ |
-| STA → AIS (non-deterministic placeholder; reader guards in Iteration 11) | `StandbyBecomesActive(c)` | `HAGroupStore.tla` | 4 | ✅ |
+| ~~STA → AIS (non-deterministic placeholder)~~ Superseded by `TriggerFailover` in Iteration 11 | ~~`StandbyBecomesActive(c)`~~ | `HAGroupStore.tla` | 4→11 | ✅ |
 | Peer AIS detected (DS → S recovery) | `PeerReactToAIS(c)` (DS disjunct) | `HAGroupStore.tla` | 4 | ✅ |
 | `HAGroupStoreManager.setHAGroupStatusToSync()` (L341-355) — dual target: `ANISTS→ATS` if current is ANISTS | `ANISTSToATS(c)` | `HAGroupStore.tla` | 15 | ⏳ |
-| `ReplicationLogDiscoveryReplay.shouldTriggerFailover()` | `TriggerFailover(c)` | `Reader.tla` | 11 | ⏳ |
-| `ReplicationLogDiscoveryReplay.replay()` | `ReplayAdvance(c)` | `Reader.tla` | 10 | ⏳ |
-| Replay SYNC → DEGRADED (peer ANIS detected) | `ReplayDetectDegraded(c)` | `Reader.tla` | 10 | ⏳ |
-| Replay DEGRADED → SYNCED_RECOVERY (peer AIS detected) | `ReplayDetectRecovery(c)` | `Reader.tla` | 10 | ⏳ |
-| SYNCED_RECOVERY rewind | `ReplayRewind(c)` | `Reader.tla` | 10 | ⏳ |
+| `ReplicationLogDiscoveryReplay.shouldTriggerFailover()` + `triggerFailover()` | `TriggerFailover(c)` | `Reader.tla` | 11 | ✅ |
+| In-progress dir non-empty during round processing | `ReplayBeginProcessing(c)` | `Reader.tla` | 11 | ✅ |
+| In-progress dir empty after round processing | `ReplayFinishProcessing(c)` | `Reader.tla` | 11 | ✅ |
+| `ReplicationLogDiscoveryReplay.replay()` | `ReplayAdvance(c)` | `Reader.tla` | 10 | ✅ |
+| Replay SYNC → DEGRADED (peer ANIS detected) | `ReplayDetectDegraded(c)` | `Reader.tla` | 10 | ✅ |
+| Replay DEGRADED → SYNCED_RECOVERY (peer AIS detected) | `ReplayDetectRecovery(c)` | `Reader.tla` | 10 | ✅ |
+| SYNCED_RECOVERY rewind | `ReplayRewind(c)` | `Reader.tla` | 10 | ✅ |
 | RS abort (fail-stop in S&F) | `RSCrash(c, rs)` | `RS.tla` | 12 | ⏳ |
 | Peer ZK connection lost (PathChildrenCache) | `ZKDisconnect(c)` | `ZK.tla` | 13 | ⏳ |
 | Peer ZK connection re-established | `ZKReconnect(c)` | `ZK.tla` | 13 | ⏳ |
@@ -1197,7 +1186,7 @@ The critical behavior is during `SYNCED_RECOVERY`: when the active returns from 
 
 This state machine is the primary mechanism for enforcing the `NoDataLoss` invariant and is modeled concretely starting in Iteration 10. Without it, a failover triggered after a degraded period could miss mutations that arrived via the forwarding pipeline between `lastRoundInSync` and `lastRoundProcessed`.
 
-**Idempotency of rewound mutations.** The `SYNCED_RECOVERY` rewind re-processes rounds that were already applied during the degraded period. Idempotency is guaranteed by two cooperating mechanisms: (1) every mutation in the replication log carries its original commit timestamp, so replaying the same cell at the same timestamp is a storage-level no-op; and (2) Phoenix compaction (`CompactionScanner`) retains all cells and delete markers within the max lookback window, ensuring tombstones are not compacted away before all mutations within the rewind window have been applied in their partial order. The design states: "Phoenix compaction in this design must already ensure we do not compact away tombstones too soon." Phoenix compaction is implemented and active in production with a 72-hour max lookback window. The design proposes a dynamic integration where the replication pipeline would extend the max lookback via `CompactionScanner.overrideMaxLookback()` to account for replication delays; this integration is not yet implemented on the `PHOENIX-7562-feature-new` branch, but is not strictly necessary when the globally configured max lookback (72 hours) vastly exceeds the maximum expected rewind span (minutes to low hours).
+The `SYNCED_RECOVERY` rewind re-processes rounds that were already applied during the degraded period. Idempotency is guaranteed by two cooperating mechanisms: (1) every mutation in the replication log carries its original commit timestamp, so replaying the same cell at the same timestamp is a storage-level no-op; and (2) Phoenix compaction (`CompactionScanner`) retains all cells and delete markers within the max lookback window, ensuring tombstones are not compacted away before all mutations within the rewind window have been applied in their partial order. The design states: "Phoenix compaction in this design must already ensure we do not compact away tombstones too soon." Phoenix compaction is implemented and active in production with a 72-hour max lookback window. The design proposes a dynamic integration where the replication pipeline would extend the max lookback via `CompactionScanner.overrideMaxLookback()` to account for replication delays; this integration is not yet implemented on the `PHOENIX-7562-feature-new` branch, but is not strictly necessary when the globally configured max lookback (72 hours) vastly exceeds the maximum expected rewind span (minutes to low hours).
 
 ### A.5 ANIS Self-Transition (Heartbeat)
 
@@ -1215,7 +1204,7 @@ With the new defaults, failover can be initiated immediately after HA group init
 
 The TLA+ `Init` predicate uses these updated defaults from Iteration 1: `clusterState = [C1 ↦ AIS, C2 ↦ S]`.
 
-### A.7 Failover Trigger Conditions
+### A.7 Failover Trigger Conditions (Updated — Iteration 11)
 
 The design states that `STA → AIS` requires "all replication logs replayed" (`state-machines.md` §5, event c). The implementation decomposes this into three explicit conditions checked by `ReplicationLogDiscoveryReplay.shouldTriggerFailover()` (L500-533):
 
@@ -1225,7 +1214,17 @@ The design states that `STA → AIS` requires "all replication logs replayed" (`
 
 The third condition provides a time-window safety margin: even after round processing completes, the system waits to confirm that no new replication log files have appeared in the expected time window before declaring replay complete. All three conditions must be satisfied simultaneously before `triggerFailover()` calls `setHAGroupStatusToSync()` to transition from `STANDBY_TO_ACTIVE` to `ACTIVE_IN_SYNC`.
 
-The TLA+ model encodes all three as explicit guards on the `TriggerFailover(c)` action in Iteration 11.
+Additionally, both `getInProgressFiles()` and `getNewFiles()` perform HDFS reads that throw `IOException` if HDFS is unavailable, implicitly blocking the failover trigger.
+
+
+The TLA+ model encodes four guards on the `TriggerFailover(c)` action:
+
+| TLA+ guard | Implementation source | Mechanism |
+|---|---|---|
+| `failoverPending[c]` | `shouldTriggerFailover()` L503 | Direct: `failoverPending.get()` |
+| `inProgressDirEmpty[c]` | `shouldTriggerFailover()` L508 | `replicationLogTracker.getInProgressFiles().isEmpty()` |
+| `replayState[c] = "SYNC"` | `shouldTriggerFailover()` (accepted fix) | Guard being added to implementation |
+| `hdfsAvailable[c] = TRUE` | `shouldTriggerFailover()` L508, L523 | Implicit: HDFS reads throw IOException if unavailable |
 
 ### A.8 Writer Fail-Stop in Store-and-Forward Mode
 
@@ -1294,15 +1293,15 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 
 ### A.15 Missing Peer-State Guard on Failover Initiation (TLC Finding — Iteration 4)
 
-**Finding**: TLC exhaustive model checking (Iteration 4) discovered that `initiateFailoverOnActiveCluster()` (`HAGroupStoreManager.java` L375-400) does not validate the peer cluster's state before initiating failover. This allows an admin to initiate a new failover on the newly-active cluster during the non-atomic window of a prior failover, producing an irrecoverable `(ATS, ATS)` deadlock where both clusters are in `ACTIVE_IN_SYNC_TO_STANDBY` with mutations blocked and no action enabled. The admin starts a second failover on c2 (which just became `AIS`) before c1's `FailoverManagementListener` reacts to the peer `AIS` and completes `ATS → S`. The method only checks `currentState == AIS || ANIS` and does not query the peer's state via `getHAGroupStoreRecordFromPeer()` (available on `HAGroupStoreClient` L421-427).
+TLC exhaustive model checking (Iteration 4) discovered that `initiateFailoverOnActiveCluster()` (`HAGroupStoreManager.java` L375-400) does not validate the peer cluster's state before initiating failover. This allows an admin to initiate a new failover on the newly-active cluster during the non-atomic window of a prior failover, producing an irrecoverable `(ATS, ATS)` deadlock where both clusters are in `ACTIVE_IN_SYNC_TO_STANDBY` with mutations blocked and no action enabled. The admin starts a second failover on c2 (which just became `AIS`) before c1's `FailoverManagementListener` reacts to the peer `AIS` and completes `ATS → S`. The method only checks `currentState == AIS || ANIS` and does not query the peer's state via `getHAGroupStoreRecordFromPeer()` (available on `HAGroupStoreClient` L421-427).
 
-**Planned fix**: Add a peer-state precondition to `initiateFailoverOnActiveCluster()` requiring the peer to be in `STANDBY` or `DEGRADED_STANDBY` before allowing `AIS → ATS` or `ANIS → ANISTS`. The TLA+ model (`Admin.tla`) encodes this as `clusterState[Peer(c)] ∈ {"S", "DS"}` on the `AdminStartFailover` action. With the guard, TLC verifies deadlock freedom for the full reachable state space.
+Add a peer-state precondition to `initiateFailoverOnActiveCluster()` requiring the peer to be in `STANDBY` or `DEGRADED_STANDBY` before allowing `AIS → ATS` or `ANIS → ANISTS`. The TLA+ model (`Admin.tla`) encodes this as `clusterState[Peer(c)] ∈ {"S", "DS"}` on the `AdminStartFailover` action. With the guard, TLC verifies deadlock freedom for the full reachable state space.
 
 ### A.16 ZK Watcher Delivery Is Not Formally Guaranteed (Source Code Analysis)
 
-**Finding**: Source code analysis of ZooKeeper confirms that watcher notification delivery is conditional, not unconditional. ZooKeeper guarantees ordering (events delivered in zxid order), happens-before (client sees watch before new data), and at-most-once (standard watches fire at most once). It does NOT guarantee: delivery during disconnection, session survival, unconditional delivery (server-side exceptions can silently drop notifications), cross-client simultaneity, or bounded delivery time.
+Source code analysis of ZooKeeper confirms that watcher notification delivery is conditional, not unconditional. ZooKeeper guarantees ordering (events delivered in zxid order), happens-before (client sees watch before new data), and at-most-once (standard watches fire at most once). It does NOT guarantee: delivery during disconnection, session survival, unconditional delivery (server-side exceptions can silently drop notifications), cross-client simultaneity, or bounded delivery time.
 
-**Impact on Phoenix failover protocol**: Every peer-reactive transition in the protocol depends on the ZK watcher notification chain:
+Every peer-reactive transition in the protocol depends on the ZK watcher notification chain:
 
 | TLA+ Action | ZK Watcher Chain | If Notification Lost |
 |---|---|---|
@@ -1320,21 +1319,41 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 4. **Netty write failure**: The `onSendBufferDoneListener` silently ignores `writeAndFlush` failures. (Source: `NettyServerCnxn.java` L222-227)
 5. **Disconnection**: No notifications delivered while disconnected. On reconnect, `primeConnection()` re-registers watches with `lastZxid` and the server fires any missed changes. Curator's `PathChildrenCache` also re-queries and generates synthetic events. (Source: `ClientCnxn.java` L1006-1082)
 
-**No polling fallback**: The `syncZKToSystemTable()` periodic job (every 900s) syncs ZK → System Table for observability only. It does NOT re-evaluate peer state, re-fire subscriber notifications, or detect missed watcher events. There is no application-level mechanism to recover from a permanently missed watcher notification without a ZK session reconnect or manual intervention.
+The `syncZKToSystemTable()` periodic job (every 900s) syncs ZK → System Table for observability only. It does NOT re-evaluate peer state, re-fire subscriber notifications, or detect missed watcher events. There is no application-level mechanism to recover from a permanently missed watcher notification without a ZK session reconnect or manual intervention.
 
-**Curator PathChildrenCache mitigation**: Phoenix uses Curator's `PathChildrenCache` rather than raw ZK watches. PathChildrenCache provides eventual delivery on reconnection by re-querying ZK and generating synthetic `CHILD_UPDATED` events for any changes detected during disconnection. This is the primary reliability backstop. However, PathChildrenCache does NOT protect against session expiry (the ZK session is dead; Curator must establish a new one) or permanent network partition (no reconnection possible).
+Phoenix uses Curator's `PathChildrenCache` rather than raw ZK watches. PathChildrenCache provides eventual delivery on reconnection by re-querying ZK and generating synthetic `CHILD_UPDATED` events for any changes detected during disconnection. This is the primary reliability backstop. However, PathChildrenCache does NOT protect against session expiry (the ZK session is dead; Curator must establish a new one) or permanent network partition (no reconnection possible).
 
-**Formal modeling implications**: ZK's conditional watcher delivery is modeled as a core protocol property. For **safety**, TLC's interleaving semantics already cover the case where peer-reactive actions are enabled but not taken — TLC explores all orderings, including paths where another action fires first. Safety (mutual exclusion, no data loss) holds regardless of watcher delivery delay because ATS/ANISTS map to `ACTIVE_TO_STANDBY` with `isMutationBlocked()=true`. For **liveness**, ZK session lifecycle (disconnect, expiry, recovery) and retry exhaustion are always part of the model (Iteration 13). Liveness properties are explicitly predicated on the ZK Liveness Assumption (ZLA, §4.2): ZK sessions are eventually alive and connected. Without ZLA, peer-reactive transitions are permanently disabled and the protocol stalls — this is a defined boundary of the protocol's operational envelope.
+ZK's conditional watcher delivery is modeled as a core protocol property. For safety, TLC's interleaving semantics already cover the case where peer-reactive actions are enabled but not taken — TLC explores all orderings, including paths where another action fires first. Safety (mutual exclusion, no data loss) holds regardless of watcher delivery delay because ATS/ANISTS map to `ACTIVE_TO_STANDBY` with `isMutationBlocked()=true`. For liveness, ZK session lifecycle (disconnect, expiry, recovery) and retry exhaustion are always part of the model (Iteration 13). Liveness properties are explicitly predicated on the ZK Liveness Assumption (ZLA, §4.2): ZK sessions are eventually alive and connected. Without ZLA, peer-reactive transitions are permanently disabled and the protocol stalls — this is a defined boundary of the protocol's operational envelope.
 
 ### A.17 Missing AbTAIS→ANIS Transition (TLC Finding — Iteration 7)
 
-**Finding**: TLC model checking (Iteration 7) discovered that HDFS failure during the abort window produces a transient `ACTIVE_IN_SYNC` state with degraded writers. When the active cluster is in `AbTAIS` and HDFS goes down, writers degrade to `STORE_AND_FWD`. The S&F heartbeat attempts `AbTAIS→ANIS` via `setHAGroupStatusToStoreAndForward()`, but `isTransitionAllowed()` rejects this because `AbTAIS→ANIS` is not in the `allowedTransitions` table (`HAGroupStoreRecord.java` L115). When `AbTAIS` auto-completes to `AIS` (`createLocalStateTransitions()` L145), the cluster is briefly `ACTIVE_IN_SYNC` with `STORE_AND_FWD` writers — misrepresenting its sync status for up to one heartbeat period (~63s) until the S&F heartbeat fires `AIS→ANIS`.
+TLC model checking (Iteration 7) discovered that HDFS failure during the abort window produces a transient `ACTIVE_IN_SYNC` state with degraded writers. When the active cluster is in `AbTAIS` and HDFS goes down, writers degrade to `STORE_AND_FWD`. The S&F heartbeat attempts `AbTAIS→ANIS` via `setHAGroupStatusToStoreAndForward()`, but `isTransitionAllowed()` rejects this because `AbTAIS→ANIS` is not in the `allowedTransitions` table (`HAGroupStoreRecord.java` L115). When `AbTAIS` auto-completes to `AIS` (`createLocalStateTransitions()` L145), the cluster is briefly `ACTIVE_IN_SYNC` with `STORE_AND_FWD` writers — misrepresenting its sync status for up to one heartbeat period (~63s) until the S&F heartbeat fires `AIS→ANIS`.
 
-**Impact**: Low severity. No safety violation (failover guards independently check writer state). Transient correctness issue: cluster state misrepresents sync status. Self-corrects within one heartbeat period.
+Low severity. No safety violation (failover guards independently check writer state). Transient correctness issue: cluster state misrepresents sync status. Self-corrects within one heartbeat period.
 
-**Planned fix**: Add `ACTIVE_NOT_IN_SYNC` to `ABORT_TO_ACTIVE_IN_SYNC.allowedTransitions`. Optionally, make the auto-completion resolver conditional on writer state. Full analysis in [`PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md`](PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md).
+Add `ACTIVE_NOT_IN_SYNC` to `ABORT_TO_ACTIVE_IN_SYNC.allowedTransitions`. Optionally, make the auto-completion resolver conditional on writer state. Full analysis in [`PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md`](PHOENIX_HA_BUG_ABTAIS_HDFS_FAILURE.md).
 
-**TLA+ model treatment**: The model assumes the fix: `<<"AbTAIS","ANIS">>` is added to `AllowedTransitions` and `AutoComplete(AbTAIS)` is conditional (→`AIS` when clean, →`ANIS` when degraded). This is a sound abstraction that collapses the implementation's two-step self-correction path into a single atomic step.
+The model assumes the fix: `<<"AbTAIS","ANIS">>` is added to `AllowedTransitions` and `AutoComplete(AbTAIS)` is conditional (→`AIS` when clean, →`ANIS` when degraded). This is a sound abstraction that collapses the implementation's two-step self-correction path into a single atomic step.
+
+### A.18 Folded PeerReactToATS + failoverPending Atomicity (Intentional — Iteration 11)
+
+The TLA+ model folds the ZK watcher notification chain that sets `failoverPending` into the `PeerReactToATS` action. In the implementation, these are two separate events:
+
+1. `FailoverManagementListener.onStateChange()` writes STA to the local ZK znode.
+2. The local `pathChildrenCache` watcher fires.
+3. `triggerFailoverListener` (L159-171) calls `failoverPending.set(true)`.
+
+There is a real (tiny) window where `clusterState` is STA but `failoverPending` is still FALSE. The model closes this window by making `PeerReactToATS` atomically set both `clusterState[c] = "STA"` and `failoverPending[c] = TRUE`.
+
+`TriggerFailover` requires `failoverPending[c] = TRUE` as a guard. If the model allowed the split, `TriggerFailover` simply could not fire during the gap — the same behavior as the implementation. The folding does not introduce any false safety proofs.
+
+If `triggerFailoverListener` registration fails or the local watcher is lost, `failoverPending` is never set and failover is permanently stuck. The model cannot detect this because it assumes the listener fires deterministically. This liveness concern is covered by ZK session modeling in Iteration 13, where local pathChildrenCache failures are modeled explicitly.
+
+### A.19 Reader Restart During STA (Deferred — Iteration 12)
+
+`ReplicationLogDiscoveryReplay.initializeLastRoundProcessed()` (L269-273) sets `failoverPending` via `compareAndSet(false, true)` if the reader initializes while already in STA. This handles reader restart during an in-progress failover — the reader process may crash and restart while the cluster is in STA, and this CAS ensures `failoverPending` is set even without the original `triggerFailoverListener` firing.
+
+Not modeled in Iteration 11 because `Init` does not produce the STA state — `Init` starts with one cluster in AIS and the other in S, so the reader-restart-during-STA scenario is not reachable. This will become relevant when reader/RS restart modeling is added in Iteration 12 (RS crash with `rsAlive` tracking).
 
 ---
 
@@ -1357,8 +1376,8 @@ The safety implication is that `SYNCED_RECOVERY` is not guaranteed to reach `SYN
 | 10a | `AISImpliesInSync` | Safety | Iter 7 | AIS ⇒ outDirEmpty ∧ all RS in SYNC/INIT (derived invariant, §4.1 property 3) |
 | 11 | `AntiFlapGate` | Action constraint | Iter 8 | ANIS→AIS and ANISTS→ATS only after timeout elapsed |
 | 12 | `ZKVersionMonotonic` | Safety | Iter 9 | ZK versions only increase |
-| 13 | `FailoverTriggerCorrectness` | Safety | Iter 11 | STA→AIS requires 3 conditions |
-| 14 | `NoDataLoss` | Safety | Iter 11 | STA→AIS only when replay complete |
+| 13 | `FailoverTriggerCorrectness` | Action constraint | Iter 11 | STA→AIS requires `failoverPending ∧ inProgressDirEmpty ∧ replayState = SYNC` |
+| 14 | `NoDataLoss` | Action constraint | Iter 11 | STA→AIS only when replay complete (equivalent to #13 in Iter 11; diverges in Iter 18) |
 | 15 | `FailoverCompletion` | Liveness | Iter 14 | Initiated failover eventually completes |
 | 16 | `DegradationRecovery` | Liveness | Iter 14 | ANIS eventually recovers to AIS |
 | 17 | `AbortCompletion` | Liveness | Iter 14 | Initiated abort eventually completes |
