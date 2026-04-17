@@ -425,17 +425,17 @@ ConsistentFailover-liveness.cfg (liveness TLC config — no symmetry, ad hoc)
 
 TLC runs are executed locally. In the early phases, exhaustive model checking is used exclusively — it provides complete coverage and the state spaces are small enough for timely completion. Simulation mode will be introduced later once state spaces grow too large for exhaustive search within a reasonable time budget.
 
-| Config | Mode | Symmetry | Model | Role | Time |
-|--------|------|----------|-------|------|------|
-| `ConsistentFailover.cfg` | Exhaustive BFS | Yes | 2c/2rs | Every iteration | target ≤1 hr |
-| `ConsistentFailover-liveness.cfg` | Exhaustive BFS | No | 2c/2rs | Ad hoc | 1 hr |
-| `ConsistentFailover-sim.cfg` | Simulation | No | 2c/3rs | When needed | varies |
+| Config | Mode | Symmetry | Model | Depth | Role | Time |
+|--------|------|----------|-------|-------|------|------|
+| `ConsistentFailover.cfg` | Exhaustive BFS | Yes | 2c/2rs, WFS=2 | BFS (75) | Every iteration | target ≤1 hr |
+| `ConsistentFailover-liveness.cfg` | Exhaustive BFS | No | 2c/2rs, WFS=2 | BFS | Ad hoc | 1 hr |
+| `ConsistentFailover-sim.cfg` | Simulation | No | 2c/9rs, WFS=5 | 10000 | Deep random | 8 hr (28800s) |
 
-where `c` = clusters, `rs` = region servers per cluster.
+where `c` = clusters, `rs` = region servers per cluster, `WFS` = `WaitTimeForSync`.
 
-**Symmetry reduction** is the key distinction between the three configs. The primary exhaustive config (`ConsistentFailover.cfg`) uses `SYMMETRY` to exploit the interchangeability of region servers within a cluster, dramatically reducing the state space and keeping exhaustive runs tractable. However, symmetry reduction is incompatible with liveness checking (TLC limitation), so `ConsistentFailover-liveness.cfg` omits it. Simulation mode (`ConsistentFailover-sim.cfg`) also omits symmetry because it samples random traces rather than exhaustively enumerating states, so symmetry reduction provides no benefit.
+**Symmetry reduction** is the key distinction between the exhaustive and simulation configs. The primary exhaustive config (`ConsistentFailover.cfg`) uses `SYMMETRY` to exploit the interchangeability of region servers within a cluster, dramatically reducing the state space and keeping exhaustive runs tractable. However, symmetry reduction is incompatible with liveness checking (TLC limitation), so `ConsistentFailover-liveness.cfg` omits it. Simulation mode (`ConsistentFailover-sim.cfg`) also omits symmetry because it samples random traces rather than exhaustively enumerating states, so symmetry reduction provides no benefit.
 
-The simulation config is reserved for later phases when exhaustive search becomes intractable. It will not be used in the early phases unless exhaustive runs exceed the 1-hour time budget.
+**Simulation config details:** The 9-RS model exercises per-RS writer interleaving at production scale (40 action schemas × 9 RS create a high branching factor). `WaitTimeForSync=5` creates a richer anti-flapping window where HDFS failures, ZK disruptions, and RS crashes can interleave while the gate is closed. Depth 10000 allows traces covering ~100 complete failover cycles (each cycle requires ~100 steps for per-RS operations with 9 RS). No state constraint — replay counters grow organically along each trace without tractability concerns. The 8-hour stopAfter budget is the standard deep run duration.
 
 SANY syntax checking is performed locally in the Cursor environment before running TLC (see §6 for the full procedure).
 
@@ -576,32 +576,37 @@ JAVA17=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java
 ITER="iter01"
 mkdir -p results/$ITER
 
-$JAVA17 -XX:+UseParallelGC \
+$JAVA17 -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
+  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover.cfg \
   -workers auto -cleanup \
   2>&1 | tee results/$ITER/tlc-exhaustive.log
 ```
 
-The `ConsistentFailover.cfg` includes a `SYMMETRY` declaration for RS permutations, which significantly reduces the state space for exhaustive BFS.
+The `ConsistentFailover.cfg` includes a `SYMMETRY` declaration for RS permutations, which significantly reduces the state space for exhaustive BFS. The `OffHeapDiskFPSet` with 8 GB of direct buffers (`-XX:MaxDirectMemorySize=8g`) keeps fingerprints off-heap, allowing larger state spaces without exhausting JVM heap memory.
 
-**Simulation** (no symmetry, for later phases when exhaustive is intractable):
+**Simulation** (9 RS, deep random traces, 8-hour run):
 
 ```bash
-$JAVA17 -XX:+UseParallelGC \
+$JAVA17 -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
+  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+  -Dtlc2.TLC.stopAfter=28800 \
   -cp tla2tools.jar:CommunityModules-deps.jar \
-  -Dtlc2.TLC.stopAfter=300 \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-sim.cfg \
-  -simulate -workers auto \
-  2>&1 | tee results/$ITER/tlc-sim-300s.log
+  -simulate -depth 10000 -workers auto \
+  2>&1 | tee results/$ITER/tlc-sim-8h.log
 ```
 
-Adjust `-Dtlc2.TLC.stopAfter` for longer runs (900s, 14400s, 86400s). No `SYMMETRY` in the simulation config — it provides no benefit for random trace sampling.
+The simulation config (`ConsistentFailover-sim.cfg`) uses 2 clusters, 9 RS, and `WaitTimeForSync=5`. The `-depth 10000` flag allows traces deep enough for ~100 complete failover cycles with 9 RS (each cycle requires ~100 steps for per-RS writer init, degradation, recovery, anti-flap timer, cluster transitions, replay, and ZK disruptions). The `-Dtlc2.TLC.stopAfter=28800` flag limits the run to 8 hours. No `SYMMETRY` — it provides no benefit for random trace sampling. No state constraint — counters grow organically along each trace.
+
+Adjust `-Dtlc2.TLC.stopAfter` for shorter feedback loops: 300 (5 min quick check), 900 (15 min validation), 3600 (1 hour standard).
 
 **Liveness check** (no symmetry — incompatible with `SYMMETRY` in TLC):
 
 ```bash
-$JAVA17 -XX:+UseParallelGC \
+$JAVA17 -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
+  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-liveness.cfg \
   -workers auto -cleanup \

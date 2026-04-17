@@ -177,7 +177,9 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 
 ## Configuration
 
-The model is configured via `ConsistentFailover.cfg`:
+Two TLC configurations are provided:
+
+### Exhaustive (`ConsistentFailover.cfg`)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -186,6 +188,16 @@ The model is configured via `ConsistentFailover.cfg`:
 | `WaitTimeForSync` | `2` | Anti-flapping timer ticks (small value sufficient for verification) |
 | Symmetry | `Permutations(RS)` | RS identifiers are interchangeable; clusters are asymmetric (AIS vs S at Init) |
 | State constraint | `lastRoundProcessed[c] <= 3` | Bounds replay counters for tractability |
+
+### Simulation (`ConsistentFailover-sim.cfg`)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `Cluster` | `{c1, c2}` | Exactly 2 clusters forming the HA pair |
+| `RS` | `{rs1, rs2, ..., rs9}` | 9 region servers per cluster (production-scale per-RS interleaving) |
+| `WaitTimeForSync` | `5` | Larger window exercises richer interleavings during anti-flapping wait |
+| Symmetry | None | No benefit for random trace sampling |
+| State constraint | None | Counters grow organically along each trace |
 
 The initial state is deterministic: one cluster starts in AIS, the other in S.  All writers start in INIT, all HDFS available, all ZK connections alive, anti-flapping timers at zero, replay in NOT_INITIALIZED.
 
@@ -202,15 +214,33 @@ java -cp tla2tools.jar tla2sany.SANY ConsistentFailover.tla
 **Exhaustive model check (TLC):**
 
 ```
-java -XX:+UseParallelGC  -cp tla2tools.jar \
+java -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
+  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+  -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover.cfg \
   -workers auto -cleanup
 ```
+
+**Simulation (8-hour random trace sampling):**
+
+```
+java -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
+  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+  -Dtlc2.TLC.stopAfter=28800 \
+  -cp tla2tools.jar:CommunityModules-deps.jar \
+  tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-sim.cfg \
+  -simulate -depth 10000 -workers auto
+```
+
+Simulation generates random execution traces up to depth 10000 (sufficient for ~100 complete failover cycles with 9 RS). The 9-RS model is too large for exhaustive search but ideal for simulation: 40 action schemas × 9 RS create a high branching factor that simulation samples efficiently. The `-Dtlc2.TLC.stopAfter=28800` flag limits the run to 8 hours. Use `OffHeapDiskFPSet` with 8 GB of direct buffers (`-XX:MaxDirectMemorySize=8g`) to handle the large fingerprint set without exhausting heap memory.
+
 ## Latest Results
+
+### Exhaustive
 
 | Metric | Value |
 |--------|-------|
-| Configuration | 2 clusters, 2 RS, WaitTimeForSync=2 |
+| Configuration | 2 clusters, 2 RS per cluster, WaitTimeForSync=2 |
 | Workers | 16 |
 | States generated | 1,587,574,945 |
 | Distinct states | 101,326,464 |
@@ -219,3 +249,18 @@ java -XX:+UseParallelGC  -cp tla2tools.jar \
 | Result | Success |
 
 All 8 state invariants and 8 action constraints verified.  No violations.
+
+### Simulation
+
+| Metric | Value |
+|--------|-------|
+| Configuration | 2 clusters, 9 RS per cluster, WaitTimeForSync=5 |
+| Workers | 128 |
+| States checked | 55,318,114,162 |
+| Traces generated | 5,531,581 |
+| Trace length | mean=10000, var=0, sd=0 |
+| Seed | 3374784671009936140 |
+| Duration | 8 hr 00 min |
+| Result | Success |
+
+All 8 state invariants and 8 action constraints verified across 5.5M traces at depth 10000.  No violations.
