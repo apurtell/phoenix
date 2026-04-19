@@ -107,8 +107,32 @@ ZKPeerDisconnect(c) ==
  * Reconnection requires a live session -- if the session is expired,
  * a new session must be established first via ZKPeerSessionRecover.
  *
+ * POST-ABORT ATS RECONCILIATION (Iteration 16, Appendix A.21):
+ * When the local cluster is in ATS and the peer is in S or DS at
+ * the moment of reconnect, the PathChildrenCache rebuild fires a
+ * synthetic event that triggers the FailoverManagementListener.
+ * No existing PeerReact* action handles (ATS, S/DS) -- the
+ * transient AbTS state was missed during the partition. The
+ * reconciliation transitions ATS -> AbTAIS, which auto-completes
+ * to AIS via AutoComplete.
+ *
+ * This is folded into the reconnect action (rather than modeled
+ * as a separate action with a boolean flag) because the
+ * CONNECTION_RECONNECTED -> PathChildrenCache rebuild ->
+ * handleStateChange() -> FailoverManagementListener chain is
+ * synchronous on the same event thread, following the same
+ * listener-effect folding pattern used for recoveryListener and
+ * degradedListener in HAGroupStore.tla.
+ *
+ * Race safety: ZKPeerReconnect requires zkPeerConnected[c] = FALSE,
+ * so it cannot fire during normal operation when the connection is
+ * healthy. The normal transient (ATS, S) state during happy-path
+ * failover is handled by PeerReactToATS on the peer side.
+ *
  * Pre:  zkPeerConnected[c] = FALSE, zkPeerSessionAlive[c] = TRUE.
  * Post: zkPeerConnected[c] = TRUE.
+ *       If clusterState[c] = ATS and peer in {S, DS}:
+ *         clusterState[c] = AbTAIS (reconciliation).
  *
  * Source: HAGroupStoreClient.createCacheListener() L903-906
  *         (CONNECTION_RECONNECTED for PEER cache)
@@ -117,7 +141,10 @@ ZKPeerReconnect(c) ==
     /\ zkPeerConnected[c] = FALSE
     /\ zkPeerSessionAlive[c] = TRUE
     /\ zkPeerConnected' = [zkPeerConnected EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
+    /\ IF clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"}
+       THEN clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
+       ELSE UNCHANGED clusterState
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, lastRoundInSync,
                    lastRoundProcessed, failoverPending, inProgressDirEmpty,
                    zkPeerSessionAlive, zkLocalConnected>>
@@ -167,8 +194,16 @@ ZKPeerSessionExpiry(c) ==
  * Session recovery implies reconnection: the new session comes with
  * a live TCP connection.
  *
+ * POST-ABORT ATS RECONCILIATION (Iteration 16, Appendix A.21):
+ * Same folded reconciliation as ZKPeerReconnect. Session recovery
+ * triggers a full PathChildrenCache rebuild with synthetic
+ * CHILD_ADDED events, which invokes the FailoverManagementListener
+ * synchronously. See ZKPeerReconnect comment for full rationale.
+ *
  * Pre:  zkPeerSessionAlive[c] = FALSE.
  * Post: zkPeerSessionAlive[c] = TRUE, zkPeerConnected[c] = TRUE.
+ *       If clusterState[c] = ATS and peer in {S, DS}:
+ *         clusterState[c] = AbTAIS (reconciliation).
  *
  * Source: Curator retry policy -> new session -> PathChildrenCache
  *         rebuild
@@ -177,7 +212,10 @@ ZKPeerSessionRecover(c) ==
     /\ zkPeerSessionAlive[c] = FALSE
     /\ zkPeerSessionAlive' = [zkPeerSessionAlive EXCEPT ![c] = TRUE]
     /\ zkPeerConnected' = [zkPeerConnected EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
+    /\ IF clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"}
+       THEN clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
+       ELSE UNCHANGED clusterState
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, lastRoundInSync,
                    lastRoundProcessed, failoverPending, inProgressDirEmpty,
                    zkLocalConnected>>

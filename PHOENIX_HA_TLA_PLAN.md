@@ -753,31 +753,15 @@ Second disjunct in `AdminStartFailover` (ANIS→ANISTS). `ANISTSToATS(c)` action
 
 #### ~~Iteration 15 — Fairness and liveness properties~~ ✅ COMPLETE
 
-`Fairness` formula: 43 temporal clauses (25 WF + 18 SF) in four tiers. Tier 1 (WF): protocol-internal — `Tick`, `ANISHeartbeat`, replay machine, `WriterInit`, `WriterSyncToSyncFwd`. Tier 2 (WF): ZK recovery — `ZKPeerReconnect`, `ZKPeerSessionRecover`, `ZKLocalReconnect`. Tier 3 (SF): actions guarded on oscillating env vars — peer-reactive, local transitions, writer degradation/recovery, RS lifecycle, `HDFSUp`; grouped into 6 mutually-exclusive disjunctions under single `SF_vars` calls. Tier 4 (none): faults, operator actions, CAS failures. Liveness properties: `FailoverCompletion` (`{STA, AbTAIS, AbTANIS, AbTS} ~> {AIS, ANIS, S}`), `DegradationRecovery` (`(ANIS /\ hdfsAvailable[Peer]) ~> ~ANIS`), `AbortCompletion` (`{AbTS, AbTAIS, AbTANIS} ~> {AIS, ANIS, S}`). Listener effects folded into atomic HAGroupStore cluster state transitions (S-entry sets `replayState = SYNCED_RECOVERY`, DS-entry sets `DEGRADED`). Per-property fairness formulas contain only critical-path clauses: `FairnessAC` (5 instantiated), `FairnessFC` (13), `FairnessDR` (25 with |RS|=2). Each has `SpecXX = Init /\ [][Next]_vars /\ FairnessXX`. Liveness checked via simulation only. Three cfg files: `ConsistentFailover-sim-liveness-{ac,fc,dr}.cfg` (RS={rs1,rs2}, WFS=2, depth 10000, 8-hour stopAfter).
+`Fairness` formula: 43 temporal clauses (25 WF + 18 SF) in four tiers. Tier 1 (WF): protocol-internal — `Tick`, `ANISHeartbeat`, replay machine, `WriterInit`, `WriterSyncToSyncFwd`. Tier 2 (WF): ZK recovery — `ZKPeerReconnect`, `ZKPeerSessionRecover`, `ZKLocalReconnect`. Tier 3 (SF): actions guarded on oscillating env vars — peer-reactive, local transitions, writer degradation/recovery, RS lifecycle, `HDFSUp`; grouped into 6 mutually-exclusive disjunctions under single `SF_vars` calls. Tier 4 (none): faults, operator actions, CAS failures. Liveness properties: `FailoverCompletion` (`{STA, AbTAIS, AbTANIS, AbTS} ~> {AIS, ANIS, S}`), `DegradationRecovery` (`(ANIS /\ hdfsAvailable[Peer]) ~> ~ANIS`), `AbortCompletion` (`{AbTS, AbTAIS, AbTANIS} ~> {AIS, ANIS, S}`). Listener effects folded into atomic HAGroupStore cluster state transitions (S-entry sets `replayState = SYNCED_RECOVERY`, DS-entry sets `DEGRADED`). Per-property fairness formulas contain only critical-path clauses: `FairnessAC` (5 instantiated), `FairnessFC` (15), `FairnessDR` (25 with |RS|=2). `FairnessFC` originally omitted `WF_vars(reader!ReplayRewind(c))`, causing a spurious liveness violation. Fixed by adding the missing WF clause.
 
 ---
 
 ### Phase 7: Post-Abort Recovery, Forced Failover, and Edge Cases
 
-#### Iteration 16 — Post-Abort ATS Reconciliation
+#### ~~Iteration 16 — Post-Abort ATS Reconciliation~~ ✅
 
-Real-cluster testing revealed that after an abort completes during a bidirectional partition, the active cluster stuck in ATS cannot self-recover when the partition is removed. The active sees peer = STANDBY on reconnect but cannot distinguish steady-state STANDBY from post-abort STANDBY (peer went S→STA→AbTS→S during partition). Curator `PathChildrenCache` rebuild on `CONNECTION_RECONNECTED` delivers only the current znode value, not missed intermediate transitions. The transient `ABORT_TO_STANDBY` state is never observed. See Appendix A.21 for full analysis.
-
-`ZK.tla`:
-- `ZKPeerReconnect(c)` and `ZKPeerSessionRecover(c)` additionally set `peerCacheRebuilt[c] = TRUE`. This models the Curator PathChildrenCache rebuild that occurs on reconnection, where the cache re-reads all children and fires synthetic events.
-
-`HAGroupStore.tla`:
-- `ATSReconcileOnReconnect(c)` action: when the local cluster is in ATS, the peer is in S or DS, and the peer cache was just rebuilt (`peerCacheRebuilt[c] = TRUE`), the local cluster transitions to AbTAIS. This triggers auto-completion (AbTAIS → AIS via `AutoComplete`), recovering the cluster to its pre-failover active state.
-  - Guard: `clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"} /\ zkPeerConnected[c] = TRUE /\ zkPeerSessionAlive[c] = TRUE /\ peerCacheRebuilt[c] = TRUE`
-  - Effect: `clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]`, `peerCacheRebuilt' = [peerCacheRebuilt EXCEPT ![c] = FALSE]`
-  - Race with happy-path: In the normal failover sequence, (ATS, S) is transient — the peer will detect ATS and move to STA. The `peerCacheRebuilt` guard ensures reconciliation only fires after a reconnect event, not during steady-state operation. All `PeerReact*` actions also clear `peerCacheRebuilt[c] = FALSE`, so if the peer detects ATS and reacts normally (PeerReactToATS on the peer side), the subsequent PeerReactToAIS on the local side clears the flag before reconciliation can fire.
-- All `PeerReact*` actions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`) additionally set `peerCacheRebuilt[c] = FALSE`. This ensures that once a peer-reactive transition fires (proving the watcher chain is working), the reconciliation action is suppressed.
-
-`ConsistentFailover.tla`:
-- Variable: `peerCacheRebuilt ∈ [Cluster → BOOLEAN]` (init FALSE).
-- Wire `ATSReconcileOnReconnect(c)` into `Next`.
-- Extend `FailoverCompletion` to include ATS: with the reconciliation action and WF fairness on `ATSReconcileOnReconnect`, ATS now resolves in all scenarios (happy path via peer reaction, post-abort via reconciliation). The previous exclusion of ATS from `FailoverCompletion` (which was justified by the lack of a recovery mechanism) is no longer necessary.
-- `Fairness`: WF on `ATSReconcileOnReconnect(c)` (deterministic protocol step when guards are satisfied).
+Post-abort stuck ATS after partition (Appendix A.21). Reconciliation is folded into `ZKPeerReconnect`/`ZKPeerSessionRecover` in `ZK.tla`: when local = ATS and peer ∈ {S, DS} at reconnect, `clusterState[c]` is atomically set to AbTAIS → AIS via `AutoComplete`. Same listener-effect folding pattern as `recoveryListener`/`degradedListener`. Race-safe: reconnect requires `zkPeerConnected = FALSE`, so it cannot fire during the happy-path transient (ATS, S). No new variable, no new action in `Next`. `AbortSafety` relaxed to allow peer = DS; new `ATSReconcileSafety` invariant.
 
 #### Iteration 17 — Replay rewind verification
 

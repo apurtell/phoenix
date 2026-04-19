@@ -101,7 +101,8 @@ The exhaustive model check verifies the following over the full reachable state 
 |-----------|----------|
 | `TypeOK` | All 13 variables have valid types |
 | `MutualExclusion` | At most one cluster in the ACTIVE role at any time |
-| `AbortSafety` | AbTAIS reachable only via peer AbTS (abort from correct side) |
+| `AbortSafety` | AbTAIS requires peer in AbTS, S, or DS (abort or post-partition reconciliation) |
+| `ATSReconcileSafety` | AbTAIS implies peer is not in ACTIVE role (reconciliation preserves mutual exclusion) |
 | `NonAtomicFailoverSafe` | ATS maps to ACTIVE_TO_STANDBY (mutations blocked) during failover window |
 | `AISImpliesInSync` | AIS implies outDirEmpty and all RS in SYNC/INIT/DEAD |
 | `NoAISWithSFWriter` | No STORE_AND_FWD writers when cluster is AIS |
@@ -153,7 +154,7 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 | `HDFS.tla` | `HDFSDown` and `HDFSUp` -- environment actions for NameNode crash/recovery. |
 | `RS.tla` | `RSCrash` (any mode->DEAD), `RSAbortOnLocalHDFSFailure` (STORE_AND_FORWARD->DEAD when own HDFS down), `RSRestart` (DEAD->INIT via process supervisor). |
 | `Clock.tla` | `Tick` -- advances all per-cluster anti-flapping countdown timers by one tick toward zero. Guarded: only fires when at least one timer is positive. |
-| `ZK.tla` | Peer ZK lifecycle (`ZKPeerDisconnect`, `ZKPeerReconnect`, `ZKPeerSessionExpiry`, `ZKPeerSessionRecover`) and local ZK lifecycle (`ZKLocalDisconnect`, `ZKLocalReconnect`). |
+| `ZK.tla` | Peer ZK lifecycle (`ZKPeerDisconnect`, `ZKPeerReconnect`, `ZKPeerSessionExpiry`, `ZKPeerSessionRecover`) and local ZK lifecycle (`ZKLocalDisconnect`, `ZKLocalReconnect`). `ZKPeerReconnect` and `ZKPeerSessionRecover` fold a post-abort ATS reconciliation: when local = ATS and peer in {S, DS} at reconnect, `clusterState` is atomically set to AbTAIS (auto-completes to AIS via `AutoComplete`). This resolves the stuck-ATS scenario after abort during inter-cluster partition. |
 
 **Total: 38 action schemas** (some parameterized over cluster and RS).
 
@@ -210,7 +211,7 @@ Liveness properties are checked via simulation, one property at a time, each wit
 | Config File | Specification | Property | Instantiated Clauses |
 |-------------|---------------|----------|---------------------|
 | `ConsistentFailover-sim-liveness-ac.cfg` | `SpecAC` | `AbortCompletion` | 5 |
-| `ConsistentFailover-sim-liveness-fc.cfg` | `SpecFC` | `FailoverCompletion` | 13 |
+| `ConsistentFailover-sim-liveness-fc.cfg` | `SpecFC` | `FailoverCompletion` | 15 |
 | `ConsistentFailover-sim-liveness-dr.cfg` | `SpecDR` | `DegradationRecovery` | 25 |
 
 All simulation liveness configs use `RS = {rs1, rs2}`, `WaitTimeForSync = 2`, no SYMMETRY. Clause counts are the number of WF/SF temporal operators after TLC expands quantifiers over |Cluster|=2, |RS|=2.
@@ -280,17 +281,13 @@ java -XX:+UseParallelGC \
   -simulate -depth 10000 -workers auto
 ```
 
-#### Fairness Dependency Analysis
-
-Each per-property fairness formula includes only the temporal clauses on the critical path for that property. Structural counts are the WF/SF lines in the formula; instantiated counts reflect TLC's expansion of `\A c \in Cluster` and `\A r \in RS` with |Cluster|=2, |RS|=2.
+Each per-property fairness formula includes the temporal clauses on the critical path for that property.
 
 | Property | Formula | Structural | Instantiated | Critical Path |
 |----------|---------|-----------|-------------|---------------|
 | `AbortCompletion` | `FairnessAC` | 3 | 5 | `AutoComplete` fires on abort states; needs `zkLocalConnected` (via `ZKLocalReconnect`) and timer (`Tick`) |
-| `FailoverCompletion` | `FairnessFC` | 7 | 13 | `AutoComplete`/`TriggerFailover` (grouped, mutually exclusive by clusterState), `HDFSUp`, replay machine (`ReplayAdvance`/`BeginProcessing`/`FinishProcessing`), `ZKLocalReconnect`, `Tick` |
+| `FailoverCompletion` | `FairnessFC` | 8 | 15 | `AutoComplete`/`TriggerFailover` (grouped, mutually exclusive by clusterState), `HDFSUp`, replay machine (`ReplayAdvance`/`ReplayRewind`/`BeginProcessing`/`FinishProcessing`), `ZKLocalReconnect`, `Tick` |
 | `DegradationRecovery` | `FairnessDR` | 9 | 25 | `ANISToAIS`, `HDFSUp`, per-RS writer recovery chain (`WriterInit`/`SyncToSyncFwd`/`StoreFwdToSyncFwd`/`SyncFwdToSync`), RS lifecycle (`RSAbortOnLocalHDFSFailure`/`RSRestart`), `ANISHeartbeat`, `ZKLocalReconnect`, `Tick` |
-
-The full `Fairness` formula and `Spec` remain in the specification for documentation and THEOREM declarations.
 
 ## Latest Results
 
@@ -300,24 +297,22 @@ The full `Fairness` formula and `Spec` remain in the specification for documenta
 |--------|-------|
 | Configuration | 2 clusters, 2 RS per cluster, WaitTimeForSync=2 |
 | Workers | 16 |
-| States generated | 1,587,574,945 |
-| Distinct states | 101,326,464 |
-| Depth | 75 |
-| Duration | 13 min 05 sec |
+| States generated | 1,500,171,841 |
+| Distinct states | 95,613,696 |
+| Depth | 55 |
+| Duration | 12 min 19 sec |
 | Result | Success |
 
-All 8 state invariants and 8 action constraints verified.  No violations.
+All 9 state invariants and 8 action constraints verified.  No violations.
 
-### Simulation
+### Liveness (Per-Property Simulation)
 
-| Metric | Value |
-|--------|-------|
-| Configuration | 2 clusters, 9 RS per cluster, WaitTimeForSync=5 |
-| Workers | 128 |
-| States checked | 55,318,114,162 |
-| Traces generated | 5,531,581 |
-| Seed | 3374784671009936140 |
-| Duration | 8 hr 00 min |
-| Result | Success |
+All runs: 2 clusters, 2 RS per cluster, WaitTimeForSync=2, 128 workers, depth 10000, 1 hr.
 
-All 8 state invariants and 8 action constraints verified.  No violations.
+| Property | Config | States Checked | Traces | Seed | Result |
+|----------|--------|---------------|--------|------|--------|
+| `AbortCompletion` | `SpecAC` | 3,056,885,301 | 305,676 | -4478997111098479953 | Success |
+| `DegradationRecovery` | `SpecDR` | 465,273,923 | 46,524 | 2282162590966442857 | Success |
+| `FailoverCompletion` | `SpecFC` | 1,137,408,142 | 113,735 | -1246613979262938318 | Success |
+
+All 3 liveness properties verified.  No violations.

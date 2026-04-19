@@ -569,12 +569,13 @@ SpecAC == Init /\ [][Next]_vars /\ FairnessAC
 
 \* FailoverCompletion: AutoComplete + TriggerFailover (SF, grouped
 \* by clusterState exclusivity), HDFSUp (SF), ZKLocalReconnect (WF),
-\* replay machine (WF), Tick (WF).
+\* replay machine including ReplayRewind (WF), Tick (WF).
 FairnessFC ==
     /\ WF_vars(clk!Tick)
     /\ \A c \in Cluster :
         /\ WF_vars(zk!ZKLocalReconnect(c))
         /\ WF_vars(reader!ReplayAdvance(c))
+        /\ WF_vars(reader!ReplayRewind(c))
         /\ WF_vars(reader!ReplayBeginProcessing(c))
         /\ WF_vars(reader!ReplayFinishProcessing(c))
         /\ SF_vars(haGroupStore!AutoComplete(c)
@@ -622,9 +623,11 @@ SpecDR == Init /\ [][Next]_vars /\ FairnessDR
  * at the right moment. With no fairness on admin actions (the
  * admin can abort every failover attempt) and no fairness on ZK
  * disconnect (the scheduler can disconnect exactly when the peer
- * is in AbTS), ATS can remain indefinitely. ATS resolution is
- * outside the current fairness envelope; it requires additional
- * assumptions about admin behavior and ZK stability.
+ * is in AbTS), ATS can remain indefinitely. ATS does have a
+ * resolution path via the reconciliation fold in ZKPeerReconnect/
+ * ZKPeerSessionRecover (ATS -> AbTAIS -> AIS when peer is in
+ * S/DS at reconnect; Iteration 16), but adding ATS here would
+ * require extending FairnessFC with the peer-reactive SF group.
  *
  * Predicated on ZLA (encoded in Fairness).
  *)
@@ -737,28 +740,53 @@ MutualExclusion ==
 
 (*
  * Abort safety: if a cluster is in AbTAIS (ABORT_TO_ACTIVE_IN_SYNC),
- * the peer must be in AbTS (the abort originator) or S (the peer
- * already auto-completed AbTS->S). This ensures abort was properly
- * initiated from the STA side, preventing dual-active races where
- * both clusters could independently transition toward ACTIVE.
+ * the peer must be in AbTS, S, or DS.
+ *
+ * AbTAIS is reached via two paths:
+ *   1. Abort path: PeerReactToAbTS (peer = AbTS). The peer can
+ *      auto-complete AbTS -> S before the local AbTAIS auto-completes.
+ *   2. Reconciliation path (Iteration 16, Appendix A.21):
+ *      ZKPeerReconnect/ZKPeerSessionRecover with local = ATS and
+ *      peer in {S, DS}. DS is reachable when the peer degraded
+ *      (S -> DS via PeerReactToANIS) before the failover partition.
+ *
+ * All three peer states (AbTS, S, DS) map to STANDBY role, so
+ * MutualExclusion is preserved in all cases.
  *
  * The abort protocol is:
  *   (ATS, STA) --[Admin]--> (ATS, AbTS) --[PeerReact]--> (AbTAIS, AbTS)
  *   then auto-complete both sides back to (AIS, S).
  *
- * AbTAIS can only be reached via PeerReactToAbTS, which requires
- * the peer to be in AbTS. The peer can then auto-complete to S
- * before the local AbTAIS auto-completes to AIS, yielding (AbTAIS, S).
+ * The reconciliation protocol is:
+ *   (ATS, S/DS) --[ZKPeerReconnect]--> (AbTAIS, S/DS)
+ *   then auto-complete AbTAIS -> AIS/ANIS.
  *
  * Source: Architecture safety argument; abort originates from
  *         setHAGroupStatusToAbortToStandby() (L419-425) on the
  *         STA side; active detects via FailoverManagementListener
- *         peer AbTS resolver (L132).
+ *         peer AbTS resolver (L132). Reconciliation added in
+ *         Iteration 16 (ZK.tla ZKPeerReconnect/ZKPeerSessionRecover).
  *)
 AbortSafety ==
     \A c \in Cluster :
         clusterState[c] = "AbTAIS" =>
-            clusterState[Peer(c)] \in {"AbTS", "S"}
+            clusterState[Peer(c)] \in {"AbTS", "S", "DS"}
+
+---------------------------------------------------------------------------
+
+(*
+ * ATS reconciliation safety (Iteration 16): the reconciliation path
+ * through AbTAIS preserves MutualExclusion. When AbTAIS is reached
+ * (via either PeerReactToAbTS or the ZKPeerReconnect/ZKPeerSession-
+ * Recover reconciliation fold), the peer cannot be in an ACTIVE
+ * role. This is a derived invariant -- subsumed by MutualExclusion
+ * but retained for explicit documentation of the reconciliation
+ * safety argument.
+ *)
+ATSReconcileSafety ==
+    \A c \in Cluster :
+        clusterState[c] = "AbTAIS" =>
+            RoleOf(clusterState[Peer(c)]) # "ACTIVE"
 
 ---------------------------------------------------------------------------
 
