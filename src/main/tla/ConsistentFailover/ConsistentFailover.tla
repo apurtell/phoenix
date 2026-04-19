@@ -91,10 +91,12 @@
  *   lastRoundProcessed      | ReplicationLogDiscoveryReplay L336-351
  *   failoverPending         | ReplicationLogDiscoveryReplay L159-171
  *   inProgressDirEmpty      | ReplicationLogDiscoveryReplay L500-533
- *   ReplayAdvance           | replay() L336-343 (SYNC round processing)
- *   ReplayDetectDegraded    | degradedListener L136-145
- *   ReplayDetectRecovery    | recoveryListener L147-157
+ *   ReplayAdvance           | replay() L336-343 (SYNC) and L345-351
+ *                           |   (DEGRADED) round processing
  *   ReplayRewind            | replay() L323-333 (CAS to SYNC)
+ *   [listener folds]        | degradedListener L136-145 and
+ *                           |   recoveryListener L147-157 are folded
+ *                           |   into HAGroupStore S/DS-entry actions
  *   TriggerFailover         | shouldTriggerFailover() L500-533 +
  *                           |   triggerFailover() L535-548
  *   FailoverTriggerCorrectness | Action constraint: STA->AIS requires
@@ -281,6 +283,13 @@ zk == INSTANCE ZK
 \* and the other in standby (S). The choice of which cluster is
 \* active is deterministic: CHOOSE picks an arbitrary but fixed
 \* element of Cluster as the initial active.
+\*
+\* The standby starts with replayState = SYNCED_RECOVERY, modeling
+\* the recoveryListener having already fired during startup
+\* (NOT_INITIALIZED -> SYNCED_RECOVERY is synchronous with S
+\* entry on the local PathChildrenCache event thread). The active
+\* starts NOT_INITIALIZED (reader is dormant until the cluster
+\* first enters S after a failover).
 Init ==
     \* Deterministically assign one cluster to AIS and the other to S.
     \* CHOOSE x \in Cluster : TRUE picks an arbitrary fixed cluster.
@@ -291,7 +300,9 @@ Init ==
        /\ outDirEmpty = [c \in Cluster |-> TRUE]
        /\ hdfsAvailable = [c \in Cluster |-> TRUE]
        /\ antiFlapTimer = [c \in Cluster |-> 0]
-       /\ replayState = [c \in Cluster |-> "NOT_INITIALIZED"]
+       /\ replayState = [c \in Cluster |->
+                            IF c = active THEN "NOT_INITIALIZED"
+                            ELSE "SYNCED_RECOVERY"]
        /\ lastRoundInSync = [c \in Cluster |-> 0]
        /\ lastRoundProcessed = [c \in Cluster |-> 0]
        /\ failoverPending = [c \in Cluster |-> FALSE]
@@ -365,9 +376,9 @@ Next ==
         \/ zk!ZKLocalDisconnect(c)
         \/ zk!ZKLocalReconnect(c)
         \* Standby-side replay state machine (reader).
+        \* Listener effects (degradedListener, recoveryListener) are
+        \* folded into the S-entry and DS-entry actions in HAGroupStore.
         \/ reader!ReplayAdvance(c)
-        \/ reader!ReplayDetectDegraded(c)
-        \/ reader!ReplayDetectRecovery(c)
         \/ reader!ReplayRewind(c)
         \* In-progress directory dynamics (reader round processing).
         \/ reader!ReplayBeginProcessing(c)
@@ -397,9 +408,271 @@ Next ==
 
 (* Specification *)
 
-\* Safety specification: initial state, followed by zero or more
-\* Next steps (or stuttering). Safety-only model (no fairness).
-Spec == Init /\ [][Next]_vars
+\* Safety-only specification: initial state, followed by zero or
+\* more Next steps (or stuttering). No fairness — used for fast
+\* safety-only model checking (no temporal overhead).
+SafetySpec == Init /\ [][Next]_vars
+
+---------------------------------------------------------------------------
+
+(* Fairness *)
+
+(*
+ * Fairness assumptions for liveness checking.
+ *
+ * Classifies every action in Next into one of four fairness tiers.
+ * The guiding principle: any action whose guard depends on an
+ * environment variable that oscillates without fairness needs SF,
+ * because the adversary can cycle the env var once per lasso cycle
+ * to break WF's continuous-enablement requirement.
+ *
+ * Tier 3 actions are grouped into disjunctions under a single
+ * SF_vars to keep the temporal formula within TLC's DNF size
+ * limit. When at most one disjunct is ENABLED in any state,
+ * SF(A1\/...\/An) ≡ SF(A1)/\.../\SF(An): the only disjunct
+ * that can fire is the one that is enabled, so the scheduler
+ * cannot satisfy the disjunction by firing a different disjunct.
+ * Mutual exclusivity is guaranteed by the single-valued nature
+ * of clusterState (per-cluster groups) and writerMode (per-RS
+ * groups).
+ *
+ *   1. WF on protocol-internal steps whose guards depend only on
+ *      protocol state variables (no env var guards). Continuous
+ *      enablement is guaranteed by protocol progress. Includes
+ *      Tick, replay state machine, WriterInit, WriterSyncToSyncFwd.
+ *      Exception: ANISHeartbeat keeps WF despite its zkLocal-
+ *      Connected guard because suppressing the heartbeat HELPS
+ *      liveness (the anti-flap gate opens sooner); SF would be
+ *      counterproductive.
+ *
+ *   2. WF on ZK recovery actions (ZKPeerReconnect, ZKPeerSession-
+ *      Recover, ZKLocalReconnect): encodes the ZK Liveness
+ *      Assumption (ZLA, §4.2). ZK sessions are eventually alive
+ *      and connected. These recovery actions are the basis for
+ *      SF on all actions guarded by zkPeerConnected or
+ *      zkLocalConnected.
+ *
+ *   3. SF on all actions guarded by environment variables that
+ *      oscillate without fairness: zkPeerConnected, zkPeerSession-
+ *      Alive, zkLocalConnected, hdfsAvailable. Grouped as:
+ *        - Peer-reactive (exclusive by clusterState[Peer(c)]):
+ *          PeerReactToATS/ANIS/AIS/AbTS
+ *        - Local transitions (exclusive by clusterState[c]):
+ *          AutoComplete, ANISToAIS, ANISTSToATS, TriggerFailover
+ *        - HDFSUp (standalone)
+ *        - Writer degradation (exclusive by writerMode):
+ *          WriterToStoreFwd, WriterSyncFwdToStoreFwd,
+ *          WriterInitToStoreFwd
+ *        - Writer recovery (exclusive by writerMode):
+ *          WriterStoreFwdToSyncFwd, WriterSyncFwdToSync
+ *        - RS lifecycle (exclusive by writerMode):
+ *          RSAbortOnLocalHDFSFailure, RSRestart
+ *
+ *   4. No fairness on non-deterministic environmental faults
+ *      (HDFSDown, RSCrash, ZKPeerDisconnect, ZKPeerSessionExpiry,
+ *      ZKLocalDisconnect, ReactiveTransitionFail), operator actions
+ *      (AdminStartFailover, AdminAbortFailover), and CAS failures
+ *      (WriterToStoreFwdFail, WriterSyncFwdToStoreFwdFail,
+ *      WriterInitToStoreFwdFail). These are genuinely non-
+ *      deterministic; imposing fairness would force unrealistic
+ *      guarantees.
+ *)
+Fairness ==
+    \* --- Tier 1: WF on protocol-internal steps ---
+    \* Guards depend only on protocol state; continuous enablement
+    \* is guaranteed by protocol progress.
+    /\ WF_vars(clk!Tick)
+    /\ \A c \in Cluster :
+        \* [S&F heartbeat] Anti-flap timer reset. Keeps WF despite
+        \* zkLocalConnected guard: suppressing the heartbeat HELPS
+        \* liveness (gate opens sooner), so SF would be counterproductive.
+        /\ WF_vars(haGroupStore!ANISHeartbeat(c))
+        \* [Reader] Replay state machine (no env var guards).
+        /\ WF_vars(reader!ReplayAdvance(c))
+        /\ WF_vars(reader!ReplayRewind(c))
+        /\ WF_vars(reader!ReplayBeginProcessing(c))
+        /\ WF_vars(reader!ReplayFinishProcessing(c))
+        \* --- Tier 2: WF on ZK recovery (encodes ZLA §4.2) ---
+        \* ZK sessions are eventually alive and connected. These
+        \* recovery actions are the basis for SF on all actions
+        \* guarded by zkPeerConnected/zkLocalConnected.
+        /\ WF_vars(zk!ZKPeerReconnect(c))
+        /\ WF_vars(zk!ZKPeerSessionRecover(c))
+        /\ WF_vars(zk!ZKLocalReconnect(c))
+        \* --- Tier 3: SF on actions guarded by env vars ---
+        \* Grouped by mutual exclusivity to keep TLC's temporal
+        \* formula within its DNF size limit. When at most one
+        \* disjunct is ENABLED in any state, SF(A1\/...\/An) is
+        \* equivalent to SF(A1)/\.../\SF(An), because the only
+        \* disjunct that can fire is the one that is enabled.
+        \*
+        \* Peer-reactive group (exclusive by clusterState[Peer(c)]:
+        \* ATS, ANIS, AbTS, AIS are mutually exclusive).
+        /\ SF_vars(haGroupStore!PeerReactToATS(c)
+                   \/ haGroupStore!PeerReactToANIS(c)
+                   \/ haGroupStore!PeerReactToAbTS(c)
+                   \/ haGroupStore!PeerReactToAIS(c))
+        \* Local cluster transition group (exclusive by
+        \* clusterState[c]: AbTS/AbTAIS/AbTANIS, ANIS, ANISTS,
+        \* STA are mutually exclusive).
+        /\ SF_vars(haGroupStore!AutoComplete(c)
+                   \/ haGroupStore!ANISToAIS(c)
+                   \/ haGroupStore!ANISTSToATS(c)
+                   \/ reader!TriggerFailover(c))
+        \* [Environmental] HDFS recovery.
+        /\ SF_vars(hdfs!HDFSUp(c))
+        \* --- Per-RS actions ---
+        /\ \A r \in RS :
+            \* Writer startup (no env var guard).
+            /\ WF_vars(writer!WriterInit(c, r))
+            \* Forwarder-driven SYNC->S&FWD (no env var guard).
+            /\ WF_vars(writer!WriterSyncToSyncFwd(c, r))
+            \* Writer degradation group (exclusive by writerMode:
+            \* SYNC, SYNC_AND_FWD, INIT are mutually exclusive;
+            \* all guarded on zkLocalConnected, ~hdfsAvailable[Peer]).
+            /\ SF_vars(writer!WriterToStoreFwd(c, r)
+                       \/ writer!WriterSyncFwdToStoreFwd(c, r)
+                       \/ writer!WriterInitToStoreFwd(c, r))
+            \* Writer recovery group (exclusive by writerMode:
+            \* STORE_AND_FWD, SYNC_AND_FWD are mutually exclusive;
+            \* guarded on hdfsAvailable[Peer]).
+            /\ SF_vars(writer!WriterStoreFwdToSyncFwd(c, r)
+                       \/ writer!WriterSyncFwdToSync(c, r))
+            \* RS lifecycle group (exclusive by writerMode:
+            \* STORE_AND_FWD, DEAD are mutually exclusive).
+            /\ SF_vars(rs!RSAbortOnLocalHDFSFailure(c, r)
+                       \/ rs!RSRestart(c, r))
+
+---------------------------------------------------------------------------
+
+(* Liveness specifications *)
+
+\* Full specification: safety conjoined with the complete fairness
+\* formula. Documents the full fairness design; too large for TLC's
+\* Buchi automaton construction (43 temporal clauses). Used only in
+\* THEOREM declarations.
+Spec == Init /\ [][Next]_vars /\ Fairness
+
+\* Per-property specifications: each conjoins only the fairness
+\* clauses on the critical path for one liveness property, keeping
+\* the temporal formula small enough for TLC.
+
+\* AbortCompletion: AutoComplete (SF, zkLocalConnected guard),
+\* ZKLocalReconnect (WF, re-enables zkLocalConnected), Tick (WF).
+FairnessAC ==
+    /\ WF_vars(clk!Tick)
+    /\ \A c \in Cluster :
+        /\ WF_vars(zk!ZKLocalReconnect(c))
+        /\ SF_vars(haGroupStore!AutoComplete(c))
+
+SpecAC == Init /\ [][Next]_vars /\ FairnessAC
+
+\* FailoverCompletion: AutoComplete + TriggerFailover (SF, grouped
+\* by clusterState exclusivity), HDFSUp (SF), ZKLocalReconnect (WF),
+\* replay machine (WF), Tick (WF).
+FairnessFC ==
+    /\ WF_vars(clk!Tick)
+    /\ \A c \in Cluster :
+        /\ WF_vars(zk!ZKLocalReconnect(c))
+        /\ WF_vars(reader!ReplayAdvance(c))
+        /\ WF_vars(reader!ReplayBeginProcessing(c))
+        /\ WF_vars(reader!ReplayFinishProcessing(c))
+        /\ SF_vars(haGroupStore!AutoComplete(c)
+                   \/ reader!TriggerFailover(c))
+        /\ SF_vars(hdfs!HDFSUp(c))
+
+SpecFC == Init /\ [][Next]_vars /\ FairnessFC
+
+\* DegradationRecovery: ANISToAIS (SF), HDFSUp (SF),
+\* ZKLocalReconnect (WF), Tick (WF), ANISHeartbeat (WF),
+\* per-RS writer recovery chain (SF) and lifecycle (SF),
+\* WriterInit and WriterSyncToSyncFwd (WF).
+FairnessDR ==
+    /\ WF_vars(clk!Tick)
+    /\ \A c \in Cluster :
+        /\ WF_vars(zk!ZKLocalReconnect(c))
+        /\ WF_vars(haGroupStore!ANISHeartbeat(c))
+        /\ SF_vars(haGroupStore!ANISToAIS(c))
+        /\ SF_vars(hdfs!HDFSUp(c))
+        /\ \A r \in RS :
+            /\ WF_vars(writer!WriterInit(c, r))
+            /\ WF_vars(writer!WriterSyncToSyncFwd(c, r))
+            /\ SF_vars(writer!WriterStoreFwdToSyncFwd(c, r)
+                       \/ writer!WriterSyncFwdToSync(c, r))
+            /\ SF_vars(rs!RSAbortOnLocalHDFSFailure(c, r)
+                       \/ rs!RSRestart(c, r))
+
+SpecDR == Init /\ [][Next]_vars /\ FairnessDR
+
+---------------------------------------------------------------------------
+
+(* Liveness properties *)
+
+(*
+ * Failover completion: standby-side and abort transient states
+ * eventually resolve to a stable state. Resolution paths:
+ *   STA -> AIS (TriggerFailover) or STA -> AbTS -> S (abort)
+ *   AbTAIS -> AIS/ANIS, AbTANIS -> ANIS, AbTS -> S
+ *       (auto-completion)
+ *
+ * ATS and ANISTS are excluded: their resolution depends on the
+ * peer completing failover (PeerReactToAIS/PeerReactToANIS) or
+ * on abort propagation (PeerReactToAbTS). Both require the peer
+ * to reach a specific state AND the ZK peer connection to be alive
+ * at the right moment. With no fairness on admin actions (the
+ * admin can abort every failover attempt) and no fairness on ZK
+ * disconnect (the scheduler can disconnect exactly when the peer
+ * is in AbTS), ATS can remain indefinitely. ATS resolution is
+ * outside the current fairness envelope; it requires additional
+ * assumptions about admin behavior and ZK stability.
+ *
+ * Predicated on ZLA (encoded in Fairness).
+ *)
+FailoverCompletion ==
+    \A c \in Cluster :
+        clusterState[c] \in {"STA", "AbTAIS", "AbTANIS", "AbTS"}
+        ~> clusterState[c] \in {"AIS", "ANIS", "S"}
+
+---------------------------------------------------------------------------
+
+(*
+ * Degradation recovery: ANIS with available peer HDFS eventually
+ * progresses out of ANIS. The recovery chain is:
+ *   S&F -> S&FWD (WriterStoreFwdToSyncFwd)
+ *     -> SYNC (WriterSyncFwdToSync, sets outDirEmpty)
+ *     -> anti-flap timer expires (Tick)
+ *     -> ANIS -> AIS (ANISToAIS)
+ *
+ * The cluster may also leave ANIS via failover (ANIS -> ANISTS),
+ * which satisfies the consequent. Under SF on HDFSUp, HDFS
+ * cannot be permanently down.
+ *
+ * Predicated on ZLA (encoded in Fairness).
+ *)
+DegradationRecovery ==
+    \A c \in Cluster :
+        (clusterState[c] = "ANIS" /\ hdfsAvailable[Peer(c)])
+        ~> clusterState[c] # "ANIS"
+
+---------------------------------------------------------------------------
+
+(*
+ * Abort completion: every abort state eventually auto-completes
+ * to a stable state.
+ *   AbTS -> S    (AutoComplete)
+ *   AbTAIS -> AIS or ANIS (AutoComplete, conditional on
+ *             writer/outDir state)
+ *   AbTANIS -> ANIS (AutoComplete)
+ *
+ * Under WF on AutoComplete, each abort state deterministically
+ * resolves. Requires zkLocalConnected (AutoComplete guard).
+ *
+ * Predicated on ZLA (encoded in Fairness).
+ *)
+AbortCompletion ==
+    \A c \in Cluster :
+        clusterState[c] \in {"AbTS", "AbTAIS", "AbTANIS"}
+        ~> clusterState[c] \in {"AIS", "ANIS", "S"}
 
 ---------------------------------------------------------------------------
 
@@ -682,6 +955,7 @@ AllowedReplayTransitions ==
       <<"NOT_INITIALIZED", "SYNCED_RECOVERY">>,
       <<"NOT_INITIALIZED", "DEGRADED">>,
       <<"SYNC", "DEGRADED">>,
+      <<"SYNC", "SYNCED_RECOVERY">>,
       <<"DEGRADED", "SYNCED_RECOVERY">>,
       <<"SYNCED_RECOVERY", "SYNC">>,
       <<"SYNCED_RECOVERY", "DEGRADED">>
@@ -827,5 +1101,14 @@ THEOREM Spec => [][FailoverTriggerCorrectness]_vars
 
 \* Safety: zero RPO -- no data loss on failover (action property).
 THEOREM Spec => [][NoDataLoss]_vars
+
+\* Liveness: failover/abort transient states eventually resolve.
+THEOREM SpecFC => FailoverCompletion
+
+\* Liveness: ANIS with available HDFS eventually recovers.
+THEOREM SpecDR => DegradationRecovery
+
+\* Liveness: abort states eventually auto-complete.
+THEOREM SpecAC => AbortCompletion
 
 ============================================================================

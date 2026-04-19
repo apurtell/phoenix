@@ -124,7 +124,7 @@ The exhaustive model check verifies the following over the full reachable state 
 ## Module Architecture
 
 ```
-ConsistentFailover.tla          (root orchestrator: variables, Init, Next, Spec, invariants)
+ConsistentFailover.tla          (root orchestrator: variables, Init, Next, SafetySpec/Spec, invariants)
   |
   +-- Types.tla                 (pure definitions: states, transitions, roles, helpers)
   |
@@ -145,17 +145,17 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 | Module | Description |
 |--------|-------------|
 | `Types.tla` | Pure definitions: 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, anti-flapping timer helpers. No variables. |
-| `ConsistentFailover.tla` | Root orchestrator. Declares 13 variables, defines Init/Next/Spec, instances sub-modules, defines all invariants and action constraints. |
-| `HAGroupStore.tla` | Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), ANISTS drain completion (`ANISTSToATS`), retry exhaustion (`ReactiveTransitionFail`). ATS->S transitions include writer lifecycle reset (live writers reset to INIT, OUT directory cleared; DEAD writers preserved for RSRestart). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`. Auto-completion, heartbeat, recovery, and drain completion guarded on `zkLocalConnected`. |
+| `ConsistentFailover.tla` | Root orchestrator. Declares 13 variables, defines Init/Next/SafetySpec/Spec, instances sub-modules, defines all invariants and action constraints. |
+| `HAGroupStore.tla` | Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), ANISTS drain completion (`ANISTSToATS`), retry exhaustion (`ReactiveTransitionFail`). ATS->S transitions include writer lifecycle reset (live writers reset to INIT, OUT directory cleared; DEAD writers preserved for RSRestart). S-entry actions atomically set `replayState = SYNCED_RECOVERY` (recoveryListener fold); DS-entry sets `replayState = DEGRADED` (degradedListener fold). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`. Auto-completion, heartbeat, recovery, and drain completion guarded on `zkLocalConnected`. |
 | `Admin.tla` | `AdminStartFailover` (AIS->ATS or ANIS->ANISTS with peer-state guard) and `AdminAbortFailover` (STA->AbTS, clears failoverPending). |
 | `Writer.tla` | Per-RS writer mode transitions: startup (`WriterInit`, `WriterInitToStoreFwd`, `WriterInitToStoreFwdFail`), degradation (`WriterToStoreFwd`, `WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwd`, `WriterSyncFwdToStoreFwdFail`), recovery (`WriterSyncToSyncFwd`, `WriterStoreFwdToSyncFwd`), drain complete (`WriterSyncFwdToSync`). ZK-writing actions guarded on `zkLocalConnected`. |
-| `Reader.tla` | Replay advance, degradation/recovery detection, rewind, in-progress directory dynamics, failover trigger (`TriggerFailover` guarded on `zkLocalConnected`). |
+| `Reader.tla` | Replay advance (SYNC and DEGRADED), rewind, in-progress directory dynamics, failover trigger (`TriggerFailover` guarded on `zkLocalConnected`). Listener effects (degradedListener, recoveryListener) are folded into HAGroupStore S/DS-entry actions. |
 | `HDFS.tla` | `HDFSDown` and `HDFSUp` -- environment actions for NameNode crash/recovery. |
 | `RS.tla` | `RSCrash` (any mode->DEAD), `RSAbortOnLocalHDFSFailure` (STORE_AND_FORWARD->DEAD when own HDFS down), `RSRestart` (DEAD->INIT via process supervisor). |
 | `Clock.tla` | `Tick` -- advances all per-cluster anti-flapping countdown timers by one tick toward zero. Guarded: only fires when at least one timer is positive. |
 | `ZK.tla` | Peer ZK lifecycle (`ZKPeerDisconnect`, `ZKPeerReconnect`, `ZKPeerSessionExpiry`, `ZKPeerSessionRecover`) and local ZK lifecycle (`ZKLocalDisconnect`, `ZKLocalReconnect`). |
 
-**Total: 40 action schemas** (some parameterized over cluster and RS).
+**Total: 38 action schemas** (some parameterized over cluster and RS).
 
 ## Variables
 
@@ -177,9 +177,11 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 
 ## Configuration
 
-Two TLC configurations are provided:
+Five TLC configurations are provided:
 
-### Exhaustive (`ConsistentFailover.cfg`)
+### Safety Checking
+
+#### Exhaustive (`ConsistentFailover.cfg`)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -188,8 +190,9 @@ Two TLC configurations are provided:
 | `WaitTimeForSync` | `2` | Anti-flapping timer ticks (small value sufficient for verification) |
 | Symmetry | `Permutations(RS)` | RS identifiers are interchangeable; clusters are asymmetric (AIS vs S at Init) |
 | State constraint | `lastRoundProcessed[c] <= 3` | Bounds replay counters for tractability |
+| Specification | `SafetySpec` | `Init /\ [][Next]_vars` (no fairness) |
 
-### Simulation (`ConsistentFailover-sim.cfg`)
+#### Simulation (`ConsistentFailover-sim.cfg`)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -198,8 +201,23 @@ Two TLC configurations are provided:
 | `WaitTimeForSync` | `5` | Larger window exercises richer interleavings during anti-flapping wait |
 | Symmetry | None | No benefit for random trace sampling |
 | State constraint | None | Counters grow organically along each trace |
+| Specification | `SafetySpec` | `Init /\ [][Next]_vars` (no fairness) |
 
-The initial state is deterministic: one cluster starts in AIS, the other in S.  All writers start in INIT, all HDFS available, all ZK connections alive, anti-flapping timers at zero, replay in NOT_INITIALIZED.
+### Liveness Checking (Per-Property Simulation)
+
+Liveness properties are checked via simulation, one property at a time, each with a per-property fairness formula containing only the temporal clauses on its critical path. Exhaustive liveness checking is infeasible at this state-space scale: TLC's Buchi automaton construction and Tarjan SCC algorithm require the full product graph (behavior graph × automaton) in memory, which exceeds heap capacity with 100M+ distinct states. Simulation samples random traces with fairness-aware temporal checking, providing strong probabilistic coverage without constructing the full state graph.
+
+| Config File | Specification | Property | Instantiated Clauses |
+|-------------|---------------|----------|---------------------|
+| `ConsistentFailover-sim-liveness-ac.cfg` | `SpecAC` | `AbortCompletion` | 5 |
+| `ConsistentFailover-sim-liveness-fc.cfg` | `SpecFC` | `FailoverCompletion` | 13 |
+| `ConsistentFailover-sim-liveness-dr.cfg` | `SpecDR` | `DegradationRecovery` | 25 |
+
+All simulation liveness configs use `RS = {rs1, rs2}`, `WaitTimeForSync = 2`, no SYMMETRY. Clause counts are the number of WF/SF temporal operators after TLC expands quantifiers over |Cluster|=2, |RS|=2.
+
+### Common Parameters
+
+The initial state is deterministic: one cluster starts in AIS, the other in S.  All writers start in INIT, all HDFS available, all ZK connections alive, anti-flapping timers at zero, replay in SYNCED_RECOVERY (standby) / NOT_INITIALIZED (active).
 
 ## Running
 
@@ -211,11 +229,12 @@ Requires JDK 11+ (JDK 17 recommended).  The `tla2tools.jar` must be on the class
 java -cp tla2tools.jar tla2sany.SANY ConsistentFailover.tla
 ```
 
+### Safety Checking
+
 **Exhaustive model check (TLC):**
 
 ```
-java -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
-  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+java -XX:+UseParallelGC \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover.cfg \
   -workers auto -cleanup
@@ -224,15 +243,54 @@ java -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
 **Simulation (8-hour random trace sampling):**
 
 ```
-java -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
-  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+java -XX:+UseParallelGC \
   -Dtlc2.TLC.stopAfter=28800 \
   -cp tla2tools.jar:CommunityModules-deps.jar \
   tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-sim.cfg \
   -simulate -depth 10000 -workers auto
 ```
 
-Simulation generates random execution traces up to depth 10000 (sufficient for ~100 complete failover cycles with 9 RS). The 9-RS model is too large for exhaustive search but ideal for simulation: 40 action schemas × 9 RS create a high branching factor that simulation samples efficiently. The `-Dtlc2.TLC.stopAfter=28800` flag limits the run to 8 hours. Use `OffHeapDiskFPSet` with 8 GB of direct buffers (`-XX:MaxDirectMemorySize=8g`) to handle the large fingerprint set without exhausting heap memory.
+Simulation generates random execution traces up to depth 10000 (sufficient for ~100 complete failover cycles with 9 RS). The 9-RS model is too large for exhaustive search but ideal for simulation: 40 action schemas × 9 RS create a high branching factor that simulation samples efficiently. The `-Dtlc2.TLC.stopAfter=28800` flag limits the run to 8 hours.
+
+### Liveness Checking
+
+Liveness properties are checked via simulation, one property at a time. Each config uses a per-property fairness formula (`FairnessAC`, `FairnessFC`, or `FairnessDR`) containing only the temporal clauses on that property's critical path. The full `Fairness` formula has 43 temporal clauses, causing TLC's Buchi automaton construction to blow up exponentially; per-property formulas keep this tractable. Exhaustive liveness checking is infeasible at this state-space scale because TLC's SCC algorithm requires the full product graph in memory.
+
+**All 3 properties (8-hour run each):**
+
+```bash
+for prop in ac fc dr; do
+  java -XX:+UseParallelGC \
+    -Dtlc2.TLC.stopAfter=28800 \
+    -cp tla2tools.jar:CommunityModules-deps.jar \
+    tlc2.TLC ConsistentFailover.tla \
+    -config ConsistentFailover-sim-liveness-${prop}.cfg \
+    -simulate -depth 10000 -workers auto
+done
+```
+
+**Single property (example: AbortCompletion):**
+
+```
+java -XX:+UseParallelGC \
+  -Dtlc2.TLC.stopAfter=28800 \
+  -cp tla2tools.jar:CommunityModules-deps.jar \
+  tlc2.TLC ConsistentFailover.tla \
+  -config ConsistentFailover-sim-liveness-ac.cfg \
+  -simulate -depth 10000 -workers auto
+```
+
+#### Fairness Dependency Analysis
+
+Each per-property fairness formula includes only the temporal clauses on the critical path for that property. Structural counts are the WF/SF lines in the formula; instantiated counts reflect TLC's expansion of `\A c \in Cluster` and `\A r \in RS` with |Cluster|=2, |RS|=2.
+
+| Property | Formula | Structural | Instantiated | Critical Path |
+|----------|---------|-----------|-------------|---------------|
+| `AbortCompletion` | `FairnessAC` | 3 | 5 | `AutoComplete` fires on abort states; needs `zkLocalConnected` (via `ZKLocalReconnect`) and timer (`Tick`) |
+| `FailoverCompletion` | `FairnessFC` | 7 | 13 | `AutoComplete`/`TriggerFailover` (grouped, mutually exclusive by clusterState), `HDFSUp`, replay machine (`ReplayAdvance`/`BeginProcessing`/`FinishProcessing`), `ZKLocalReconnect`, `Tick` |
+| `DegradationRecovery` | `FairnessDR` | 9 | 25 | `ANISToAIS`, `HDFSUp`, per-RS writer recovery chain (`WriterInit`/`SyncToSyncFwd`/`StoreFwdToSyncFwd`/`SyncFwdToSync`), RS lifecycle (`RSAbortOnLocalHDFSFailure`/`RSRestart`), `ANISHeartbeat`, `ZKLocalReconnect`, `Tick` |
+
+The full `Fairness` formula and `Spec` remain in the specification for documentation and THEOREM declarations.
 
 ## Latest Results
 
@@ -258,9 +316,8 @@ All 8 state invariants and 8 action constraints verified.  No violations.
 | Workers | 128 |
 | States checked | 55,318,114,162 |
 | Traces generated | 5,531,581 |
-| Trace length | mean=10000, var=0, sd=0 |
 | Seed | 3374784671009936140 |
 | Duration | 8 hr 00 min |
 | Result | Success |
 
-All 8 state invariants and 8 action constraints verified across 5.5M traces at depth 10000.  No violations.
+All 8 state invariants and 8 action constraints verified.  No violations.

@@ -5,10 +5,7 @@
  *
  * The standby cluster's reader replays replication logs round-by-round,
  * tracking two counters (lastRoundProcessed, lastRoundInSync) and a
- * replay state that determines how the counters advance. Transitions
- * are driven by local HA group state changes (S -> DS triggers
- * degradation, DS -> S triggers recovery) and by the replay() loop
- * itself (SYNCED_RECOVERY -> SYNC after rewind).
+ * replay state that determines how the counters advance.
  *
  * REPLAY STATE SEMANTICS:
  *   SYNC:             Both counters advance together (in-sync replay).
@@ -16,20 +13,25 @@
  *                     is frozen (degraded replay).
  *   SYNCED_RECOVERY:  Rewinds lastRoundProcessed to lastRoundInSync,
  *                     then CAS-transitions to SYNC.
- *   NOT_INITIALIZED:  Pre-init; transitions to SYNCED_RECOVERY or
- *                     DEGRADED on first local state observation.
+ *   NOT_INITIALIZED:  Pre-init on the active side; transitions to
+ *                     SYNCED_RECOVERY on first S entry after failover.
  *
- * TRANSITION TRIGGERS: Replay state transitions are driven by *local*
- * HA group state changes, not direct peer detection. Both the
- * degradedListener and recoveryListener use unconditional .set()
- * (not .compareAndSet()), so they can overwrite any prior replay state.
+ * LISTENER EFFECTS: The degradedListener and recoveryListener use
+ * unconditional .set() (not .compareAndSet()). These fire
+ * synchronously on the local PathChildrenCache event thread during
+ * the cluster state transition and are modeled as atomic with the
+ * triggering state-entry actions in HAGroupStore.tla:
+ *   - S entry:  set(SYNCED_RECOVERY) -- folded into PeerReactToAIS,
+ *               PeerReactToANIS (ATS->S), AutoComplete (AbTS->S)
+ *   - DS entry: set(DEGRADED) -- folded into PeerReactToANIS (S->DS)
  *
  * CAS SEMANTICS: The SYNCED_RECOVERY -> SYNC transition uses
  * compareAndSet(SYNCED_RECOVERY, SYNC) at L332-333. The CAS can
- * only fail if a concurrent set(DEGRADED) fires first. TLC's
- * interleaving semantics model this race: either ReplayRewind fires
- * first (CAS succeeds) or ReplayDetectDegraded fires first (state
- * becomes DEGRADED, ReplayRewind is no longer enabled).
+ * only fail if a concurrent set(DEGRADED) fires first (the cluster
+ * re-degrades before replay() can CAS). TLC's interleaving semantics
+ * model this race: either ReplayRewind fires first (CAS succeeds)
+ * or the DS-entry fold in PeerReactToANIS fires first (state becomes
+ * DEGRADED, ReplayRewind is no longer enabled).
  *
  * Implementation traceability:
  *
@@ -37,11 +39,6 @@
  *   --------------------------+--------------------------------------------
  *   ReplayAdvance(c)          | replay() L336-343 (SYNC) and L345-351
  *                             |   (DEGRADED) -- round processing loop
- *   ReplayDetectDegraded(c)   | degradedListener L136-145 --
- *                             |   replicationReplayState.set(DEGRADED)
- *   ReplayDetectRecovery(c)   | recoveryListener L147-157 --
- *                             |   replicationReplayState.set(
- *                             |   SYNCED_RECOVERY)
  *   ReplayRewind(c)           | replay() L323-333 --
  *                             |   compareAndSet(SYNCED_RECOVERY, SYNC);
  *                             |   getFirstRoundToProcess() rewinds to
@@ -67,81 +64,29 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
 ---------------------------------------------------------------------------
 
 (*
- * Replay advance in SYNC state: both counters advance together.
+ * Replay advance: round processing in SYNC or DEGRADED state.
  *
- * The reader processes the next round of replication logs. In SYNC
- * state, both lastRoundProcessed and lastRoundInSync advance,
- * maintaining the invariant that they are equal.
+ * The reader processes the next round of replication logs.
+ *   - SYNC: both lastRoundProcessed and lastRoundInSync advance,
+ *     maintaining the invariant that they are equal.
+ *   - DEGRADED: only lastRoundProcessed advances; lastRoundInSync
+ *     is frozen, modeling degraded replay where rounds are processed
+ *     but the in-sync consistency point does not advance.
  *
  * Guard: cluster is in a standby state or STA (replay continues
- * during failover pending) and replay is in SYNC.
+ * during failover pending) and replay is in SYNC or DEGRADED.
  *
- * Source: replay() L336-343
+ * Source: replay() L336-343 (SYNC), L345-351 (DEGRADED)
  *)
 ReplayAdvance(c) ==
     /\ clusterState[c] \in StandbyStates \union {"STA"}
-    /\ replayState[c] = "SYNC"
+    /\ replayState[c] \in {"SYNC", "DEGRADED"}
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = @ + 1]
-    /\ lastRoundInSync' = [lastRoundInSync EXCEPT ![c] = @ + 1]
+    /\ lastRoundInSync' = [lastRoundInSync EXCEPT ![c] =
+           IF replayState[c] = "SYNC" THEN @ + 1 ELSE @]
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, failoverPending,
                    inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
-
----------------------------------------------------------------------------
-
-(*
- * Detect degradation: transition to DEGRADED when local state is DS.
- *
- * When the cluster enters DEGRADED_STANDBY (reacting to peer ANIS),
- * the degradedListener fires replicationReplayState.set(DEGRADED).
- * This is an unconditional set() -- it overwrites any prior replay
- * state, including SYNCED_RECOVERY (modeling the re-degradation
- * interleaving at L141).
- *
- * In DEGRADED state, only lastRoundProcessed advances; lastRoundInSync
- * is frozen. This action combines the state transition with one round
- * of degraded replay.
- *
- * Guard: cluster is in DS and replay is in a state that can degrade.
- *
- * Source: degradedListener L136-145 --
- *         replicationReplayState.set(DEGRADED)
- *)
-ReplayDetectDegraded(c) ==
-    /\ clusterState[c] = "DS"
-    /\ replayState[c] \in {"NOT_INITIALIZED", "SYNC", "SYNCED_RECOVERY"}
-    /\ replayState' = [replayState EXCEPT ![c] = "DEGRADED"]
-    /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = @ + 1]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, lastRoundInSync, failoverPending,
-                   inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
-
----------------------------------------------------------------------------
-
-(*
- * Detect recovery: transition to SYNCED_RECOVERY when local state is S.
- *
- * When the cluster returns to STANDBY (peer recovered to AIS), the
- * recoveryListener fires replicationReplayState.set(SYNCED_RECOVERY).
- * This is an unconditional set() -- it overwrites any prior state.
- *
- * No counter changes occur at this point -- the rewind happens in
- * ReplayRewind when replay() processes the SYNCED_RECOVERY state.
- *
- * Guard: cluster is in S and replay is in a state that can recover.
- *
- * Source: recoveryListener L147-157 --
- *         replicationReplayState.set(SYNCED_RECOVERY)
- *)
-ReplayDetectRecovery(c) ==
-    /\ clusterState[c] = "S"
-    /\ replayState[c] \in {"NOT_INITIALIZED", "DEGRADED"}
-    /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, lastRoundProcessed, lastRoundInSync,
-                   failoverPending, inProgressDirEmpty,
                    zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
@@ -156,8 +101,8 @@ ReplayDetectRecovery(c) ==
  * The CAS can only fail if a concurrent set(DEGRADED) fires first
  * (the cluster re-degrades before replay() can CAS). TLC's
  * interleaving semantics model this race naturally: either this
- * action fires (CAS succeeds, state becomes SYNC) or
- * ReplayDetectDegraded fires first (state becomes DEGRADED,
+ * action fires (CAS succeeds, state becomes SYNC) or the DS-entry
+ * fold in PeerReactToANIS fires first (state becomes DEGRADED,
  * this action is no longer enabled).
  *
  * Source: replay() L323-333 -- compareAndSet(SYNCED_RECOVERY, SYNC);
