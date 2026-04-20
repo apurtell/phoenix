@@ -107,7 +107,7 @@ ZKPeerDisconnect(c) ==
  * Reconnection requires a live session -- if the session is expired,
  * a new session must be established first via ZKPeerSessionRecover.
  *
- * POST-ABORT ATS RECONCILIATION (Iteration 16, Appendix A.21):
+ * POST-ABORT ATS RECONCILIATION:
  * When the local cluster is in ATS and the peer is in S or DS at
  * the moment of reconnect, the PathChildrenCache rebuild fires a
  * synthetic event that triggers the FailoverManagementListener.
@@ -194,7 +194,7 @@ ZKPeerSessionExpiry(c) ==
  * Session recovery implies reconnection: the new session comes with
  * a live TCP connection.
  *
- * POST-ABORT ATS RECONCILIATION (Iteration 16, Appendix A.21):
+ * POST-ABORT ATS RECONCILIATION:
  * Same folded reconciliation as ZKPeerReconnect. Session recovery
  * triggers a full PathChildrenCache rebuild with synthetic
  * CHILD_ADDED events, which invokes the FailoverManagementListener

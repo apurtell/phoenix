@@ -2,6 +2,50 @@
 
 Formal specification of the Phoenix Consistent Failover protocol using TLA+ and the TLC model checker.  The spec verifies safety properties (mutual exclusion, zero RPO, abort correctness) under arbitrary interleavings of admin actions, HDFS failures, RS crashes, ZK connection/session failures, watcher retry exhaustion, and the anti-flapping timer.
 
+## Literate Specification
+
+Literate programming versions of all specification files are available in the [`markdown/`](markdown/) directory. Each file includes the complete TLA+ code with comments converted to prose that discusses modeling choices, tradeoffs, and implementation traceability in depth.
+
+### Root Orchestrator
+
+| Literate Version | Source | Description |
+|-----------------|--------|-------------|
+| [`ConsistentFailover.md`](markdown/ConsistentFailover.md) | [`ConsistentFailover.tla`](ConsistentFailover.tla) | Variables, Init, Next, Spec, invariants, action constraints, fairness, liveness properties |
+
+### Pure Definitions
+
+| Literate Version | Source | Description |
+|-----------------|--------|-------------|
+| [`Types.md`](markdown/Types.md) | [`Types.tla`](Types.tla) | Constants, 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, anti-flapping timer helpers |
+
+### Actor Modules
+
+| Literate Version | Source | Description |
+|-----------------|--------|-------------|
+| [`HAGroupStore.md`](markdown/HAGroupStore.md) | [`HAGroupStore.tla`](HAGroupStore.tla) | Peer-reactive transitions, auto-completion, S&F heartbeat, ANIS recovery, ANISTS drain, retry exhaustion |
+| [`Admin.md`](markdown/Admin.md) | [`Admin.tla`](Admin.tla) | Operator-initiated failover (AIS->ATS, ANIS->ANISTS) and abort (STA->AbTS) |
+| [`Writer.md`](markdown/Writer.md) | [`Writer.tla`](Writer.tla) | Per-RS writer mode state machine: startup, degradation (CAS success/failure), recovery, drain |
+| [`Reader.md`](markdown/Reader.md) | [`Reader.tla`](Reader.tla) | Standby replay state machine: advance, rewind, in-progress directory, failover trigger |
+
+### Environment Modules
+
+| Literate Version | Source | Description |
+|-----------------|--------|-------------|
+| [`HDFS.md`](markdown/HDFS.md) | [`HDFS.tla`](HDFS.tla) | NameNode crash/recovery environment actions |
+| [`RS.md`](markdown/RS.md) | [`RS.tla`](RS.tla) | RS crash, local HDFS abort, process supervisor restart |
+| [`Clock.md`](markdown/Clock.md) | [`Clock.tla`](Clock.tla) | Anti-flapping countdown timer (Lamport CHARME 2005) |
+| [`ZK.md`](markdown/ZK.md) | [`ZK.tla`](ZK.tla) | ZK peer/local connection lifecycle, session expiry/recovery, ATS reconciliation |
+
+### TLC Configurations
+
+| Literate Version | Source | Description |
+|-----------------|--------|-------------|
+| [`ConsistentFailover-cfg.md`](markdown/ConsistentFailover-cfg.md) | [`ConsistentFailover.cfg`](ConsistentFailover.cfg) | Exhaustive safety: 2 clusters, 2 RS, full state-space exploration |
+| [`ConsistentFailover-sim-cfg.md`](markdown/ConsistentFailover-sim-cfg.md) | [`ConsistentFailover-sim.cfg`](ConsistentFailover-sim.cfg) | Simulation safety: 2 clusters, 9 RS, random trace sampling |
+| [`ConsistentFailover-sim-liveness-ac-cfg.md`](markdown/ConsistentFailover-sim-liveness-ac-cfg.md) | [`ConsistentFailover-sim-liveness-ac.cfg`](ConsistentFailover-sim-liveness-ac.cfg) | AbortCompletion liveness (5 fairness clauses) |
+| [`ConsistentFailover-sim-liveness-fc-cfg.md`](markdown/ConsistentFailover-sim-liveness-fc-cfg.md) | [`ConsistentFailover-sim-liveness-fc.cfg`](ConsistentFailover-sim-liveness-fc.cfg) | FailoverCompletion liveness (15 fairness clauses) |
+| [`ConsistentFailover-sim-liveness-dr-cfg.md`](markdown/ConsistentFailover-sim-liveness-dr-cfg.md) | [`ConsistentFailover-sim-liveness-dr.cfg`](ConsistentFailover-sim-liveness-dr.cfg) | DegradationRecovery liveness (25 fairness clauses) |
+
 ## Solution Design
 
 Phoenix clusters are deployed in pairs across distinct failure domains. The Consistent Failover protocol provides zero-RPO failover between a Primary (active) and Standby cluster using Phoenix Synchronous Replication. Every committed mutation on the active cluster is synchronously written to a replication log file on the standby cluster's HDFS before the mutation is acknowledged. A set of replay threads on the standby asynchronously consumes these log files round-by-round, applying changes to local HBase tables so the standby remains close to in-sync with the active.
@@ -102,10 +146,7 @@ The exhaustive model check verifies the following over the full reachable state 
 | `TypeOK` | All 13 variables have valid types |
 | `MutualExclusion` | At most one cluster in the ACTIVE role at any time |
 | `AbortSafety` | AbTAIS requires peer in AbTS, S, or DS (abort or post-partition reconciliation) |
-| `ATSReconcileSafety` | AbTAIS implies peer is not in ACTIVE role (reconciliation preserves mutual exclusion) |
-| `NonAtomicFailoverSafe` | ATS maps to ACTIVE_TO_STANDBY (mutations blocked) during failover window |
 | `AISImpliesInSync` | AIS implies outDirEmpty and all RS in SYNC/INIT/DEAD |
-| `NoAISWithSFWriter` | No STORE_AND_FWD writers when cluster is AIS |
 | `WriterClusterConsistency` | Degraded writer modes only on non-AIS active or transitional states |
 | `ZKSessionConsistency` | Peer session expiry implies peer disconnection |
 

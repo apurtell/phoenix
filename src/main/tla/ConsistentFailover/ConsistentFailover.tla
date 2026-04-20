@@ -12,7 +12,7 @@
  * listeners, writer/reader state changes, HDFS availability
  * incidents, and ZK coordination failures.
  *
- * ZK COORDINATION MODEL (Iteration 13): ZK connection and session
+ * ZK COORDINATION MODEL: ZK connection and session
  * lifecycle are modeled explicitly. Peer-reactive transitions
  * (PeerReact actions) are guarded on zkPeerConnected[c] and
  * zkPeerSessionAlive[c]. Auto-completion, heartbeat, writer ZK
@@ -60,8 +60,6 @@
  *                           |   (see PHOENIX_HA_TLA_PLAN.md Appendix A.6)
  *   MutualExclusion         | Architecture safety argument: at most one
  *                           |   cluster in ACTIVE role at any time
- *   NonAtomicFailoverSafe   | Safety during (ATS, AIS) window;
- *                           |   isMutationBlocked()=true for ATS
  *   AbortSafety             | Abort originates from STA side; AbTAIS
  *                           |   only reachable via peer AbTS detection
  *   AllowedTransitions      | HAGroupStoreRecord.java L99-123
@@ -103,8 +101,7 @@
  *                           |   failoverPending /\ inProgressDirEmpty
  *                           |   /\ replayState = SYNC
  *   NoDataLoss              | Action constraint: zero RPO property
- *                           |   (currently logically equivalent to
- *                           |   FailoverTriggerCorrectness)
+ *                           |   for failover (STA->AIS)
  *   zkPeerConnected         | peerPathChildrenCache TCP connection
  *                           |   state (HAGroupStoreClient L110-112)
  *   zkPeerSessionAlive      | Peer ZK session state (Curator internal)
@@ -626,8 +623,8 @@ SpecDR == Init /\ [][Next]_vars /\ FairnessDR
  * is in AbTS), ATS can remain indefinitely. ATS does have a
  * resolution path via the reconciliation fold in ZKPeerReconnect/
  * ZKPeerSessionRecover (ATS -> AbTAIS -> AIS when peer is in
- * S/DS at reconnect; Iteration 16), but adding ATS here would
- * require extending FairnessFC with the peer-reactive SF group.
+ * S/DS at reconnect), but adding ATS here would require
+ * extending FairnessFC with the peer-reactive SF group.
  *
  * Predicated on ZLA (encoded in Fairness).
  *)
@@ -745,10 +742,10 @@ MutualExclusion ==
  * AbTAIS is reached via two paths:
  *   1. Abort path: PeerReactToAbTS (peer = AbTS). The peer can
  *      auto-complete AbTS -> S before the local AbTAIS auto-completes.
- *   2. Reconciliation path (Iteration 16, Appendix A.21):
- *      ZKPeerReconnect/ZKPeerSessionRecover with local = ATS and
- *      peer in {S, DS}. DS is reachable when the peer degraded
- *      (S -> DS via PeerReactToANIS) before the failover partition.
+ *   2. Reconciliation path: ZKPeerReconnect/ZKPeerSessionRecover
+ *      with local = ATS and peer in {S, DS}. DS is reachable when
+ *      the peer degraded (S -> DS via PeerReactToANIS) before the
+ *      failover partition.
  *
  * All three peer states (AbTS, S, DS) map to STANDBY role, so
  * MutualExclusion is preserved in all cases.
@@ -764,52 +761,13 @@ MutualExclusion ==
  * Source: Architecture safety argument; abort originates from
  *         setHAGroupStatusToAbortToStandby() (L419-425) on the
  *         STA side; active detects via FailoverManagementListener
- *         peer AbTS resolver (L132). Reconciliation added in
- *         Iteration 16 (ZK.tla ZKPeerReconnect/ZKPeerSessionRecover).
+ *         peer AbTS resolver (L132). Reconciliation path is in
+ *         ZK.tla (ZKPeerReconnect/ZKPeerSessionRecover).
  *)
 AbortSafety ==
     \A c \in Cluster :
         clusterState[c] = "AbTAIS" =>
             clusterState[Peer(c)] \in {"AbTS", "S", "DS"}
-
----------------------------------------------------------------------------
-
-(*
- * ATS reconciliation safety (Iteration 16): the reconciliation path
- * through AbTAIS preserves MutualExclusion. When AbTAIS is reached
- * (via either PeerReactToAbTS or the ZKPeerReconnect/ZKPeerSession-
- * Recover reconciliation fold), the peer cannot be in an ACTIVE
- * role. This is a derived invariant -- subsumed by MutualExclusion
- * but retained for explicit documentation of the reconciliation
- * safety argument.
- *)
-ATSReconcileSafety ==
-    \A c \in Cluster :
-        clusterState[c] = "AbTAIS" =>
-            RoleOf(clusterState[Peer(c)]) # "ACTIVE"
-
----------------------------------------------------------------------------
-
-(*
- * Non-atomic failover safety: during the window between the new
- * active writing AIS and the old active writing S, mutual exclusion
- * is maintained because ATS maps to role ACTIVE_TO_STANDBY, which
- * is not an active role (isMutationBlocked()=true).
- *
- * This invariant is subsumed by MutualExclusion (which verifies
- * role-level mutual exclusion over all reachable states) but is
- * retained for explicit documentation of the non-atomic window
- * safety argument.
- *
- * Source: ClusterRoleRecord.java L84 --
- *         ACTIVE_TO_STANDBY has isMutationBlocked()=true.
- *)
-NonAtomicFailoverSafe ==
-    \A c1, c2 \in Cluster :
-        /\ c1 # c2
-        /\ clusterState[c1] = "ATS"
-        /\ clusterState[c2] = "AIS"
-        => RoleOf(clusterState[c1]) \notin ActiveRoles
 
 ---------------------------------------------------------------------------
 
@@ -955,11 +913,6 @@ FailoverTriggerCorrectness ==
  * have been in SYNC (no pending SYNCED_RECOVERY rewind), the
  * in-progress directory must be empty, and the failover must
  * have been properly initiated.
- *
- * Currently logically equivalent to FailoverTriggerCorrectness
- * but serves a different documentary purpose: this states the
- * safety property; FailoverTriggerCorrectness validates the
- * implementation mechanism.
  *)
 NoDataLoss ==
     \A c \in Cluster :
@@ -1033,34 +986,12 @@ ReplayTransitionValid ==
  * AIS. RSCrash sets writerMode to DEAD but does not change
  * clusterState. The HA group state in ZK is independent of RS
  * process lifecycle.
- *
- * Holds by construction: every action that degrades writers or
- * sets outDirEmpty=FALSE also transitions AIS -> ANIS; every
- * path back to AIS (ANISToAIS) requires outDirEmpty and all SYNC.
- * RSCrash leaves clusterState unchanged.
  *)
 AISImpliesInSync ==
     \A c \in Cluster :
         clusterState[c] = "AIS" =>
             /\ outDirEmpty[c]
             /\ \A r \in RS : writerMode[c][r] \in {"INIT", "SYNC", "DEAD"}
-
----------------------------------------------------------------------------
-
-(*
- * No AIS with S&F writer: a cluster in AIS cannot have any RS in
- * STORE_AND_FWD mode. Subsumed by AISImpliesInSync but retained
- * for independent documentary value as the minimal statement of
- * the critical safety property.
- *
- * Holds by construction: the only paths that create S&F writers
- * (WriterToStoreFwd, WriterInitToStoreFwd) atomically transition
- * AIS -> ANIS.
- *)
-NoAISWithSFWriter ==
-    \A c \in Cluster :
-        (\E r \in RS : writerMode[c][r] = "STORE_AND_FWD") =>
-            clusterState[c] # "AIS"
 
 ---------------------------------------------------------------------------
 
@@ -1134,14 +1065,8 @@ THEOREM Spec => []MutualExclusion
 \* Safety: abort is always initiated from the correct side.
 THEOREM Spec => []AbortSafety
 
-\* Safety: non-atomic failover window preserves mutual exclusion.
-THEOREM Spec => []NonAtomicFailoverSafe
-
 \* Safety: AIS implies in-sync (derived invariant).
 THEOREM Spec => []AISImpliesInSync
-
-\* Safety: AIS clusters have no S&F writers.
-THEOREM Spec => []NoAISWithSFWriter
 
 \* Safety: degraded writer modes only on degraded-active clusters.
 THEOREM Spec => []WriterClusterConsistency
