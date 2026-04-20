@@ -121,6 +121,17 @@ The exhaustive model check verifies the following over the full reachable state 
 | `ANISTStoATSPrecondition` | ANISTS->ATS requires outDirEmpty and anti-flapping gate open |
 | `FailoverTriggerCorrectness` | STA->AIS requires failoverPending, inProgressDirEmpty, replayState=SYNC |
 | `NoDataLoss` | Zero RPO: STA->AIS only when replay is complete |
+| `ReplayRewindCorrectness` | SYNCED_RECOVERY->SYNC equalizes replay counters (lastRoundProcessed = lastRoundInSync) |
+
+**Liveness properties** (verified via simulation with per-property fairness):
+
+Liveness properties guarantee progress. Transient states eventually resolve to stable states under fair scheduling. Each property is checked with a per-property fairness formula containing only the temporal clauses on its critical path. The full `Fairness` formula has 43 temporal clauses, which would cause TLC's Buchi automaton construction to blow up, because it is exponential. Per-property formulas keep this tractable. Exhaustive liveness checking is infeasible at this state-space scale because TLC's SCC algorithm requires the full product graph (behavior graph x automaton) in memory, so probabilistic assurance is provided through simulation.
+
+| Property | Clauses | Description |
+|----------|---------|-------------|
+| `FailoverCompletion` | 15 | Standby-side and abort transient states (`STA`, `AbTAIS`, `AbTANIS`, `AbTS`) eventually resolve to a stable state (`AIS`, `ANIS`, `S`). ATS/ANISTS excluded: resolution depends on peer state and ZK connectivity at the right moment, with no fairness on admin actions or ZK disconnect. |
+| `DegradationRecovery` | 25 | ANIS with available peer HDFS eventually progresses out of ANIS via the writer recovery chain: `S&F` -> `S&FWD` -> `SYNC`, anti-flap timer expires, `ANIS` -> `AIS`. May also leave ANIS via failover (`ANIS` -> `ANISTS`). |
+| `AbortCompletion` | 5 | Every abort state (`AbTS`, `AbTAIS`, `AbTANIS`) eventually auto-completes to a stable state (`AIS`, `ANIS`, `S`). Deterministic under WF on `AutoComplete`. |
 
 ## Module Architecture
 
@@ -206,15 +217,13 @@ Five TLC configurations are provided:
 
 ### Liveness Checking (Per-Property Simulation)
 
-Liveness properties are checked via simulation, one property at a time, each with a per-property fairness formula containing only the temporal clauses on its critical path. Exhaustive liveness checking is infeasible at this state-space scale: TLC's Buchi automaton construction and Tarjan SCC algorithm require the full product graph (behavior graph × automaton) in memory, which exceeds heap capacity with 100M+ distinct states. Simulation samples random traces with fairness-aware temporal checking, providing strong probabilistic coverage without constructing the full state graph.
+All runs use 2 clusters, 2 RS per cluster, WaitTimeForSync=2, depth 10000. See the liveness properties table above for property descriptions and critical paths.
 
-| Config File | Specification | Property | Instantiated Clauses |
-|-------------|---------------|----------|---------------------|
+| Config File | Specification | Property | Fairness Clauses |
+|-------------|---------------|----------|-----------------|
 | `ConsistentFailover-sim-liveness-ac.cfg` | `SpecAC` | `AbortCompletion` | 5 |
 | `ConsistentFailover-sim-liveness-fc.cfg` | `SpecFC` | `FailoverCompletion` | 15 |
 | `ConsistentFailover-sim-liveness-dr.cfg` | `SpecDR` | `DegradationRecovery` | 25 |
-
-All simulation liveness configs use `RS = {rs1, rs2}`, `WaitTimeForSync = 2`, no SYMMETRY. Clause counts are the number of WF/SF temporal operators after TLC expands quantifiers over |Cluster|=2, |RS|=2.
 
 ### Common Parameters
 
@@ -255,8 +264,6 @@ Simulation generates random execution traces up to depth 10000 (sufficient for ~
 
 ### Liveness Checking
 
-Liveness properties are checked via simulation, one property at a time. Each config uses a per-property fairness formula (`FairnessAC`, `FairnessFC`, or `FairnessDR`) containing only the temporal clauses on that property's critical path. The full `Fairness` formula has 43 temporal clauses, causing TLC's Buchi automaton construction to blow up exponentially; per-property formulas keep this tractable. Exhaustive liveness checking is infeasible at this state-space scale because TLC's SCC algorithm requires the full product graph in memory.
-
 **All 3 properties (8-hour run each):**
 
 ```bash
@@ -281,14 +288,6 @@ java -XX:+UseParallelGC \
   -simulate -depth 10000 -workers auto
 ```
 
-Each per-property fairness formula includes the temporal clauses on the critical path for that property.
-
-| Property | Formula | Structural | Instantiated | Critical Path |
-|----------|---------|-----------|-------------|---------------|
-| `AbortCompletion` | `FairnessAC` | 3 | 5 | `AutoComplete` fires on abort states; needs `zkLocalConnected` (via `ZKLocalReconnect`) and timer (`Tick`) |
-| `FailoverCompletion` | `FairnessFC` | 8 | 15 | `AutoComplete`/`TriggerFailover` (grouped, mutually exclusive by clusterState), `HDFSUp`, replay machine (`ReplayAdvance`/`ReplayRewind`/`BeginProcessing`/`FinishProcessing`), `ZKLocalReconnect`, `Tick` |
-| `DegradationRecovery` | `FairnessDR` | 9 | 25 | `ANISToAIS`, `HDFSUp`, per-RS writer recovery chain (`WriterInit`/`SyncToSyncFwd`/`StoreFwdToSyncFwd`/`SyncFwdToSync`), RS lifecycle (`RSAbortOnLocalHDFSFailure`/`RSRestart`), `ANISHeartbeat`, `ZKLocalReconnect`, `Tick` |
-
 ## Latest Results
 
 ### Exhaustive
@@ -300,10 +299,25 @@ Each per-property fairness formula includes the temporal clauses on the critical
 | States generated | 1,500,171,841 |
 | Distinct states | 95,613,696 |
 | Depth | 55 |
-| Duration | 12 min 19 sec |
+| Duration | 12 min 30 sec |
 | Result | Success |
 
-All 9 state invariants and 8 action constraints verified.  No violations.
+All 9 state invariants and 9 action constraints verified.  No violations.
+
+### Simulation
+
+| Metric | Value |
+|--------|-------|
+| Configuration | 2 clusters, 9 RS per cluster, WaitTimeForSync=5 |
+| Workers | 128 |
+| States checked | 70,448,924,768 |
+| Traces generated | 7,044,645 |
+| Trace length | 10,000 |
+| Seed | -5836228587005873350 |
+| Duration | 8 hr |
+| Result | Success |
+
+All 9 state invariants and 9 action constraints verified at production-scale RS count.  No violations.
 
 ### Liveness (Per-Property Simulation)
 

@@ -971,6 +971,34 @@ NoDataLoss ==
 ---------------------------------------------------------------------------
 
 (*
+ * Replay rewind correctness: the SYNCED_RECOVERY -> SYNC
+ * transition (ReplayRewind CAS) equalizes the replay counters.
+ *
+ * After a degradation period, lastRoundProcessed can advance
+ * beyond lastRoundInSync (ReplayAdvance in DEGRADED only
+ * increments lastRoundProcessed). When the cluster recovers
+ * (DS -> S or ATS -> S), recoveryListener sets replayState to
+ * SYNCED_RECOVERY. ReplayRewind then resets lastRoundProcessed
+ * back to lastRoundInSync, ensuring re-processing of all rounds
+ * from the last known in-sync point before replay resumes in
+ * SYNC mode.
+ *
+ * This property verifies the mechanism; NoDataLoss verifies the
+ * safety outcome. Together they guarantee zero RPO: the rewind
+ * closes the counter gap, and TriggerFailover (which requires
+ * replayState = SYNC) cannot fire until the rewind completes.
+ *
+ * Source: replay() L323-333 -- compareAndSet(SYNCED_RECOVERY, SYNC);
+ *         getFirstRoundToProcess() L389 -- rewinds to lastRoundInSync
+ *)
+ReplayRewindCorrectness ==
+    \A c \in Cluster :
+        replayState[c] = "SYNCED_RECOVERY" /\ replayState'[c] = "SYNC"
+        => lastRoundProcessed'[c] = lastRoundInSync'[c]
+
+---------------------------------------------------------------------------
+
+(*
  * Every replay state change follows the allowed replay transitions.
  * Action constraint checked by TLC analogous to TransitionValid
  * and WriterTransitionValid.
@@ -1129,6 +1157,9 @@ THEOREM Spec => [][FailoverTriggerCorrectness]_vars
 
 \* Safety: zero RPO -- no data loss on failover (action property).
 THEOREM Spec => [][NoDataLoss]_vars
+
+\* Safety: replay rewind equalizes counters (action property).
+THEOREM Spec => [][ReplayRewindCorrectness]_vars
 
 \* Liveness: failover/abort transient states eventually resolve.
 THEOREM SpecFC => FailoverCompletion

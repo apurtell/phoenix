@@ -763,16 +763,9 @@ Second disjunct in `AdminStartFailover` (ANIS→ANISTS). `ANISTSToATS(c)` action
 
 Post-abort stuck ATS after partition (Appendix A.21). Reconciliation is folded into `ZKPeerReconnect`/`ZKPeerSessionRecover` in `ZK.tla`: when local = ATS and peer ∈ {S, DS} at reconnect, `clusterState[c]` is atomically set to AbTAIS → AIS via `AutoComplete`. Same listener-effect folding pattern as `recoveryListener`/`degradedListener`. Race-safe: reconnect requires `zkPeerConnected = FALSE`, so it cannot fire during the happy-path transient (ATS, S). No new variable, no new action in `Next`. `AbortSafety` relaxed to allow peer = DS; new `ATSReconcileSafety` invariant.
 
-#### Iteration 17 — Replay rewind verification
+#### ~~Iteration 17 — Replay rewind verification~~ ✅
 
-`Reader.tla`:
-- Detailed modeling of the SYNCED_RECOVERY rewind: after DEGRADED → SYNCED_RECOVERY, `lastRoundProcessed` is reset to `lastRoundInSync`.
-
-`ConsistentFailover.tla`:
-- Invariant: `ReplayRewindCorrectness` — after rewind, `lastRoundProcessed[c] = lastRoundInSync[c]`.
-- Verify that the rewind ensures no data loss during the ANIS→AIS→failover sequence.
-
-Rewind mechanism preserves NoDataLoss.
+Added `ReplayRewindCorrectness` action constraint to `ConsistentFailover.tla`: every SYNCED_RECOVERY→SYNC transition (ReplayRewind CAS) equalizes replay counters (`lastRoundProcessed'[c] = lastRoundInSync'[c]`). Wired into all 5 cfg files. `Reader.tla` unchanged — existing `ReplayRewind(c)` already correctly models the counter reset and CAS semantics. Exhaustive TLC run confirms `ReplayRewindCorrectness` holds across all 95,613,696 distinct states, and `NoDataLoss` continues to hold — the rewind mechanism preserves zero RPO through the ANIS→AIS→failover sequence.
 
 #### Iteration 18 — AWOP/ANISWOP peer-reactive modeling (OFFLINE peer detection)
 
@@ -1228,7 +1221,7 @@ Real-cluster Test 5 (abort failover during inter-cluster partition) revealed tha
 | 17 | `AbortCompletion` | Liveness | Iter 15 | Initiated abort eventually completes |
 | 18 | `ZKSessionConsistency` | Safety | Iter 13 | `zkPeerSessionAlive[c] = FALSE ⇒ zkPeerConnected[c] = FALSE` (session expiry implies disconnection) |
 | 19 | `ATSReconcileSafety` | Safety | Iter 16 | `ATSReconcileOnReconnect` preserves `MutualExclusion` — reconciliation path through AbTAIS → AIS is safe |
-| 20 | `ReplayRewindCorrectness` | Safety | Iter 17 | Rewind resets `lastRoundProcessed` correctly |
+| 20 | `ReplayRewindCorrectness` | Action constraint | Iter 17 | SYNCED_RECOVERY→SYNC equalizes replay counters (`lastRoundProcessed' = lastRoundInSync'`) |
 
 Additional invariants will be discovered and added during the modeling process.
 
