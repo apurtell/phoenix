@@ -57,6 +57,13 @@
  *   AutoComplete(c)           | createLocalStateTransitions() L144, L145, L147
  *   ANISTSToATS(c)            | HAGroupStoreManager.setHAGroupStatusToSync()
  *                             |   L341-355 (ANISTS -> ATS drain completion)
+ *   PeerReactToOFFLINE(c)     | (proactive, Iteration 18) intended peer
+ *                             |   OFFLINE detection; no impl trigger yet;
+ *                             |   gated on UseOfflinePeerDetection
+ *   PeerRecoverFromOFFLINE(c) | (proactive, Iteration 18) intended peer
+ *                             |   OFFLINE recovery detection; no impl
+ *                             |   trigger yet; gated on
+ *                             |   UseOfflinePeerDetection
  *   ReactiveTransitionFail(c) | FailoverManagementListener.onStateChange()
  *                             |   L653-704 (2 retries exhausted, returns
  *                             |   silently)
@@ -431,6 +438,91 @@ ANISTSToATS(c) ==
 ---------------------------------------------------------------------------
 
 (*
+ * Peer transitions to OFFLINE.
+ *
+ * Gated on UseOfflinePeerDetection (Iteration 18, proactive modeling).
+ *
+ * When the active cluster detects its peer has entered OFFLINE, it
+ * transitions to AWOP or ANISWOP depending on its current state:
+ *   AIS  -> AWOP    (peer went offline while active is in sync)
+ *   ANIS -> ANISWOP (peer went offline while active is not in sync)
+ *
+ * Both AWOP and ANISWOP map to ClusterRole.ACTIVE via
+ * getClusterRole() (isMutationBlocked()=false), so the active
+ * cluster continues serving mutations while its peer is offline.
+ *
+ * No writer or timer side effects: the transition is purely a
+ * cluster-state annotation recording the peer's unavailability.
+ *
+ * ZK watcher dependency: Delivered via peerPathChildrenCache.
+ * Guarded on zkPeerConnected[c] and zkPeerSessionAlive[c].
+ *
+ * NOTE: This models intended protocol behavior. No
+ * FailoverManagementListener entry for peer OFFLINE currently
+ * exists in the implementation (createPeerStateTransitions()
+ * has no OFFLINE entry). The TLA+ model verifies the design
+ * ahead of implementation.
+ *
+ * Source: (proactive) AIS->AWOP from allowedTransitions L103;
+ *         ANIS->ANISWOP from allowedTransitions L101.
+ *)
+PeerReactToOFFLINE(c) ==
+    /\ UseOfflinePeerDetection = TRUE
+    /\ zkPeerConnected[c] = TRUE
+    /\ zkPeerSessionAlive[c] = TRUE
+    /\ clusterState[Peer(c)] = "OFFLINE"
+    /\ \/ /\ clusterState[c] = "AIS"
+          /\ clusterState' = [clusterState EXCEPT ![c] = "AWOP"]
+       \/ /\ clusterState[c] = "ANIS"
+          /\ clusterState' = [clusterState EXCEPT ![c] = "ANISWOP"]
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+
+---------------------------------------------------------------------------
+
+(*
+ * Peer recovers from OFFLINE.
+ *
+ * Gated on UseOfflinePeerDetection (Iteration 18, proactive modeling).
+ *
+ * When the active cluster (in AWOP or ANISWOP) detects its peer
+ * has left OFFLINE (re-entered a non-OFFLINE state via manual
+ * --force recovery), the active returns to ANIS:
+ *   AWOP    -> ANIS (per AWOP.allowedTransitions = {ANIS})
+ *   ANISWOP -> ANIS (per ANISWOP.allowedTransitions = {ANIS})
+ *
+ * Both paths enter ANIS because peer recovery is treated as a
+ * new peer entering sync -- the active must first synchronize,
+ * so it enters ANIS (not AIS). The anti-flap timer is reset to
+ * StartAntiFlapWait on ANIS entry.
+ *
+ * ZK watcher dependency: Delivered via peerPathChildrenCache.
+ * Guarded on zkPeerConnected[c] and zkPeerSessionAlive[c].
+ *
+ * NOTE: This models intended protocol behavior. See
+ * PeerReactToOFFLINE comment for implementation status.
+ *
+ * Source: (proactive) AWOP->ANIS from allowedTransitions L113;
+ *         ANISWOP->ANIS from allowedTransitions L123.
+ *)
+PeerRecoverFromOFFLINE(c) ==
+    /\ UseOfflinePeerDetection = TRUE
+    /\ zkPeerConnected[c] = TRUE
+    /\ zkPeerSessionAlive[c] = TRUE
+    /\ clusterState[Peer(c)] # "OFFLINE"
+    /\ clusterState[c] \in {"AWOP", "ANISWOP"}
+    /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
+    /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+
+---------------------------------------------------------------------------
+
+(*
  * Reactive transition retry exhaustion.
  *
  * Models the FailoverManagementListener (HAGroupStoreManager.java
@@ -471,6 +563,14 @@ ReactiveTransitionFail(c) ==
           /\ clusterState[c] = "ATS"
        \/ /\ clusterState[Peer(c)] = "AIS"
           /\ clusterState[c] \in {"ATS", "DS"}
+       \* Iteration 18 (proactive): mirrors PeerReactToOFFLINE
+       \/ /\ UseOfflinePeerDetection = TRUE
+          /\ clusterState[Peer(c)] = "OFFLINE"
+          /\ clusterState[c] \in {"AIS", "ANIS"}
+       \* Iteration 18 (proactive): mirrors PeerRecoverFromOFFLINE
+       \/ /\ UseOfflinePeerDetection = TRUE
+          /\ clusterState[Peer(c)] # "OFFLINE"
+          /\ clusterState[c] \in {"AWOP", "ANISWOP"}
     /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
                    antiFlapTimer, replayState, lastRoundInSync,
                    lastRoundProcessed, failoverPending, inProgressDirEmpty,

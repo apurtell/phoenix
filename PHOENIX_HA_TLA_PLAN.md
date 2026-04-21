@@ -115,22 +115,22 @@ UNKNOWN:                   UNKNOWN (default)
 
 Note: `ACTIVE_TO_STANDBY` role has `isMutationBlocked() = true` (`ClusterRoleRecord.java` L84), which is how safety is maintained during the non-atomic failover window — the old active rejects mutations while in ATS.
 
-Implemented transition table (from `HAGroupStoreRecord.java` L99-123, verified against `PHOENIX-7562-feature-new` branch HEAD `5a9e2d50c9`):
+Transition table (baseline from `HAGroupStoreRecord.java` L99-123 on `PHOENIX-7562-feature-new` branch HEAD `5a9e2d50c9`; model extensions noted inline — `AbTAIS→ANIS` per A.17, `S/DS→OFFLINE` and `OFFLINE→S` per Iteration 18):
 
 ```
 ANIS    → {ANIS, AIS, ANISTS, ANISWOP}
 AIS     → {ANIS, AWOP, ATS}
-S       → {STA, DS}
+S       → {STA, DS, OFFLINE}
 ANISTS  → {AbTANIS, ATS}
 ATS     → {AbTAIS, S}
 STA     → {AbTS, AIS}
-DS      → {S, STA}
+DS      → {S, STA, OFFLINE}
 AWOP    → {ANIS}
-AbTAIS  → {AIS}
+AbTAIS  → {AIS, ANIS}
 AbTANIS → {ANIS}
 AbTS    → {S}
 ANISWOP → {ANIS}
-OFFLINE → {} (sink state — no outbound transitions)
+OFFLINE → {S} (via admin --force; implementation sink bypassed by PhoenixHAAdminTool)
 UNKNOWN → {} (sink state)
 ```
 
@@ -327,7 +327,7 @@ This delay must be modeled in the TLA+ spec for the ANISTS failover path.
 
 7. **Writer-Cluster Consistency**: Writer mode and cluster state must be consistent.
    - `(∃ rs: writerMode[c][rs] ∈ {S&F, SYNC&FWD}) ⇒
-      clusterState[c] ∈ {ANIS, ANISTS, ANISWOP, AbTANIS}`
+      clusterState[c] ∈ {ANIS, ANISTS, ATS, ANISWOP, AbTANIS, AbTAIS, AWOP}`
    - `(∀ rs: writerMode[c][rs] = SYNC ∧ outDirEmpty[c]) ⇒
       clusterState[c] ∉ {ANIS, ANISTS}` (eventually; modulo anti-flapping delay)
 
@@ -340,9 +340,7 @@ This delay must be modeled in the TLA+ spec for the ANISTS failover path.
        replayState[c] = SYNC)`
    - The originally planned `lastRoundProcessed[c] ≥ lastRoundInSync[c]` guard was found tautological (no model transition violates it) and replaced with `replayState[c] = SYNC`, which is genuinely constraining. The team accepted adding `replicationReplayState == SYNC` to `shouldTriggerFailover()` in the implementation. A fourth guard, `hdfsAvailable[c] = TRUE`, is on `TriggerFailover` but excluded from the action constraint (environmental/liveness guard, not a replay-completeness condition).
 
-10. **OFFLINE Sink State**: Once a cluster enters OFFLINE, it cannot transition out via the normal state machine.
-    - `clusterState[c] = OFFLINE ⇒ clusterState'[c] = OFFLINE`
-    (unless `UseForceQuirk = TRUE` to model manual ZK manipulation; not in current plan)
+10. **OFFLINE Lifecycle**: OFFLINE has no outbound transitions in the implementation's `allowedTransitions` table — it is a sink state in the normal state machine. Recovery requires `PhoenixHAAdminTool update --force`, which bypasses the transition table. The TLA+ model includes both entry (`AdminGoOffline`: S/DS→OFFLINE) and recovery (`AdminForceRecover`: OFFLINE→S), gated on `UseOfflinePeerDetection`. When `UseOfflinePeerDetection = FALSE`, OFFLINE is unreachable and the property `clusterState[c] = OFFLINE ⇒ clusterState'[c] = OFFLINE` holds vacuously.
 
 ### 4.2 Liveness Properties
 
@@ -403,7 +401,9 @@ ZK.tla                          (ZooKeeper coordination: ZKPeerDisconnect, ZKPee
 ConsistentFailover.tla          (root orchestrator: variables, Init, Next, Fairness, invariants, Symmetry)
 ConsistentFailover.cfg          (primary TLC config — exhaustive BFS, symmetry reduction, every iteration)
 ConsistentFailover-sim.cfg      (simulation TLC config — no symmetry, deep random traces)
-ConsistentFailover-liveness.cfg (liveness TLC config — no symmetry, ad hoc)
+ConsistentFailover-sim-liveness-ac.cfg  (liveness: AbortCompletion, simulation)
+ConsistentFailover-sim-liveness-fc.cfg  (liveness: FailoverCompletion, simulation)
+ConsistentFailover-sim-liveness-dr.cfg  (liveness: DegradationRecovery, simulation)
 ```
 
 **Module introduction schedule:**
@@ -439,7 +439,7 @@ where `c` = clusters, `rs` = region servers per cluster, `WFS` = `WaitTimeForSyn
 
 **Liveness checking approach:** Liveness properties are checked via simulation, one property at a time, each with a per-property fairness formula containing only the temporal clauses on its critical path. Exhaustive liveness checking is infeasible at this state-space scale: TLC's Buchi automaton construction and Tarjan SCC algorithm require the full product graph (behavior graph × automaton) in memory, which exceeds heap capacity with 100M+ distinct states. The full `Fairness` formula (43 clauses: 25 WF + 18 SF) causes exponential blowup in automaton construction even with simulation; per-property formulas reduce this to 5 instantiated clauses (`FairnessAC`), 13 (`FairnessFC`), or 25 (`FairnessDR` with |RS|=2), keeping the automaton tractable. Each per-property config uses its own `SpecXX = Init /\ [][Next]_vars /\ FairnessXX` and checks a single `PROPERTY`. The full `Fairness` and `Spec` remain in the specification for documentation and THEOREM declarations.
 
-**Simulation config details:** The safety sim (`-sim.cfg`) uses a 9-RS model to exercise per-RS writer interleaving at production scale (40 action schemas × 9 RS create a high branching factor). `WaitTimeForSync=5` creates a richer anti-flapping window where HDFS failures, ZK disruptions, and RS crashes can interleave while the gate is closed. Depth 10000 allows traces covering ~100 complete failover cycles. The liveness sim configs (`-sim-liveness-*.cfg`) use 2 RS and depth 10000. All simulation configs use an 8-hour stopAfter budget.
+**Simulation config details:** The safety sim (`-sim.cfg`) uses a 9-RS model to exercise per-RS writer interleaving at production scale (42 action schemas × 9 RS create a high branching factor). `WaitTimeForSync=5` creates a richer anti-flapping window where HDFS failures, ZK disruptions, and RS crashes can interleave while the gate is closed. Depth 10000 allows traces covering ~100 complete failover cycles. The liveness sim configs (`-sim-liveness-*.cfg`) use 2 RS and depth 10000. All simulation configs use an 8-hour stopAfter budget.
 
 SANY syntax checking is performed locally in the Cursor environment before running TLC (see §6 for the full procedure).
 
@@ -467,10 +467,10 @@ SANY syntax checking is performed locally in the Cursor environment before runni
 | Client-side connections | **Omitted** | Focus on server-side protocol; client role detection is a consequence |
 | Metrics | **Omitted** | Observability, not correctness |
 | Reader lag (DSFR) | **Deferred** (Iteration 8+) | Design sub-state collapsed in implementation; add if needed |
-| Forced failover / `--force` recovery | **Deferred** | Operator escape hatch for stuck transitional states (ATS, ANISTS, OFFLINE); not in current plan |
-| OFFLINE state | **Deferred** (Iteration 18) | Intentional sink state; OFFLINE entry modeled in Iteration 18 for AWOP/ANISWOP reachability; `--force` bypass not in current plan |
+| Forced failover / `--force` recovery | **Partial** (Iteration 18) | `AdminForceRecover` (OFFLINE→S) modeled in Iteration 18, gated on `UseOfflinePeerDetection`. `--force` for stuck ATS/ANISTS not yet modeled. |
+| OFFLINE state | **Concrete** (Iteration 18) | OFFLINE entry via `AdminGoOffline` (S/DS→OFFLINE) and recovery via `AdminForceRecover` (OFFLINE→S), both gated on `UseOfflinePeerDetection`. AWOP/ANISWOP peer-reactive transitions included. |
 | RS crash/abort | **Concrete** (Phase 3) | Writer fail-stop in S&F is a protocol-relevant failure mode |
-| Number of RS per cluster | **Parameterized** | 2 for exhaustive (with RS symmetry reduction), 3 for simulation (no symmetry); races between RS matter |
+| Number of RS per cluster | **Parameterized** | 2 for exhaustive (with RS symmetry reduction), 9 for simulation (no symmetry); races between RS matter |
 | Degraded standby sub-states | **Implementation** (single DS) | Follow implementation's collapsed `DEGRADED_STANDBY`; design's DSFW/DSFR/DS intentionally removed for simplicity |
 | Non-atomic failover | **Concrete** | Critical modeling point: two separate ZK writes, not one atomic step |
 | ANIS self-transition | **Concrete** | Heartbeat that resets `antiFlapTimer` to `StartAntiFlapWait`; essential for anti-flapping |
@@ -606,15 +606,17 @@ The simulation config (`ConsistentFailover-sim.cfg`) uses 2 clusters, 9 RS, and 
 
 Adjust `-Dtlc2.TLC.stopAfter` for shorter feedback loops: 300 (5 min quick check), 900 (15 min validation), 3600 (1 hour standard).
 
-**Liveness check** (no symmetry — incompatible with `SYMMETRY` in TLC):
+**Liveness check** (per-property simulation — no symmetry, incompatible with `SYMMETRY` in TLC):
 
 ```bash
+# One per liveness property: -ac (AbortCompletion), -fc (FailoverCompletion), -dr (DegradationRecovery)
 $JAVA17 -XX:+UseParallelGC -XX:MaxDirectMemorySize=8g \
   -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+  -Dtlc2.TLC.stopAfter=28800 \
   -cp tla2tools.jar:CommunityModules-deps.jar \
-  tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-liveness.cfg \
-  -workers auto -cleanup \
-  2>&1 | tee results/$ITER/tlc-liveness.log
+  tlc2.TLC ConsistentFailover.tla -config ConsistentFailover-sim-liveness-ac.cfg \
+  -simulate -depth 10000 -workers auto \
+  2>&1 | tee results/$ITER/tlc-liveness-ac.log
 ```
 
 ### Analyze Results
@@ -761,48 +763,15 @@ Second disjunct in `AdminStartFailover` (ANIS→ANISTS). `ANISTSToATS(c)` action
 
 #### ~~Iteration 16 — Post-Abort ATS Reconciliation~~ ✅
 
-Post-abort stuck ATS after partition (Appendix A.21). Reconciliation is folded into `ZKPeerReconnect`/`ZKPeerSessionRecover` in `ZK.tla`: when local = ATS and peer ∈ {S, DS} at reconnect, `clusterState[c]` is atomically set to AbTAIS → AIS via `AutoComplete`. Same listener-effect folding pattern as `recoveryListener`/`degradedListener`. Race-safe: reconnect requires `zkPeerConnected = FALSE`, so it cannot fire during the happy-path transient (ATS, S). No new variable, no new action in `Next`. `AbortSafety` relaxed to allow peer = DS; new `ATSReconcileSafety` invariant.
+Post-abort stuck ATS after partition (Appendix A.21). Reconciliation is folded into `ZKPeerReconnect`/`ZKPeerSessionRecover` in `ZK.tla`: when local = ATS and peer ∈ {S, DS} at reconnect, `clusterState[c]` is atomically set to AbTAIS → AIS via `AutoComplete`. Same listener-effect folding pattern as `recoveryListener`/`degradedListener`. Race-safe: reconnect requires `zkPeerConnected = FALSE`, so it cannot fire during the happy-path transient (ATS, S). No new variable, no new action in `Next`. `AbortSafety` relaxed to allow peer ∈ {AbTS, S, DS} (previously only AbTS, S). Reconciliation safety is verified by the existing `AbortSafety` and `MutualExclusion` invariants — no separate `ATSReconcileSafety` invariant was needed.
 
 #### ~~Iteration 17 — Replay rewind verification~~ ✅
 
 Added `ReplayRewindCorrectness` action constraint to `ConsistentFailover.tla`: every SYNCED_RECOVERY→SYNC transition (ReplayRewind CAS) equalizes replay counters (`lastRoundProcessed'[c] = lastRoundInSync'[c]`). Wired into all 5 cfg files. `Reader.tla` unchanged — existing `ReplayRewind(c)` already correctly models the counter reset and CAS semantics. Exhaustive TLC run confirms `ReplayRewindCorrectness` holds across all 95,613,696 distinct states, and `NoDataLoss` continues to hold — the rewind mechanism preserves zero RPO through the ANIS→AIS→failover sequence.
 
-#### Iteration 18 — AWOP/ANISWOP peer-reactive modeling (OFFLINE peer detection)
+#### ~~Iteration 18 — AWOP/ANISWOP peer-reactive modeling (OFFLINE peer detection)~~ ✅
 
-The `ACTIVE_WITH_OFFLINE_PEER` (AWOP) and `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER` (ANISWOP) states exist in the implementation at three levels:
-
-1. **Enum declaration:** Both are declared in `HAGroupStoreRecord.HAGroupState` (L51-65) and map to `ClusterRole.ACTIVE` via `getClusterRole()` (L73-97), meaning `isMutationBlocked()=false` — the active cluster continues serving mutations while its peer is OFFLINE.
-
-2. **Transition table:** The following transitions are in `allowedTransitions` (`HAGroupStoreRecord.java` L99-123):
-   - `AIS → AWOP` (L104: `ACTIVE_IN_SYNC.allowedTransitions` includes `ACTIVE_WITH_OFFLINE_PEER`)
-   - `ANIS → ANISWOP` (L101: `ACTIVE_NOT_IN_SYNC.allowedTransitions` includes `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER`)
-   - `AWOP → ANIS` (L118: `ACTIVE_WITH_OFFLINE_PEER.allowedTransitions = ImmutableSet.of(ACTIVE_NOT_IN_SYNC)`)
-   - `ANISWOP → ANIS` (L122: `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER.allowedTransitions = ImmutableSet.of(ACTIVE_NOT_IN_SYNC)`)
-
-3. **No peer-reactive trigger in FailoverManagementListener:** The `createPeerStateTransitions()` method (`HAGroupStoreManager.java` L104-138) has peer state entries for ATS, AIS, ANIS, and AbTS — but **no entry for OFFLINE**. There is no automatic reactive transition that fires when the active cluster detects its peer has entered OFFLINE. The transitions `AIS → AWOP` and `ANIS → ANISWOP` are in the `allowedTransitions` table but are not triggered by any code path in the current implementation.
-
-AWOP and ANISWOP are currently unreachable states in the implementation. The enum values and transition table entries exist as infrastructure for a future feature (detecting and reacting to peer OFFLINE), but no mechanism currently drives the transition. The `HAGroupStoreClient.setHAGroupStatusIfNeeded()` method (L325-394) would accept these transitions (they pass `isTransitionAllowed()`), but nothing calls it with AWOP or ANISWOP as the target state in response to peer OFFLINE detection.
-
-**What to add:**
-
-`HAGroupStore.tla`:
-- `PeerReactToOFFLINE(c)` action: when `clusterState[Peer(c)] = "OFFLINE"`, the active cluster transitions to AWOP or ANISWOP depending on its current state. Two sub-cases:
-  - `clusterState[c] = "AIS"` → `clusterState'[c] = "AWOP"` (peer went OFFLINE while active is in sync).
-  - `clusterState[c] = "ANIS"` → `clusterState'[c] = "ANISWOP"` (peer went OFFLINE while active is not in sync).
-  - Guard: `clusterState[c] \in {"AIS", "ANIS"}` — only fires from stable active states.
-- `PeerRecoverFromOFFLINE(c)` action: when `clusterState[Peer(c)] \notin {"OFFLINE"}` (peer re-enters a non-OFFLINE state via manual recovery), the active cluster returns from AWOP/ANISWOP. Two sub-cases:
-  - `clusterState[c] = "AWOP"` → `clusterState'[c] = "ANIS"` (per `AWOP.allowedTransitions = {ANIS}`; peer recovery is treated as a new peer entering sync — the active must first synchronize, so it enters ANIS not AIS).
-  - `clusterState[c] = "ANISWOP"` → `clusterState'[c] = "ANIS"` (per `ANISWOP.allowedTransitions = {ANIS}`).
-  - Resets `antiFlapTimer[c]` to `StartAntiFlapWait` on ANIS entry.
-- Note: Both actions model the *intended* protocol behavior since no FailoverManagementListener entry currently implements peer OFFLINE detection. The TLA+ model documents this as a design-ahead verification — verifying that the AWOP/ANISWOP states preserve mutual exclusion and writer-cluster consistency if/when the implementation adds the trigger. This follows the plan's precedent for assumed fixes (A.11, A.17) where the model verifies the intended design rather than the current incomplete implementation.
-
-`ConsistentFailover.tla`:
-- Wire `PeerReactToOFFLINE(c)` and `PeerRecoverFromOFFLINE(c)` into `Next`.
-- Verify `MutualExclusion` holds with AWOP/ANISWOP reachable: both states are in `ActiveStates` (map to `ACTIVE` role), so only one cluster can be in an active state including AWOP/ANISWOP. The peer is in OFFLINE (maps to `OFFLINE` role, not `ACTIVE`), so no dual-active.
-- Verify `WriterClusterConsistency` holds: AWOP and ANISWOP are already in the allowed set (added in Iteration 7). AWOP with degraded writers should be impossible (AIS→AWOP requires AIS which implies all writers SYNC); ANISWOP with degraded writers is expected.
-- Verify `AISImpliesInSync` is not violated: AWOP is not AIS, so the invariant is not directly affected.
-
-AWOP and ANISWOP become reachable states for the first time. All existing invariants hold with these states in the reachable state space. AWOP/ANISWOP do not introduce dual-active because the peer is in OFFLINE. The transitions AWOP→ANIS and ANISWOP→ANIS correctly return the cluster to its degraded-active state when the peer recovers.
+Added `UseOfflinePeerDetection` boolean constant to `Types.tla` as a feature gate; when FALSE (default in all cfg files), all new actions have unsatisfiable guards and the state space is identical to pre-Iteration 18. Added `AllowedTransitions` entries for S/DS→OFFLINE and OFFLINE→S. Added `AdminGoOffline(c)` (S/DS→OFFLINE) and `AdminForceRecover(c)` (OFFLINE→S with S-entry side effects) to `Admin.tla`, both gated on the feature flag and using the `--force` path (no ZK connectivity guard). Added `PeerReactToOFFLINE(c)` (AIS→AWOP, ANIS→ANISWOP) and `PeerRecoverFromOFFLINE(c)` (AWOP/ANISWOP→ANIS with anti-flap timer reset) to `HAGroupStore.tla`; extended `ReactiveTransitionFail(c)` with matching OFFLINE disjuncts. Extended `WriterToStoreFwd` and `WriterInitToStoreFwd` in `Writer.tla` to degrade AWOP/ANISWOP→ANIS (not just AIS→ANIS) on HDFS failure. Wired all four new actions into `Next` in `ConsistentFailover.tla`; added `PeerReactToOFFLINE`/`PeerRecoverFromOFFLINE` to the Tier 3 peer-reactive SF group; classified `AdminGoOffline`/`AdminForceRecover` as Tier 4 (no fairness).
 
 ---
 
@@ -852,11 +821,11 @@ AWOP and ANISWOP become reachable states for the first time. All existing invari
 | Peer ZK session re-established | `ZKPeerSessionRecover(c)` | `ZK.tla` | 13 | ✅ |
 | Local ZK connection lost (pathChildrenCache; `isHealthy = false`) | `ZKLocalDisconnect(c)` | `ZK.tla` | 13 | ✅ |
 | Local ZK connection re-established (`isHealthy = true`) | `ZKLocalReconnect(c)` | `ZK.tla` | 13 | ✅ |
-| Post-abort ATS reconciliation on peer cache reconnect (Test 5 fix) | `ATSReconcileOnReconnect(c)` | `HAGroupStore.tla` | 16 | ⏳ |
-| Peer cache rebuilt after ZK reconnect/session recovery | `peerCacheRebuilt[c]` variable | `ZK.tla` | 16 | ⏳ |
-| Peer goes OFFLINE | `AdminGoOffline(c)` | `Admin.tla` | 18 | ⏳ |
-| Active detects peer OFFLINE → AWOP/ANISWOP | `PeerReactToOFFLINE(c)` | `HAGroupStore.tla` | 18 | ⏳ |
-| Peer recovers from OFFLINE → AWOP/ANISWOP → ANIS | `PeerRecoverFromOFFLINE(c)` | `HAGroupStore.tla` | 18 | ⏳ |
+| Post-abort ATS reconciliation on peer cache reconnect (Test 5 fix) | Folded into `ZKPeerReconnect(c)` / `ZKPeerSessionRecover(c)` | `ZK.tla` | 16 | ✅ |
+| Peer goes OFFLINE | `AdminGoOffline(c)` | `Admin.tla` | 18 | ✅ |
+| Peer recovers from OFFLINE via --force | `AdminForceRecover(c)` | `Admin.tla` | 18 | ✅ |
+| Active detects peer OFFLINE → AWOP/ANISWOP | `PeerReactToOFFLINE(c)` | `HAGroupStore.tla` | 18 | ✅ |
+| Peer recovers from OFFLINE → AWOP/ANISWOP → ANIS | `PeerRecoverFromOFFLINE(c)` | `HAGroupStore.tla` | 18 | ✅ |
 | `setData().withVersion()` (ZK optimistic locking) | CAS semantics in Writer/HAGroupStore actions | various | 9 | ✅ |
 | Forwarder permanently stuck (no timeout on `FileUtil.copy()`) | `ForwarderStuck(c)` | `Writer.tla` | — | deferred |
 | `FailoverManagementListener` retry exhaustion (2 retries, then lost) | `ReactiveTransitionFail(c)` | `HAGroupStore.tla` | 13 | ✅ |
@@ -971,7 +940,7 @@ A true atomic multi-op across two independent ZK quorums is not possible without
 
 The window between the two writes is bounded by the failover tool's built-in timeout. If the old active does not transition to `STANDBY` within the timeout period, the admin is required to take action. The TLA+ model can treat this as a finite bound on the non-atomic window.
 
-The TLA+ model decomposes this into two separate actions in Iteration 4. The `NonAtomicFailoverSafe` invariant verifies mutual exclusion during the interleaving window.
+The TLA+ model decomposes this into two separate actions in Iteration 4. The `MutualExclusion` invariant verifies mutual exclusion during the interleaving window (the originally planned `NonAtomicFailoverSafe` invariant was subsumed by `MutualExclusion`).
 
 ### A.2 Collapsed Degraded Standby Sub-States (Intentional Simplification)
 
@@ -985,7 +954,7 @@ The design shows bidirectional transitions `S → OFFLINE` and `OFFLINE → S` (
 
 The team confirmed this is intentional, not an oversight. The admin decides when to place a cluster offline and when to bring it back via `--force`. The `--force` recovery procedure should be documented as a standard operational runbook step.
 
-The TLA+ model uses the implementation's sink behavior. Iteration 18 models OFFLINE entry via `AdminGoOffline` for AWOP/ANISWOP reachability. The `--force` bypass (`AdminForceRecover`) is not in the current plan.
+The TLA+ model includes both entry and recovery: `AdminGoOffline` (S/DS→OFFLINE) and `AdminForceRecover` (OFFLINE→S), both gated on `UseOfflinePeerDetection`. The `--force` bypass is modeled as a direct ZK write with no `zkLocalConnected` guard, matching the implementation's `PhoenixHAAdminTool update --force` path that bypasses `isTransitionAllowed()`. When `UseOfflinePeerDetection = FALSE` (default), all OFFLINE-related actions have unsatisfiable guards and the state space is identical to pre-Iteration 18.
 
 ### A.4 Replay State Machine (Implementation-Only)
 
@@ -1192,7 +1161,7 @@ Real-cluster Test 5 (abort failover during inter-cluster partition) revealed tha
 
 **Spec status:** The spec correctly models this as a stuck state. No action in `HAGroupStore.tla` handles (ATS, S). The `FailoverCompletion` liveness property explicitly excluded ATS for this reason (lines 537-543 of `ConsistentFailover.tla`). Test 5 confirms this is not just a theoretical boundary but an operationally encountered failure mode.
 
-**Proposed fix (modeled in Iteration 16):** Add an `ATSReconcileOnReconnect(c)` action that fires when the peer cache is rebuilt after a reconnect event (`peerCacheRebuilt[c] = TRUE`), the local cluster is in ATS, and the peer is in S or DS. The action transitions the local cluster to AbTAIS, which auto-completes to AIS via the existing `AutoComplete` path. The `peerCacheRebuilt` guard prevents the reconciliation from racing with the normal failover happy path.
+**Modeled fix (Iteration 16):** Reconciliation is folded into `ZKPeerReconnect(c)` and `ZKPeerSessionRecover(c)` in `ZK.tla`: when local = ATS and peer ∈ {S, DS} at reconnect, the action atomically sets `clusterState[c]` to AbTAIS, which auto-completes to AIS via the existing `AutoComplete` path. No new variable (`peerCacheRebuilt`) or action (`ATSReconcileOnReconnect`) was needed — the originally proposed design was simplified by folding the reconciliation logic into the existing reconnect actions, using the same listener-effect folding pattern as `recoveryListener`/`degradedListener`. Race-safety: reconnect requires `zkPeerConnected[c] = FALSE`, so it cannot fire during the happy-path transient (ATS, S).
 
 **Operational implication (until fix is implemented):** Operators must be prepared to use `PhoenixHAAdminTool update -s ACTIVE_IN_SYNC -av -F` to manually recover from stuck ATS after an abort during partition. Monitoring should alert on any HA group held in `ACTIVE_IN_SYNC_TO_STANDBY` for more than ~2× the expected failover duration.
 
@@ -1204,26 +1173,28 @@ Real-cluster Test 5 (abort failover during inter-cluster partition) revealed tha
 |---|-----------|------|-------|-------------|
 | 1 | `TypeOK` | Safety | Iter 1 | All variables have valid types (consolidated: cluster state, writer mode, outDirEmpty, hdfsAvailable, antiFlapTimer, replay state/counters/flags, ZK variables) |
 | 2 | `TransitionValid` | Action constraint | Iter 1 | Every state change follows `AllowedTransitions` |
-| 3 | `MutualExclusion` | Safety | Iter 1 | No dual-active (via `RoleOf`) |
-| 4 | `AbortSafety` | Safety | Iter 3 | Abort from correct side only |
-| 5 | `NonAtomicFailoverSafe` | Safety | Iter 4 | Safety during non-atomic failover window |
-| 6 | `WriterTransitionValid` | Action constraint | Iter 5 | Writer transitions follow allowed set |
-| 7 | `AIStoATSPrecondition` | Action constraint | Iter 6 | OUT empty + all RS in SYNC or DEAD before AIS→ATS (relaxed Iter 12) |
-| 8 | `WriterClusterConsistency` | Safety | Iter 7 | Degraded writer modes (S&F, SYNC&FWD) ⇒ cluster in `{ANIS, ANISTS, ANISWOP, AbTANIS}` (relaxed Iter 12: DEAD excluded from degraded check) |
-| 9 | `NoAISWithSFWriter` | Safety | Iter 7 | AIS ⇒ no S&F writers |
-| 10 | `AISImpliesInSync` | Safety | Iter 7 | AIS ⇒ outDirEmpty ∧ all RS in SYNC/INIT/DEAD (derived invariant, §4.1 property 3; relaxed Iter 12 to allow DEAD) |
-| 11 | `AntiFlapGate` | Action constraint | Iter 8 | ANIS→AIS and ANISTS→ATS only after timeout elapsed |
-| 12 | `ZKVersionMonotonic` | Safety | Iter 9 | ZK versions only increase |
-| 13 | `FailoverTriggerCorrectness` | Action constraint | Iter 11 | STA→AIS requires `failoverPending ∧ inProgressDirEmpty ∧ replayState = SYNC` |
-| 14 | `NoDataLoss` | Action constraint | Iter 11 | STA→AIS only when replay complete (equivalent to #13 in Iter 11) |
-| 15 | `FailoverCompletion` | Liveness | Iter 15 | Initiated failover eventually completes |
-| 16 | `DegradationRecovery` | Liveness | Iter 15 | ANIS eventually recovers to AIS |
-| 17 | `AbortCompletion` | Liveness | Iter 15 | Initiated abort eventually completes |
-| 18 | `ZKSessionConsistency` | Safety | Iter 13 | `zkPeerSessionAlive[c] = FALSE ⇒ zkPeerConnected[c] = FALSE` (session expiry implies disconnection) |
-| 19 | `ATSReconcileSafety` | Safety | Iter 16 | `ATSReconcileOnReconnect` preserves `MutualExclusion` — reconciliation path through AbTAIS → AIS is safe |
-| 20 | `ReplayRewindCorrectness` | Action constraint | Iter 17 | SYNCED_RECOVERY→SYNC equalizes replay counters (`lastRoundProcessed' = lastRoundInSync'`) |
+| 3 | `MutualExclusion` | Safety | Iter 1 | No dual-active (via `RoleOf`); subsumes the planned `NonAtomicFailoverSafe` from Iter 4 |
+| 4 | `AbortSafety` | Safety | Iter 3 | Abort from correct side only; peer ∈ `{AbTS, S, DS, OFFLINE}` when local = AbTAIS (updated Iter 16 for DS, Iter 18 for OFFLINE) |
+| 5 | `WriterTransitionValid` | Action constraint | Iter 5 | Writer transitions follow allowed set |
+| 6 | `AIStoATSPrecondition` | Action constraint | Iter 6 | OUT empty + all RS in SYNC or DEAD before AIS→ATS (relaxed Iter 12) |
+| 7 | `WriterClusterConsistency` | Safety | Iter 7 | Degraded writer modes (S&F, SYNC&FWD) ⇒ cluster in `{ANIS, ANISTS, ATS, ANISWOP, AbTANIS, AbTAIS, AWOP}` (relaxed Iter 12: DEAD excluded; expanded Iter 14/18: ATS, AbTAIS, AWOP added) |
+| 8 | `AISImpliesInSync` | Safety | Iter 7 | AIS ⇒ outDirEmpty ∧ all RS in SYNC/INIT/DEAD (derived invariant, §4.1 property 3; relaxed Iter 12 to allow DEAD; subsumes `NoAISWithSFWriter`) |
+| 9 | `AntiFlapGate` | Action constraint | Iter 8 | ANIS→AIS and ANISTS→ATS only after timeout elapsed |
+| 10 | `ANISTStoATSPrecondition` | Action constraint | Iter 14 | ANISTS→ATS requires `outDirEmpty ∧ AntiFlapGateOpen` |
+| 11 | `ReplayTransitionValid` | Action constraint | Iter 10 | Replay state changes follow `AllowedReplayTransitions` |
+| 12 | `FailoverTriggerCorrectness` | Action constraint | Iter 11 | STA→AIS requires `failoverPending ∧ inProgressDirEmpty ∧ replayState = SYNC` |
+| 13 | `NoDataLoss` | Action constraint | Iter 11 | STA→AIS only when replay complete (equivalent to #12 in Iter 11) |
+| 14 | `ZKSessionConsistency` | Safety | Iter 13 | `zkPeerSessionAlive[c] = FALSE ⇒ zkPeerConnected[c] = FALSE` (session expiry implies disconnection) |
+| 15 | `ReplayRewindCorrectness` | Action constraint | Iter 17 | SYNCED_RECOVERY→SYNC equalizes replay counters (`lastRoundProcessed' = lastRoundInSync'`) |
+| 16 | `FailoverCompletion` | Liveness | Iter 15 | Initiated failover eventually completes (sim only) |
+| 17 | `DegradationRecovery` | Liveness | Iter 15 | ANIS eventually recovers to AIS (sim only) |
+| 18 | `AbortCompletion` | Liveness | Iter 15 | Initiated abort eventually completes (sim only) |
 
-Additional invariants will be discovered and added during the modeling process.
+**Planned invariants not carried forward:**
+- `NonAtomicFailoverSafe` (Iter 4): subsumed by `MutualExclusion` over reachable states.
+- `NoAISWithSFWriter` (Iter 7): subsumed by `AISImpliesInSync`.
+- `ZKVersionMonotonic` (Iter 9): ZK versions not modeled as explicit variables; CAS semantics captured by TLC interleaving.
+- `ATSReconcileSafety` (Iter 16): reconciliation folded into `ZKPeerReconnect`/`ZKPeerSessionRecover`; safety covered by `AbortSafety` (peer ∈ `{S, DS}` allowed).
 
 ---
 
@@ -1245,7 +1216,7 @@ Additional invariants will be discovered and added during the modeling process.
 | §4.3 Scenario 6 | Source: `HAGroupStoreManager.java` L653-704; `HAGroupStoreClient.java` L1104-1110 | Retry exhaustion; core ZK property modeled in Iteration 13 (see §2.4) |
 | §4.3 Scenario 7 | `HAGroupStoreRecord.java` L117; `HAGroupStoreManager.java` L109 | DS→STA resolved (transition added) |
 | §4.3 Scenario 8 | Source: `ClusterRoleRecord.java` L84; `ReplicationLogDiscoveryReplay.java` L309-317, L500-533 | HDFS fail during (ATS,STA); mutation blocking |
-| Phase 7 (Iter 16-18) | Post-abort recovery, AWOP/ANISWOP, replay rewind | Remaining pending iterations |
+| Phase 7 (Iter 16-18) | Post-abort recovery, AWOP/ANISWOP, replay rewind | All complete (Iter 16: ATS reconciliation; Iter 17: replay rewind; Iter 18: OFFLINE lifecycle) |
 | §9 Source Code | `IMPL_CROSS_REFERENCE.md` §13; verified against source | File index with line numbers |
 | Appendix A | `IMPL_CROSS_REFERENCE.md` §11; source-verified | Divergences (21 items; A.2, A.3, A.6, A.11, A.12 resolved/updated; A.20, A.21 added from test findings) |
 | Appendix A.16 | `ZOOKEEPER_WATCHER_DELIVERY_ANALYSIS.md`; ZK source code analysis | ZK watcher delivery is conditional, not guaranteed; 5 failure modes identified |

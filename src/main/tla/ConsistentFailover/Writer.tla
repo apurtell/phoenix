@@ -111,6 +111,8 @@ WriterInit(c, rs) ==
  * cluster AIS -> ANIS (setHAGroupStatusToStoreAndForward).
  * Writers only run on the active cluster.
  *
+ * AWOP/ANISWOP handling: same as WriterToStoreFwd.
+ *
  * Guarded on zkLocalConnected[c] because this calls
  * setHAGroupStatusToStoreAndForward() which requires
  * isHealthy = true.
@@ -124,10 +126,10 @@ WriterInitToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] = "AIS"
+    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] = "AIS"
+    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
     /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
@@ -250,6 +252,14 @@ WriterSyncFwdToSync(c, rs) ==
  * transitions to STORE_AND_FWD and the cluster transitions
  * AIS -> ANIS (if still AIS). Writers only run on the active cluster.
  *
+ * AWOP/ANISWOP handling: when AWOP or ANISWOP
+ * are reachable (UseOfflinePeerDetection = TRUE), HDFS failure
+ * during these states triggers setHAGroupStatusToStoreAndForward()
+ * which CAS-writes ANIS. AWOP.allowedTransitions = {ANIS} and
+ * ANISWOP.allowedTransitions = {ANIS}, so the transition succeeds.
+ * When UseOfflinePeerDetection = FALSE, AWOP/ANISWOP are
+ * unreachable and the extended IF is a no-op.
+ *
  * Guarded on zkLocalConnected[c] because the CAS write goes through
  * setHAGroupStatusIfNeeded() which requires isHealthy = true.
  *
@@ -263,10 +273,10 @@ WriterToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] = "AIS"
+    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] = "AIS"
+    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
     /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,

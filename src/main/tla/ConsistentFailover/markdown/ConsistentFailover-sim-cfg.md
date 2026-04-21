@@ -44,11 +44,14 @@ CONSTANTS
     Cluster = {c1, c2}
     RS = {rs1, rs2, rs3, rs4, rs5, rs6, rs7, rs8, rs9}
     WaitTimeForSync = 5
+    UseOfflinePeerDetection = FALSE
 ```
 
 **`RS = {rs1, ..., rs9}`:** 9 RS exercises per-RS writer interleaving at production scale. With 9 RS, the CAS race during HDFS failure produces rich interleavings: multiple RS detect the failure at different times, some succeed at the CAS write, some fail and abort, and the resulting mix of SYNC, STORE_AND_FWD, SYNC_AND_FWD, and DEAD modes across 9 RS creates scenarios not reachable with only 2 RS.
 
 **`WaitTimeForSync = 5`:** Larger than the exhaustive model to explore richer interleavings during the anti-flapping wait window. With 5 ticks, the system has more time for HDFS failures, ZK disruptions, RS crashes, heartbeat resets, and forwarder drain events to interleave while the anti-flapping gate is closed.
+
+**`UseOfflinePeerDetection = FALSE`:** Feature gate for proactive AWOP/ANISWOP modeling. Set to TRUE to verify the OFFLINE peer detection lifecycle.
 
 ### Invariants
 

@@ -16,7 +16,7 @@ This is the primary (exhaustive) TLC model configuration for the Phoenix Consist
 - `lastRoundProcessed[c] <= 3` (state constraint to bound replay counter growth)
 - RS symmetry reduction (`Permutations(RS)`)
 
-These choices keep the state space tractable (~95M distinct states, ~12 minutes on 16 workers) while exercising all safety-relevant interleavings.
+These choices keep the state space tractable (~95M distinct states, ~12 minutes on 16 workers with `UseOfflinePeerDetection = FALSE`). With `UseOfflinePeerDetection = TRUE`, the state space grows to ~171M distinct states, ~24 minutes on 16 workers. Both configurations exercise all safety-relevant interleavings.
 
 ### Run Command
 
@@ -42,6 +42,7 @@ CONSTANTS
     Cluster = {c1, c2}
     RS = {rs1, rs2}
     WaitTimeForSync = 2
+    UseOfflinePeerDetection = FALSE
 ```
 
 **`Cluster = {c1, c2}`:** Exactly 2 clusters forming the HA pair, matching the protocol's architectural requirement.
@@ -49,6 +50,8 @@ CONSTANTS
 **`RS = {rs1, rs2}`:** 2 region servers per cluster. This is the minimum needed to exercise the ZK CAS race: when HDFS fails, two RS independently detect the failure and race to CAS-write AIS -> ANIS. The first succeeds; the second gets `BadVersionException` and aborts. With only 1 RS, CAS failure is unreachable.
 
 **`WaitTimeForSync = 2`:** The minimum value that exercises the timer's counting behavior (the timer can be at 0, 1, or 2). Larger values add more timer states without exercising new protocol interleavings.
+
+**`UseOfflinePeerDetection = FALSE`:** Feature gate for proactive AWOP/ANISWOP modeling.
 
 ### Symmetry
 

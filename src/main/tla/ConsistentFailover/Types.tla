@@ -20,6 +20,7 @@
  *   Peer(c)           -- returns the other cluster in a 2-cluster model
  *   WriterMode        -- the 5 replication writer modes (per-RS)
  *   ReplayStateSet    -- the 4 replication replay states (standby reader)
+ *   UseOfflinePeerDetection -- feature gate for AWOP/ANISWOP modeling
  *   AntiFlapGateOpen  -- countdown timer helper: wait elapsed
  *   AntiFlapGateClosed -- countdown timer helper: wait in progress
  *   DecrementTimer    -- countdown timer helper: advance one tick
@@ -67,6 +68,20 @@ CONSTANTS WaitTimeForSync
 \* WaitTimeForSync must be a positive natural number.
 ASSUME WaitTimeForSync \in Nat
 ASSUME WaitTimeForSync > 0
+
+\* Feature gate for proactive AWOP/ANISWOP modeling.
+\* When TRUE, AdminGoOffline, PeerReactToOFFLINE,
+\* PeerRecoverFromOFFLINE, and AdminForceRecover are enabled,
+\* making AWOP/ANISWOP reachable.
+\*
+\* This models the intended protocol behavior for a future
+\* implementation feature. AWOP/ANISWOP exist as enum values and
+\* allowedTransitions entries but are currently unreachable in
+\* the implementation (no FailoverManagementListener entry for
+\* peer OFFLINE detection).
+CONSTANTS UseOfflinePeerDetection
+
+ASSUME UseOfflinePeerDetection \in BOOLEAN
 
 ---------------------------------------------------------------------------
 
@@ -201,10 +216,13 @@ AllowedTransitions ==
       <<"AIS", "ANIS">>,
       <<"AIS", "AWOP">>,
       <<"AIS", "ATS">>,
-      \* S (standby) can begin failover (STA) or degrade (DS).
-      \* Source: L105
+      \* S (standby) can begin failover (STA), degrade (DS),
+      \* or go offline (OFFLINE) via admin --force.
+      \* Source: L105; OFFLINE entry via PhoenixHAAdminTool
+      \*         update --force (bypasses isTransitionAllowed)
       <<"S", "STA">>,
       <<"S", "DS">>,
+      <<"S", "OFFLINE">>,
       \* ANISTS can abort (AbTANIS) or advance to ATS once OUT
       \* dir is drained (subject to anti-flapping gate).
       \* Source: L107
@@ -218,12 +236,15 @@ AllowedTransitions ==
       \* Source: L111
       <<"STA", "AbTS">>,
       <<"STA", "AIS">>,
-      \* DS can recover to S or begin failover (STA).
+      \* DS can recover to S, begin failover (STA), or go offline
+      \* (OFFLINE) via admin --force.
       \* DS -> STA supports the ANIS failover path where the
       \* standby is in DEGRADED_STANDBY when failover proceeds.
-      \* Source: L117
+      \* Source: L117; OFFLINE entry via PhoenixHAAdminTool
+      \*         update --force (bypasses isTransitionAllowed)
       <<"DS", "S">>,
       <<"DS", "STA">>,
+      <<"DS", "OFFLINE">>,
       \* AWOP returns to ANIS when peer comes back.
       \* Source: L113
       <<"AWOP", "ANIS">>,
@@ -238,7 +259,12 @@ AllowedTransitions ==
       <<"AbTS", "S">>,
       \* ANISWOP returns to ANIS when peer comes back.
       \* Source: L123
-      <<"ANISWOP", "ANIS">>
+      <<"ANISWOP", "ANIS">>,
+      \* OFFLINE can recover to S via admin --force.
+      \* Source: PhoenixHAAdminTool update --force --state STANDBY
+      \*         (bypasses isTransitionAllowed; OFFLINE.allowed-
+      \*         Transitions = {} in the implementation)
+      <<"OFFLINE", "S">>
     }
 
 ---------------------------------------------------------------------------

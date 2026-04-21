@@ -58,6 +58,7 @@ CONSTANTS
     Cluster = {c1, c2}
     RS = {rs1, rs2}
     WaitTimeForSync = 2
+    UseOfflinePeerDetection = FALSE
 ```
 
 Same as the exhaustive safety model.

@@ -98,7 +98,7 @@ Phoenix clusters are deployed in pairs across distinct failure domains. The Cons
 The protocol is governed by six interrelated state machines, all modeled in this specification:
 
 **HA Group State (14 states).**
-Each cluster's lifecycle: `ACTIVE_IN_SYNC`, `ACTIVE_NOT_IN_SYNC`, `ACTIVE_IN_SYNC_TO_STANDBY`, `ACTIVE_NOT_IN_SYNC_TO_STANDBY`, `STANDBY`, `STANDBY_TO_ACTIVE`, `DEGRADED_STANDBY`, `ABORT_TO_ACTIVE_IN_SYNC`, `ABORT_TO_ACTIVE_NOT_IN_SYNC`, `ABORT_TO_STANDBY`, `ACTIVE_WITH_OFFLINE_PEER`, `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER`, `OFFLINE`, `UNKNOWN`. States map to roles visible to clients: ACTIVE (serves reads/writes), ACTIVE_TO_STANDBY (mutations blocked), `STANDBY`, `STANDBY_TO_ACTIVE`, `OFFLINE`, `UNKNOWN`.
+Each cluster's lifecycle: `ACTIVE_IN_SYNC`, `ACTIVE_NOT_IN_SYNC`, `ACTIVE_IN_SYNC_TO_STANDBY`, `ACTIVE_NOT_IN_SYNC_TO_STANDBY`, `STANDBY`, `STANDBY_TO_ACTIVE`, `DEGRADED_STANDBY`, `ABORT_TO_ACTIVE_IN_SYNC`, `ABORT_TO_ACTIVE_NOT_IN_SYNC`, `ABORT_TO_STANDBY`, `ACTIVE_WITH_OFFLINE_PEER` (reachable when `UseOfflinePeerDetection = TRUE`), `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER` (reachable when `UseOfflinePeerDetection = TRUE`), `OFFLINE` (reachable when `UseOfflinePeerDetection = TRUE`), `UNKNOWN`. States map to roles visible to clients: ACTIVE (serves reads/writes), ACTIVE_TO_STANDBY (mutations blocked), `STANDBY`, `STANDBY_TO_ACTIVE`, `OFFLINE`, `UNKNOWN`.
 
 **Replication Writer Mode (4 modes per RS).**
 `INIT` (pre-initialization), `SYNC` (writing directly to standby HDFS), `STORE_AND_FORWARD` (writing locally when standby is unavailable), `SYNC_AND_FORWARD` (draining local queue while also writing synchronously). A write error in `STORE_AND_FORWARD` mode triggers RS abort (fail-stop).
@@ -145,7 +145,7 @@ The exhaustive model check verifies the following over the full reachable state 
 |-----------|----------|
 | `TypeOK` | All 13 variables have valid types |
 | `MutualExclusion` | At most one cluster in the ACTIVE role at any time |
-| `AbortSafety` | AbTAIS requires peer in AbTS, S, or DS (abort or post-partition reconciliation) |
+| `AbortSafety` | AbTAIS requires peer in AbTS, S, DS, or OFFLINE (abort, post-partition reconciliation, or offline peer) |
 | `AISImpliesInSync` | AIS implies outDirEmpty and all RS in SYNC/INIT/DEAD |
 | `WriterClusterConsistency` | Degraded writer modes only on non-AIS active or transitional states |
 | `ZKSessionConsistency` | Peer session expiry implies peer disconnection |
@@ -199,8 +199,8 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 |--------|-------------|
 | `Types.tla` | Pure definitions: 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, anti-flapping timer helpers. No variables. |
 | `ConsistentFailover.tla` | Root orchestrator. Declares 13 variables, defines Init/Next/SafetySpec/Spec, instances sub-modules, defines all invariants and action constraints. |
-| `HAGroupStore.tla` | Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), ANISTS drain completion (`ANISTSToATS`), retry exhaustion (`ReactiveTransitionFail`). ATS->S transitions include writer lifecycle reset (live writers reset to INIT, OUT directory cleared; DEAD writers preserved for RSRestart). S-entry actions atomically set `replayState = SYNCED_RECOVERY` (recoveryListener fold); DS-entry sets `replayState = DEGRADED` (degradedListener fold). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`. Auto-completion, heartbeat, recovery, and drain completion guarded on `zkLocalConnected`. |
-| `Admin.tla` | `AdminStartFailover` (AIS->ATS or ANIS->ANISTS with peer-state guard) and `AdminAbortFailover` (STA->AbTS, clears failoverPending). |
+| `HAGroupStore.tla` | 11 action schemas. Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), ANISTS drain completion (`ANISTSToATS`), retry exhaustion (`ReactiveTransitionFail`), peer OFFLINE detection (`PeerReactToOFFLINE`, `PeerRecoverFromOFFLINE`). ATS->S transitions include writer lifecycle reset (live writers reset to INIT, OUT directory cleared; DEAD writers preserved for RSRestart). S-entry actions atomically set `replayState = SYNCED_RECOVERY` (recoveryListener fold); DS-entry sets `replayState = DEGRADED` (degradedListener fold). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`; OFFLINE lifecycle peer-reactive actions additionally guarded on `UseOfflinePeerDetection`. Auto-completion, heartbeat, recovery, and drain completion guarded on `zkLocalConnected`. |
+| `Admin.tla` | `AdminStartFailover` (AIS->ATS or ANIS->ANISTS with peer-state guard), `AdminAbortFailover` (STA->AbTS, clears failoverPending), `AdminGoOffline` (S/DS->OFFLINE, gated on `UseOfflinePeerDetection`), and `AdminForceRecover` (OFFLINE->S, gated on `UseOfflinePeerDetection`). |
 | `Writer.tla` | Per-RS writer mode transitions: startup (`WriterInit`, `WriterInitToStoreFwd`, `WriterInitToStoreFwdFail`), degradation (`WriterToStoreFwd`, `WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwd`, `WriterSyncFwdToStoreFwdFail`), recovery (`WriterSyncToSyncFwd`, `WriterStoreFwdToSyncFwd`), drain complete (`WriterSyncFwdToSync`). ZK-writing actions guarded on `zkLocalConnected`. |
 | `Reader.tla` | Replay advance (SYNC and DEGRADED), rewind, in-progress directory dynamics, failover trigger (`TriggerFailover` guarded on `zkLocalConnected`). Listener effects (degradedListener, recoveryListener) are folded into HAGroupStore S/DS-entry actions. |
 | `HDFS.tla` | `HDFSDown` and `HDFSUp` -- environment actions for NameNode crash/recovery. |
@@ -208,7 +208,7 @@ All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.t
 | `Clock.tla` | `Tick` -- advances all per-cluster anti-flapping countdown timers by one tick toward zero. Guarded: only fires when at least one timer is positive. |
 | `ZK.tla` | Peer ZK lifecycle (`ZKPeerDisconnect`, `ZKPeerReconnect`, `ZKPeerSessionExpiry`, `ZKPeerSessionRecover`) and local ZK lifecycle (`ZKLocalDisconnect`, `ZKLocalReconnect`). `ZKPeerReconnect` and `ZKPeerSessionRecover` fold a post-abort ATS reconciliation: when local = ATS and peer in {S, DS} at reconnect, `clusterState` is atomically set to AbTAIS (auto-completes to AIS via `AutoComplete`). This resolves the stuck-ATS scenario after abort during inter-cluster partition. |
 
-**Total: 38 action schemas** (some parameterized over cluster and RS).
+**Total: 42 action schemas** (some parameterized over cluster and RS).
 
 ## Variables
 
@@ -241,6 +241,7 @@ Five TLC configurations are provided:
 | `Cluster` | `{c1, c2}` | Exactly 2 clusters forming the HA pair |
 | `RS` | `{rs1, rs2}` | 2 region servers per cluster |
 | `WaitTimeForSync` | `2` | Anti-flapping timer ticks (small value sufficient for verification) |
+| `UseOfflinePeerDetection` | `FALSE` | Feature gate for proactive AWOP/ANISWOP modeling; set `TRUE` to verify OFFLINE peer detection |
 | Symmetry | `Permutations(RS)` | RS identifiers are interchangeable; clusters are asymmetric (AIS vs S at Init) |
 | State constraint | `lastRoundProcessed[c] <= 3` | Bounds replay counters for tractability |
 | Specification | `SafetySpec` | `Init /\ [][Next]_vars` (no fairness) |
@@ -337,10 +338,11 @@ java -XX:+UseParallelGC \
 |--------|-------|
 | Configuration | 2 clusters, 2 RS per cluster, WaitTimeForSync=2 |
 | Workers | 16 |
-| States generated | 1,500,171,841 |
-| Distinct states | 95,613,696 |
+| States generated | 2,718,437,761 |
+| Distinct states | 170,978,688 |
 | Depth | 55 |
-| Duration | 12 min 30 sec |
+| Duration | 24 min 19 sec |
+| Date | 2026-04-21 |
 | Result | Success |
 
 All 9 state invariants and 9 action constraints verified.  No violations.
@@ -356,6 +358,7 @@ All 9 state invariants and 9 action constraints verified.  No violations.
 | Trace length | 10,000 |
 | Seed | -5836228587005873350 |
 | Duration | 8 hr |
+| Date | 2026-04-21 |
 | Result | Success |
 
 All 9 state invariants and 9 action constraints verified at production-scale RS count.  No violations.
@@ -364,10 +367,10 @@ All 9 state invariants and 9 action constraints verified at production-scale RS 
 
 All runs: 2 clusters, 2 RS per cluster, WaitTimeForSync=2, 128 workers, depth 10000, 1 hr.
 
-| Property | Config | States Checked | Traces | Seed | Result |
-|----------|--------|---------------|--------|------|--------|
-| `AbortCompletion` | `SpecAC` | 3,056,885,301 | 305,676 | -4478997111098479953 | Success |
-| `DegradationRecovery` | `SpecDR` | 465,273,923 | 46,524 | 2282162590966442857 | Success |
-| `FailoverCompletion` | `SpecFC` | 1,137,408,142 | 113,735 | -1246613979262938318 | Success |
+| Property | Config | States Checked | Traces | Seed | Date | Result |
+|----------|--------|---------------|--------|------|------|--------|
+| `AbortCompletion` | `SpecAC` | 2,671,855,331 | 267,165 | -3508296420780792285 | 2026-04-21 | Success |
+| `DegradationRecovery` | `SpecDR` | 454,322,354 | 45,430 | 650174316504703997 | 2026-04-21 | Success |
+| `FailoverCompletion` | `SpecFC` | 1,107,505,130 | 110,740 | 3654016485672320894 | 2026-04-21 | Success |
 
 All 3 liveness properties verified.  No violations.

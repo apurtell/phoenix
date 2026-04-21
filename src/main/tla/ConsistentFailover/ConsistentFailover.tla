@@ -56,6 +56,15 @@
  *   AdminStartFailover      | initiateFailoverOnActiveCluster() L375-400
  *                           |   AIS -> ATS or ANIS -> ANISTS
  *   AdminAbortFailover      | setHAGroupStatusToAbortToStandby() L419-425
+ *   AdminGoOffline          | PhoenixHAAdminTool update --state OFFLINE
+ *                           |   (gated on UseOfflinePeerDetection)
+ *   AdminForceRecover       | PhoenixHAAdminTool update --force
+ *                           |   --state STANDBY (OFFLINE -> S)
+ *                           |   (gated on UseOfflinePeerDetection)
+ *   PeerReactToOFFLINE      | intended peer OFFLINE detection;
+ *                           |   gated on UseOfflinePeerDetection
+ *   PeerRecoverFromOFFLINE  | intended peer OFFLINE recovery;
+ *                           |   gated on UseOfflinePeerDetection
  *   Init (AIS, S)           | Default initial states per team confirmation
  *                           |   (see PHOENIX_HA_TLA_PLAN.md Appendix A.6)
  *   MutualExclusion         | Architecture safety argument: at most one
@@ -358,10 +367,22 @@ Next ==
         \/ haGroupStore!ANISTSToATS(c)
         \* [Retry exhaustion] PeerReact retry failure: transition lost.
         \/ haGroupStore!ReactiveTransitionFail(c)
+        \* [ZK watcher] Peer-reactive: active detects peer OFFLINE.
+        \* (gated on UseOfflinePeerDetection)
+        \/ haGroupStore!PeerReactToOFFLINE(c)
+        \* [ZK watcher] Peer-reactive: active detects peer left OFFLINE.
+        \* (gated on UseOfflinePeerDetection)
+        \/ haGroupStore!PeerRecoverFromOFFLINE(c)
         \* [Direct ZK write] Admin initiates failover: AIS->ATS or ANIS->ANISTS.
         \/ admin!AdminStartFailover(c)
         \* [Direct ZK write] Admin aborts failover: STA->AbTS.
         \/ admin!AdminAbortFailover(c)
+        \* [Direct ZK write] Admin takes standby offline: S/DS->OFFLINE.
+        \* (gated on UseOfflinePeerDetection)
+        \/ admin!AdminGoOffline(c)
+        \* [Direct ZK write] Admin force-recovers from OFFLINE: OFFLINE->S.
+        \* (gated on UseOfflinePeerDetection)
+        \/ admin!AdminForceRecover(c)
         \* HDFS NameNode crash/recovery incidents.
         \/ hdfs!HDFSDown(c)
         \/ hdfs!HDFSUp(c)
@@ -468,7 +489,8 @@ SafetySpec == Init /\ [][Next]_vars
  *   4. No fairness on non-deterministic environmental faults
  *      (HDFSDown, RSCrash, ZKPeerDisconnect, ZKPeerSessionExpiry,
  *      ZKLocalDisconnect, ReactiveTransitionFail), operator actions
- *      (AdminStartFailover, AdminAbortFailover), and CAS failures
+ *      (AdminStartFailover, AdminAbortFailover, AdminGoOffline,
+ *      AdminForceRecover), and CAS failures
  *      (WriterToStoreFwdFail, WriterSyncFwdToStoreFwdFail,
  *      WriterInitToStoreFwdFail). These are genuinely non-
  *      deterministic; imposing fairness would force unrealistic
@@ -503,12 +525,17 @@ Fairness ==
         \* equivalent to SF(A1)/\.../\SF(An), because the only
         \* disjunct that can fire is the one that is enabled.
         \*
-        \* Peer-reactive group (exclusive by clusterState[Peer(c)]:
-        \* ATS, ANIS, AbTS, AIS are mutually exclusive).
+        \* Peer-reactive group (exclusive by clusterState[Peer(c)]
+        \* and clusterState[c]: ATS, ANIS, AbTS, AIS, OFFLINE are
+        \* mutually exclusive peer states; AWOP/ANISWOP are mutually
+        \* exclusive with S/DS/ATS local states of other PeerReact
+        \* actions).
         /\ SF_vars(haGroupStore!PeerReactToATS(c)
                    \/ haGroupStore!PeerReactToANIS(c)
                    \/ haGroupStore!PeerReactToAbTS(c)
-                   \/ haGroupStore!PeerReactToAIS(c))
+                   \/ haGroupStore!PeerReactToAIS(c)
+                   \/ haGroupStore!PeerReactToOFFLINE(c)
+                   \/ haGroupStore!PeerRecoverFromOFFLINE(c))
         \* Local cluster transition group (exclusive by
         \* clusterState[c]: AbTS/AbTAIS/AbTANIS, ANIS, ANISTS,
         \* STA are mutually exclusive).
@@ -767,7 +794,7 @@ MutualExclusion ==
 AbortSafety ==
     \A c \in Cluster :
         clusterState[c] = "AbTAIS" =>
-            clusterState[Peer(c)] \in {"AbTS", "S", "DS"}
+            clusterState[Peer(c)] \in {"AbTS", "S", "DS", "OFFLINE"}
 
 ---------------------------------------------------------------------------
 

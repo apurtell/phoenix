@@ -34,6 +34,10 @@ EXTENDS Types
 | `ANISTSToATS` | `HAGroupStoreManager.setHAGroupStatusToSync()` L341-355 |
 | `AdminStartFailover` | `initiateFailoverOnActiveCluster()` L375-400 |
 | `AdminAbortFailover` | `setHAGroupStatusToAbortToStandby()` L419-425 |
+| `AdminGoOffline` | `PhoenixHAAdminTool update --state OFFLINE` (gated on `UseOfflinePeerDetection`) |
+| `AdminForceRecover` | `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE -> S) (gated on `UseOfflinePeerDetection`) |
+| `PeerReactToOFFLINE` | intended peer OFFLINE detection: AIS->AWOP, ANIS->ANISWOP; gated on `UseOfflinePeerDetection` |
+| `PeerRecoverFromOFFLINE` | intended peer OFFLINE recovery: AWOP/ANISWOP->ANIS; gated on `UseOfflinePeerDetection` |
 | `Init (AIS, S)` | Default initial states per team confirmation (PHOENIX_HA_TLA_PLAN.md Appendix A.6) |
 | `MutualExclusion` | Architecture safety argument: at most one cluster in ACTIVE role |
 | `AbortSafety` | Abort originates from STA side; AbTAIS only reachable via peer AbTS detection |
@@ -237,8 +241,12 @@ Next ==
         \/ haGroupStore!ANISToAIS(c)
         \/ haGroupStore!ANISTSToATS(c)
         \/ haGroupStore!ReactiveTransitionFail(c)
+        \/ haGroupStore!PeerReactToOFFLINE(c)
+        \/ haGroupStore!PeerRecoverFromOFFLINE(c)
         \/ admin!AdminStartFailover(c)
         \/ admin!AdminAbortFailover(c)
+        \/ admin!AdminGoOffline(c)
+        \/ admin!AdminForceRecover(c)
         \/ hdfs!HDFSDown(c)
         \/ hdfs!HDFSUp(c)
         \/ zk!ZKPeerDisconnect(c)
@@ -269,13 +277,13 @@ Next ==
 
 ### Action Categories
 
-The 38 action schemas decompose into:
+The 42 action schemas decompose into:
 
 - **Timer:** `Tick` -- global, not per-cluster
-- **ZK watcher (peer):** `PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS` -- require `zkPeerConnected` and `zkPeerSessionAlive`
+- **ZK watcher (peer):** `PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`, `PeerReactToOFFLINE`, `PeerRecoverFromOFFLINE` -- require `zkPeerConnected` and `zkPeerSessionAlive`
 - **ZK watcher (local):** `AutoComplete`, `ANISHeartbeat`, `ANISToAIS`, `ANISTSToATS`, `TriggerFailover` -- require `zkLocalConnected`
 - **Retry exhaustion:** `ReactiveTransitionFail` -- requires peer ZK connectivity (same as PeerReact*)
-- **Direct ZK write:** `AdminStartFailover`, `AdminAbortFailover` -- not watcher-dependent
+- **Direct ZK write:** `AdminStartFailover`, `AdminAbortFailover`, `AdminGoOffline`, `AdminForceRecover` -- not watcher-dependent
 - **Environment:** `HDFSDown`, `HDFSUp`, `ZKPeer*`, `ZKLocal*` -- environment actions
 - **Reader:** `ReplayAdvance`, `ReplayRewind`, `ReplayBeginProcessing`, `ReplayFinishProcessing` -- replay state machine
 - **Writer (per-RS):** 10 writer mode transitions -- some require `zkLocalConnected`
@@ -339,7 +347,9 @@ When at most one disjunct is ENABLED in any state, `SF(A1 \/ ... \/ An)` is equi
         /\ SF_vars(haGroupStore!PeerReactToATS(c)
                    \/ haGroupStore!PeerReactToANIS(c)
                    \/ haGroupStore!PeerReactToAbTS(c)
-                   \/ haGroupStore!PeerReactToAIS(c))
+                   \/ haGroupStore!PeerReactToAIS(c)
+                   \/ haGroupStore!PeerReactToOFFLINE(c)
+                   \/ haGroupStore!PeerRecoverFromOFFLINE(c))
         /\ SF_vars(haGroupStore!AutoComplete(c)
                    \/ haGroupStore!ANISToAIS(c)
                    \/ haGroupStore!ANISTSToATS(c)
@@ -359,7 +369,7 @@ When at most one disjunct is ENABLED in any state, `SF(A1 \/ ... \/ An)` is equi
 
 ### Tier 4: No Fairness
 
-No fairness on non-deterministic environmental faults (`HDFSDown`, `RSCrash`, `ZKPeerDisconnect`, `ZKPeerSessionExpiry`, `ZKLocalDisconnect`, `ReactiveTransitionFail`), operator actions (`AdminStartFailover`, `AdminAbortFailover`), and CAS failures (`WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwdFail`, `WriterInitToStoreFwdFail`). These are genuinely non-deterministic; imposing fairness would force unrealistic guarantees.
+No fairness on non-deterministic environmental faults (`HDFSDown`, `RSCrash`, `ZKPeerDisconnect`, `ZKPeerSessionExpiry`, `ZKLocalDisconnect`, `ReactiveTransitionFail`), operator actions (`AdminStartFailover`, `AdminAbortFailover`, `AdminGoOffline`, `AdminForceRecover`), and CAS failures (`WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwdFail`, `WriterInitToStoreFwdFail`). These are genuinely non-deterministic; imposing fairness would force unrealistic guarantees.
 
 ## Per-Property Liveness Specifications
 
@@ -515,15 +525,16 @@ Source: Architecture safety argument; `ClusterRoleRecord.java` L84 -- ACTIVE_TO_
 AbortSafety ==
     \A c \in Cluster :
         clusterState[c] = "AbTAIS" =>
-            clusterState[Peer(c)] \in {"AbTS", "S", "DS"}
+            clusterState[Peer(c)] \in {"AbTS", "S", "DS", "OFFLINE"}
 ```
 
-If a cluster is in AbTAIS, the peer must be in AbTS, S, or DS. AbTAIS is reached via two paths:
+If a cluster is in AbTAIS, the peer must be in AbTS, S, DS, or OFFLINE. AbTAIS is reached via three paths:
 
 1. **Abort path:** `PeerReactToAbTS` (peer = AbTS). The peer can auto-complete AbTS -> S before the local AbTAIS auto-completes.
 2. **Reconciliation path:** `ZKPeerReconnect`/`ZKPeerSessionRecover` with local = ATS and peer in {S, DS}. DS is reachable when the peer degraded (S -> DS via `PeerReactToANIS`) before the failover partition.
+3. **OFFLINE path:** When the peer transitions to OFFLINE (via `AdminGoOffline`) while the local cluster is in AbTAIS, safety is preserved because OFFLINE is a non-active state.
 
-All three peer states (AbTS, S, DS) map to STANDBY role, so MutualExclusion is preserved in all cases.
+All four peer states (AbTS, S, DS, OFFLINE) map to STANDBY role, so MutualExclusion is preserved in all cases.
 
 ### AISImpliesInSync
 

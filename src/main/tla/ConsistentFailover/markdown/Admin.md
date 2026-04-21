@@ -4,13 +4,13 @@
 
 ## Overview
 
-`Admin` models the human operator (Admin actor) who drives failover and abort via the `PhoenixHAAdminTool` CLI, which delegates to `HAGroupStoreManager` coprocessor endpoints. This module contains exactly two actions: `AdminStartFailover` (initiate failover) and `AdminAbortFailover` (abort an in-progress failover).
+`Admin` models the human operator (Admin actor) who drives failover and abort via the `PhoenixHAAdminTool` CLI, which delegates to `HAGroupStoreManager` coprocessor endpoints. This module contains four actions: `AdminStartFailover` (initiate failover), `AdminAbortFailover` (abort an in-progress failover), `AdminGoOffline` (take a standby cluster offline), and `AdminForceRecover` (force-recover from OFFLINE). The last two are gated on the `UseOfflinePeerDetection` feature flag and model the proactive design for peer OFFLINE detection using `PhoenixHAAdminTool update --force`.
 
-These are the only actions in the specification that represent deliberate human decisions rather than automated system behavior. They receive **no fairness** in the liveness specifications (Tier 4) -- the admin is genuinely non-deterministic. The admin might never initiate a failover, or might abort every failover attempt. Imposing fairness on admin actions would force unrealistic guarantees about human behavior.
+These are the only actions in the specification that represent deliberate human decisions rather than automated system behavior. All four (`AdminStartFailover`, `AdminAbortFailover`, `AdminGoOffline`, `AdminForceRecover`) receive no fairness in the liveness specifications. The admin is genuinely non-deterministic. The admin might never initiate a failover, or might abort every failover attempt. Imposing fairness on admin actions would force unrealistic guarantees about human behavior.
 
 ### Modeling Choice: Direct ZK Writes
 
-Unlike the peer-reactive transitions in [HAGroupStore.md](HAGroupStore.md), admin actions are direct ZK writes -- they are not watcher-dependent. The admin CLI writes directly to the local ZK znode via the coprocessor endpoint. No `zkPeerConnected` or `zkLocalConnected` guard is needed because the admin tool manages its own ZK connection independently of the `HAGroupStoreClient` watcher infrastructure.
+Unlike the peer-reactive transitions in [HAGroupStore.md](HAGroupStore.md), admin actions are direct ZK writes -- they are not watcher-dependent. The admin CLI writes directly to the local ZK znode via the coprocessor endpoint. No `zkPeerConnected` or `zkLocalConnected` guard is needed because the admin tool manages its own ZK connection independently of the `HAGroupStoreClient` watcher infrastructure. `AdminGoOffline` and `AdminForceRecover` also use the `--force` path which writes directly to ZK, so no `zkLocalConnected` guard is needed for those actions either.
 
 ## Implementation Traceability
 
@@ -18,6 +18,8 @@ Unlike the peer-reactive transitions in [HAGroupStore.md](HAGroupStore.md), admi
 |---|---|
 | `AdminStartFailover(c)` | `HAGroupStoreManager.initiateFailoverOnActiveCluster()` L375-400 |
 | `AdminAbortFailover(c)` | `HAGroupStoreManager.setHAGroupStatusToAbortToStandby()` L419-425; also clears `failoverPending` (models `abortFailoverListener` L173-185) |
+| `AdminGoOffline(c)` | `PhoenixHAAdminTool update --state OFFLINE` (gated on `UseOfflinePeerDetection`) |
+| `AdminForceRecover(c)` | `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE -> S; gated on `UseOfflinePeerDetection`) |
 
 ```tla
 EXTENDS Types
@@ -93,5 +95,62 @@ AdminAbortFailover(c) ==
     /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
                    replayState, lastRoundInSync, lastRoundProcessed,
                    inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+```
+
+## AdminGoOffline -- Take Standby Cluster Offline
+
+Admin takes a standby cluster offline. Gated on `UseOfflinePeerDetection`.
+
+Pre: Cluster `c` is in S or DS (a standby state).
+Post: Cluster `c` transitions to OFFLINE.
+
+In the implementation, entering OFFLINE requires `PhoenixHAAdminTool update --force --state OFFLINE`, which bypasses `isTransitionAllowed()`. The operator decides when to take a cluster offline for maintenance or decommissioning.
+
+No ZK connectivity guard: the `--force` path writes directly to ZK, bypassing the `isHealthy` check used by `setHAGroupStatusIfNeeded()`.
+
+Source: `PhoenixHAAdminTool update --state OFFLINE (--force)`.
+
+```tla
+AdminGoOffline(c) ==
+    /\ UseOfflinePeerDetection = TRUE
+    /\ clusterState[c] \in {"S", "DS"}
+    /\ clusterState' = [clusterState EXCEPT ![c] = "OFFLINE"]
+    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
+                   replayState, lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty,
+                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+```
+
+## AdminForceRecover -- Force-Recover from OFFLINE
+
+Admin force-recovers a cluster from OFFLINE. Gated on `UseOfflinePeerDetection`.
+
+Pre: Cluster `c` is in OFFLINE.
+Post: Cluster `c` transitions to S (STANDBY).
+
+Recovery from OFFLINE requires `PhoenixHAAdminTool update --force --state STANDBY`, which bypasses `isTransitionAllowed()` (OFFLINE has no allowed outbound transitions in the implementation).
+
+The S-entry side effects mirror the pattern used by `PeerReactToAIS` (ATS->S) and `AutoComplete` (AbTS->S):
+- `writerMode` reset to INIT for all RS (replication subsystem restart on standby entry)
+- `outDirEmpty` set to TRUE (OUT directory cleared)
+- `replayState` set to SYNCED_RECOVERY (recoveryListener fold)
+
+No ZK connectivity guard: the `--force` path writes directly to ZK.
+
+Source: `PhoenixHAAdminTool update --force --state STANDBY`.
+
+```tla
+AdminForceRecover(c) ==
+    /\ UseOfflinePeerDetection = TRUE
+    /\ clusterState[c] = "OFFLINE"
+    /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
+    /\ writerMode' = [writerMode EXCEPT ![c] =
+            [rs \in RS |-> "INIT"]]
+    /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
+    /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
+    /\ UNCHANGED <<hdfsAvailable, antiFlapTimer,
+                   lastRoundInSync, lastRoundProcessed,
+                   failoverPending, inProgressDirEmpty,
                    zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 ```

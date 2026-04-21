@@ -4,7 +4,7 @@
 
 ## Overview
 
-`Types` is a pure-definition module that provides all constants, type sets, state definitions, valid transition tables, role mappings, and helper operators used throughout the Phoenix Consistent Failover specification. It declares no variables; every definition is stateless. All sub-modules and the root orchestrator import these definitions via `EXTENDS Types`.
+`Types` is a pure-definition module that provides all constants, type sets, state definitions, valid transition tables, role mappings, feature gates (`UseOfflinePeerDetection`), and helper operators used throughout the Phoenix Consistent Failover specification. It declares no variables; every definition is stateless. All sub-modules and the root orchestrator import these definitions via `EXTENDS Types`.
 
 This module establishes the vocabulary of the specification: what states exist, which transitions between them are legal, how states map to the cluster roles visible to clients, and how the anti-flapping countdown timer operates. By centralizing these definitions, the specification ensures that every module shares a single source of truth for the protocol's state space.
 
@@ -21,6 +21,7 @@ Factoring pure definitions into their own module is a TLA+ best practice for spe
 | `ClusterRole` (6 roles) | `ClusterRoleRecord.ClusterRole` enum (L59-107) |
 | `RoleOf(state)` | `HAGroupState.getClusterRole()` (L73-97) |
 | ANIS self-transition | `HAGroupStoreRecord` L101 (heartbeat support) |
+| `UseOfflinePeerDetection` | Feature gate for AWOP/ANISWOP modeling |
 | `WriterMode` (5 modes) | `ReplicationLogGroup` mode classes (SyncModeImpl, StoreAndForwardModeImpl, SyncAndForwardModeImpl) |
 | `ReplayStateSet` (4 states) | `ReplicationLogDiscoveryReplay` replay state (L550-555) |
 
@@ -68,6 +69,16 @@ ASSUME WaitTimeForSync > 0
 
 `WaitTimeForSync` is the anti-flapping wait threshold in logical time ticks. It controls how long the system must wait after the last STORE_AND_FWD heartbeat before the ANIS-to-AIS recovery transition is allowed. In the implementation, this maps to `HAGroupStoreClient.java` L98 where `ZK_SESSION_TIMEOUT_MULTIPLIER = 1.1` scales the ZK session timeout to produce the wait duration. The exhaustive model uses `WaitTimeForSync = 2` (the minimum value that exercises the timer's counting behavior); the simulation model uses `WaitTimeForSync = 5` to explore richer interleavings during the anti-flapping wait window.
 
+### UseOfflinePeerDetection
+
+```tla
+CONSTANTS UseOfflinePeerDetection
+
+ASSUME UseOfflinePeerDetection \in BOOLEAN
+```
+
+`UseOfflinePeerDetection` is a boolean feature gate for proactive AWOP/ANISWOP modeling. This models the intended protocol behavior for a future implementation feature.
+
 ## HA Group State Definitions
 
 The HA group state is the central state variable of the protocol. Each cluster maintains its state as a ZooKeeper znode, updated via versioned `setData` (optimistic CAS locking).
@@ -92,8 +103,8 @@ Each TLA+ abbreviation maps to a Java enum constant in `HAGroupStoreRecord.HAGro
 | `"ANISTS"` | `ACTIVE_NOT_IN_SYNC_TO_STANDBY` | ANIS failover path: draining OUT before advancing to ATS |
 | `"AbTAIS"` | `ABORT_TO_ACTIVE_IN_SYNC` | Aborting failover, returning to AIS |
 | `"AbTANIS"` | `ABORT_TO_ACTIVE_NOT_IN_SYNC` | Aborting failover, returning to ANIS |
-| `"AWOP"` | `ACTIVE_WITH_OFFLINE_PEER` | Active with offline peer (not currently modeled in actions) |
-| `"ANISWOP"` | `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER` | ANIS with offline peer (not currently modeled in actions) |
+| `"AWOP"` | `ACTIVE_WITH_OFFLINE_PEER` | Active with offline peer. Reachable when `UseOfflinePeerDetection = TRUE` |
+| `"ANISWOP"` | `ACTIVE_NOT_IN_SYNC_WITH_OFFLINE_PEER` | ANIS with offline peer. Reachable when `UseOfflinePeerDetection = TRUE` |
 | `"S"` | `STANDBY` | Standby cluster, receiving and replaying replication logs |
 | `"STA"` | `STANDBY_TO_ACTIVE` | Transitioning from standby to active (failover in progress) |
 | `"DS"` | `DEGRADED_STANDBY` | Standby with degraded active peer (peer in ANIS) |
@@ -101,7 +112,7 @@ Each TLA+ abbreviation maps to a Java enum constant in `HAGroupStoreRecord.HAGro
 | `"OFFLINE"` | `OFFLINE` | Cluster is offline |
 | `"UNKNOWN"` | `UNKNOWN` | Unknown state |
 
-The abbreviations are used throughout the specification for readability. `OFFLINE` and `UNKNOWN` are included for type completeness but are not reachable from the initial state in this model.
+The abbreviations are used throughout the specification for readability. `OFFLINE` is reachable when `UseOfflinePeerDetection = TRUE`; `UNKNOWN` is included for type completeness but is not reachable from the initial state in this model.
 
 ### State Classification Sets
 
@@ -186,6 +197,7 @@ AllowedTransitions ==
       <<"AIS", "ATS">>,
       <<"S", "STA">>,
       <<"S", "DS">>,
+      <<"S", "OFFLINE">>,
       <<"ANISTS", "AbTANIS">>,
       <<"ANISTS", "ATS">>,
       <<"ATS", "AbTAIS">>,
@@ -194,12 +206,14 @@ AllowedTransitions ==
       <<"STA", "AIS">>,
       <<"DS", "S">>,
       <<"DS", "STA">>,
+      <<"DS", "OFFLINE">>,
       <<"AWOP", "ANIS">>,
       <<"AbTAIS", "AIS">>,
       <<"AbTAIS", "ANIS">>,
       <<"AbTANIS", "ANIS">>,
       <<"AbTS", "S">>,
-      <<"ANISWOP", "ANIS">>
+      <<"ANISWOP", "ANIS">>,
+      <<"OFFLINE", "S">>
     }
 ```
 
@@ -210,6 +224,10 @@ AllowedTransitions ==
 **DS -> STA** (`<<"DS", "STA">>`): This entry supports the ANIS failover path where the standby is in `DEGRADED_STANDBY` when failover proceeds. The admin initiates failover on the active (ANIS -> ANISTS), the forwarder drains OUT (ANISTS -> ATS), and the standby detects ATS and transitions DS -> STA. Source: L117.
 
 **AbTAIS -> ANIS** (`<<"AbTAIS", "ANIS">>`): This entry is needed so that HDFS failure during the abort window can route the cluster to ANIS. Without it, S&F writers that degrade during AbTAIS would have no path to a consistent state -- the cluster would be stuck in AbTAIS with degraded writers and no way for `AutoComplete` to route to ANIS.
+
+**S -> OFFLINE and DS -> OFFLINE** (`<<"S", "OFFLINE">>`, `<<"DS", "OFFLINE">>`): Admin takes a standby cluster offline via `PhoenixHAAdminTool update --force --state OFFLINE`, bypassing `isTransitionAllowed()`.
+
+**OFFLINE -> S** (`<<"OFFLINE", "S">>`): Admin force-recovers from OFFLINE via `PhoenixHAAdminTool update --force --state STANDBY`, bypassing `isTransitionAllowed()` (OFFLINE has no allowed outbound transitions in the implementation).
 
 ### Transition Diagram
 
@@ -232,9 +250,11 @@ stateDiagram-v2
 
     S --> STA : Peer ATS detected
     S --> DS : Peer ANIS detected
+    S --> OFFLINE : Admin offline
 
     DS --> S : Peer AIS detected
     DS --> STA : Peer ATS detected
+    DS --> OFFLINE : Admin offline
 
     STA --> AIS : Failover trigger
     STA --> AbTS : Admin abort
@@ -246,6 +266,8 @@ stateDiagram-v2
 
     AWOP --> ANIS : Peer back
     ANISWOP --> ANIS : Peer back
+
+    OFFLINE --> S : Admin force recover
 ```
 
 ## Cluster Role Definitions

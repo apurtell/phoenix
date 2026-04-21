@@ -104,6 +104,8 @@ WriterInit(c, rs) ==
 
 RS initializes but standby HDFS is unreachable; begins buffering locally in the OUT directory. Also transitions cluster AIS -> ANIS (`setHAGroupStatusToStoreAndForward`). This is the AIS-to-ANIS coupling: the first RS to degrade atomically transitions the cluster state.
 
+**AWOP/ANISWOP handling:** Same as `WriterToStoreFwd` -- when AWOP or ANISWOP are reachable (`UseOfflinePeerDetection = TRUE`), HDFS failure during these states triggers `setHAGroupStatusToStoreAndForward()` which CAS-writes ANIS. `AWOP.allowedTransitions = {ANIS}` and `ANISWOP.allowedTransitions = {ANIS}`, so the transition succeeds. When `UseOfflinePeerDetection = FALSE`, AWOP/ANISWOP are unreachable and the extended IF is a no-op.
+
 Guarded on `zkLocalConnected[c]` because this calls `setHAGroupStatusToStoreAndForward()` which requires `isHealthy = true`.
 
 Source: `StoreAndForwardModeImpl.onEnter()` L54-64.
@@ -116,10 +118,10 @@ WriterInitToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] = "AIS"
+    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] = "AIS"
+    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
     /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
@@ -203,6 +205,8 @@ Models a single RS detecting standby HDFS unavailability via IOException and suc
 
 This is the primary AIS-to-ANIS coupling mechanism: the first RS to detect HDFS failure atomically transitions both its own mode and the cluster state.
 
+**AWOP/ANISWOP handling:** When AWOP or ANISWOP are reachable (`UseOfflinePeerDetection = TRUE`), HDFS failure during these states triggers `setHAGroupStatusToStoreAndForward()` which CAS-writes ANIS. `AWOP.allowedTransitions = {ANIS}` and `ANISWOP.allowedTransitions = {ANIS}`, so the transition succeeds. When `UseOfflinePeerDetection = FALSE`, AWOP/ANISWOP are unreachable and the extended IF is a no-op.
+
 Source: `SyncModeImpl.onFailure()` L61-74 -> `setHAGroupStatusToStoreAndForward()`.
 
 ```tla
@@ -213,10 +217,10 @@ WriterToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] = "AIS"
+    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] = "AIS"
+    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
     /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,

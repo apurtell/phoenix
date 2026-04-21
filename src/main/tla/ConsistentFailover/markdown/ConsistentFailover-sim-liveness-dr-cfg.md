@@ -65,6 +65,7 @@ CONSTANTS
     Cluster = {c1, c2}
     RS = {rs1, rs2}
     WaitTimeForSync = 2
+    UseOfflinePeerDetection = FALSE
 ```
 
 Same as the exhaustive safety model. 2 RS is the maximum feasible for `DegradationRecovery` liveness checking due to the per-RS fairness clause multiplication.
