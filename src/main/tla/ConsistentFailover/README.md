@@ -10,13 +10,14 @@ Literate programming versions of all specification files are available in the [`
 
 | Literate Version | Source | Description |
 |-----------------|--------|-------------|
-| [`ConsistentFailover.md`](markdown/ConsistentFailover.md) | [`ConsistentFailover.tla`](ConsistentFailover.tla) | Variables, Init, Next, Spec, invariants, action constraints, fairness, liveness properties |
+| [`ConsistentFailover.md`](markdown/ConsistentFailover.md) | [`ConsistentFailover.tla`](ConsistentFailover.tla) | Init, Next, Spec, invariants, action constraints, fairness, liveness properties |
+| [`SpecState.md`](markdown/SpecState.md) | [`SpecState.tla`](SpecState.tla) | Shared `VARIABLE` declarations (13 state functions) for the root and all sub-modules |
 
 ### Pure Definitions
 
 | Literate Version | Source | Description |
 |-----------------|--------|-------------|
-| [`Types.md`](markdown/Types.md) | [`Types.tla`](Types.tla) | Constants, 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, anti-flapping timer helpers |
+| [`Types.md`](markdown/Types.md) | [`Types.tla`](Types.tla) | Constants, 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, liveness state sets, writer/replay transition tables, anti-flapping timer helpers |
 
 ### Actor Modules
 
@@ -177,7 +178,9 @@ Liveness properties guarantee progress. Transient states eventually resolve to s
 ## Module Architecture
 
 ```
-ConsistentFailover.tla          (root orchestrator: variables, Init, Next, SafetySpec/Spec, invariants)
+ConsistentFailover.tla          (root orchestrator: Init, Next, SafetySpec/Spec, invariants)
+  |
+  +-- SpecState.tla             (shared VARIABLE declarations for root + all sub-modules)
   |
   +-- Types.tla                 (pure definitions: states, transitions, roles, helpers)
   |
@@ -191,14 +194,15 @@ ConsistentFailover.tla          (root orchestrator: variables, Init, Next, Safet
   +-- ZK.tla                    (ZK connection/session lifecycle)
 ```
 
-All sub-modules extend `Types.tla` for shared definitions. `ConsistentFailover.tla` composes them via `INSTANCE`.
+All sub-modules extend `SpecState.tla` and `Types.tla` for shared variables and definitions. `ConsistentFailover.tla` composes them via `INSTANCE`.
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| `Types.tla` | Pure definitions: 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, anti-flapping timer helpers. No variables. |
-| `ConsistentFailover.tla` | Root orchestrator. Declares 13 variables, defines Init/Next/SafetySpec/Spec, instances sub-modules, defines all invariants and action constraints. |
+| `SpecState.tla` | Declares the 13 specification variables once; root and sub-modules `EXTEND SpecState, Types`. |
+| `Types.tla` | Pure definitions: 14 HA group states, allowed transitions, cluster roles, writer modes, replay states, liveness state sets, writer/replay transition tables, anti-flapping timer helpers. No variables. |
+| `ConsistentFailover.tla` | Root orchestrator. Defines Init/Next/SafetySpec/Spec, instances sub-modules, defines all invariants and action constraints. |
 | `HAGroupStore.tla` | 11 action schemas. Peer-reactive transitions (`PeerReactToATS`, `PeerReactToANIS`, `PeerReactToAbTS`, `PeerReactToAIS`), local auto-completion (`AutoComplete`), STORE_AND_FORWARD heartbeat (`ANISHeartbeat`), ANIS recovery (`ANISToAIS`), ANISTS drain completion (`ANISTSToATS`), retry exhaustion (`ReactiveTransitionFail`), peer OFFLINE detection (`PeerReactToOFFLINE`, `PeerRecoverFromOFFLINE`). ATS->S transitions include writer lifecycle reset (live writers reset to INIT, OUT directory cleared; DEAD writers preserved for RSRestart). S-entry actions atomically set `replayState = SYNCED_RECOVERY` (recoveryListener fold); DS-entry sets `replayState = DEGRADED` (degradedListener fold). All peer-reactive actions guarded on `zkPeerConnected` and `zkPeerSessionAlive`; OFFLINE lifecycle peer-reactive actions additionally guarded on `UseOfflinePeerDetection`. Auto-completion, heartbeat, recovery, and drain completion guarded on `zkLocalConnected`. |
 | `Admin.tla` | `AdminStartFailover` (AIS->ATS or ANIS->ANISTS with peer-state guard), `AdminAbortFailover` (STA->AbTS, clears failoverPending), `AdminGoOffline` (S/DS->OFFLINE, gated on `UseOfflinePeerDetection`), and `AdminForceRecover` (OFFLINE->S, gated on `UseOfflinePeerDetection`). |
 | `Writer.tla` | Per-RS writer mode transitions: startup (`WriterInit`, `WriterInitToStoreFwd`, `WriterInitToStoreFwdFail`), degradation (`WriterToStoreFwd`, `WriterToStoreFwdFail`, `WriterSyncFwdToStoreFwd`, `WriterSyncFwdToStoreFwdFail`), recovery (`WriterSyncToSyncFwd`, `WriterStoreFwdToSyncFwd`), drain complete (`WriterSyncFwdToSync`). ZK-writing actions guarded on `zkLocalConnected`. |

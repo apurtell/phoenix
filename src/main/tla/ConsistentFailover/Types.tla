@@ -37,6 +37,12 @@
  *   ANIS self-transition   | HAGroupStoreRecord L101 (heartbeat support)
  *   WriterMode             | ReplicationLogGroup mode (SYNC/S&F/S&FWD)
  *   ReplayStateSet         | ReplicationLogDiscoveryReplay replay state
+ *   StableClusterStates,   | Named sets for liveness (~> consequents/antecedents)
+ *   FailoverCompletionAntecedentStates,
+ *   AbortCompletionAntecedentStates,
+ *   NotANISClusterStates   |
+ *   AllowedWriterTransitions | Per-RS writer mode pairs (action constraint)
+ *   AllowedReplayTransitions | Replay state machine pairs (action constraint)
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -121,6 +127,19 @@ HAGroupState ==
 \* Source: HAGroupState.getClusterRole() L73-97 -- these states
 \*         return ClusterRole.ACTIVE.
 ActiveStates == { "AIS", "ANIS", "AbTAIS", "AbTANIS", "AWOP", "ANISWOP" }
+
+\* Active states whose writer-degradation path couples to ANIS
+\* (AIS-like states with mutation-serving role and no in-flight
+\* failover/abort). The Writer actions WriterInitToStoreFwd and
+\* WriterToStoreFwd atomically transition clusterState to ANIS
+\* and reset antiFlapTimer when a writer degrades from any of
+\* these states.
+\*
+\* AIS is the base case. AWOP and ANISWOP are the OFFLINE-peer
+\* variants (gated on UseOfflinePeerDetection): both serve
+\* mutations while the peer is OFFLINE and are treated as
+\* AIS-equivalents for writer-degradation coupling.
+AISLikeStates == { "AIS", "AWOP", "ANISWOP" }
 
 \* States that map to the STANDBY cluster role.
 \* A cluster in any of these states is receiving and replaying
@@ -265,6 +284,59 @@ AllowedTransitions ==
       \*         (bypasses isTransitionAllowed; OFFLINE.allowed-
       \*         Transitions = {} in the implementation)
       <<"OFFLINE", "S">>
+    }
+
+---------------------------------------------------------------------------
+
+(* Named sets for liveness formulas (ConsistentFailover.tla). *)
+
+StableClusterStates ==
+    {"AIS", "ANIS", "S"}
+
+FailoverCompletionAntecedentStates ==
+    {"STA", "AbTAIS", "AbTANIS", "AbTS"}
+
+AbortCompletionAntecedentStates ==
+    {"AbTS", "AbTAIS", "AbTANIS"}
+
+NotANISClusterStates == HAGroupState \ {"ANIS"}
+
+---------------------------------------------------------------------------
+
+(* Allowed writer mode (per-RS) transition pairs. *)
+
+AllowedWriterTransitions ==
+    {
+      <<"INIT", "SYNC">>,
+      <<"INIT", "STORE_AND_FWD">>,
+      <<"INIT", "DEAD">>,
+      <<"SYNC", "STORE_AND_FWD">>,
+      <<"SYNC", "SYNC_AND_FWD">>,
+      <<"SYNC", "DEAD">>,
+      <<"SYNC", "INIT">>,
+      <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
+      <<"STORE_AND_FWD", "DEAD">>,
+      <<"STORE_AND_FWD", "INIT">>,
+      <<"SYNC_AND_FWD", "SYNC">>,
+      <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
+      <<"SYNC_AND_FWD", "DEAD">>,
+      <<"SYNC_AND_FWD", "INIT">>,
+      <<"DEAD", "INIT">>
+    }
+
+---------------------------------------------------------------------------
+
+(* Allowed replay state transition pairs. *)
+
+AllowedReplayTransitions ==
+    {
+      <<"NOT_INITIALIZED", "SYNCED_RECOVERY">>,
+      <<"NOT_INITIALIZED", "DEGRADED">>,
+      <<"SYNC", "DEGRADED">>,
+      <<"SYNC", "SYNCED_RECOVERY">>,
+      <<"DEGRADED", "SYNCED_RECOVERY">>,
+      <<"SYNCED_RECOVERY", "SYNC">>,
+      <<"SYNCED_RECOVERY", "DEGRADED">>
     }
 
 ---------------------------------------------------------------------------

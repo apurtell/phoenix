@@ -36,12 +36,7 @@ The `Tick` action is guarded so it only fires when at least one timer is still c
 In the implementation, the anti-flapping gate is implemented via timestamp comparison: `validateTransitionAndGetWaitTime()` reads the ZK znode's `mtime` and computes the elapsed time since the last ANIS write. If the elapsed time is less than `waitTimeForSyncModeInMs`, the transition is deferred. The TLA+ countdown timer abstracts this timestamp-based mechanism into discrete ticks.
 
 ```tla
-EXTENDS Types
-
-VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## Tick -- Advance All Countdown Timers

@@ -27,6 +27,17 @@ The liveness specifications encode the ZK Liveness Assumption via WF on `ZKPeerR
 
 This is folded into the reconnect action (rather than modeled as a separate action with a boolean flag) because the CONNECTION_RECONNECTED -> `PathChildrenCache` rebuild -> `handleStateChange()` -> `FailoverManagementListener` chain is synchronous on the same event thread, following the same listener-effect folding pattern used for `recoveryListener` and `degradedListener` in [HAGroupStore.md](HAGroupStore.md).
 
+Both `ZKPeerReconnect` and `ZKPeerSessionRecover` reuse the identical reconciliation fold (Curator rebuild is the same whether triggered by reconnection or session recovery), so it is extracted into a module-local operator:
+
+```tla
+ATSReconcileEffect(c) ==
+    IF clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"}
+    THEN clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
+    ELSE UNCHANGED clusterState
+```
+
+This keeps the two actions' reconciliation branches from drifting apart.
+
 **Race safety:** `ZKPeerReconnect` requires `zkPeerConnected[c] = FALSE`, so it cannot fire during normal operation when the connection is healthy. The normal transient (ATS, S) state during happy-path failover is handled by `PeerReactToATS` on the peer side.
 
 ### Retry Exhaustion
@@ -45,12 +56,7 @@ Retry exhaustion of the `FailoverManagementListener` (2-retry limit) is modeled 
 | `ZKLocalReconnect(c)` | `HAGroupStoreClient.createCacheListener()` L903-906 -- `pathChildrenCache` (LOCAL) CONNECTION_RECONNECTED sets `isHealthy = true` |
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## ZKPeerDisconnect -- Peer ZK Connection Drops

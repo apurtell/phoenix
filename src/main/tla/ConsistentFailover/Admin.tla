@@ -29,12 +29,7 @@
  *                            |   --state STANDBY (OFFLINE -> S)
  *                            |   (gated on UseOfflinePeerDetection)
  *)
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
@@ -86,10 +81,9 @@ AdminStartFailover(c) ==
           /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
        \/ /\ clusterState[c] = "ANIS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "ANISTS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -115,10 +109,8 @@ AdminAbortFailover(c) ==
     /\ clusterState[c] = "STA"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTS"]
     /\ failoverPending' = [failoverPending EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -145,10 +137,9 @@ AdminGoOffline(c) ==
     /\ UseOfflinePeerDetection = TRUE
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "OFFLINE"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -184,9 +175,8 @@ AdminForceRecover(c) ==
             [rs \in RS |-> "INIT"]]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
     /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
-    /\ UNCHANGED <<hdfsAvailable, antiFlapTimer,
-                   lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<envVars,
+                   antiFlapTimer, failoverPending, inProgressDirEmpty,
+                   lastRoundInSync, lastRoundProcessed>>
 
 ============================================================================

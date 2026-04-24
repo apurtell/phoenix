@@ -134,6 +134,8 @@ OFFLINE → {S} (via admin --force; implementation sink bypassed by PhoenixHAAdm
 UNKNOWN → {} (sink state)
 ```
 
+**Authoritative TLA+ source:** The machine-checkable HA-group transition relation is the set `AllowedTransitions` in [`src/main/tla/ConsistentFailover/Types.tla`](src/main/tla/ConsistentFailover/Types.tla) (see also [`markdown/Types.md`](src/main/tla/ConsistentFailover/markdown/Types.md)). The ASCII summary above is for human reading; if it ever disagrees with `Types.tla`, trust the TLA+ module.
+
 ### 3.2 Replication Writer State Machine (SM4, per-RegionServer)
 
 4 modes from `ReplicationLogGroup.java`:
@@ -381,24 +383,26 @@ This states that for every cluster, ZK sessions are eventually alive and connect
 
 **Pattern:**
 
-- **`Types.tla`** — `EXTENDS Naturals, FiniteSets, TLC`. Declares all `CONSTANTS`, `ASSUME` checks, state/type set definitions, valid transition tables, role mappings, and helper operators. No variables.
-- **Sub-modules** (e.g., `HAGroupStore.tla`, `Admin.tla`) — Each does `EXTENDS Types` and declares all shared variables as `VARIABLE` (same names as the root module). Defines actions grouped by actor or concern.
-- **Root module** (`ConsistentFailover.tla`) — `EXTENDS Types`, declares all variables, uses `INSTANCE` (no `WITH` clause — TLA+ matches identifiers by name) to import sub-modules as namespaced prefixes (e.g., `haGroupStore == INSTANCE HAGroupStore`). Defines `Init`, `Next` (composing `haGroupStore!Action(...)`, `admin!Action(...)`, etc.), `Fairness`, `Spec`, all invariants, and `Symmetry`.
+- **`Types.tla`** — `EXTENDS Naturals, FiniteSets, TLC`. Declares all `CONSTANTS`, `ASSUME` checks, state/type set definitions (including `AISLikeStates = {"AIS", "AWOP", "ANISWOP"}` for HDFS-failure-driven writer degradation), valid transition tables (including `AllowedWriterTransitions` / `AllowedReplayTransitions`), role mappings, liveness state-set helpers, and timer helpers. No variables.
+- **`SpecState.tla`** — Declares the 13 shared specification `VARIABLE`s once plus grouped shorthand tuples (`writerVars`, `clusterVars`, `replayVars`, `envVars`, and the aggregate `vars`) used in every action's `UNCHANGED` clause, plus shared ZK-health predicates `PeerZKHealthy(c)` and `LocalZKHealthy(c)`. The root and every sub-module use `EXTENDS SpecState, Types`.
+- **Sub-modules** (e.g., `HAGroupStore.tla`, `Admin.tla`) — Each does `EXTENDS SpecState, Types` and defines actions grouped by actor or concern.
+- **Root module** (`ConsistentFailover.tla`) — `EXTENDS SpecState, Types`, uses `INSTANCE` (no `WITH` clause — TLA+ matches identifiers by name) to import sub-modules as namespaced prefixes (e.g., `haGroupStore == INSTANCE HAGroupStore`). Defines `Init`, `Next` (composing `haGroupStore!Action(...)`, `admin!Action(...)`, etc.), `Fairness`, `Spec`, all invariants, and `Symmetry`.
 - **`.cfg` files** reference `Spec`, `SYMMETRY Symmetry`, `INVARIANT`, `ACTION_CONSTRAINT`, etc. from the root module.
 
 **Planned modules:**
 
 ```
-Types.tla                       (constants, state sets, transition table, role mapping, helpers)
-HAGroupStore.tla                (cluster state transitions: peer-reactive, auto-complete, ZK locking)
+SpecState.tla                   (shared VARIABLE declarations)
+Types.tla                       (constants, state sets, transition tables, role mapping, helpers)
+HAGroupStore.tla                (cluster state transitions: peer-reactive, auto-complete, ZK locking; shared helpers ResetToStandbyEntry, PeerReactWouldFire)
 Admin.tla                       (operator-initiated actions: start/abort failover)
 Writer.tla                      (replication writer mode state machine, per-RS)
 Reader.tla                      (replication reader/replay state machine)
 HDFS.tla                        (HDFS availability incident actions: HDFSDown, HDFSUp)
 Clock.tla                       (countdown timer: Tick — Lamport CHARME 2005)
 RS.tla                          (RegionServer lifecycle: RSCrash, RSRestart)
-ZK.tla                          (ZooKeeper coordination: ZKPeerDisconnect, ZKPeerReconnect, ZKPeerSessionExpiry, ZKPeerSessionRecover, ZKLocalDisconnect, ZKLocalReconnect)
-ConsistentFailover.tla          (root orchestrator: variables, Init, Next, Fairness, invariants, Symmetry)
+ZK.tla                          (ZooKeeper coordination: ZKPeerDisconnect, ZKPeerReconnect, ZKPeerSessionExpiry, ZKPeerSessionRecover, ZKLocalDisconnect, ZKLocalReconnect; shared ATSReconcileEffect fold)
+ConsistentFailover.tla          (root orchestrator: Init, Next, Fairness, invariants, Symmetry)
 ConsistentFailover.cfg          (primary TLC config — exhaustive BFS, symmetry reduction, every iteration)
 ConsistentFailover-sim.cfg      (simulation TLC config — no symmetry, deep random traces)
 ConsistentFailover-sim-liveness-ac.cfg  (liveness: AbortCompletion, simulation)
@@ -411,7 +415,8 @@ ConsistentFailover-sim-liveness-dr.cfg  (liveness: DegradationRecovery, simulati
 | Module | First Appears | Content at Introduction |
 |--------|---------------|------------------------|
 | `Types.tla` | Iteration 1 | `HAGroupState`, `ActiveStates`, `StandbyStates`, `AllowedTransitions` |
-| `ConsistentFailover.tla` | Iteration 1 | Variables, `Init`, `Next` (direct actions), invariants, `Symmetry` |
+| `SpecState.tla` | (refactor) | Centralized `VARIABLE` declarations, grouped tuples (`writerVars`/`clusterVars`/`replayVars`/`envVars`/`vars`), and shared ZK-health predicates (`PeerZKHealthy`, `LocalZKHealthy`) for root + sub-modules |
+| `ConsistentFailover.tla` | Iteration 1 | `Init`, `Next` (direct actions), invariants, `Symmetry` |
 | `HAGroupStore.tla` | Iteration 3 | `PeerReact`, `AutoComplete` actions |
 | `Admin.tla` | Iteration 3 | `AdminStartFailover`, `AdminAbortFailover` |
 | `Writer.tla` | Iteration 5 | Writer mode actions (`WriterInit`, `WriterToStoreFwd`, etc.) |
@@ -563,14 +568,16 @@ Use SANY for fast syntax checking during iterative development (Step 3 of the pe
 ```bash
 cd /Users/apurtell/src/phoenix
 JAVA17=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java
-$JAVA17 -cp tla2tools.jar tla2sany.SANY ConsistentFailover.tla
+$JAVA17 -cp tla2tools.jar tla2sany.SANY src/main/tla/ConsistentFailover/ConsistentFailover.tla
 ```
 
-This completes in under a second and catches all parse errors before running TLC.
+This completes in under a second and catches all parse errors before running TLC. If SANY reports that it cannot find `SpecState` (or other local modules), run it with working directory `src/main/tla/ConsistentFailover` and `ConsistentFailover.tla` as the argument so sibling modules resolve.
 
 ### Local: TLC Execution
 
 All TLC runs (exhaustive, simulation, liveness) are executed locally. Output is captured to a log file for later analysis.
+
+**Operational entry points:** Day-to-day commands, invariant tables, and change patterns for the spec live in [`src/main/tla/ConsistentFailover/README.md`](src/main/tla/ConsistentFailover/README.md) and [`src/main/tla/ConsistentFailover/DEVELOPING.md`](src/main/tla/ConsistentFailover/DEVELOPING.md). Run TLC from `src/main/tla/ConsistentFailover` (or pass the full path to the `.tla` file) so module resolution finds `SpecState.tla`, `Types.tla`, and the actor modules alongside `ConsistentFailover.tla`.
 
 **Exhaustive check** (with symmetry reduction, per-iteration — run to completion):
 
@@ -1159,7 +1166,7 @@ Real-cluster Test 5 (abort failover during inter-cluster partition) revealed tha
 
 **Root cause:** The `FailoverManagementListener`'s peer-reactive transitions are keyed on specific peer states (AIS, ANIS, ATS, AbTS). There is no entry for peer = STANDBY when local = ATS. In steady-state operation, (ATS, S) is a transient state — the peer will detect ATS via its own watcher and react. But when a partition hides the intermediate AbTS transition, the (ATS, S) state becomes permanent.
 
-**Spec status:** The spec correctly models this as a stuck state. No action in `HAGroupStore.tla` handles (ATS, S). The `FailoverCompletion` liveness property explicitly excluded ATS for this reason (lines 537-543 of `ConsistentFailover.tla`). Test 5 confirms this is not just a theoretical boundary but an operationally encountered failure mode.
+**Spec status:** The spec models this as a stuck state. No action in `HAGroupStore.tla` handles (ATS, S). The `FailoverCompletion` liveness property in `ConsistentFailover.tla` explicitly excludes `ATS` and `ANISTS` from its antecedent (see the comment block above the `FailoverCompletion` definition: resolution of those states depends on peer fairness not assumed in `SpecFC`). Test 5 confirms this is not just a theoretical boundary but an operationally encountered failure mode.
 
 **Modeled fix (Iteration 16):** Reconciliation is folded into `ZKPeerReconnect(c)` and `ZKPeerSessionRecover(c)` in `ZK.tla`: when local = ATS and peer ∈ {S, DS} at reconnect, the action atomically sets `clusterState[c]` to AbTAIS, which auto-completes to AIS via the existing `AutoComplete` path. No new variable (`peerCacheRebuilt`) or action (`ATSReconcileOnReconnect`) was needed — the originally proposed design was simplified by folding the reconciliation logic into the existing reconnect actions, using the same listener-effect folding pattern as `recoveryListener`/`degradedListener`. Race-safety: reconnect requires `zkPeerConnected[c] = FALSE`, so it cannot fire during the happy-path transient (ATS, S).
 

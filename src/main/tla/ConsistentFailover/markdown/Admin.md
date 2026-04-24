@@ -22,12 +22,7 @@ Unlike the peer-reactive transitions in [HAGroupStore.md](HAGroupStore.md), admi
 | `AdminForceRecover(c)` | `PhoenixHAAdminTool update --force --state STANDBY` (OFFLINE -> S; gated on `UseOfflinePeerDetection`) |
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## AdminStartFailover -- Initiate Failover

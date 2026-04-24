@@ -71,12 +71,45 @@
  * Failover completion (STA -> AIS) is modeled in Reader.tla
  * (TriggerFailover action), not in this module.
  *)
-EXTENDS Types
+EXTENDS SpecState, Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+---------------------------------------------------------------------------
+
+(*
+ * Standby entry from ATS (S-entry side effects).
+ *
+ * Shared by the ATS -> S branches of PeerReactToAIS and
+ * PeerReactToANIS. On standby entry from ATS, three side effects
+ * fire atomically:
+ *
+ *   1. Live writers reset to INIT (DEAD preserved). Models the
+ *      replication subsystem restart on standby entry: the entire
+ *      ReplicationLogGroup is destroyed, so any SYNC/SYNC_AND_FWD/
+ *      STORE_AND_FWD writers become INIT. DEAD writers (from
+ *      RSCrash or CAS failure) are preserved because crashed RSes
+ *      cannot process the state-change notification; they are
+ *      handled by RSRestart independently.
+ *
+ *   2. OUT directory cleared. The forwarder drains before ATS
+ *      auto-completes, so outDirEmpty is TRUE by the time the
+ *      peer's AIS triggers the local S entry.
+ *
+ *   3. recoveryListener (L147-157) fires synchronously on the
+ *      local PathChildrenCache event thread during S entry,
+ *      unconditionally setting replayState to SYNCED_RECOVERY.
+ *
+ * Not applied to AdminForceRecover (resets all writers to INIT
+ * with no DEAD-preservation) or AutoComplete AbTS->S (only sets
+ * replayState; no writer/OUT reset needed because AbTS was never
+ * active).
+ *)
+ResetToStandbyEntry(c) ==
+    /\ writerMode' = [writerMode EXCEPT ![c] =
+            [rs \in RS |-> IF writerMode[c][rs] = "DEAD"
+                           THEN "DEAD"
+                           ELSE "INIT"]]
+    /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
+    /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
 
 ---------------------------------------------------------------------------
 
@@ -106,16 +139,13 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
  * the sole producer of STA.
  *)
 PeerReactToATS(c) ==
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
+    /\ PeerZKHealthy(c)
     /\ clusterState[Peer(c)] = "ATS"
     /\ clusterState[c] \in {"S", "DS"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "STA"]
     /\ failoverPending' = [failoverPending EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -137,8 +167,7 @@ PeerReactToATS(c) ==
  * mutations blocked. No polling fallback.
  *)
 PeerReactToANIS(c) ==
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
+    /\ PeerZKHealthy(c)
     /\ clusterState[Peer(c)] = "ANIS"
     /\ \/ /\ clusterState[c] = "S"
           /\ clusterState' = [clusterState EXCEPT ![c] = "DS"]
@@ -146,25 +175,16 @@ PeerReactToANIS(c) ==
           \* synchronously on local PathChildrenCache thread during
           \* DS entry. Counter advance is handled by ReplayAdvance.
           /\ replayState' = [replayState EXCEPT ![c] = "DEGRADED"]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                         lastRoundInSync, lastRoundProcessed,
+          /\ UNCHANGED <<writerVars, envVars,
+                         outDirEmpty, antiFlapTimer,
                          failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+                         lastRoundInSync, lastRoundProcessed>>
        \/ /\ clusterState[c] = "ATS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-          /\ writerMode' = [writerMode EXCEPT ![c] =
-                  [rs \in RS |-> IF writerMode[c][rs] = "DEAD"
-                                  THEN "DEAD"
-                                  ELSE "INIT"]]
-          /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
-          \* recoveryListener: unconditional set(SYNCED_RECOVERY)
-          \* fires synchronously on local PathChildrenCache thread
-          \* during S entry.
-          /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
-          /\ UNCHANGED <<hdfsAvailable, antiFlapTimer,
-                         lastRoundInSync, lastRoundProcessed,
-                         failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+          /\ ResetToStandbyEntry(c)
+          /\ UNCHANGED <<envVars,
+                         antiFlapTimer, failoverPending, inProgressDirEmpty,
+                         lastRoundInSync, lastRoundProcessed>>
 
 ---------------------------------------------------------------------------
 
@@ -183,15 +203,13 @@ PeerReactToANIS(c) ==
  * Source: createPeerStateTransitions() L132.
  *)
 PeerReactToAbTS(c) ==
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
+    /\ PeerZKHealthy(c)
     /\ clusterState[Peer(c)] = "AbTS"
     /\ clusterState[c] = "ATS"
     /\ clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -220,33 +238,31 @@ PeerReactToAbTS(c) ==
  *   AbTANIS -> ANIS (L147)
  *)
 AutoComplete(c) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ \/ /\ clusterState[c] = "AbTS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
           \* recoveryListener: unconditional set(SYNCED_RECOVERY)
           \* fires synchronously on local PathChildrenCache thread
           \* during S entry.
           /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                         lastRoundInSync, lastRoundProcessed,
+          /\ UNCHANGED <<writerVars, envVars,
+                         outDirEmpty, antiFlapTimer,
                          failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+                         lastRoundInSync, lastRoundProcessed>>
        \/ /\ clusterState[c] = "AbTAIS"
           /\ clusterState' = [clusterState EXCEPT ![c] =
                  IF outDirEmpty[c] /\ \A rs \in RS : writerMode[c][rs] \in {"INIT", "SYNC"}
                  THEN "AIS"
                  ELSE "ANIS"]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                         replayState, lastRoundInSync, lastRoundProcessed,
-                         failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+          /\ UNCHANGED <<writerVars, replayVars, envVars,
+                         outDirEmpty, antiFlapTimer,
+                         failoverPending, inProgressDirEmpty>>
        \/ /\ clusterState[c] = "AbTANIS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
           /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
-                         replayState, lastRoundInSync, lastRoundProcessed,
-                         failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+          /\ UNCHANGED <<writerVars, replayVars, envVars,
+                         outDirEmpty,
+                         failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -288,34 +304,24 @@ AutoComplete(c) ==
  *         resolver for peer ACTIVE_IN_SYNC.
  *)
 PeerReactToAIS(c) ==
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
+    /\ PeerZKHealthy(c)
     /\ clusterState[Peer(c)] = "AIS"
     /\ \/ /\ clusterState[c] = "ATS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
-          /\ writerMode' = [writerMode EXCEPT ![c] =
-                  [rs \in RS |-> IF writerMode[c][rs] = "DEAD"
-                                  THEN "DEAD"
-                                  ELSE "INIT"]]
-          /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
-          \* recoveryListener: unconditional set(SYNCED_RECOVERY)
-          \* fires synchronously on local PathChildrenCache thread
-          \* during S entry.
-          /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
-          /\ UNCHANGED <<hdfsAvailable, antiFlapTimer,
-                         lastRoundInSync, lastRoundProcessed,
-                         failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+          /\ ResetToStandbyEntry(c)
+          /\ UNCHANGED <<envVars,
+                         antiFlapTimer, failoverPending, inProgressDirEmpty,
+                         lastRoundInSync, lastRoundProcessed>>
        \/ /\ clusterState[c] = "DS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "S"]
           \* recoveryListener: unconditional set(SYNCED_RECOVERY)
           \* fires synchronously on local PathChildrenCache thread
           \* during S entry.
           /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
-          /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                         lastRoundInSync, lastRoundProcessed,
+          /\ UNCHANGED <<writerVars, envVars,
+                         outDirEmpty, antiFlapTimer,
                          failoverPending, inProgressDirEmpty,
-                         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+                         lastRoundInSync, lastRoundProcessed>>
 
 ---------------------------------------------------------------------------
 
@@ -340,14 +346,13 @@ PeerReactToAIS(c) ==
  *         L71-87; HAGroupStoreRecord.java L101 (ANIS self-transition).
  *)
 ANISHeartbeat(c) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] = "ANIS"
     /\ \E rs \in RS : writerMode[c][rs] = "STORE_AND_FWD"
     /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   clusterState, outDirEmpty,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -374,7 +379,7 @@ ANISHeartbeat(c) ==
  * Source: setHAGroupStatusToSync() L341-355, after forwarder drain.
  *)
 ANISToAIS(c) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] = "ANIS"
     /\ AntiFlapGateOpen(antiFlapTimer[c])
     /\ \A rs \in RS : writerMode[c][rs] \in {"SYNC", "SYNC_AND_FWD"}
@@ -384,10 +389,9 @@ ANISToAIS(c) ==
             [rs \in RS |-> IF writerMode[c][rs] = "SYNC_AND_FWD"
                            THEN "SYNC"
                            ELSE writerMode[c][rs]]]
-    /\ UNCHANGED <<outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<replayVars, envVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -425,15 +429,14 @@ ANISToAIS(c) ==
  *         L1027-1046 (anti-flapping gate).
  *)
 ANISTSToATS(c) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] = "ANISTS"
     /\ AntiFlapGateOpen(antiFlapTimer[c])
     /\ outDirEmpty[c]
     /\ clusterState' = [clusterState EXCEPT ![c] = "ATS"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -468,17 +471,15 @@ ANISTSToATS(c) ==
  *)
 PeerReactToOFFLINE(c) ==
     /\ UseOfflinePeerDetection = TRUE
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
+    /\ PeerZKHealthy(c)
     /\ clusterState[Peer(c)] = "OFFLINE"
     /\ \/ /\ clusterState[c] = "AIS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "AWOP"]
        \/ /\ clusterState[c] = "ANIS"
           /\ clusterState' = [clusterState EXCEPT ![c] = "ANISWOP"]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -509,16 +510,13 @@ PeerReactToOFFLINE(c) ==
  *)
 PeerRecoverFromOFFLINE(c) ==
     /\ UseOfflinePeerDetection = TRUE
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
+    /\ PeerZKHealthy(c)
     /\ clusterState[Peer(c)] # "OFFLINE"
     /\ clusterState[c] \in {"AWOP", "ANISWOP"}
     /\ clusterState' = [clusterState EXCEPT ![c] = "ANIS"]
     /\ antiFlapTimer' = [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -552,28 +550,34 @@ PeerRecoverFromOFFLINE(c) ==
  *         (HAGroupStoreManager.java L653-704) --
  *         2-retry exhaustion, method returns silently.
  *)
+
+\* Guard disjunction shared by ReactiveTransitionFail. Mirrors the
+\* peer-state/local-state enabling conditions of PeerReactToATS,
+\* PeerReactToANIS, PeerReactToAbTS, PeerReactToAIS,
+\* PeerReactToOFFLINE, and PeerRecoverFromOFFLINE so the retry-
+\* exhaustion action cannot drift from the reactive transitions
+\* it shadows. Intentionally does NOT include the PeerZKHealthy(c)
+\* guard: that is applied at the call site uniformly for all
+\* PeerReact* actions and ReactiveTransitionFail itself.
+PeerReactWouldFire(c) ==
+    \/ /\ clusterState[Peer(c)] = "ATS"
+       /\ clusterState[c] \in {"S", "DS"}
+    \/ /\ clusterState[Peer(c)] = "ANIS"
+       /\ clusterState[c] \in {"S", "ATS"}
+    \/ /\ clusterState[Peer(c)] = "AbTS"
+       /\ clusterState[c] = "ATS"
+    \/ /\ clusterState[Peer(c)] = "AIS"
+       /\ clusterState[c] \in {"ATS", "DS"}
+    \/ /\ UseOfflinePeerDetection = TRUE
+       /\ clusterState[Peer(c)] = "OFFLINE"
+       /\ clusterState[c] \in {"AIS", "ANIS"}
+    \/ /\ UseOfflinePeerDetection = TRUE
+       /\ clusterState[Peer(c)] # "OFFLINE"
+       /\ clusterState[c] \in {"AWOP", "ANISWOP"}
+
 ReactiveTransitionFail(c) ==
-    /\ zkPeerConnected[c] = TRUE
-    /\ zkPeerSessionAlive[c] = TRUE
-    /\ \/ /\ clusterState[Peer(c)] = "ATS"
-          /\ clusterState[c] \in {"S", "DS"}
-       \/ /\ clusterState[Peer(c)] = "ANIS"
-          /\ clusterState[c] \in {"S", "ATS"}
-       \/ /\ clusterState[Peer(c)] = "AbTS"
-          /\ clusterState[c] = "ATS"
-       \/ /\ clusterState[Peer(c)] = "AIS"
-          /\ clusterState[c] \in {"ATS", "DS"}
-       \* Iteration 18 (proactive): mirrors PeerReactToOFFLINE
-       \/ /\ UseOfflinePeerDetection = TRUE
-          /\ clusterState[Peer(c)] = "OFFLINE"
-          /\ clusterState[c] \in {"AIS", "ANIS"}
-       \* Iteration 18 (proactive): mirrors PeerRecoverFromOFFLINE
-       \/ /\ UseOfflinePeerDetection = TRUE
-          /\ clusterState[Peer(c)] # "OFFLINE"
-          /\ clusterState[c] \in {"AWOP", "ANISWOP"}
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ PeerZKHealthy(c)
+    /\ PeerReactWouldFire(c)
+    /\ UNCHANGED vars
 
 ============================================================================

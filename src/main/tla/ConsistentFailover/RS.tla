@@ -35,12 +35,7 @@
  *                                   |   -> setMode(SYNC) or
  *                                   |   setMode(STORE_AND_FORWARD)
  *)
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
@@ -60,10 +55,7 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
 RSRestart(c, rs) ==
     /\ writerMode[c][rs] = "DEAD"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "INIT"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -84,10 +76,7 @@ RSRestart(c, rs) ==
 RSCrash(c, rs) ==
     /\ writerMode[c][rs] /= "DEAD"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -123,9 +112,6 @@ RSAbortOnLocalHDFSFailure(c, rs) ==
     /\ writerMode[c][rs] = "STORE_AND_FWD"
     /\ hdfsAvailable[c] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ============================================================================

@@ -4,13 +4,13 @@
 
 ## Overview
 
-`Types` is a pure-definition module that provides all constants, type sets, state definitions, valid transition tables, role mappings, feature gates (`UseOfflinePeerDetection`), and helper operators used throughout the Phoenix Consistent Failover specification. It declares no variables; every definition is stateless. All sub-modules and the root orchestrator import these definitions via `EXTENDS Types`.
+`Types` is a pure-definition module that provides all constants, type sets, state definitions, valid transition tables, role mappings, feature gates (`UseOfflinePeerDetection`), and helper operators used throughout the Phoenix Consistent Failover specification. It declares no variables; every definition is stateless. The root orchestrator and all sub-modules import these definitions via `EXTENDS SpecState, Types` (variables live in [`SpecState.tla`](../SpecState.tla)).
 
 This module establishes the vocabulary of the specification: what states exist, which transitions between them are legal, how states map to the cluster roles visible to clients, and how the anti-flapping countdown timer operates. By centralizing these definitions, the specification ensures that every module shares a single source of truth for the protocol's state space.
 
 ### Why a Separate Module?
 
-Factoring pure definitions into their own module is a TLA+ best practice for specifications of this size. It avoids duplication, makes the allowed-transition table auditable in isolation, and allows each sub-module to `EXTENDS Types` without pulling in variable declarations or action definitions from unrelated modules.
+Factoring pure definitions into their own module is a TLA+ best practice for specifications of this size. It avoids duplication, makes the allowed-transition table auditable in isolation, and allows each sub-module to `EXTENDS SpecState, Types` without pulling in action definitions from unrelated modules.
 
 ## Implementation Traceability
 
@@ -24,6 +24,9 @@ Factoring pure definitions into their own module is a TLA+ best practice for spe
 | `UseOfflinePeerDetection` | Feature gate for AWOP/ANISWOP modeling |
 | `WriterMode` (5 modes) | `ReplicationLogGroup` mode classes (SyncModeImpl, StoreAndForwardModeImpl, SyncAndForwardModeImpl) |
 | `ReplayStateSet` (4 states) | `ReplicationLogDiscoveryReplay` replay state (L550-555) |
+| `StableClusterStates`, `FailoverCompletionAntecedentStates`, `AbortCompletionAntecedentStates`, `NotANISClusterStates` | Named sets for liveness (`~>`) formulas in the root module |
+| `AllowedWriterTransitions` | Per-RS writer mode pairs; `WriterTransitionValid` in the root module |
+| `AllowedReplayTransitions` | Replay state pairs; `ReplayTransitionValid` in the root module |
 
 ## Standard Module Extensions
 
@@ -123,6 +126,12 @@ ActiveStates == { "AIS", "ANIS", "AbTAIS", "AbTANIS", "AWOP", "ANISWOP" }
 ```
 
 A cluster in any `ActiveStates` member is considered active and serves mutations. The `MutualExclusion` invariant requires that at most one cluster be in an `ActiveStates` member at any time. Source: `HAGroupState.getClusterRole()` L73-97 -- these states return `ClusterRole.ACTIVE`.
+
+```tla
+AISLikeStates == { "AIS", "AWOP", "ANISWOP" }
+```
+
+`AISLikeStates` is the subset of `ActiveStates` whose writer-degradation path couples to `ANIS`. The [`Writer.tla`](../Writer.tla) actions `WriterInitToStoreFwd` and `WriterToStoreFwd` atomically transition `clusterState` to `ANIS` and reset `antiFlapTimer` when a writer degrades from any of these states. `AIS` is the base case; `AWOP` and `ANISWOP` are the OFFLINE-peer variants (gated on `UseOfflinePeerDetection`) -- both serve mutations while the peer is OFFLINE and are treated as `AIS`-equivalents for writer-degradation coupling.
 
 ```tla
 StandbyStates == { "S", "DS", "AbTS" }
@@ -269,6 +278,63 @@ stateDiagram-v2
 
     OFFLINE --> S : Admin force recover
 ```
+
+## Liveness State Sets
+
+These named subsets of `HAGroupState` keep the root module's `~>` formulas readable and aligned with a single definition.
+
+```tla
+StableClusterStates ==
+    {"AIS", "ANIS", "S"}
+
+FailoverCompletionAntecedentStates ==
+    {"STA", "AbTAIS", "AbTANIS", "AbTS"}
+
+AbortCompletionAntecedentStates ==
+    {"AbTS", "AbTAIS", "AbTANIS"}
+
+NotANISClusterStates == HAGroupState \ {"ANIS"}
+```
+
+`StableClusterStates` is the consequent set for `FailoverCompletion` and `AbortCompletion`. `NotANISClusterStates` is equivalent to `clusterState[c] # "ANIS"` whenever `clusterState[c] \in HAGroupState`.
+
+## Allowed Writer and Replay Transitions
+
+The HA-group `AllowedTransitions` table lives in the previous section. The per-RS writer mode table and the replay state machine table are also centralized here so all transition pair sets live in one module.
+
+```tla
+AllowedWriterTransitions ==
+    {
+      <<"INIT", "SYNC">>,
+      <<"INIT", "STORE_AND_FWD">>,
+      <<"INIT", "DEAD">>,
+      <<"SYNC", "STORE_AND_FWD">>,
+      <<"SYNC", "SYNC_AND_FWD">>,
+      <<"SYNC", "DEAD">>,
+      <<"SYNC", "INIT">>,
+      <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
+      <<"STORE_AND_FWD", "DEAD">>,
+      <<"STORE_AND_FWD", "INIT">>,
+      <<"SYNC_AND_FWD", "SYNC">>,
+      <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
+      <<"SYNC_AND_FWD", "DEAD">>,
+      <<"SYNC_AND_FWD", "INIT">>,
+      <<"DEAD", "INIT">>
+    }
+
+AllowedReplayTransitions ==
+    {
+      <<"NOT_INITIALIZED", "SYNCED_RECOVERY">>,
+      <<"NOT_INITIALIZED", "DEGRADED">>,
+      <<"SYNC", "DEGRADED">>,
+      <<"SYNC", "SYNCED_RECOVERY">>,
+      <<"DEGRADED", "SYNCED_RECOVERY">>,
+      <<"SYNCED_RECOVERY", "SYNC">>,
+      <<"SYNCED_RECOVERY", "DEGRADED">>
+    }
+```
+
+Sources: `ReplicationLogGroup` mode transitions and standby lifecycle resets; `ReplicationLogDiscoveryReplay` listeners, CAS, and replay loop.
 
 ## Cluster Role Definitions
 

@@ -2,7 +2,7 @@
 (*
  * TLA+ specification of the Phoenix Consistent Failover protocol.
  *
- * Root orchestrator module: declares variables, defines Init, Next,
+ * Root orchestrator module: EXTENDS SpecState (variables), defines Init, Next,
  * Spec, invariants, and action constraints. Composes actor-driven
  * actions from sub-modules via INSTANCE.
  *
@@ -129,129 +129,24 @@
  *   Set FALSE: TriggerFailover (Reader.tla)
  *   Set FALSE: AdminAbortFailover (Admin.tla)
  *)
-EXTENDS Types
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
-(* Variables *)
+\* The variable-group tuples (writerVars, clusterVars, replayVars,
+\* envVars) and the full `vars` tuple used in temporal formulas
+\* ([][Next]_vars, WF_vars, SF_vars) are defined in SpecState.tla
+\* so they are shared by all sub-modules via EXTENDS.
 
-\* clusterState[c] is the current HA group state of cluster c.
-\* Each cluster maintains its state as a ZK znode, updated via
-\* setData().withVersion() (optimistic locking).
-\*
-\* Source: HAGroupStoreRecord per-cluster ZK znode at
-\*         phoenix/consistentHA/<group>
-VARIABLE clusterState
-
-\* writerMode[c][rs] is the current replication writer mode of
-\* region server rs on cluster c.
-\*
-\* Source: ReplicationLogGroup per-RS mode (SyncModeImpl,
-\*         StoreAndForwardModeImpl, SyncAndForwardModeImpl)
-VARIABLE writerMode
-
-\* outDirEmpty[c] is TRUE when the OUT directory on cluster c
-\* contains no buffered replication log files (all forwarded or
-\* never written). FALSE when writes are accumulating locally.
-\*
-\* Source: ReplicationLogDiscoveryForwarder.processNoMoreRoundsLeft()
-\*         L155-184 checks getInProgressFiles().isEmpty() &&
-\*         getNewFilesForRound(nextRound).isEmpty()
-VARIABLE outDirEmpty
-
-\* hdfsAvailable[c] is TRUE when cluster c's HDFS (NameNode) is
-\* accessible to its peer cluster's writers. FALSE after a NameNode
-\* crash. Not explicitly tracked in the implementation -- detected
-\* reactively via IOException from HDFS write operations.
-VARIABLE hdfsAvailable
-
-\* antiFlapTimer[c] is the per-cluster anti-flapping countdown timer.
-\* Counts down from WaitTimeForSync toward 0. The ANIS -> AIS
-\* transition is blocked while the timer is positive (gate closed).
-\* The S&F heartbeat resets the timer to WaitTimeForSync; the Tick
-\* action decrements it. See Types.tla for helper operator docs.
-\*
-\* Modeled via Lamport's countdown timer pattern from "Real Time
-\* is Really Simple" (CHARME 2005).
-\*
-\* Source: HAGroupStoreClient.validateTransitionAndGetWaitTime()
-\*         L1027-1046
-VARIABLE antiFlapTimer
-
-\* replayState[c] is the current replication replay state of
-\* cluster c's reader. Tracks the standby-side replay progress
-\* through four states: NOT_INITIALIZED, SYNC, DEGRADED,
-\* SYNCED_RECOVERY.
-\*
-\* Source: ReplicationLogDiscoveryReplay.java L550-555
-VARIABLE replayState
-
-\* lastRoundInSync[c] is the last replication round number that
-\* was processed while the reader was in SYNC state. Frozen during
-\* DEGRADED periods; used as the rewind target during recovery.
-\*
-\* Source: ReplicationLogDiscoveryReplay.java L336-343 (advance),
-\*         L389 (rewind target via getFirstRoundToProcess())
-VARIABLE lastRoundInSync
-
-\* lastRoundProcessed[c] is the last replication round number
-\* processed by the reader, regardless of replay state. Advances
-\* in both SYNC and DEGRADED states; rewinds to lastRoundInSync
-\* during SYNCED_RECOVERY.
-\*
-\* Source: ReplicationLogDiscoveryReplay.java L336-351
-VARIABLE lastRoundProcessed
-
-\* failoverPending[c] is TRUE when the standby cluster has received
-\* a STANDBY_TO_ACTIVE notification and is waiting for replay to
-\* complete before triggering failover. Set by the STA listener;
-\* cleared by ABORT_TO_STANDBY listener.
-\*
-\* Source: ReplicationLogDiscoveryReplay.java L159-171 (set true),
-\*         L173-185 (set false)
-VARIABLE failoverPending
-
-\* inProgressDirEmpty[c] is TRUE when the IN-PROGRESS directory on
-\* cluster c contains no partially-processed replication log files.
-\* Required for failover trigger completeness.
-\*
-\* Source: ReplicationLogDiscoveryReplay.shouldTriggerFailover()
-\*         L500-533
-VARIABLE inProgressDirEmpty
-
-\* zkPeerConnected[c] is TRUE when cluster c's peerPathChildrenCache
-\* has a live TCP connection to the peer ZK quorum. When FALSE, no
-\* watcher notifications from the peer are delivered, suppressing
-\* all PeerReact* transitions.
-\*
-\* Source: HAGroupStoreClient.createCacheListener() L894-906
-\*         (peerPathChildrenCache CONNECTION_LOST/CONNECTION_RECONNECTED)
-VARIABLE zkPeerConnected
-
-\* zkPeerSessionAlive[c] is TRUE when cluster c's peer ZK session is
-\* alive (not expired). Session expiry permanently loses all watches
-\* until a new session is established. Session expiry implies
-\* disconnection (zkPeerSessionAlive = FALSE => zkPeerConnected = FALSE).
-\*
-\* Source: Curator internal session management; no explicit Phoenix
-\*         SESSION_EXPIRED handler
-VARIABLE zkPeerSessionAlive
-
-\* zkLocalConnected[c] is TRUE when cluster c's pathChildrenCache
-\* (local) has a live connection to the local ZK quorum. When FALSE,
-\* isHealthy = false, blocking all setHAGroupStatusIfNeeded() calls
-\* and suppressing auto-completion, heartbeat, writer ZK writes, and
-\* failover trigger.
-\*
-\* Source: HAGroupStoreClient.createCacheListener() L894-906
-\*         (pathChildrenCache CONNECTION_LOST/CONNECTION_RECONNECTED)
-VARIABLE zkLocalConnected
-
-\* Tuple of all variables for use in temporal formulas.
-vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-          replayState, lastRoundInSync, lastRoundProcessed,
-          failoverPending, inProgressDirEmpty,
-          zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+(*
+ * Replay-completeness guards for STA -> AIS (TriggerFailover /
+ * shouldTriggerFailover). Shared by FailoverTriggerCorrectness and
+ * NoDataLoss so the two action constraints cannot drift apart.
+ *)
+STAtoAISTriggerReplayGuards(c) ==
+    /\ failoverPending[c]
+    /\ inProgressDirEmpty[c]
+    /\ replayState[c] = "SYNC"
 
 ---------------------------------------------------------------------------
 
@@ -657,8 +552,8 @@ SpecDR == Init /\ [][Next]_vars /\ FairnessDR
  *)
 FailoverCompletion ==
     \A c \in Cluster :
-        clusterState[c] \in {"STA", "AbTAIS", "AbTANIS", "AbTS"}
-        ~> clusterState[c] \in {"AIS", "ANIS", "S"}
+        clusterState[c] \in FailoverCompletionAntecedentStates
+        ~> clusterState[c] \in StableClusterStates
 
 ---------------------------------------------------------------------------
 
@@ -679,7 +574,7 @@ FailoverCompletion ==
 DegradationRecovery ==
     \A c \in Cluster :
         (clusterState[c] = "ANIS" /\ hdfsAvailable[Peer(c)])
-        ~> clusterState[c] # "ANIS"
+        ~> clusterState[c] \in NotANISClusterStates
 
 ---------------------------------------------------------------------------
 
@@ -698,8 +593,8 @@ DegradationRecovery ==
  *)
 AbortCompletion ==
     \A c \in Cluster :
-        clusterState[c] \in {"AbTS", "AbTAIS", "AbTANIS"}
-        ~> clusterState[c] \in {"AIS", "ANIS", "S"}
+        clusterState[c] \in AbortCompletionAntecedentStates
+        ~> clusterState[c] \in StableClusterStates
 
 ---------------------------------------------------------------------------
 
@@ -827,26 +722,9 @@ TransitionValid ==
  *
  * Source: ReplicationLogGroup.java mode transitions;
  *         FailoverManagementListener replication subsystem restart.
+ *
+ * AllowedWriterTransitions is defined in Types.tla.
  *)
-AllowedWriterTransitions ==
-    {
-      <<"INIT", "SYNC">>,
-      <<"INIT", "STORE_AND_FWD">>,
-      <<"INIT", "DEAD">>,
-      <<"SYNC", "STORE_AND_FWD">>,
-      <<"SYNC", "SYNC_AND_FWD">>,
-      <<"SYNC", "DEAD">>,
-      <<"SYNC", "INIT">>,
-      <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
-      <<"STORE_AND_FWD", "DEAD">>,
-      <<"STORE_AND_FWD", "INIT">>,
-      <<"SYNC_AND_FWD", "SYNC">>,
-      <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
-      <<"SYNC_AND_FWD", "DEAD">>,
-      <<"SYNC_AND_FWD", "INIT">>,
-      <<"DEAD", "INIT">>
-    }
-
 WriterTransitionValid ==
     \A c \in Cluster :
         \A r \in RS :
@@ -928,9 +806,7 @@ ANISTStoATSPrecondition ==
 FailoverTriggerCorrectness ==
     \A c \in Cluster :
         clusterState[c] = "STA" /\ clusterState'[c] = "AIS"
-        => /\ failoverPending[c]
-           /\ inProgressDirEmpty[c]
-           /\ replayState[c] = "SYNC"
+        => STAtoAISTriggerReplayGuards(c)
 
 ---------------------------------------------------------------------------
 
@@ -944,9 +820,7 @@ FailoverTriggerCorrectness ==
 NoDataLoss ==
     \A c \in Cluster :
         clusterState[c] = "STA" /\ clusterState'[c] = "AIS"
-        => /\ failoverPending[c]
-           /\ inProgressDirEmpty[c]
-           /\ replayState[c] = "SYNC"
+        => STAtoAISTriggerReplayGuards(c)
 
 ---------------------------------------------------------------------------
 
@@ -985,18 +859,9 @@ ReplayRewindCorrectness ==
  *
  * Source: ReplicationLogDiscoveryReplay.java L131-206 (listeners),
  *         L323-333 (CAS), L336-351 (replay loop)
+ *
+ * AllowedReplayTransitions is defined in Types.tla.
  *)
-AllowedReplayTransitions ==
-    {
-      <<"NOT_INITIALIZED", "SYNCED_RECOVERY">>,
-      <<"NOT_INITIALIZED", "DEGRADED">>,
-      <<"SYNC", "DEGRADED">>,
-      <<"SYNC", "SYNCED_RECOVERY">>,
-      <<"DEGRADED", "SYNCED_RECOVERY">>,
-      <<"SYNCED_RECOVERY", "SYNC">>,
-      <<"SYNCED_RECOVERY", "DEGRADED">>
-    }
-
 ReplayTransitionValid ==
     \A c \in Cluster :
         replayState'[c] # replayState[c] =>

@@ -51,9 +51,45 @@ The `recoveryListener` (L147-157) and `degradedListener` (L136-145) from `Replic
 
 This folding is sound because the listener fires deterministically and synchronously on every state entry -- there is no observable intermediate state between the cluster state change and the replay state change.
 
+The ATS->S side-effect bundle (live writers reset to INIT preserving DEAD, `outDirEmpty` cleared, `replayState` set to SYNCED_RECOVERY) is shared by `PeerReactToAIS` (ATS->S) and `PeerReactToANIS` (ATS->S) and extracted into a module-local operator:
+
+```tla
+ResetToStandbyEntry(c) ==
+    /\ writerMode' = [writerMode EXCEPT ![c] =
+            [rs \in RS |-> IF writerMode[c][rs] = "DEAD"
+                           THEN "DEAD"
+                           ELSE "INIT"]]
+    /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
+    /\ replayState' = [replayState EXCEPT ![c] = "SYNCED_RECOVERY"]
+```
+
+`ResetToStandbyEntry` is intentionally NOT applied to `AdminForceRecover` (which resets all writers to INIT with no DEAD-preservation) or to `AutoComplete` AbTS->S (which only sets `replayState`; no writer/OUT reset is needed because AbTS was never active).
+
 ### Retry Exhaustion
 
 The `FailoverManagementListener` retries each reactive transition exactly 2 times (`HAGroupStoreManager.java` L653-704). After exhaustion, the method returns silently. This is modeled by the `ReactiveTransitionFail(c)` action, which non-deterministically "consumes" a pending peer-reactive transition without updating `clusterState`.
+
+The retry-exhaustion action shadows every `PeerReact*` action's enabling condition. To keep the two from drifting apart, the peer-state/local-state disjunction is factored out into a module-local predicate `PeerReactWouldFire(c)`:
+
+```tla
+PeerReactWouldFire(c) ==
+    \/ /\ clusterState[Peer(c)] = "ATS"
+       /\ clusterState[c] \in {"S", "DS"}
+    \/ /\ clusterState[Peer(c)] = "ANIS"
+       /\ clusterState[c] \in {"S", "ATS"}
+    \/ /\ clusterState[Peer(c)] = "AbTS"
+       /\ clusterState[c] = "ATS"
+    \/ /\ clusterState[Peer(c)] = "AIS"
+       /\ clusterState[c] \in {"ATS", "DS"}
+    \/ /\ UseOfflinePeerDetection = TRUE
+       /\ clusterState[Peer(c)] = "OFFLINE"
+       /\ clusterState[c] \in {"AIS", "ANIS"}
+    \/ /\ UseOfflinePeerDetection = TRUE
+       /\ clusterState[Peer(c)] # "OFFLINE"
+       /\ clusterState[c] \in {"AWOP", "ANISWOP"}
+```
+
+`ReactiveTransitionFail(c)` combines `PeerZKHealthy(c)` (the ZK connectivity guard, defined in [`SpecState.tla`](../SpecState.tla)) with `PeerReactWouldFire(c)`. The `PeerReact*` action bodies keep their inline peer-state/local-state guards so each action's enabling condition remains readable at the definition site.
 
 ## Implementation Traceability
 
@@ -72,12 +108,7 @@ The `FailoverManagementListener` retries each reactive transition exactly 2 time
 Failover completion (STA -> AIS) is modeled in [Reader.md](Reader.md) (`TriggerFailover` action), not in this module.
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## PeerReactToATS -- Standby Detects Peer ATS

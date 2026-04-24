@@ -50,12 +50,7 @@ The `SYNCED_RECOVERY -> SYNC` transition uses `compareAndSet(SYNCED_RECOVERY, SY
 | `TriggerFailover(c)` | `shouldTriggerFailover()` L500-533 (guards); `triggerFailover()` L535-548 (effect); `setHAGroupStatusToSync()` L341-355 (ZK write) |
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## ReplayAdvance -- Round Processing in SYNC or DEGRADED
@@ -173,4 +168,4 @@ TriggerFailover(c) ==
 
 ### Relationship to Safety Properties
 
-The `FailoverTriggerCorrectness` and `NoDataLoss` action constraints in [ConsistentFailover.md](ConsistentFailover.md) cross-check these guards: they verify that every STA -> AIS transition in the model satisfies `failoverPending`, `inProgressDirEmpty`, and `replayState = "SYNC"`. If `TriggerFailover` were the only action producing STA -> AIS transitions (which it is), these constraints are redundant with the action's guards -- but they serve as independent safety net checks that would catch any accidental removal of guards during specification evolution.
+The `FailoverTriggerCorrectness` and `NoDataLoss` action constraints in [ConsistentFailover.md](ConsistentFailover.md) cross-check these guards via the shared operator `STAtoAISTriggerReplayGuards` (so the two constraints stay textually aligned). They verify that every STA -> AIS transition in the model satisfies `failoverPending`, `inProgressDirEmpty`, and `replayState = "SYNC"`. If `TriggerFailover` were the only action producing STA -> AIS transitions (which it is), these constraints are redundant with the action's guards -- but they serve as independent safety net checks that would catch any accidental removal of guards during specification evolution.

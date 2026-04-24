@@ -58,12 +58,7 @@
  *   CanDegradeToStoreFwd(c, rs)      | Guard predicate: RS is in a mode
  *                                    |   that writes to standby HDFS
  *)
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
@@ -96,10 +91,7 @@ WriterInit(c, rs) ==
     /\ clusterState[c] \in ActiveStates
     /\ writerMode[c][rs] = "INIT"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -120,21 +112,20 @@ WriterInit(c, rs) ==
  * Source: StoreAndForwardModeImpl.onEnter() L54-64
  *)
 WriterInitToStoreFwd(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates
     /\ writerMode[c][rs] = "INIT"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ clusterState' = IF clusterState[c] \in AISLikeStates
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ antiFlapTimer' = IF clusterState[c] \in AISLikeStates
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
-    /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<replayVars, envVars,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -158,10 +149,7 @@ WriterSyncToSyncFwd(c, rs) ==
     /\ clusterState[c] = "ANIS"
     /\ writerMode[c][rs] = "SYNC"
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC_AND_FWD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -185,10 +173,7 @@ WriterStoreFwdToSyncFwd(c, rs) ==
     /\ writerMode[c][rs] = "STORE_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = TRUE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC_AND_FWD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -226,17 +211,16 @@ WriterStoreFwdToSyncFwd(c, rs) ==
  *         setHAGroupStatusToSync() L171
  *)
 WriterSyncFwdToSync(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = TRUE
     /\ \A rs2 \in RS : writerMode[c][rs2] \notin {"STORE_AND_FWD"}
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "SYNC"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<replayVars, envVars,
+                   clusterState, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -267,21 +251,20 @@ WriterSyncFwdToSync(c, rs) ==
  *         setHAGroupStatusToStoreAndForward()
  *)
 WriterToStoreFwd(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates
     /\ writerMode[c][rs] = "SYNC"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ clusterState' = IF clusterState[c] \in AISLikeStates
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ antiFlapTimer' = IF clusterState[c] \in AISLikeStates
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
-    /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<replayVars, envVars,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -303,16 +286,15 @@ WriterToStoreFwd(c, rs) ==
  *         setHAGroupStatusToStoreAndForward()
  *)
 WriterSyncFwdToStoreFwd(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<replayVars, envVars,
+                   clusterState, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty>>
 
 ---------------------------------------------------------------------------
 
@@ -337,15 +319,12 @@ WriterSyncFwdToStoreFwd(c, rs) ==
  * Source: SyncModeImpl.onFailure() L61-74 catch block -> abort()
  *)
 WriterToStoreFwdFail(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates \ {"AIS"}
     /\ writerMode[c][rs] = "SYNC"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -365,15 +344,12 @@ WriterToStoreFwdFail(c, rs) ==
  *         -> abort()
  *)
 WriterSyncFwdToStoreFwdFail(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates \union TransitionalActiveStates
     /\ writerMode[c][rs] = "SYNC_AND_FWD"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ---------------------------------------------------------------------------
 
@@ -395,14 +371,11 @@ WriterSyncFwdToStoreFwdFail(c, rs) ==
  *         LogEventHandler.initializeMode() failure path
  *)
 WriterInitToStoreFwdFail(c, rs) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] \in ActiveStates \ {"AIS"}
     /\ writerMode[c][rs] = "INIT"
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "DEAD"]
-    /\ UNCHANGED <<clusterState, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<clusterVars, replayVars, envVars>>
 
 ============================================================================

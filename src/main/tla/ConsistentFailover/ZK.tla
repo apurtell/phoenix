@@ -55,12 +55,32 @@
  *                            |   CONNECTION_RECONNECTED sets isHealthy =
  *                            |   true
  *)
-EXTENDS Types
+EXTENDS SpecState, Types
 
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+---------------------------------------------------------------------------
+
+(*
+ * Post-abort ATS reconciliation fold.
+ *
+ * When the peer connection or session is re-established and the
+ * local cluster is in ATS while the peer is in S or DS at the
+ * moment of rebuild, the PathChildrenCache rebuild fires a
+ * synthetic event that triggers the FailoverManagementListener.
+ * No existing PeerReact* action handles (ATS, S/DS) -- the
+ * transient AbTS state was missed during the partition. The
+ * reconciliation transitions ATS -> AbTAIS, which auto-completes
+ * to AIS via AutoComplete.
+ *
+ * Shared by ZKPeerReconnect and ZKPeerSessionRecover: both reuse
+ * the identical synthetic-event -> listener chain (Curator rebuild
+ * is the same whether triggered by reconnection or session
+ * recovery). Extracting this operator keeps the two actions'
+ * reconciliation branches from drifting apart.
+ *)
+ATSReconcileEffect(c) ==
+    IF clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"}
+    THEN clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
+    ELSE UNCHANGED clusterState
 
 ---------------------------------------------------------------------------
 
@@ -84,10 +104,8 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
 ZKPeerDisconnect(c) ==
     /\ zkPeerConnected[c] = TRUE
     /\ zkPeerConnected' = [zkPeerConnected EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, clusterVars, replayVars,
+                   hdfsAvailable, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -141,13 +159,11 @@ ZKPeerReconnect(c) ==
     /\ zkPeerConnected[c] = FALSE
     /\ zkPeerSessionAlive[c] = TRUE
     /\ zkPeerConnected' = [zkPeerConnected EXCEPT ![c] = TRUE]
-    /\ IF clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"}
-       THEN clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
-       ELSE UNCHANGED clusterState
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerSessionAlive, zkLocalConnected>>
+    /\ ATSReconcileEffect(c)
+    /\ UNCHANGED <<writerVars, replayVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty,
+                   hdfsAvailable, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -176,10 +192,8 @@ ZKPeerSessionExpiry(c) ==
     /\ zkPeerSessionAlive[c] = TRUE
     /\ zkPeerSessionAlive' = [zkPeerSessionAlive EXCEPT ![c] = FALSE]
     /\ zkPeerConnected' = [zkPeerConnected EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, clusterVars, replayVars,
+                   hdfsAvailable, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -212,13 +226,11 @@ ZKPeerSessionRecover(c) ==
     /\ zkPeerSessionAlive[c] = FALSE
     /\ zkPeerSessionAlive' = [zkPeerSessionAlive EXCEPT ![c] = TRUE]
     /\ zkPeerConnected' = [zkPeerConnected EXCEPT ![c] = TRUE]
-    /\ IF clusterState[c] = "ATS" /\ clusterState[Peer(c)] \in {"S", "DS"}
-       THEN clusterState' = [clusterState EXCEPT ![c] = "AbTAIS"]
-       ELSE UNCHANGED clusterState
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkLocalConnected>>
+    /\ ATSReconcileEffect(c)
+    /\ UNCHANGED <<writerVars, replayVars,
+                   outDirEmpty, antiFlapTimer,
+                   failoverPending, inProgressDirEmpty,
+                   hdfsAvailable, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
 
@@ -240,10 +252,8 @@ ZKPeerSessionRecover(c) ==
 ZKLocalDisconnect(c) ==
     /\ zkLocalConnected[c] = TRUE
     /\ zkLocalConnected' = [zkLocalConnected EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive>>
+    /\ UNCHANGED <<writerVars, clusterVars, replayVars,
+                   hdfsAvailable, zkPeerConnected, zkPeerSessionAlive>>
 
 ---------------------------------------------------------------------------
 
@@ -263,9 +273,7 @@ ZKLocalDisconnect(c) ==
 ZKLocalReconnect(c) ==
     /\ zkLocalConnected[c] = FALSE
     /\ zkLocalConnected' = [zkLocalConnected EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive>>
+    /\ UNCHANGED <<writerVars, clusterVars, replayVars,
+                   hdfsAvailable, zkPeerConnected, zkPeerSessionAlive>>
 
 ============================================================================

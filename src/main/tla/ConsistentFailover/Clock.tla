@@ -23,12 +23,7 @@
  *                |   HAGroupStoreClient.validateTransitionAndGet-
  *                |   WaitTime() checks (L1027-1046).
  *)
-EXTENDS Types
-
-VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
@@ -43,9 +38,8 @@ VARIABLE antiFlapTimer, clusterState, writerMode, outDirEmpty, hdfsAvailable,
 Tick ==
     /\ \E c \in Cluster : AntiFlapGateClosed(antiFlapTimer[c])
     /\ antiFlapTimer' = [c \in Cluster |-> DecrementTimer(antiFlapTimer[c])]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   clusterState, outDirEmpty,
+                   failoverPending, inProgressDirEmpty>>
 
 ============================================================================

@@ -25,12 +25,7 @@
  *                   |   successful FileUtil.copy() in processFile()
  *                   |   L132-152
  *)
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
@@ -61,9 +56,7 @@ VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
 HDFSDown(c) ==
     /\ hdfsAvailable[c] = TRUE
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
+    /\ UNCHANGED <<writerVars, clusterVars, replayVars,
                    zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ---------------------------------------------------------------------------
@@ -85,9 +78,7 @@ HDFSDown(c) ==
 HDFSUp(c) ==
     /\ hdfsAvailable[c] = FALSE
     /\ hdfsAvailable' = [hdfsAvailable EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   failoverPending, inProgressDirEmpty,
+    /\ UNCHANGED <<writerVars, clusterVars, replayVars,
                    zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
 
 ============================================================================

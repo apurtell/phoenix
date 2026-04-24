@@ -4,7 +4,7 @@
 
 ## Overview
 
-`ConsistentFailover` is the root orchestrator module of the Phoenix Consistent Failover TLA+ specification. It declares all 13 specification variables, defines the initial state (`Init`), the next-state relation (`Next`), the specification formulas (`SafetySpec`, `Spec`), and all safety invariants, action constraints, liveness properties, and fairness assumptions. It composes actor-driven actions from sub-modules via `INSTANCE`.
+`ConsistentFailover` is the root orchestrator module of the Phoenix Consistent Failover TLA+ specification. State variables are declared in [`SpecState.tla`](../SpecState.tla); the root module has `EXTENDS SpecState, Types`. The root module defines the initial state (`Init`), the next-state relation (`Next`), the specification formulas (`SafetySpec`, `Spec`), and all safety invariants, action constraints, liveness properties, and fairness assumptions. It composes actor-driven actions from sub-modules via `INSTANCE`.
 
 The module models the HA group state machine for two paired Phoenix/HBase clusters. Each cluster maintains its HA group state in ZooKeeper. State transitions are driven by five categories of actors:
 
@@ -19,7 +19,7 @@ The module models the HA group state machine for two paired Phoenix/HBase cluste
 ZK connection and session lifecycle are modeled explicitly. Peer-reactive transitions (`PeerReact*` actions) are guarded on `zkPeerConnected[c]` and `zkPeerSessionAlive[c]`. Auto-completion, heartbeat, writer ZK writes, and failover trigger are guarded on `zkLocalConnected[c]`. Retry exhaustion of the `FailoverManagementListener` (2-retry limit) is modeled as `ReactiveTransitionFail(c)` in [HAGroupStore.md](HAGroupStore.md).
 
 ```tla
-EXTENDS Types
+EXTENDS SpecState, Types
 ```
 
 ## Implementation Traceability
@@ -82,7 +82,7 @@ EXTENDS Types
 
 ## Variables
 
-The specification uses 13 variables, grouped by the subsystem they model.
+The specification uses 13 variables, declared in [`SpecState.tla`](../SpecState.tla). The subsections below describe each variable’s role; see also [SpecState.md](SpecState.md).
 
 ### Cluster State
 
@@ -164,14 +164,25 @@ These three booleans per cluster model the ZK coordination substrate:
 
 ### Variable Tuple
 
+The `vars` tuple aggregates all 13 variables for use in temporal formulas (`[][Next]_vars`, `WF_vars(...)`, `SF_vars(...)`). It is defined in [`SpecState.tla`](../SpecState.tla) as a composition of four variable-group tuples -- `writerVars`, `clusterVars`, `replayVars`, `envVars` -- so every sub-module shares the same groups when writing `UNCHANGED` clauses. See [SpecState.md](SpecState.md) for the group definitions.
+
 ```tla
-vars == <<clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-          replayState, lastRoundInSync, lastRoundProcessed,
-          failoverPending, inProgressDirEmpty,
-          zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+\* Defined in SpecState.tla:
+\*   writerVars  == <<writerMode>>
+\*   clusterVars == <<clusterState, outDirEmpty, antiFlapTimer,
+\*                    failoverPending, inProgressDirEmpty>>
+\*   replayVars  == <<replayState, lastRoundInSync, lastRoundProcessed>>
+\*   envVars     == <<hdfsAvailable,
+\*                    zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+\*   vars        == <<writerVars, clusterVars, replayVars, envVars>>
+
+STAtoAISTriggerReplayGuards(c) ==
+    /\ failoverPending[c]
+    /\ inProgressDirEmpty[c]
+    /\ replayState[c] = "SYNC"
 ```
 
-The `vars` tuple aggregates all 13 variables for use in temporal formulas (`[][Next]_vars`, `WF_vars(...)`, `SF_vars(...)`).
+`STAtoAISTriggerReplayGuards` is the shared replay-completeness conjunction for STA -> AIS. `FailoverTriggerCorrectness` and `NoDataLoss` both use it so they cannot drift apart.
 
 ## Sub-Module Instances
 
@@ -439,8 +450,8 @@ Critical path: `ANISToAIS` (SF), `HDFSUp` (SF), `ZKLocalReconnect` (WF), `Tick` 
 ```tla
 FailoverCompletion ==
     \A c \in Cluster :
-        clusterState[c] \in {"STA", "AbTAIS", "AbTANIS", "AbTS"}
-        ~> clusterState[c] \in {"AIS", "ANIS", "S"}
+        clusterState[c] \in FailoverCompletionAntecedentStates
+        ~> clusterState[c] \in StableClusterStates
 ```
 
 Standby-side and abort transient states eventually resolve to a stable state. Resolution paths:
@@ -456,7 +467,7 @@ Standby-side and abort transient states eventually resolve to a stable state. Re
 DegradationRecovery ==
     \A c \in Cluster :
         (clusterState[c] = "ANIS" /\ hdfsAvailable[Peer(c)])
-        ~> clusterState[c] # "ANIS"
+        ~> clusterState[c] \in NotANISClusterStates
 ```
 
 ANIS with available peer HDFS eventually progresses out of ANIS. The recovery chain is: S&F -> S&FWD (`WriterStoreFwdToSyncFwd`) -> SYNC (`WriterSyncFwdToSync`, sets `outDirEmpty`) -> anti-flap timer expires (`Tick`) -> ANIS -> AIS (`ANISToAIS`). The cluster may also leave ANIS via failover (ANIS -> ANISTS), which satisfies the consequent.
@@ -466,8 +477,8 @@ ANIS with available peer HDFS eventually progresses out of ANIS. The recovery ch
 ```tla
 AbortCompletion ==
     \A c \in Cluster :
-        clusterState[c] \in {"AbTS", "AbTAIS", "AbTANIS"}
-        ~> clusterState[c] \in {"AIS", "ANIS", "S"}
+        clusterState[c] \in AbortCompletionAntecedentStates
+        ~> clusterState[c] \in StableClusterStates
 ```
 
 Every abort state eventually auto-completes to a stable state. Under WF on `AutoComplete`, each abort state deterministically resolves. Requires `zkLocalConnected` (`AutoComplete` guard).
@@ -575,26 +586,9 @@ Every state change follows the `AllowedTransitions` table from [Types.md](Types.
 
 ### WriterTransitionValid
 
-```tla
-AllowedWriterTransitions ==
-    {
-      <<"INIT", "SYNC">>,
-      <<"INIT", "STORE_AND_FWD">>,
-      <<"INIT", "DEAD">>,
-      <<"SYNC", "STORE_AND_FWD">>,
-      <<"SYNC", "SYNC_AND_FWD">>,
-      <<"SYNC", "DEAD">>,
-      <<"SYNC", "INIT">>,
-      <<"STORE_AND_FWD", "SYNC_AND_FWD">>,
-      <<"STORE_AND_FWD", "DEAD">>,
-      <<"STORE_AND_FWD", "INIT">>,
-      <<"SYNC_AND_FWD", "SYNC">>,
-      <<"SYNC_AND_FWD", "STORE_AND_FWD">>,
-      <<"SYNC_AND_FWD", "DEAD">>,
-      <<"SYNC_AND_FWD", "INIT">>,
-      <<"DEAD", "INIT">>
-    }
+`AllowedWriterTransitions` is defined in [Types.md](Types.md).
 
+```tla
 WriterTransitionValid ==
     \A c \in Cluster :
         \A r \in RS :
@@ -644,9 +638,7 @@ ANISTS -> ATS requires empty OUT directory and open anti-flapping gate.
 FailoverTriggerCorrectness ==
     \A c \in Cluster :
         clusterState[c] = "STA" /\ clusterState'[c] = "AIS"
-        => /\ failoverPending[c]
-           /\ inProgressDirEmpty[c]
-           /\ replayState[c] = "SYNC"
+        => STAtoAISTriggerReplayGuards(c)
 ```
 
 STA -> AIS requires replay-completeness conditions. Cross-checks the `TriggerFailover` action's guards. `hdfsAvailable` is excluded because it is an environmental/liveness guard, not a replay-completeness condition.
@@ -657,9 +649,7 @@ STA -> AIS requires replay-completeness conditions. Cross-checks the `TriggerFai
 NoDataLoss ==
     \A c \in Cluster :
         clusterState[c] = "STA" /\ clusterState'[c] = "AIS"
-        => /\ failoverPending[c]
-           /\ inProgressDirEmpty[c]
-           /\ replayState[c] = "SYNC"
+        => STAtoAISTriggerReplayGuards(c)
 ```
 
 **Zero RPO property.** When the standby completes STA -> AIS, replay must have been in SYNC (no pending SYNCED_RECOVERY rewind), the in-progress directory must be empty, and the failover must have been properly initiated.
@@ -677,18 +667,9 @@ The SYNCED_RECOVERY -> SYNC transition equalizes the replay counters. Together w
 
 ### ReplayTransitionValid
 
-```tla
-AllowedReplayTransitions ==
-    {
-      <<"NOT_INITIALIZED", "SYNCED_RECOVERY">>,
-      <<"NOT_INITIALIZED", "DEGRADED">>,
-      <<"SYNC", "DEGRADED">>,
-      <<"SYNC", "SYNCED_RECOVERY">>,
-      <<"DEGRADED", "SYNCED_RECOVERY">>,
-      <<"SYNCED_RECOVERY", "SYNC">>,
-      <<"SYNCED_RECOVERY", "DEGRADED">>
-    }
+`AllowedReplayTransitions` is defined in [Types.md](Types.md).
 
+```tla
 ReplayTransitionValid ==
     \A c \in Cluster :
         replayState'[c] # replayState[c] =>

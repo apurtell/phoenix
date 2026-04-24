@@ -45,7 +45,11 @@ CAS failure is only possible when `clusterState /= "AIS"` because the first RS t
 
 ### ZK Local Connectivity
 
-Actions that perform ZK writes (`setHAGroupStatusToStoreAndForward`, `setHAGroupStatusToSync`) require `isHealthy = true`, modeled by the `zkLocalConnected[c]` guard. Actions that are purely mode transitions driven by HDFS operations or forwarder events (`WriterInit`, `WriterSyncToSyncFwd`, `WriterStoreFwdToSyncFwd`) do NOT require a ZK connection.
+Actions that perform ZK writes (`setHAGroupStatusToStoreAndForward`, `setHAGroupStatusToSync`) require `isHealthy = true`, modeled by the `LocalZKHealthy(c)` predicate from [`SpecState.tla`](../SpecState.tla) (which expands to `zkLocalConnected[c] = TRUE`). Actions that are purely mode transitions driven by HDFS operations or forwarder events (`WriterInit`, `WriterSyncToSyncFwd`, `WriterStoreFwdToSyncFwd`) do NOT require a ZK connection.
+
+### AIS-Like State Coupling
+
+`WriterInitToStoreFwd` and `WriterToStoreFwd` both atomically transition `clusterState` to `ANIS` and reset `antiFlapTimer` when a writer degrades from an AIS-like state. The set of AIS-like states (`AIS`, `AWOP`, `ANISWOP`) is named in [`Types.tla`](../Types.tla) as `AISLikeStates` and documented in [Types.md](Types.md#HA-Group-State-Classification).
 
 ## Implementation Traceability
 
@@ -64,12 +68,7 @@ Actions that perform ZK writes (`setHAGroupStatusToStoreAndForward`, `setHAGroup
 | `CanDegradeToStoreFwd(c, rs)` | Guard predicate: RS is in a mode that writes to standby HDFS |
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## Predicates
@@ -118,10 +117,10 @@ WriterInitToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ clusterState' = IF clusterState[c] \in AISLikeStates
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ antiFlapTimer' = IF clusterState[c] \in AISLikeStates
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
     /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,
@@ -217,10 +216,10 @@ WriterToStoreFwd(c, rs) ==
     /\ hdfsAvailable[Peer(c)] = FALSE
     /\ writerMode' = [writerMode EXCEPT ![c][rs] = "STORE_AND_FWD"]
     /\ outDirEmpty' = [outDirEmpty EXCEPT ![c] = FALSE]
-    /\ clusterState' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ clusterState' = IF clusterState[c] \in AISLikeStates
                         THEN [clusterState EXCEPT ![c] = "ANIS"]
                         ELSE clusterState
-    /\ antiFlapTimer' = IF clusterState[c] \in {"AIS", "AWOP", "ANISWOP"}
+    /\ antiFlapTimer' = IF clusterState[c] \in AISLikeStates
                          THEN [antiFlapTimer EXCEPT ![c] = StartAntiFlapWait]
                          ELSE antiFlapTimer
     /\ UNCHANGED <<hdfsAvailable, replayState, lastRoundInSync,

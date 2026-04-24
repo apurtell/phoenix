@@ -36,12 +36,7 @@ Any cluster's HDFS can fail at any time, producing two distinct scenarios:
 | `HDFSUp(c)` | NameNode recovery; forwarder detects via successful `FileUtil.copy()` in `processFile()` L132-152 |
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## HDFSDown -- NameNode Crash

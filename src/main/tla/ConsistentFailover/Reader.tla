@@ -54,12 +54,7 @@
  *                             |   setHAGroupStatusToSync() L341-355
  *                             |   (ZK write)
  *)
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 
 ---------------------------------------------------------------------------
 
@@ -84,10 +79,7 @@ ReplayAdvance(c) ==
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = @ + 1]
     /\ lastRoundInSync' = [lastRoundInSync EXCEPT ![c] =
            IF replayState[c] = "SYNC" THEN @ + 1 ELSE @]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, failoverPending,
-                   inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, clusterVars, envVars, replayState>>
 
 ---------------------------------------------------------------------------
 
@@ -112,10 +104,7 @@ ReplayRewind(c) ==
     /\ replayState[c] = "SYNCED_RECOVERY"
     /\ replayState' = [replayState EXCEPT ![c] = "SYNC"]
     /\ lastRoundProcessed' = [lastRoundProcessed EXCEPT ![c] = lastRoundInSync[c]]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, lastRoundInSync, failoverPending,
-                   inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, clusterVars, envVars, lastRoundInSync>>
 
 ---------------------------------------------------------------------------
 
@@ -139,10 +128,8 @@ ReplayBeginProcessing(c) ==
     /\ clusterState[c] \in StandbyStates \union {"STA"}
     /\ inProgressDirEmpty[c] = TRUE
     /\ inProgressDirEmpty' = [inProgressDirEmpty EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   clusterState, outDirEmpty, antiFlapTimer, failoverPending>>
 
 ---------------------------------------------------------------------------
 
@@ -161,10 +148,8 @@ ReplayBeginProcessing(c) ==
 ReplayFinishProcessing(c) ==
     /\ inProgressDirEmpty[c] = FALSE
     /\ inProgressDirEmpty' = [inProgressDirEmpty EXCEPT ![c] = TRUE]
-    /\ UNCHANGED <<clusterState, writerMode, outDirEmpty, hdfsAvailable,
-                   antiFlapTimer, replayState, lastRoundInSync,
-                   lastRoundProcessed, failoverPending,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   clusterState, outDirEmpty, antiFlapTimer, failoverPending>>
 
 ---------------------------------------------------------------------------
 
@@ -200,7 +185,7 @@ ReplayFinishProcessing(c) ==
  *         setHAGroupStatusToSync() L341-355 (ZK write)
  *)
 TriggerFailover(c) ==
-    /\ zkLocalConnected[c] = TRUE
+    /\ LocalZKHealthy(c)
     /\ clusterState[c] = "STA"
     /\ failoverPending[c]
     /\ inProgressDirEmpty[c]
@@ -208,9 +193,7 @@ TriggerFailover(c) ==
     /\ hdfsAvailable[c] = TRUE
     /\ clusterState' = [clusterState EXCEPT ![c] = "AIS"]
     /\ failoverPending' = [failoverPending EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-                   replayState, lastRoundInSync, lastRoundProcessed,
-                   inProgressDirEmpty,
-                   zkPeerConnected, zkPeerSessionAlive, zkLocalConnected>>
+    /\ UNCHANGED <<writerVars, replayVars, envVars,
+                   outDirEmpty, antiFlapTimer, inProgressDirEmpty>>
 
 ============================================================================

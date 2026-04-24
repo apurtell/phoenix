@@ -68,7 +68,7 @@ java -XX:+UseParallelGC \
 
 **Where to edit:**
 
-1. **`Types.tla`** — Add the new state to `HAGroupState` and the new transition pair to `AllowedTransitions`. Update `ActiveStates`, `StandbyStates`, or  `TransitionalActiveStates` if the new state maps to one of those roles. Update `RoleOf` accordingly.
+1. **`Types.tla`** — Add the new state to `HAGroupState` and the new transition pair to `AllowedTransitions`. Update `ActiveStates`, `StandbyStates`, or  `TransitionalActiveStates` if the new state maps to one of those roles. Update `RoleOf` accordingly. If liveness uses named state sets (`StableClusterStates`, `FailoverCompletionAntecedentStates`, `AbortCompletionAntecedentStates`, `NotANISClusterStates`), extend them when a new state should appear in a `~>` antecedent or consequent.
 2. **`HAGroupStore.tla`** or **`Admin.tla`** — Add or modify the action that produces the new transition. Set appropriate ZK connectivity guards (`zkPeerConnected`, `zkPeerSessionAlive`, `zkLocalConnected`).
 3. **`ConsistentFailover.tla`** — Wire the new action into the `Next` disjunction and, if appropriate, into the `Fairness` condition. Add a new invariant if the transition introduces new safety requirements.
 
@@ -89,9 +89,9 @@ java -XX:+UseParallelGC \
 
 **Where to edit:**
 
-1. **`Types.tla`** — Add the new mode to `WriterMode` if adding a new mode.
+1. **`Types.tla`** — Add the new mode to `WriterMode` if adding a new mode. Add any new `(from, to)` pair to `AllowedWriterTransitions`.
 2. **`Writer.tla`** — Add or modify the action. Set `zkLocalConnected` guard on any action that performs a ZK CAS write. Ensure the AIS-to-ANIS coupling fires atomically when the first RS degrades.
-3. **`ConsistentFailover.tla`** — Add to `AllowedWriterTransitions` if adding a new transition. Wire new actions into `Next` and `Fairness`.
+3. **`ConsistentFailover.tla`** — Wire new actions into `Next` and `Fairness`.
 
 **What to verify (primary invariants and constraints):**
 
@@ -110,10 +110,9 @@ java -XX:+UseParallelGC \
 
 **Where to edit:**
 
-1. **`Types.tla`** — Update `ReplayStateSet` if adding a new replay state.
+1. **`Types.tla`** — Update `ReplayStateSet` if adding a new replay state. Update `AllowedReplayTransitions` for any new replay `(from, to)` pair.
 2. **`Reader.tla`** — Modify `ReplayAdvance`, `ReplayRewind`, `ReplayBeginProcessing`, `ReplayFinishProcessing`, or `TriggerFailover`.
 3. **`HAGroupStore.tla`** — If changing listener folds (recoveryListener or degradedListener effects on S-entry or DS-entry actions), modify the `replayState'` assignments in `PeerReactToAIS`, `PeerReactToANIS`, and `AutoComplete`.
-4. **`ConsistentFailover.tla`** — Update `AllowedReplayTransitions` if adding new replay state transitions.
 
 **What to verify (primary invariants and constraints):**
 
@@ -253,9 +252,11 @@ code you are changing:
 
 6. **Check both tiers.** A change that passes exhaustive (2 RS) may fail in simulation (9 RS) due to deeper per-RS interleavings. Always run both.
 
-7. **Update all five `.cfg` files.** When adding a new invariant or action constraint, add it to `ConsistentFailover.cfg`, `ConsistentFailover-sim.cfg`, and all three liveness configs.
+7. **New state variables.** Declare them in `SpecState.tla` (single `VARIABLE` line), add them to the `vars` tuple in `ConsistentFailover.tla`, extend every sub-module action’s `UNCHANGED` / primed update lists as needed, and wire new actions into `Next` and `Fairness`.
 
-8. **Classify new actions by fairness tier.** Every new action must be
+8. **Update all five `.cfg` files.** When adding a new invariant or action constraint, add it to `ConsistentFailover.cfg`, `ConsistentFailover-sim.cfg`, and all three liveness configs.
+
+9. **Classify new actions by fairness tier.** Every new action must be
    classified into one of four tiers:
    - **Tier 1 (WF):** Guards depend only on protocol state, no env var guards
    - **Tier 2 (WF):** ZK recovery actions (encodes ZK Liveness Assumption)

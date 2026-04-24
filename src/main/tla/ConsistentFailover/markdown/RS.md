@@ -29,12 +29,7 @@ When a cluster transitions ATS -> S (becoming standby), the replication subsyste
 | `RSRestart(c, rs)` | Kubernetes/YARN pod restart -> HBase RS startup -> `ReplicationLogGroup.initializeReplicationMode()` |
 
 ```tla
-EXTENDS Types
-
-VARIABLE clusterState, writerMode, outDirEmpty, hdfsAvailable, antiFlapTimer,
-         replayState, lastRoundInSync, lastRoundProcessed,
-         failoverPending, inProgressDirEmpty,
-         zkPeerConnected, zkPeerSessionAlive, zkLocalConnected
+EXTENDS SpecState, Types
 ```
 
 ## RSRestart -- Process Supervisor Restarts Dead RS: DEAD -> INIT
