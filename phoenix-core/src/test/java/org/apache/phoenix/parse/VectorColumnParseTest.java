@@ -31,9 +31,13 @@ import java.util.Map;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
+import org.apache.phoenix.parse.HintNode.Hint;
 import org.apache.phoenix.query.QueryConstants;
+import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.SortOrder;
+import org.apache.phoenix.schema.VectorIndexType;
 import org.apache.phoenix.schema.types.PVectorDouble;
 import org.apache.phoenix.schema.types.PVectorFloat;
 import org.junit.Test;
@@ -327,9 +331,17 @@ public class VectorColumnParseTest {
     assertTrue("Expected CreateIndexStatement", stmt instanceof CreateIndexStatement);
     CreateIndexStatement indexStmt = (CreateIndexStatement) stmt;
     assertNull(indexStmt.getVectorAlgorithm());
+    assertNull(indexStmt.getVectorIndexType());
     assertNull(indexStmt.getVectorMetric());
     assertNull(indexStmt.getVectorLists());
     assertNull(indexStmt.getVectorSampleSize());
+    assertNull(indexStmt.getHnswM());
+    assertNull(indexStmt.getHnswEfConstruction());
+    assertNull(indexStmt.getHnswAlpha());
+    assertNull(indexStmt.getQuantizationType());
+    assertNull(indexStmt.getPqSegments());
+    assertNull(indexStmt.getPqTrainingSize());
+    assertNull(indexStmt.getVectorIndexParams());
   }
 
   @Test
@@ -341,6 +353,22 @@ public class VectorColumnParseTest {
     BindableStatement stmt = parser.parseStatement();
     assertTrue("Expected CreateIndexStatement", stmt instanceof CreateIndexStatement);
     CreateIndexStatement indexStmt = (CreateIndexStatement) stmt;
+
+    assertEquals("IDX", indexStmt.getIndexTableName().getTableName());
+    assertEquals(PTable.IndexType.VECTOR_GLOBAL, indexStmt.getIndexType());
+    assertFalse(indexStmt.isAsync());
+    assertFalse(indexStmt.ifNotExists());
+
+    assertEquals("HNSW", indexStmt.getVectorAlgorithm());
+    assertEquals(VectorIndexType.HNSW, indexStmt.getVectorIndexType());
+    assertEquals("COSINE", indexStmt.getVectorMetric());
+    assertEquals(Integer.valueOf(16), indexStmt.getHnswM());
+    assertEquals(Integer.valueOf(64), indexStmt.getHnswEfConstruction());
+    assertEquals(Double.valueOf(1.25), indexStmt.getHnswAlpha());
+    assertEquals("PQ", indexStmt.getQuantizationType());
+    assertEquals(Integer.valueOf(4), indexStmt.getPqSegments());
+    assertEquals(Integer.valueOf(500), indexStmt.getPqTrainingSize());
+
     assertEquals("HNSW", CreateIndexStatement.getVectorAlgorithm(indexStmt.getProps()));
     assertEquals("COSINE", CreateIndexStatement.getVectorMetric(indexStmt.getProps()));
     assertEquals(Integer.valueOf(128),
@@ -371,6 +399,99 @@ public class VectorColumnParseTest {
   }
 
   @Test
+  public void testDdlWithoutParenthesesAroundProperties() throws Exception {
+    String ddl = "CREATE VECTOR INDEX idx ON t (v) WITH metric='L2', algorithm='HNSW', M=32, "
+      + "ef_construction=128, alpha=1.5, quantization='SQ8'";
+    SQLParser parser = new SQLParser(ddl);
+    CreateIndexStatement indexStmt = (CreateIndexStatement) parser.parseStatement();
+
+    assertEquals("L2", indexStmt.getVectorMetric());
+    assertEquals("HNSW", indexStmt.getVectorAlgorithm());
+    assertEquals(VectorIndexType.HNSW, indexStmt.getVectorIndexType());
+    assertEquals(Integer.valueOf(32), indexStmt.getHnswM());
+    assertEquals(Integer.valueOf(128), indexStmt.getHnswEfConstruction());
+    assertEquals(Double.valueOf(1.5), indexStmt.getHnswAlpha());
+    assertEquals("SQ8", indexStmt.getQuantizationType());
+    assertNull(indexStmt.getPqSegments());
+    assertNull(indexStmt.getPqTrainingSize());
+  }
+
+  @Test
+  public void testCaseInsensitiveAndAliasProperties() throws Exception {
+    String ddl = "CREATE VECTOR INDEX idx ON t (v) WITH (ALGORITHM='HNSW', HNSW_M=48, "
+      + "HNSW_EF_CONSTRUCTION=256, HNSW_ALPHA=1.8, QUANTIZATION_TYPE='PQ', "
+      + "VECTOR_PQ_SEGMENTS=64, VECTOR_PQ_TRAINING_SIZE=2048)";
+    SQLParser parser = new SQLParser(ddl);
+    CreateIndexStatement indexStmt = (CreateIndexStatement) parser.parseStatement();
+
+    assertEquals("HNSW", indexStmt.getVectorAlgorithm());
+    assertEquals(Integer.valueOf(48), indexStmt.getHnswM());
+    assertEquals(Integer.valueOf(256), indexStmt.getHnswEfConstruction());
+    assertEquals(Double.valueOf(1.8), indexStmt.getHnswAlpha());
+    assertEquals("PQ", indexStmt.getQuantizationType());
+    assertEquals(Integer.valueOf(64), indexStmt.getPqSegments());
+    assertEquals(Integer.valueOf(2048), indexStmt.getPqTrainingSize());
+  }
+
+  @Test
+  public void testCreateIndexStatementHnswConstructorOverload() {
+    CreateIndexStatement stmt = new CreateIndexStatement(new NamedNode("IDX"),
+      new NamedTableNode(null, TableName.create(null, "T")), IndexKeyConstraint.EMPTY, null, null,
+      null, false, PTable.IndexType.VECTOR_GLOBAL, false, 0, null, null, "HNSW", "COSINE", 16, 200,
+      1.2, "PQ", 96, 500);
+
+    assertEquals("HNSW", stmt.getVectorAlgorithm());
+    assertEquals(VectorIndexType.HNSW, stmt.getVectorIndexType());
+    assertEquals("COSINE", stmt.getVectorMetric());
+    assertEquals(Integer.valueOf(16), stmt.getHnswM());
+    assertEquals(Integer.valueOf(200), stmt.getHnswEfConstruction());
+    assertEquals(Double.valueOf(1.2), stmt.getHnswAlpha());
+    assertEquals("PQ", stmt.getQuantizationType());
+    assertEquals(Integer.valueOf(96), stmt.getPqSegments());
+    assertEquals(Integer.valueOf(500), stmt.getPqTrainingSize());
+  }
+
+  @Test
+  public void testOmittedParametersPreservedAsNull() throws Exception {
+    String ddl = "CREATE VECTOR INDEX idx ON t (v) WITH (algorithm='HNSW', M=16)";
+    SQLParser parser = new SQLParser(ddl);
+    CreateIndexStatement stmt = (CreateIndexStatement) parser.parseStatement();
+
+    assertEquals("HNSW", stmt.getVectorAlgorithm());
+    assertEquals(Integer.valueOf(16), stmt.getHnswM());
+    assertNull(stmt.getHnswEfConstruction());
+    assertNull(stmt.getHnswAlpha());
+    assertNull(stmt.getQuantizationType());
+    assertNull(stmt.getPqSegments());
+    assertNull(stmt.getPqTrainingSize());
+    assertNull(stmt.getVectorMetric());
+  }
+
+  @Test
+  public void testVectorIndexParamsBuilderAndCopy() {
+    CreateIndexStatement.VectorIndexParams params =
+      new CreateIndexStatement.VectorIndexParams.Builder().setAlgorithm("HNSW").setMetric("COSINE")
+        .setHnswM(32).setHnswEfConstruction(100).setHnswAlpha(1.4).setQuantizationType("SQ8")
+        .build();
+
+    assertEquals("HNSW", params.getAlgorithm());
+    assertEquals(VectorIndexType.HNSW, params.getType());
+    assertEquals("COSINE", params.getMetric());
+    assertEquals(Integer.valueOf(32), params.getHnswM());
+    assertEquals(Integer.valueOf(100), params.getHnswEfConstruction());
+    assertEquals(Double.valueOf(1.4), params.getHnswAlpha());
+    assertEquals("SQ8", params.getQuantizationType());
+    assertNull(params.getPqSegments());
+    assertNull(params.getPqTrainingSize());
+
+    CreateIndexStatement.VectorIndexParams copy =
+      new CreateIndexStatement.VectorIndexParams.Builder(params).setPqSegments(64).build();
+    assertEquals("HNSW", copy.getAlgorithm());
+    assertEquals(Integer.valueOf(32), copy.getHnswM());
+    assertEquals(Integer.valueOf(64), copy.getPqSegments());
+  }
+
+  @Test
   public void testParseBsonVectorValueFunctionInSelect() throws Exception {
     String sql = "SELECT BSON_VECTOR_VALUE(doc, 'path', 128) FROM t";
     SQLParser parser = new SQLParser(sql);
@@ -383,5 +504,50 @@ public class VectorColumnParseTest {
     BsonVectorValueParseNode funcNode = (BsonVectorValueParseNode) node;
     assertEquals("BSON_VECTOR_VALUE", funcNode.getName());
     assertEquals(3, funcNode.getChildren().size());
+  }
+
+  @Test
+  public void testVectorIndexQueryHintParsing() throws Exception {
+    String sql = "SELECT /*+ VECTOR_INDEX(ef_search=128) */ * FROM t";
+    SQLParser parser = new SQLParser(sql);
+    BindableStatement stmt = parser.parseStatement();
+    assertTrue("Expected SelectStatement", stmt instanceof SelectStatement);
+    SelectStatement selectStmt = (SelectStatement) stmt;
+    HintNode hintNode = selectStmt.getHint();
+    assertNotNull(hintNode);
+    assertTrue(hintNode.hasHint(Hint.VECTOR_INDEX));
+    Map<String, String> params = HintNode.parseVectorIndexHint(hintNode);
+    assertEquals("128", params.get(HintNode.HINT_PARAM_EF_SEARCH));
+
+    // Multi-parameter hint
+    HintNode multiHint =
+      new HintNode("/*+ VECTOR_INDEX(probes=100, oversample=3.0, ef_search=128) */");
+    assertTrue(multiHint.hasHint(Hint.VECTOR_INDEX));
+    Map<String, String> multiParams = HintNode.parseVectorIndexHint(multiHint);
+    assertEquals("100", multiParams.get(HintNode.HINT_PARAM_PROBES));
+    assertEquals("3.0", multiParams.get(HintNode.HINT_PARAM_OVERSAMPLE));
+    assertEquals("128", multiParams.get(HintNode.HINT_PARAM_EF_SEARCH));
+
+    // Flag parameter without value
+    HintNode flagHint = new HintNode("/*+ VECTOR_INDEX(probes=100, oversample) */");
+    Map<String, String> flagParams = HintNode.parseVectorIndexHint(flagHint);
+    assertEquals("100", flagParams.get(HintNode.HINT_PARAM_PROBES));
+    assertEquals("true", flagParams.get(HintNode.HINT_PARAM_OVERSAMPLE));
+
+    // Combined with other hints
+    HintNode combined = new HintNode("/*+ INDEX(t idx) VECTOR_INDEX(ef_search=128) */");
+    assertTrue(combined.hasHint(Hint.INDEX));
+    assertTrue(combined.hasHint(Hint.VECTOR_INDEX));
+    assertEquals("128", HintNode.parseVectorIndexHint(combined).get(HintNode.HINT_PARAM_EF_SEARCH));
+  }
+
+  @Test
+  public void testHnswEfSearchConfigurationDefault() {
+    assertEquals(64, QueryServicesOptions.DEFAULT_HNSW_EF_SEARCH);
+    assertEquals("phoenix.vector.hnsw.ef_search.default", QueryServices.HNSW_EF_SEARCH_ATTRIB);
+    QueryServicesOptions options = QueryServicesOptions.withDefaults();
+    assertEquals(64, options.getHnswEfSearch());
+    options.setHnswEfSearch(128);
+    assertEquals(128, options.getHnswEfSearch());
   }
 }

@@ -18,10 +18,12 @@
 package org.apache.phoenix.parse;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.phoenix.util.SchemaUtil;
@@ -38,9 +40,17 @@ public class HintNode {
   public static final char SEPARATOR = ' ';
   public static final String PREFIX = "(";
   public static final String SUFFIX = ")";
+
+  public static final String HINT_PARAM_PROBES = "probes";
+  public static final String HINT_PARAM_OVERSAMPLE = "oversample";
+  public static final String HINT_PARAM_MAX_PROBE_LIMIT = "max_probe_limit";
+  public static final String HINT_PARAM_EF_SEARCH = "ef_search";
+
   private static final Pattern HINT_PATTERN = Pattern.compile(
     "(?<hintWord>\\w+)(?:\\s*\\(\\s*(?<hintArgs>[^)]+)\\s*\\)|\\s*=\\s*(?<eqArg>\\S+)|\\s+(?<valArg>\\d+))?");
   private static final Pattern HINT_ARG_PATTERN = Pattern.compile("(?<hintArg>\"[^\"]+\"|\\S+)");
+  private static final Pattern VECTOR_INDEX_PARAM_PATTERN =
+    Pattern.compile("(?<key>[a-zA-Z_][a-zA-Z0-9_]*)(?:\\s*=\\s*(?<val>[^,;\\s()]+))?");
 
   public enum Hint {
     /**
@@ -127,22 +137,46 @@ public class HintNode {
     CDC_INCLUDE,
 
     /**
-     * Override the default probe count for IVF vector index search.
+     * Override vector index search parameters (e.g. probes, oversample, max_probe_limit,
+     * ef_search).
      */
-    VECTOR_PROBE_COUNT,
-
-    /**
-     * Override the default oversample factor for two-phase IVF vector index search.
-     */
-    OVERSAMPLE,
-
-    /**
-     * Override the maximum probe limit (batches) for adaptive probing in IVF vector index search.
-     */
-    MAX_PROBE_LIMIT;
+    VECTOR_INDEX;
   };
 
   private final Map<Hint, String> hints;
+
+  /**
+   * Parses key-value parameters from a VECTOR_INDEX hint.
+   * @param hintNode the hint node to extract parameters from
+   * @return a case-insensitive map of parameter key-value pairs, or empty map if hint is not
+   *         present
+   */
+  public static Map<String, String> parseVectorIndexHint(HintNode hintNode) {
+    if (hintNode == null || !hintNode.hasHint(Hint.VECTOR_INDEX)) {
+      return Collections.emptyMap();
+    }
+    return parseVectorIndexHint(hintNode.getHint(Hint.VECTOR_INDEX));
+  }
+
+  /**
+   * Parses key-value parameters from a VECTOR_INDEX hint value string.
+   * @param hintVal the raw hint value string (e.g. "(probes=100, oversample=3.0)")
+   * @return a case-insensitive map of parameter key-value pairs, or empty map if hintVal is
+   *         null/empty
+   */
+  public static Map<String, String> parseVectorIndexHint(String hintVal) {
+    if (hintVal == null || hintVal.trim().isEmpty()) {
+      return Collections.emptyMap();
+    }
+    Map<String, String> params = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    Matcher matcher = VECTOR_INDEX_PARAM_PATTERN.matcher(hintVal);
+    while (matcher.find()) {
+      String key = matcher.group("key");
+      String val = matcher.group("val");
+      params.put(key, val != null ? val : "true");
+    }
+    return Collections.unmodifiableMap(params);
+  }
 
   public static HintNode create(HintNode hintNode, Hint hint) {
     return create(hintNode, hint, "");

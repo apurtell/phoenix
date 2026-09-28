@@ -1510,7 +1510,7 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       Float[] boxedQ = new Float[] { queryVec[0], queryVec[1], queryVec[2], queryVec[3] };
 
       // Adaptive probe expansion continues across centroids until query limit is satisfied.
-      String querySql = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID, CATEGORY FROM " + tableName
+      String querySql = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID, CATEGORY FROM " + tableName
         + " WHERE CATEGORY = 'B' ORDER BY L2_DISTANCE(V, ?) LIMIT 3";
 
       List<String> actualIds = new ArrayList<>();
@@ -1582,7 +1582,7 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       Float[] boxedQ = new Float[] { queryVec[0], queryVec[1], queryVec[2], queryVec[3] };
 
       // Query hint bounds probe expansion batches.
-      String hintSql = "SELECT /*+ VECTOR_PROBE_COUNT(1) MAX_PROBE_LIMIT(2) */ ID, CATEGORY FROM "
+      String hintSql = "SELECT /*+ VECTOR_INDEX(probes=1, max_probe_limit=2) */ ID, CATEGORY FROM "
         + tableName + " WHERE CATEGORY = 'B' ORDER BY L2_DISTANCE(V, ?) LIMIT 3";
       List<String> actualHintIds = new ArrayList<>();
       try (PhoenixPreparedStatement pps =
@@ -1606,7 +1606,7 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       Properties sessionProps = new Properties();
       sessionProps.setProperty(QueryServices.VECTOR_MAX_PROBE_LIMIT_ATTRIB, "2");
       try (Connection conn2 = DriverManager.getConnection(getUrl(), sessionProps)) {
-        String sessionSql = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID, CATEGORY FROM " + tableName
+        String sessionSql = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID, CATEGORY FROM " + tableName
           + " WHERE CATEGORY = 'B' ORDER BY L2_DISTANCE(V, ?) LIMIT 3";
         List<String> actualSessionIds = new ArrayList<>();
         try (PhoenixPreparedStatement pps =
@@ -1676,7 +1676,7 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       Float[] boxedQ = new Float[] { queryVec[0], queryVec[1], queryVec[2], queryVec[3] };
 
       // Adaptive probing exhausts all centroids when candidate count remains below limit.
-      String querySql = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID, CATEGORY FROM " + tableName
+      String querySql = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID, CATEGORY FROM " + tableName
         + " WHERE CATEGORY = 'B' ORDER BY L2_DISTANCE(V, ?) LIMIT 10";
 
       List<String> actualIds = new ArrayList<>();
@@ -1861,7 +1861,7 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       }
 
       Float[] boxedQ = boxed(new float[] { 0.0f, 0.0f, 0.0f, 0.0f });
-      String sql = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + tableName
+      String sql = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
 
       List<String> actualIds = new ArrayList<>();

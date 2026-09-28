@@ -174,6 +174,7 @@ public interface QueryServices extends SQLCloseable {
     "phoenix.vector.index.rebuild.probe.policy";
   public static final String VECTOR_INDEX_REBUILD_PROBE_FACTOR_ATTRIB =
     "phoenix.vector.index.rebuild.probe.factor";
+  public static final String HNSW_EF_SEARCH_ATTRIB = "phoenix.vector.hnsw.ef_search.default";
   public static final String HA_GROUP_NAME_ATTRIB = "phoenix.ha.group";
   public static final String AUTO_UPGRADE_WHITELIST_ATTRIB = "phoenix.client.autoUpgradeWhiteList";
   // Mainly for testing to force spilling

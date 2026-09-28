@@ -317,7 +317,7 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       // 4. Query with probe=1: exactly 25 rows, all distance 0
       Float[] q0 = new Float[] { distinctInputs[0][0], distinctInputs[0][1], distinctInputs[0][2],
         distinctInputs[0][3] };
-      String queryProbe1 = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + tableName
+      String queryProbe1 = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 30";
       try (PreparedStatement ps = conn.prepareStatement("EXPLAIN " + queryProbe1)) {
         ps.setArray(1, conn.createArrayOf("FLOAT", q0));
@@ -345,7 +345,7 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       }
 
       // Query with probe=4: 30 rows, first 25 at distance 0, next 5 at distance sqrt(12)
-      String queryProbe4 = "SELECT /*+ VECTOR_PROBE_COUNT(4) */ ID FROM " + tableName
+      String queryProbe4 = "SELECT /*+ VECTOR_INDEX(probes=4) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 30";
       List<String> probe4Ids = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(queryProbe4)) {
@@ -678,7 +678,7 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
         VectorIndexTestUtil.buildProbeFixture(conn, tableName, indexName, null, false);
 
       // Under generation 1 centroids, probe=1 routes to centroid 0 and returns [A1, A2].
-      String probeQuery = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + tableName
+      String probeQuery = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       List<String> gen1Actual = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(probeQuery)) {
@@ -763,7 +763,7 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
         VectorIndexTestUtil.buildProbeFixture(conn, tableName, indexName, null, false);
       Float[] boxed = new Float[] { fixture.queryVector[0], fixture.queryVector[1],
         fixture.queryVector[2], fixture.queryVector[3] };
-      String probeQuery = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + tableName
+      String probeQuery = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
 
       // Under generation 1 centroids, a single-probe query selects centroid 0.
@@ -815,7 +815,7 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       CentroidManager.setDefaultConnection(null);
 
       // Run probe=1 query with cold cache
-      String query = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + tableName
+      String query = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       Float[] boxed = new Float[] { fixture.queryVector[0], fixture.queryVector[1],
         fixture.queryVector[2], fixture.queryVector[3] };
@@ -1032,7 +1032,7 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
 
         // Query with probe=4 (all centroids) while rebuild is in progress
         Float[] queryVec = new Float[] { 0.0f, 1.0f, 2.0f, 3.0f };
-        String query = "SELECT /*+ VECTOR_PROBE_COUNT(4) */ ID FROM " + tableName
+        String query = "SELECT /*+ VECTOR_INDEX(probes=4) */ ID FROM " + tableName
           + " ORDER BY L2_DISTANCE(V, ?) LIMIT " + rowCount;
         Set<String> resultIds = new HashSet<>();
         int totalRows = 0;

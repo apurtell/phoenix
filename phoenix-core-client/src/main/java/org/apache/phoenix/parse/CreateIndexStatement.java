@@ -350,6 +350,20 @@ public class CreateIndexStatement extends SingleTableStatement {
     IndexKeyConstraint indexKeyConstraint, List<ColumnName> includeColumns, List<ParseNode> splits,
     ListMultimap<String, Pair<String, Object>> props, boolean ifNotExists, IndexType indexType,
     boolean async, int bindCount, Map<String, UDFParseNode> udfParseNodes, ParseNode where,
+    String vectorAlgorithm, String vectorMetric, Integer hnswM, Integer hnswEfConstruction,
+    Double hnswAlpha, String quantizationType, Integer pqSegments, Integer pqTrainingSize) {
+    this(indexTableName, dataTable, indexKeyConstraint, includeColumns, splits, props, ifNotExists,
+      indexType, async, bindCount, udfParseNodes, where, getIndexConsistency(props),
+      new VectorIndexParams.Builder().setAlgorithm(vectorAlgorithm).setMetric(vectorMetric)
+        .setHnswM(hnswM).setHnswEfConstruction(hnswEfConstruction).setHnswAlpha(hnswAlpha)
+        .setQuantizationType(quantizationType).setPqSegments(pqSegments)
+        .setPqTrainingSize(pqTrainingSize).build());
+  }
+
+  public CreateIndexStatement(NamedNode indexTableName, NamedTableNode dataTable,
+    IndexKeyConstraint indexKeyConstraint, List<ColumnName> includeColumns, List<ParseNode> splits,
+    ListMultimap<String, Pair<String, Object>> props, boolean ifNotExists, IndexType indexType,
+    boolean async, int bindCount, Map<String, UDFParseNode> udfParseNodes, ParseNode where,
     IndexConsistency indexConsistency, VectorIndexParams vectorIndexParams) {
     super(dataTable, bindCount);
     this.indexTableName =

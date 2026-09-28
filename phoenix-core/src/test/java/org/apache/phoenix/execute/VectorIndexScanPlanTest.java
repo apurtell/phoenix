@@ -119,30 +119,30 @@ public class VectorIndexScanPlanTest extends BaseConnectionlessQueryTest {
 
   @Test
   public void testCustomProbeHint() {
-    // /*+ VECTOR_PROBE_COUNT 5 */
-    HintNode hintNode1 = new HintNode("/*+ VECTOR_PROBE_COUNT 5 */");
-    assertTrue(hintNode1.hasHint(Hint.VECTOR_PROBE_COUNT));
+    // /*+ VECTOR_INDEX(probes=5) */
+    HintNode hintNode1 = new HintNode("/*+ VECTOR_INDEX(probes=5) */");
+    assertTrue(hintNode1.hasHint(Hint.VECTOR_INDEX));
     assertEquals(5, VectorIndexScanPlan.resolveProbeCount(null, hintNode1, null, 1024));
 
-    // /*+ VECTOR_PROBE_COUNT(5) */
-    HintNode hintNode2 = new HintNode("/*+ VECTOR_PROBE_COUNT(5) */");
-    assertTrue(hintNode2.hasHint(Hint.VECTOR_PROBE_COUNT));
+    // With spaces: /*+ VECTOR_INDEX(probes = 5) */
+    HintNode hintNode2 = new HintNode("/*+ VECTOR_INDEX(probes = 5) */");
+    assertTrue(hintNode2.hasHint(Hint.VECTOR_INDEX));
     assertEquals(5, VectorIndexScanPlan.resolveProbeCount(null, hintNode2, null, 1024));
 
-    // /*+ VECTOR_PROBE_COUNT = 5 */
-    HintNode hintNode3 = new HintNode("/*+ VECTOR_PROBE_COUNT = 5 */");
-    assertTrue(hintNode3.hasHint(Hint.VECTOR_PROBE_COUNT));
+    // Multi-parameter hint: /*+ VECTOR_INDEX(probes=5, oversample=2.5) */
+    HintNode hintNode3 = new HintNode("/*+ VECTOR_INDEX(probes=5, oversample=2.5) */");
+    assertTrue(hintNode3.hasHint(Hint.VECTOR_INDEX));
     assertEquals(5, VectorIndexScanPlan.resolveProbeCount(null, hintNode3, null, 1024));
 
-    // Programmatic creation: HintNode.create(..., Hint.VECTOR_PROBE_COUNT, "5")
-    HintNode hintNode4 = HintNode.create(HintNode.EMPTY_HINT_NODE, Hint.VECTOR_PROBE_COUNT, "5");
-    assertTrue(hintNode4.hasHint(Hint.VECTOR_PROBE_COUNT));
+    // Programmatic creation: HintNode.create(..., Hint.VECTOR_INDEX, "(probes=5)")
+    HintNode hintNode4 = HintNode.create(HintNode.EMPTY_HINT_NODE, Hint.VECTOR_INDEX, "(probes=5)");
+    assertTrue(hintNode4.hasHint(Hint.VECTOR_INDEX));
     assertEquals(5, VectorIndexScanPlan.resolveProbeCount(null, hintNode4, null, 1024));
 
-    // Combined hint: /*+ INDEX(T IDX) VECTOR_PROBE_COUNT 12 */
-    HintNode combinedHint = new HintNode("/*+ INDEX(T IDX) VECTOR_PROBE_COUNT 12 */");
+    // Combined hint: /*+ INDEX(T IDX) VECTOR_INDEX(probes=12) */
+    HintNode combinedHint = new HintNode("/*+ INDEX(T IDX) VECTOR_INDEX(probes=12) */");
     assertTrue(combinedHint.hasHint(Hint.INDEX));
-    assertTrue(combinedHint.hasHint(Hint.VECTOR_PROBE_COUNT));
+    assertTrue(combinedHint.hasHint(Hint.VECTOR_INDEX));
     assertEquals(12, VectorIndexScanPlan.resolveProbeCount(null, combinedHint, null, 1024));
   }
 
@@ -168,9 +168,9 @@ public class VectorIndexScanPlanTest extends BaseConnectionlessQueryTest {
 
   @Test
   public void testProbeCountPrecedence() throws SQLException {
-    HintNode hint5 = new HintNode("/*+ VECTOR_PROBE_COUNT 5 */");
-    HintNode hintAbc = new HintNode("/*+ VECTOR_PROBE_COUNT(abc) */");
-    HintNode hint0 = new HintNode("/*+ VECTOR_PROBE_COUNT(0) */");
+    HintNode hint5 = new HintNode("/*+ VECTOR_INDEX(probes=5) */");
+    HintNode hintAbc = new HintNode("/*+ VECTOR_INDEX(probes=abc) */");
+    HintNode hint0 = new HintNode("/*+ VECTOR_INDEX(probes=0) */");
 
     Properties props7 = new Properties();
     props7.setProperty(QueryServices.VECTOR_PROBE_COUNT_ATTRIB, "7");
@@ -257,22 +257,27 @@ public class VectorIndexScanPlanTest extends BaseConnectionlessQueryTest {
     assertEquals(3.0, VectorIndexScanPlan.resolveOversampleFactor(null, null, null), 1e-6);
 
     // Hint overrides default factor
-    HintNode hint5 = new HintNode("/*+ OVERSAMPLE(5.0) */");
+    HintNode hint5 = new HintNode("/*+ VECTOR_INDEX(oversample=5.0) */");
     assertEquals(5.0, VectorIndexScanPlan.resolveOversampleFactor(null, hint5, null), 1e-6);
 
-    // Hint syntax without parentheses
-    HintNode hint5Plain = new HintNode("/*+ OVERSAMPLE 5.0 */");
-    assertEquals(5.0, VectorIndexScanPlan.resolveOversampleFactor(null, hint5Plain, null), 1e-6);
+    // Hint syntax with spaces
+    HintNode hint5WithSpaces = new HintNode("/*+ VECTOR_INDEX(oversample = 5.0) */");
+    assertEquals(5.0, VectorIndexScanPlan.resolveOversampleFactor(null, hint5WithSpaces, null),
+      1e-6);
+
+    // Flag parameter without value uses default factor
+    HintNode hintFlag = new HintNode("/*+ VECTOR_INDEX(oversample) */");
+    assertEquals(3.0, VectorIndexScanPlan.resolveOversampleFactor(null, hintFlag, null), 1e-6);
 
     // Explicit parameter takes precedence over hint
     assertEquals(4.0, VectorIndexScanPlan.resolveOversampleFactor(4.0, hint5, null), 1e-6);
 
     // Non-numeric hint falls back to default
-    HintNode hintAbc = new HintNode("/*+ OVERSAMPLE(abc) */");
+    HintNode hintAbc = new HintNode("/*+ VECTOR_INDEX(oversample=abc) */");
     assertEquals(3.0, VectorIndexScanPlan.resolveOversampleFactor(null, hintAbc, null), 1e-6);
 
     // Oversample factor below 1.0 is rejected and falls back to default
-    HintNode hintSub1 = new HintNode("/*+ OVERSAMPLE(0.5) */");
+    HintNode hintSub1 = new HintNode("/*+ VECTOR_INDEX(oversample=0.5) */");
     assertEquals(3.0, VectorIndexScanPlan.resolveOversampleFactor(null, hintSub1, null), 1e-6);
 
     // Session and connection property resolution
@@ -294,23 +299,24 @@ public class VectorIndexScanPlanTest extends BaseConnectionlessQueryTest {
     assertEquals(Integer.MAX_VALUE, VectorIndexScanPlan.resolveMaxProbeLimit(null, null, null));
 
     // Query hint overrides default
-    HintNode hint3 = new HintNode("/*+ MAX_PROBE_LIMIT(3) */");
-    assertTrue(hint3.hasHint(Hint.MAX_PROBE_LIMIT));
+    HintNode hint3 = new HintNode("/*+ VECTOR_INDEX(max_probe_limit=3) */");
+    assertTrue(hint3.hasHint(Hint.VECTOR_INDEX));
     assertEquals(3, VectorIndexScanPlan.resolveMaxProbeLimit(null, hint3, null));
 
-    HintNode hint3Eq = new HintNode("/*+ MAX_PROBE_LIMIT = 3 */");
-    assertTrue(hint3Eq.hasHint(Hint.MAX_PROBE_LIMIT));
-    assertEquals(3, VectorIndexScanPlan.resolveMaxProbeLimit(null, hint3Eq, null));
+    HintNode hint3Spaces = new HintNode("/*+ VECTOR_INDEX(max_probe_limit = 3) */");
+    assertTrue(hint3Spaces.hasHint(Hint.VECTOR_INDEX));
+    assertEquals(3, VectorIndexScanPlan.resolveMaxProbeLimit(null, hint3Spaces, null));
 
-    HintNode hint3Plain = new HintNode("/*+ MAX_PROBE_LIMIT 3 */");
-    assertTrue(hint3Plain.hasHint(Hint.MAX_PROBE_LIMIT));
-    assertEquals(3, VectorIndexScanPlan.resolveMaxProbeLimit(null, hint3Plain, null));
+    // Multi-parameter hint
+    HintNode hintMulti = new HintNode("/*+ VECTOR_INDEX(probes=5, max_probe_limit=3) */");
+    assertTrue(hintMulti.hasHint(Hint.VECTOR_INDEX));
+    assertEquals(3, VectorIndexScanPlan.resolveMaxProbeLimit(null, hintMulti, null));
 
     // Explicit parameter takes precedence over hint
     assertEquals(2, VectorIndexScanPlan.resolveMaxProbeLimit(2, hint3, null));
 
     // Invalid query hint falls back to default
-    HintNode hintInvalid = new HintNode("/*+ MAX_PROBE_LIMIT(abc) */");
+    HintNode hintInvalid = new HintNode("/*+ VECTOR_INDEX(max_probe_limit=abc) */");
     assertEquals(Integer.MAX_VALUE,
       VectorIndexScanPlan.resolveMaxProbeLimit(null, hintInvalid, null));
 

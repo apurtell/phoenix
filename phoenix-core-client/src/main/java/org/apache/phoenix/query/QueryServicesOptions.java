@@ -61,6 +61,7 @@ import static org.apache.phoenix.query.QueryServices.GROUPBY_MAX_CACHE_SIZE_ATTR
 import static org.apache.phoenix.query.QueryServices.GROUPBY_SPILLABLE_ATTRIB;
 import static org.apache.phoenix.query.QueryServices.GROUPBY_SPILL_FILES_ATTRIB;
 import static org.apache.phoenix.query.QueryServices.HBASE_CLIENT_SCANNER_TIMEOUT_ATTRIB;
+import static org.apache.phoenix.query.QueryServices.HNSW_EF_SEARCH_ATTRIB;
 import static org.apache.phoenix.query.QueryServices.IMMUTABLE_ROWS_ATTRIB;
 import static org.apache.phoenix.query.QueryServices.INDEX_CREATE_DEFAULT_STATE;
 import static org.apache.phoenix.query.QueryServices.INDEX_MUTATE_BATCH_SIZE_THRESHOLD_ATTRIB;
@@ -247,6 +248,7 @@ public class QueryServicesOptions {
   public static final long DEFAULT_VECTOR_INDEX_REBUILD_MIN_INTERVAL_MS = 86400000L;
   public static final String DEFAULT_VECTOR_INDEX_REBUILD_PROBE_POLICY = "EXPAND";
   public static final double DEFAULT_VECTOR_INDEX_REBUILD_PROBE_FACTOR = 2.0;
+  public static final int DEFAULT_HNSW_EF_SEARCH = 64;
   public static final int DEFAULT_GROUPBY_ESTIMATED_DISTINCT_VALUES = 1000;
   public static final int DEFAULT_CLOCK_SKEW_INTERVAL = 2000;
   public static final boolean DEFAULT_INDEX_FAILURE_HANDLING_REBUILD = true; // auto rebuild on
@@ -650,7 +652,8 @@ public class QueryServicesOptions {
       .setIfUnset(CQSI_THREAD_POOL_METRICS_ENABLED, DEFAULT_CQSI_THREAD_POOL_METRICS_ENABLED)
       .setIfUnset(CDC_TTL_MUTATION_MAX_RETRIES, DEFAULT_CDC_TTL_MUTATION_MAX_RETRIES)
       .setIfUnset(CDC_TTL_MUTATION_BATCH_SIZE, DEFAULT_CDC_TTL_MUTATION_BATCH_SIZE)
-      .setIfUnset(CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS, DEFAULT_CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS);
+      .setIfUnset(CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS, DEFAULT_CDC_TTL_SHARED_CACHE_EXPIRY_SECONDS)
+      .setIfUnset(HNSW_EF_SEARCH_ATTRIB, DEFAULT_HNSW_EF_SEARCH);
 
     // HBase sets this to 1, so we reset it to something more appropriate.
     // Hopefully HBase will change this, because we can't know if a user set
@@ -801,6 +804,14 @@ public class QueryServicesOptions {
 
   public int getKeepAliveMs() {
     return config.getInt(KEEP_ALIVE_MS_ATTRIB, DEFAULT_KEEP_ALIVE_MS);
+  }
+
+  public int getHnswEfSearch() {
+    return config.getInt(HNSW_EF_SEARCH_ATTRIB, DEFAULT_HNSW_EF_SEARCH);
+  }
+
+  public QueryServicesOptions setHnswEfSearch(int efSearch) {
+    return set(HNSW_EF_SEARCH_ATTRIB, efSearch);
   }
 
   public int getThreadPoolSize() {

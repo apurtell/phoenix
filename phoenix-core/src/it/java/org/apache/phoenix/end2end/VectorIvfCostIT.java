@@ -112,9 +112,9 @@ public class VectorIvfCostIT extends ParallelStatsEnabledIT {
   @Test
   public void testProbeFractionAppliedOnce() throws Exception {
     try (Connection conn = getCostBasedConnection()) {
-      String query1 = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + tableName
+      String query1 = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
-      String query4 = "SELECT /*+ VECTOR_PROBE_COUNT(4) */ ID FROM " + tableName
+      String query4 = "SELECT /*+ VECTOR_INDEX(probes=4) */ ID FROM " + tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
       String queryExact =
         "SELECT /*+ NO_INDEX */ ID FROM " + tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
@@ -165,13 +165,13 @@ public class VectorIvfCostIT extends ParallelStatsEnabledIT {
   public void testLookupsAreCosted() throws Exception {
     try (Connection conn = getCostBasedConnection()) {
       // Fully covered vector index scan with no base table lookups
-      String queryCovered = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID, CATEGORY FROM " + tableName
+      String queryCovered = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID, CATEGORY FROM " + tableName
         + " WHERE CATEGORY = 'catA' ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
       // Vector index scan with deferred projection lookups for top-k rows
-      String queryProjLookup = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID, DESCRIPTION FROM "
+      String queryProjLookup = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID, DESCRIPTION FROM "
         + tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
       // Vector index scan with filter-time lookups to evaluate predicates before sorting
-      String queryFilterLookup = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID, CATEGORY FROM "
+      String queryFilterLookup = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID, CATEGORY FROM "
         + tableName + " WHERE DESCRIPTION = 'desc_k0_r0001' ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
 
       Cost costCovered;

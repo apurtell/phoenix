@@ -491,7 +491,7 @@ public class VectorIndexScanPlan extends ScanPlan {
   }
 
   /**
-   * Resolves the effective probe count based on explicit parameter, VECTOR_PROBE_COUNT query hint,
+   * Resolves the effective probe count based on explicit parameter, VECTOR_INDEX query hint,
    * connection property, query services configuration, or default square-root heuristic clamped to
    * the centroid count.
    */
@@ -507,19 +507,17 @@ public class VectorIndexScanPlan extends ScanPlan {
       candidate = explicitProbeCount;
     }
 
-    if (candidate <= 0 && hintNode != null && hintNode.hasHint(HintNode.Hint.VECTOR_PROBE_COUNT)) {
-      String hintVal = hintNode.getHint(HintNode.Hint.VECTOR_PROBE_COUNT);
-      if (hintVal != null) {
-        String clean = hintVal.replaceAll("[()=\\s]", "");
-        if (!clean.isEmpty()) {
-          try {
-            int p = Integer.parseInt(clean);
-            if (p > 0) {
-              candidate = p;
-            }
-          } catch (NumberFormatException e) {
-            LOGGER.warn("Invalid numeric VECTOR_PROBE_COUNT hint: {}", hintVal);
+    if (candidate <= 0 && hintNode != null && hintNode.hasHint(HintNode.Hint.VECTOR_INDEX)) {
+      Map<String, String> params = HintNode.parseVectorIndexHint(hintNode);
+      String val = params.get(HintNode.HINT_PARAM_PROBES);
+      if (val != null) {
+        try {
+          int p = Integer.parseInt(val);
+          if (p > 0) {
+            candidate = p;
           }
+        } catch (NumberFormatException e) {
+          LOGGER.warn("Invalid numeric probes parameter in VECTOR_INDEX hint: {}", val);
         }
       }
     }
@@ -653,8 +651,9 @@ public class VectorIndexScanPlan extends ScanPlan {
 
   /**
    * Resolves the oversample factor for two-phase vector search with precedence: 1. Explicit
-   * parameter (>= 1.0) 2. Query hint OVERSAMPLE (>= 1.0) 3. Connection client info property / query
-   * services configuration 4. Default: QueryServicesOptions.DEFAULT_VECTOR_OVERSAMPLE_FACTOR (3.0)
+   * parameter (>= 1.0) 2. Query hint VECTOR_INDEX(oversample=N.N) (>= 1.0) 3. Connection client
+   * info property / query services configuration 4. Default:
+   * QueryServicesOptions.DEFAULT_VECTOR_OVERSAMPLE_FACTOR (3.0)
    */
   public static double resolveOversampleFactor(Double explicitOversampleFactor, HintNode hintNode,
     PhoenixConnection connection) {
@@ -664,18 +663,20 @@ public class VectorIndexScanPlan extends ScanPlan {
       candidate = explicitOversampleFactor;
     }
 
-    if (candidate < 1.0 && hintNode != null && hintNode.hasHint(HintNode.Hint.OVERSAMPLE)) {
-      String hintVal = hintNode.getHint(HintNode.Hint.OVERSAMPLE);
-      if (hintVal != null) {
-        String clean = hintVal.replaceAll("[()=\\s]", "");
-        if (!clean.isEmpty()) {
+    if (candidate < 1.0 && hintNode != null && hintNode.hasHint(HintNode.Hint.VECTOR_INDEX)) {
+      Map<String, String> params = HintNode.parseVectorIndexHint(hintNode);
+      String val = params.get(HintNode.HINT_PARAM_OVERSAMPLE);
+      if (val != null) {
+        if ("true".equalsIgnoreCase(val)) {
+          candidate = QueryServicesOptions.DEFAULT_VECTOR_OVERSAMPLE_FACTOR;
+        } else {
           try {
-            double f = Double.parseDouble(clean);
+            double f = Double.parseDouble(val);
             if (f >= 1.0) {
               candidate = f;
             }
           } catch (NumberFormatException e) {
-            LOGGER.warn("Invalid numeric OVERSAMPLE hint: {}", hintVal);
+            LOGGER.warn("Invalid numeric oversample parameter in VECTOR_INDEX hint: {}", val);
           }
         }
       }
@@ -735,22 +736,17 @@ public class VectorIndexScanPlan extends ScanPlan {
       return explicitMaxProbeLimit;
     }
 
-    if (hintNode != null) {
-      String hintVal = null;
-      if (hintNode.hasHint(HintNode.Hint.MAX_PROBE_LIMIT)) {
-        hintVal = hintNode.getHint(HintNode.Hint.MAX_PROBE_LIMIT);
-      }
-      if (hintVal != null) {
-        String clean = hintVal.replaceAll("[()=\\s]", "");
-        if (!clean.isEmpty()) {
-          try {
-            int p = Integer.parseInt(clean);
-            if (p > 0) {
-              return p;
-            }
-          } catch (NumberFormatException e) {
-            LOGGER.warn("Invalid numeric MAX_PROBE_LIMIT hint: {}", hintVal);
+    if (hintNode != null && hintNode.hasHint(HintNode.Hint.VECTOR_INDEX)) {
+      Map<String, String> params = HintNode.parseVectorIndexHint(hintNode);
+      String val = params.get(HintNode.HINT_PARAM_MAX_PROBE_LIMIT);
+      if (val != null) {
+        try {
+          int p = Integer.parseInt(val);
+          if (p > 0) {
+            return p;
           }
+        } catch (NumberFormatException e) {
+          LOGGER.warn("Invalid numeric max_probe_limit parameter in VECTOR_INDEX hint: {}", val);
         }
       }
     }

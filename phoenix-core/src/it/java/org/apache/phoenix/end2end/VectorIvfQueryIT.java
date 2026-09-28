@@ -339,7 +339,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       // Single-probe query restricts scan to centroid 0 posting list.
       Float[] qVec = new Float[] { fixProbe.queryVector[0], fixProbe.queryVector[1],
         fixProbe.queryVector[2], fixProbe.queryVector[3] };
-      String probe1Sql = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + fixProbe.tableName
+      String probe1Sql = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + fixProbe.tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       try (PreparedStatement ps = conn.prepareStatement("EXPLAIN " + probe1Sql)) {
         ps.setArray(1, conn.createArrayOf("FLOAT", qVec));
@@ -362,7 +362,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
         actualProbe1);
 
       // Two-probe query expands scan across both centroid posting lists.
-      String probe2Sql = "SELECT /*+ VECTOR_PROBE_COUNT(2) */ ID FROM " + fixProbe.tableName
+      String probe2Sql = "SELECT /*+ VECTOR_INDEX(probes=2) */ ID FROM " + fixProbe.tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       try (PreparedStatement ps = conn.prepareStatement("EXPLAIN " + probe2Sql)) {
         ps.setArray(1, conn.createArrayOf("FLOAT", qVec));
@@ -433,7 +433,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
 
       int[] probeCounts = { 1, 3, 4 }; // lists = 4 on fixture 1
       for (int probe : probeCounts) {
-        String sql = "SELECT /*+ VECTOR_PROBE_COUNT(" + probe + ") */ ID FROM "
+        String sql = "SELECT /*+ VECTOR_INDEX(probes=" + probe + ") */ ID FROM "
           + fixL2Covered.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
 
         try (PhoenixPreparedStatement pps =
@@ -1315,7 +1315,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       List<String> oracleTop5 = VectorIndexTestUtil.bruteForceTopK(cosineRows, q, "COSINE", 5);
 
       // Probe=4: ordered equality with brute force top-5
-      String queryProbe4 = "SELECT /*+ VECTOR_PROBE_COUNT(4) */ ID FROM " + cosineTable
+      String queryProbe4 = "SELECT /*+ VECTOR_INDEX(probes=4) */ ID FROM " + cosineTable
         + " ORDER BY COSINE_DISTANCE(V, ?) LIMIT 5";
       List<String> actualProbe4 = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(queryProbe4)) {
@@ -1329,7 +1329,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       assertEquals(oracleTop5, actualProbe4);
 
       // Probe=1: all results must be in nearest centroid (0)
-      String queryProbe1 = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + cosineTable
+      String queryProbe1 = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + cosineTable
         + " ORDER BY COSINE_DISTANCE(V, ?) LIMIT 5";
       List<String> actualProbe1 = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(queryProbe1)) {
@@ -1374,7 +1374,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       List<String> oracleTop5 = VectorIndexTestUtil.bruteForceTopK(ipRows, q, "INNER_PRODUCT", 5);
 
       // Probe=4: ordered equality with brute force top-5
-      String queryProbe4 = "SELECT /*+ VECTOR_PROBE_COUNT(4) */ ID FROM " + ipTable
+      String queryProbe4 = "SELECT /*+ VECTOR_INDEX(probes=4) */ ID FROM " + ipTable
         + " ORDER BY INNER_PRODUCT(V, ?) LIMIT 5";
       List<String> actualProbe4 = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(queryProbe4)) {
@@ -1388,7 +1388,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       assertEquals(oracleTop5, actualProbe4);
 
       // Probe=1: all results must belong to nearest centroid (0)
-      String queryProbe1 = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + ipTable
+      String queryProbe1 = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + ipTable
         + " ORDER BY INNER_PRODUCT(V, ?) LIMIT 5";
       List<String> actualProbe1 = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(queryProbe1)) {
@@ -1426,7 +1426,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       // Probe=1 on salted table returns [A1, A2]
       Float[] qVec = new Float[] { fixSaltedProbe.queryVector[0], fixSaltedProbe.queryVector[1],
         fixSaltedProbe.queryVector[2], fixSaltedProbe.queryVector[3] };
-      String probe1Sql = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + fixSaltedProbe.tableName
+      String probe1Sql = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + fixSaltedProbe.tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       List<String> actualProbe1 = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(probe1Sql)) {
@@ -1441,7 +1441,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
         actualProbe1);
 
       // Probe=2 on salted table returns [A1, B1]
-      String probe2Sql = "SELECT /*+ VECTOR_PROBE_COUNT(2) */ ID FROM " + fixSaltedProbe.tableName
+      String probe2Sql = "SELECT /*+ VECTOR_INDEX(probes=2) */ ID FROM " + fixSaltedProbe.tableName
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       List<String> actualProbe2 = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(probe2Sql)) {
@@ -1464,7 +1464,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
 
     // Tenant T1 connection
     try (Connection t1Conn = getTenantConnection("T1")) {
-      String queryT1 = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + mtTable
+      String queryT1 = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + mtTable
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
 
       try (PreparedStatement ps = t1Conn.prepareStatement("EXPLAIN " + queryT1)) {
@@ -1501,7 +1501,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
 
     // Tenant T2 connection
     try (Connection t2Conn = getTenantConnection("T2")) {
-      String queryT2 = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + mtTable
+      String queryT2 = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + mtTable
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
 
       try (PhoenixPreparedStatement pps =
@@ -1533,7 +1533,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
 
     // Multi-tenant + SALT_BUCKETS=3 (exercises tenantColIndex = 1 branch)
     try (Connection t1Conn = getTenantConnection("T1")) {
-      String querySalt = "SELECT /*+ VECTOR_PROBE_COUNT(1) */ ID FROM " + mtSaltTable
+      String querySalt = "SELECT /*+ VECTOR_INDEX(probes=1) */ ID FROM " + mtSaltTable
         + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       List<String> actualSalt = new ArrayList<>();
       try (PreparedStatement ps = t1Conn.prepareStatement(querySalt)) {
@@ -1600,8 +1600,8 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
         fixProbe.queryVector[2], fixProbe.queryVector[3] };
 
       // Two-phase scoring with explicit oversampling factor 5.0.
-      String sqlWithHint = "SELECT /*+ OVERSAMPLE(5.0) */ ID FROM " + fixProbe.tableName
-        + " ORDER BY L2_DISTANCE(V, ?) LIMIT 10";
+      String sqlWithHint = "SELECT /*+ VECTOR_INDEX(oversample=5.0) */ ID FROM "
+        + fixProbe.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 10";
       try (PreparedStatement ps = conn.prepareStatement("EXPLAIN " + sqlWithHint)) {
         ps.setArray(1, conn.createArrayOf("FLOAT", qVec));
         try (ResultSet rs = ps.executeQuery()) {
@@ -1633,8 +1633,8 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       }
 
       // Oversampling factor 1.0 disables two-phase rescore.
-      String sqlNoRescore = "SELECT /*+ OVERSAMPLE(1.0) */ ID FROM " + fixProbe.tableName
-        + " ORDER BY L2_DISTANCE(V, ?) LIMIT 10";
+      String sqlNoRescore = "SELECT /*+ VECTOR_INDEX(oversample=1.0) */ ID FROM "
+        + fixProbe.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 10";
       try (PreparedStatement ps = conn.prepareStatement("EXPLAIN " + sqlNoRescore)) {
         ps.setArray(1, conn.createArrayOf("FLOAT", qVec));
         try (ResultSet rs = ps.executeQuery()) {
@@ -1657,8 +1657,8 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       Float[] qVec = new Float[] { fixProbe.queryVector[0], fixProbe.queryVector[1],
         fixProbe.queryVector[2], fixProbe.queryVector[3] };
 
-      // Evaluate query in single-phase mode (OVERSAMPLE(1.0)).
-      String sqlSingle = "SELECT /*+ OVERSAMPLE(1.0) VECTOR_PROBE_COUNT(2) */ ID FROM "
+      // Evaluate query in single-phase mode (oversample=1.0).
+      String sqlSingle = "SELECT /*+ VECTOR_INDEX(oversample=1.0, probes=2) */ ID FROM "
         + fixProbe.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       List<String> resultsSingle = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(sqlSingle)) {
@@ -1670,8 +1670,8 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
         }
       }
 
-      // Evaluate query in two-phase mode (OVERSAMPLE(3.0)).
-      String sqlTwoPhase = "SELECT /*+ OVERSAMPLE(3.0) VECTOR_PROBE_COUNT(2) */ ID FROM "
+      // Evaluate query in two-phase mode (oversample=3.0).
+      String sqlTwoPhase = "SELECT /*+ VECTOR_INDEX(oversample=3.0, probes=2) */ ID FROM "
         + fixProbe.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 2";
       List<String> resultsTwoPhase = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(sqlTwoPhase)) {
@@ -1698,7 +1698,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       Set<String> groundTruthSet = new HashSet<>(groundTruth);
 
       // Single-phase evaluation with probe=1.
-      String singleSql = "SELECT /*+ OVERSAMPLE(1.0) VECTOR_PROBE_COUNT(1) */ ID FROM "
+      String singleSql = "SELECT /*+ VECTOR_INDEX(oversample=1.0, probes=1) */ ID FROM "
         + fixL2Covered.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT " + k;
       List<String> singlePhaseResults = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(singleSql)) {
@@ -1711,7 +1711,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       }
 
       // Two-phase evaluation with probe=1.
-      String twoPhaseSql = "SELECT /*+ OVERSAMPLE(3.0) VECTOR_PROBE_COUNT(1) */ ID FROM "
+      String twoPhaseSql = "SELECT /*+ VECTOR_INDEX(oversample=3.0, probes=1) */ ID FROM "
         + fixL2Covered.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT " + k;
       List<String> twoPhaseResults = new ArrayList<>();
       try (PreparedStatement ps = conn.prepareStatement(twoPhaseSql)) {
@@ -1922,7 +1922,7 @@ public class VectorIvfQueryIT extends ParallelStatsDisabledIT {
       Float[] boxedQ = new Float[] { q[0], q[1], q[2], q[3] };
 
       // Projection-time lookup plan specifying an explicit probe count hint
-      String queryProj = "SELECT /*+ VECTOR_PROBE_COUNT(3) */ ID, DESCRIPTION FROM "
+      String queryProj = "SELECT /*+ VECTOR_INDEX(probes=3) */ ID, DESCRIPTION FROM "
         + fixL2Covered.tableName + " ORDER BY L2_DISTANCE(V, ?) LIMIT 5";
       try (PhoenixPreparedStatement pps =
         conn.prepareStatement(queryProj).unwrap(PhoenixPreparedStatement.class)) {
