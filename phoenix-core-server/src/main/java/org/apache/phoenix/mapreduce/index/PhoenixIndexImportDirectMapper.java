@@ -130,22 +130,18 @@ public class PhoenixIndexImportDirectMapper
       isVectorIndex = PhoenixConfigurationUtil.getIsVectorIndex(configuration)
         || (pIndexTable != null && pIndexTable.isVectorIndex());
       if (isVectorIndex) {
+        PTable.VectorIndex vi = pIndexTable != null ? pIndexTable.getVectorIndex() : null;
         vectorCentroidGeneration =
           PhoenixConfigurationUtil.getVectorCentroidGeneration(configuration);
-        if (
-          vectorCentroidGeneration <= 0 && pIndexTable != null
-            && pIndexTable.getVectorCentroidGeneration() != null
-        ) {
-          vectorCentroidGeneration = pIndexTable.getVectorCentroidGeneration();
+        if (vectorCentroidGeneration <= 0 && vi != null && vi.getCentroidGeneration() != null) {
+          vectorCentroidGeneration = vi.getCentroidGeneration();
         }
         if (vectorCentroidGeneration <= 0) {
           vectorCentroidGeneration = 1L;
         }
         vectorDistanceMetric = PhoenixConfigurationUtil.getVectorDistanceMetric(configuration);
-        if (vectorDistanceMetric == null && pIndexTable != null) {
-          vectorDistanceMetric = pIndexTable.getVectorDistanceMetric() != null
-            ? pIndexTable.getVectorDistanceMetric()
-            : "L2";
+        if (vectorDistanceMetric == null && vi != null) {
+          vectorDistanceMetric = vi.getDistanceMetric() != null ? vi.getDistanceMetric() : "L2";
         }
         vectorIndexInSelected = PhoenixConfigurationUtil.getVectorIndexInSelected(configuration);
         nonCentroidColCount =

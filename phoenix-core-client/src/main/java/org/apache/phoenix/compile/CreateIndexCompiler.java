@@ -378,26 +378,51 @@ public class CreateIndexCompiler {
 
     // Validate that the requested indexing algorithm is supported.
     String algorithm = create.getVectorAlgorithm();
-    boolean validAlgorithm = algorithm != null && algorithm.trim().equalsIgnoreCase("IVF");
+    boolean validAlgorithm = algorithm != null
+      && (algorithm.trim().equalsIgnoreCase("IVF") || algorithm.trim().equalsIgnoreCase("HNSW"));
     if (!validAlgorithm) {
       throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_INDEX_ALGORITHM)
         .setMessage("Unsupported vector index algorithm: " + algorithm).build().buildException();
     }
 
-    // Validate IVF cluster partition count and training sample bounds.
-    if ("IVF".equalsIgnoreCase(algorithm.trim())) {
-      Integer lists = create.getVectorLists();
-      Integer sampleSize = create.getVectorSampleSize();
-      if (lists == null || sampleSize == null) {
-        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS).setMessage(
-          "Missing required IVF parameters: " + (lists == null ? "lists is required. " : "")
-            + (sampleSize == null ? "sample_size is required." : ""))
+    String algoTrimmed = algorithm.trim();
+
+    // Reject parameter cross-contamination
+    if ("HNSW".equalsIgnoreCase(algoTrimmed)) {
+      if (
+        create.getVectorLists() != null || create.getVectorSampleSize() != null
+          || CreateIndexStatement.hasProperty(create.getProps(), "LISTS", "VECTOR_IVF_LISTS",
+            "IVF_LISTS", "SAMPLE_SIZE", "VECTOR_IVF_SAMPLE_SIZE", "IVF_SAMPLE_SIZE")
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.VECTOR_ALGORITHM_PARAM_MISMATCH)
+          .setMessage(
+            "Vector index parameter is not valid for the specified algorithm: " + algorithm)
           .build().buildException();
       }
-      if (lists <= 0 || sampleSize < lists) {
-        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+    } else if ("IVF".equalsIgnoreCase(algoTrimmed)) {
+      if (
+        create.getHnswM() != null || create.getHnswEfConstruction() != null
+          || create.getHnswAlpha() != null || create.getQuantizationType() != null
+          || create.getPqSegments() != null || create.getPqTrainingSize() != null
+          || CreateIndexStatement.hasProperty(create.getProps(), "M", "HNSW_M", "VECTOR_HNSW_M",
+            "EF_CONSTRUCTION", "HNSW_EF_CONSTRUCTION", "VECTOR_HNSW_EF_CONSTRUCTION", "ALPHA",
+            "HNSW_ALPHA", "VECTOR_HNSW_ALPHA", "QUANTIZATION", "QUANTIZATION_TYPE",
+            "VECTOR_QUANTIZATION_TYPE", "PQ_SEGMENTS", "VECTOR_PQ_SEGMENTS", "PQ_TRAINING_SIZE",
+            "VECTOR_PQ_TRAINING_SIZE")
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.VECTOR_ALGORITHM_PARAM_MISMATCH)
           .setMessage(
-            "Invalid vector index parameters: lists=" + lists + ", sample_size=" + sampleSize)
+            "Vector index parameter is not valid for the specified algorithm: " + algorithm)
+          .build().buildException();
+      }
+    }
+
+    // Covering column prohibition for HNSW
+    if ("HNSW".equalsIgnoreCase(algoTrimmed)) {
+      if (create.getIncludeColumns() != null && !create.getIncludeColumns().isEmpty()) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.HNSW_INCLUDE_NOT_SUPPORTED)
+          .setMessage(
+            "INCLUDE is not supported for HNSW vector indexes: " + create.getIncludeColumns())
           .build().buildException();
       }
     }
@@ -418,7 +443,156 @@ public class CreateIndexCompiler {
         .build().buildException();
     }
 
-    return new CreateIndexStatement(create, dimension);
+    Integer m = null;
+    Integer efConstruction = null;
+    Double alpha = null;
+    String quantization = null;
+    Integer pqSegments = null;
+    Integer pqTrainingSize = null;
+
+    if ("IVF".equalsIgnoreCase(algoTrimmed)) {
+      Integer lists = create.getVectorLists();
+      Integer sampleSize = create.getVectorSampleSize();
+      if (lists == null || sampleSize == null) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS).setMessage(
+          "Missing required IVF parameters: " + (lists == null ? "lists is required. " : "")
+            + (sampleSize == null ? "sample_size is required." : ""))
+          .build().buildException();
+      }
+      if (lists <= 0 || sampleSize < lists) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage(
+            "Invalid vector index parameters: lists=" + lists + ", sample_size=" + sampleSize)
+          .build().buildException();
+      }
+    } else if ("HNSW".equalsIgnoreCase(algoTrimmed)) {
+      if (
+        CreateIndexStatement.hasProperty(create.getProps(), "M", "HNSW_M", "VECTOR_HNSW_M")
+          && create.getHnswM() == null
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("M must be an integer").build().buildException();
+      }
+      m = create.getHnswM();
+      if (m != null && (m < 4 || m > 64)) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("M must be an integer between 4 and 64, but was: " + m).build()
+          .buildException();
+      }
+
+      if (
+        CreateIndexStatement.hasProperty(create.getProps(), "EF_CONSTRUCTION",
+          "HNSW_EF_CONSTRUCTION", "VECTOR_HNSW_EF_CONSTRUCTION")
+          && create.getHnswEfConstruction() == null
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("ef_construction must be an integer").build().buildException();
+      }
+      efConstruction = create.getHnswEfConstruction();
+      if (efConstruction != null && (efConstruction < 16 || efConstruction > 512)) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage(
+            "ef_construction must be an integer between 16 and 512, but was: " + efConstruction)
+          .build().buildException();
+      }
+
+      if (
+        CreateIndexStatement.hasProperty(create.getProps(), "ALPHA", "HNSW_ALPHA",
+          "VECTOR_HNSW_ALPHA") && create.getHnswAlpha() == null
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("alpha must be a double").build().buildException();
+      }
+      alpha = create.getHnswAlpha();
+      if (alpha != null && (alpha < 1.0 || alpha > 2.0)) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("alpha must be a double between 1.0 and 2.0, but was: " + alpha).build()
+          .buildException();
+      }
+      if (alpha == null) {
+        alpha = 1.2;
+      }
+
+      quantization = create.getQuantizationType();
+      if (quantization != null) {
+        String upperQ = quantization.toUpperCase();
+        if (!upperQ.equals("NONE") && !upperQ.equals("SQ8") && !upperQ.equals("PQ")) {
+          throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_QUANTIZATION_TYPE)
+            .setMessage("Unsupported vector quantization type: " + quantization
+              + ". Supported types are NONE, SQ8, and PQ.")
+            .build().buildException();
+        }
+        if (upperQ.equals("SQ8") && !(vectorExpr.getDataType() instanceof PVectorFloat)) {
+          throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_QUANTIZATION_TYPE)
+            .setMessage(
+              "Scalar quantization (SQ8) is only supported for single-precision vector columns (VECTOR(FLOAT, dim)), found: "
+                + vectorExpr.getDataType().getSqlTypeName())
+            .build().buildException();
+        }
+      }
+
+      if (
+        CreateIndexStatement.hasProperty(create.getProps(), "PQ_SEGMENTS", "VECTOR_PQ_SEGMENTS")
+          && create.getPqSegments() == null
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("pq_segments must be an integer").build().buildException();
+      }
+      pqSegments = create.getPqSegments();
+      if (pqSegments != null) {
+        if (pqSegments < 1 || pqSegments > 256) {
+          throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+            .setMessage("pq_segments must be an integer between 1 and 256, but was: " + pqSegments)
+            .build().buildException();
+        }
+        if (dimension % pqSegments != 0) {
+          throw new SQLExceptionInfo.Builder(
+            SQLExceptionCode.VECTOR_QUANTIZATION_DIMENSION_MISMATCH)
+              .setMessage("Vector dimension " + dimension
+                + " is not evenly divisible by pq_segments " + pqSegments)
+              .build().buildException();
+        }
+      }
+
+      if (
+        CreateIndexStatement.hasProperty(create.getProps(), "PQ_TRAINING_SIZE",
+          "VECTOR_PQ_TRAINING_SIZE") && create.getPqTrainingSize() == null
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("pq_training_size must be an integer").build().buildException();
+      }
+      pqTrainingSize = create.getPqTrainingSize();
+      if (pqTrainingSize != null && pqTrainingSize <= 0) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("pq_training_size must be a positive integer, but was: " + pqTrainingSize)
+          .build().buildException();
+      }
+    }
+
+    CreateIndexStatement.VectorIndexParams.Builder builder =
+      new CreateIndexStatement.VectorIndexParams.Builder(create.getVectorIndexParams());
+    if (dimension != null) {
+      builder.setDimension(dimension);
+    }
+    if (m != null) {
+      builder.setHnswM(m);
+    }
+    if (efConstruction != null) {
+      builder.setHnswEfConstruction(efConstruction);
+    }
+    if (alpha != null) {
+      builder.setHnswAlpha(alpha);
+    }
+    if (quantization != null) {
+      builder.setQuantizationType(quantization);
+    }
+    if (pqSegments != null) {
+      builder.setPqSegments(pqSegments);
+    }
+    if (pqTrainingSize != null) {
+      builder.setPqTrainingSize(pqTrainingSize);
+    }
+    return new CreateIndexStatement(create, builder.build());
   }
 
   /**

@@ -114,9 +114,14 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.USE_STATS_FOR_PARA
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_CENTROID_GENERATION;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_DIMENSION;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_DISTANCE_METRIC;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_HNSW_M;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_IVF_LISTS;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_IVF_SAMPLE_SIZE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_QUANTIZATION_TYPE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_CONSTANT;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_INDEX_ID_DATA_TYPE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_STATEMENT;
@@ -369,9 +374,11 @@ public class MetaDataClient {
     + SCHEMA_VERSION + "," + STREAMING_TOPIC_NAME + "," + INDEX_WHERE + "," + CDC_INCLUDE_TABLE
     + "," + TTL + "," + ROW_KEY_MATCHER + "," + IS_STRICT_TTL + "," + INDEX_CONSISTENCY + ","
     + VECTOR_INDEX_ALGORITHM + "," + VECTOR_DISTANCE_METRIC + "," + VECTOR_DIMENSION + ","
-    + VECTOR_IVF_LISTS + "," + VECTOR_IVF_SAMPLE_SIZE + "," + VECTOR_CENTROID_GENERATION
+    + VECTOR_IVF_LISTS + "," + VECTOR_IVF_SAMPLE_SIZE + "," + VECTOR_CENTROID_GENERATION + ","
+    + VECTOR_HNSW_M + "," + VECTOR_HNSW_EF_CONSTRUCTION + "," + VECTOR_HNSW_ALPHA + ","
+    + VECTOR_QUANTIZATION_TYPE + "," + VECTOR_PQ_SEGMENTS
     + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-    + "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    + "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, " + "?, ?, ?, ?, ?)";
 
   private static final String CREATE_SCHEMA = "UPSERT INTO " + SYSTEM_CATALOG_SCHEMA + ".\""
     + SYSTEM_CATALOG_TABLE + "\"( " + TABLE_SCHEM + "," + TABLE_NAME + ") VALUES (?,?)";
@@ -1552,7 +1559,9 @@ public class MetaDataClient {
 
       if (index.isVectorIndex()) {
         long gen =
-          index.getVectorCentroidGeneration() != null ? index.getVectorCentroidGeneration() : 1L;
+          index.getVectorIndex() != null && index.getVectorIndex().getCentroidGeneration() != null
+            ? index.getVectorIndex().getCentroidGeneration()
+            : 1L;
         VectorIndexScorecard.reconcile(connection, index.getName().getString(), gen);
       }
 
@@ -1650,7 +1659,11 @@ public class MetaDataClient {
     }
     boolean isVectorIndex = statement.getIndexType() == IndexType.VECTOR_GLOBAL;
     if (isVectorIndex) {
-      validateServerVectorSupport();
+      String algo = statement.getVectorAlgorithm();
+      if (algo == null && statement.getProps() != null) {
+        algo = CreateIndexStatement.getVectorAlgorithm(statement.getProps());
+      }
+      validateServerVectorSupport(algo);
     }
     Set<String> acquiredColumnMutexSet = Sets.newHashSetWithExpectedSize(3);
     String physicalSchemaName = null;
@@ -1746,15 +1759,14 @@ public class MetaDataClient {
           col.getName().getString(), col.isRowTimestamp()));
       }
 
-      // Vector indexes inherit the data table storage scheme and prepend the centroid ID
-      // column to the primary key constraint.
-      if (isVectorIndex) {
-        ColumnName centroidColName =
-          ColumnName.caseSensitiveColumnName(IndexUtil.getIndexColumnName(null, CENTROID_ID));
-        allPkColumns
-          .add(new ColumnDefInPkConstraint(centroidColName, SortOrder.getDefault(), false));
-        columnDefs.add(FACTORY.columnDef(centroidColName, PInteger.INSTANCE.getSqlTypeName(), false,
-          null, null, false, SortOrder.getDefault(), null, false));
+      // Vector indexes inherit the data table storage scheme. Algorithm-specific methods
+      // define the primary key constraints and column definitions (e.g. IVF prepends centroid ID,
+      // while HNSW preserves standard primary key columns without a centroid column).
+      VectorIndexType vectorIndexType = isVectorIndex ? statement.getVectorIndexType() : null;
+      if (isVectorIndex && vectorIndexType == VectorIndexType.IVF) {
+        applyIvfIndexSchema(allPkColumns, columnDefs);
+      } else if (isVectorIndex && vectorIndexType == VectorIndexType.HNSW) {
+        applyHnswIndexSchema(allPkColumns, columnDefs);
       }
       List<ColumnDef> vectorColDefs = isVectorIndex ? new ArrayList<ColumnDef>() : null;
 
@@ -1978,22 +1990,8 @@ public class MetaDataClient {
 
       tableProps.put(MetaDataUtil.DATA_TABLE_NAME_PROP_NAME,
         dataTable.getPhysicalName().getString());
-      if (isVectorIndex) {
-        if (statement.getVectorAlgorithm() != null) {
-          tableProps.put(VECTOR_INDEX_ALGORITHM, statement.getVectorAlgorithm());
-        }
-        if (statement.getVectorMetric() != null) {
-          tableProps.put(VECTOR_DISTANCE_METRIC, statement.getVectorMetric());
-        }
-        if (statement.getVectorDimension() != null) {
-          tableProps.put(VECTOR_DIMENSION, statement.getVectorDimension());
-        }
-        if (statement.getVectorLists() != null) {
-          tableProps.put(VECTOR_IVF_LISTS, statement.getVectorLists());
-        }
-        if (statement.getVectorSampleSize() != null) {
-          tableProps.put(VECTOR_IVF_SAMPLE_SIZE, statement.getVectorSampleSize());
-        }
+      if (isVectorIndex && statement.getVectorIndexParams() != null) {
+        statement.getVectorIndexParams().populateTableProps(tableProps);
       }
       CreateTableStatement tableStatement = FACTORY.createTable(indexTableName,
         statement.getProps(), columnDefs, pk, statement.getSplitNodes(), PTableType.INDEX,
@@ -2065,6 +2063,11 @@ public class MetaDataClient {
   }
 
   private void validateServerVectorSupport() throws SQLException {
+    validateServerVectorSupport(null);
+  }
+
+  private void validateServerVectorSupport(String algorithm) throws SQLException {
+    boolean isHnsw = "HNSW".equalsIgnoreCase(algorithm != null ? algorithm.trim() : null);
     try {
       PTable sysCatalog = null;
       try {
@@ -2075,13 +2078,18 @@ public class MetaDataClient {
       }
       if (sysCatalog != null) {
         sysCatalog.getColumnForColumnName(PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM);
+        if (isHnsw) {
+          sysCatalog.getColumnForColumnName(PhoenixDatabaseMetaData.VECTOR_HNSW_M);
+        }
       }
     } catch (ColumnNotFoundException | TableNotFoundException e) {
+      String detailMsg = isHnsw
+        ? "Cannot create vector index: the connected server does not support HNSW vector indexes. "
+          + "The system catalog lacks required vector index metadata columns. A server upgrade is required."
+        : "Cannot create vector index: the connected server does not support vector indexes. "
+          + "The system catalog lacks required vector index metadata columns. A server upgrade is required.";
       throw new SQLExceptionInfo.Builder(SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR)
-        .setMessage(
-          "Cannot create vector index: the connected server does not support vector indexes. "
-            + "The system catalog lacks required vector index metadata columns. A server upgrade is required.")
-        .setRootCause(e).build().buildException();
+        .setMessage(detailMsg).setRootCause(e).build().buildException();
     }
     if (!connection.getQueryServices().supportsFeature(Feature.VECTOR_INDEX)) {
       throw new SQLExceptionInfo.Builder(SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR)
@@ -2090,6 +2098,71 @@ public class MetaDataClient {
             + "A server upgrade is required.")
         .build().buildException();
     }
+    if (
+      isHnsw
+        && !MetaDataUtil.supportsVectorIndex(connection.getQueryServices(), VectorIndexType.HNSW)
+    ) {
+      throw new SQLExceptionInfo.Builder(SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR)
+        .setMessage(
+          "Cannot create vector index: the connected server does not support HNSW vector indexes. "
+            + "A server upgrade is required.")
+        .build().buildException();
+    }
+  }
+
+  /**
+   * Applies the schema and primary key layout specific to Inverted File (IVF) vector indexes.
+   * <p>
+   * IVF vector indexes partition vector embeddings across centroid clusters. The row key layout
+   * prepends a synthetic centroid identifier column ({@link PhoenixDatabaseMetaData#CENTROID_ID})
+   * of type {@link PInteger} to the index table's primary key constraint:
+   *
+   * <pre>
+   *   [salt?][view_index_id?][tenant_id?][CENTROID_ID][base table PK columns]
+   * </pre>
+   *
+   * This centroid ID enables partition pruned range scans across cluster postings lists during
+   * approximate nearest neighbor query execution. The indexed vector column itself is maintained as
+   * a value column in the default column family rather than encoded in the row key.
+   * @param allPkColumns list of primary key column definitions in constraint order
+   * @param columnDefs   list of all table column definitions
+   */
+  private static void applyIvfIndexSchema(List<ColumnDefInPkConstraint> allPkColumns,
+    List<ColumnDef> columnDefs) {
+    ColumnName centroidColName =
+      ColumnName.caseSensitiveColumnName(IndexUtil.getIndexColumnName(null, CENTROID_ID));
+    allPkColumns.add(new ColumnDefInPkConstraint(centroidColName, SortOrder.getDefault(), false));
+    columnDefs.add(FACTORY.columnDef(centroidColName, PInteger.INSTANCE.getSqlTypeName(), false,
+      null, null, false, SortOrder.getDefault(), null, false));
+  }
+
+  /**
+   * Applies the schema and primary key layout specific to Hierarchical Navigable Small World (HNSW)
+   * graph-based vector indexes.
+   * <p>
+   * Unlike row-based IVF indexes, HNSW vector indexes store graph adjacency structures and vector
+   * embeddings within off-heap JVector segments and MOB storage rather than row-based cluster
+   * postings lists. Consequently, no synthetic centroid identifier column is prepended to the
+   * physical row key.
+   * <p>
+   * The physical primary key layout for an HNSW index table consists strictly of:
+   *
+   * <pre>
+   *   [salt?][view_index_id?][tenant_id?][base table PK columns]
+   * </pre>
+   *
+   * Vector ordinal-to-primary-key mappings and vector coordinates are encapsulated directly within
+   * the JVector index segments. The index table row key mirrors the base table primary key
+   * structure (prefixed by optional salt buckets, view index prefix, or tenant ID), facilitating
+   * direct point lookups and region-aligned scans without centroid indirection.
+   * @param allPkColumns list of primary key column definitions in constraint order
+   * @param columnDefs   list of all table column definitions
+   */
+  private static void applyHnswIndexSchema(List<ColumnDefInPkConstraint> allPkColumns,
+    List<ColumnDef> columnDefs) {
+    // HNSW graph indexes do not require centroid columns in the physical row key.
+    // The primary key consists solely of [salt?][view_index_id?][tenant_id?][base table PK
+    // columns].
   }
 
   private MutationState buildVectorIndex(PTable index, TableRef dataTableRef,
@@ -2097,19 +2170,30 @@ public class MetaDataClient {
     PTable dataTable = dataTableRef.getTable();
     String fullIndexName = index.getName().getString();
 
-    int lists = index.getVectorIvfLists() != null
-      ? index.getVectorIvfLists()
+    PTable.VectorIndex vi = index.getVectorIndex();
+    VectorIndexType algorithmType =
+      vi != null && vi.getType() != null ? vi.getType() : statement.getVectorIndexType();
+    if (algorithmType == VectorIndexType.HNSW) {
+      LOGGER.info(
+        "Bypassing synchronous centroid training and activation for HNSW vector index {}. "
+          + "The index is initialized in {} state and will be populated asynchronously via IndexTool.",
+        fullIndexName, PIndexState.BUILDING);
+      return new MutationState(0, 0, connection);
+    }
+
+    int lists = vi != null && vi.getIvfLists() != null
+      ? vi.getIvfLists()
       : (statement.getVectorLists() != null ? statement.getVectorLists() : 256);
-    int sampleSize = index.getVectorIvfSampleSize() != null
-      ? index.getVectorIvfSampleSize()
+    int sampleSize = vi != null && vi.getIvfSampleSize() != null
+      ? vi.getIvfSampleSize()
       : (statement.getVectorSampleSize() != null
         ? statement.getVectorSampleSize()
         : Math.max(lists * 100, 1000));
-    String metric = index.getVectorDistanceMetric() != null
-      ? index.getVectorDistanceMetric()
+    String metric = vi != null && vi.getDistanceMetric() != null
+      ? vi.getDistanceMetric()
       : (statement.getVectorMetric() != null ? statement.getVectorMetric() : "L2");
-    int dimension = index.getVectorDimension() != null
-      ? index.getVectorDimension()
+    int dimension = vi != null && vi.getDimension() != null
+      ? vi.getDimension()
       : (statement.getVectorDimension() != null ? statement.getVectorDimension() : 0);
 
     String vectorColName = null;
@@ -3913,7 +3997,10 @@ public class MetaDataClient {
         }
       }
       if (indexType == IndexType.VECTOR_GLOBAL) {
-        validateServerVectorSupport();
+        String algo = tableProps != null
+          ? (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM)
+          : null;
+        validateServerVectorSupport(algo);
         defaultCreateState = PIndexState.BUILDING;
       }
       PIndexState indexState =
@@ -3923,18 +4010,7 @@ public class MetaDataClient {
       if (indexState == null && tableProps.containsKey(INDEX_STATE)) {
         indexState = PIndexState.fromSerializedValue(tableProps.get(INDEX_STATE).toString());
       }
-      String vectorIndexAlgorithm = (String) tableProps.get(VECTOR_INDEX_ALGORITHM);
-      String vectorDistanceMetric = (String) tableProps.get(VECTOR_DISTANCE_METRIC);
-      Object dimObj = tableProps.get(VECTOR_DIMENSION);
-      Integer vectorDimension = dimObj instanceof Number ? ((Number) dimObj).intValue() : null;
-      Object listsObj = tableProps.get(VECTOR_IVF_LISTS);
-      Integer vectorIvfLists = listsObj instanceof Number ? ((Number) listsObj).intValue() : null;
-      Object sampleObj = tableProps.get(VECTOR_IVF_SAMPLE_SIZE);
-      Integer vectorIvfSampleSize =
-        sampleObj instanceof Number ? ((Number) sampleObj).intValue() : null;
-      Object genObj = tableProps.get(VECTOR_CENTROID_GENERATION);
-      Long vectorCentroidGeneration =
-        genObj instanceof Number ? ((Number) genObj).longValue() : null;
+      PTable.VectorIndex clientVectorIndex = PTable.VectorIndex.fromTableProps(tableProps);
       PreparedStatement tableUpsert = connection.prepareStatement(CREATE_TABLE);
       tableUpsert.setString(1, tenantIdStr);
       tableUpsert.setString(2, schemaName);
@@ -4073,41 +4149,7 @@ public class MetaDataClient {
         tableUpsert.setNull(39, Types.CHAR);
       }
 
-      if (vectorIndexAlgorithm == null) {
-        tableUpsert.setNull(40, Types.VARCHAR);
-      } else {
-        tableUpsert.setString(40, vectorIndexAlgorithm);
-      }
-
-      if (vectorDistanceMetric == null) {
-        tableUpsert.setNull(41, Types.VARCHAR);
-      } else {
-        tableUpsert.setString(41, vectorDistanceMetric);
-      }
-
-      if (vectorDimension == null) {
-        tableUpsert.setNull(42, Types.INTEGER);
-      } else {
-        tableUpsert.setInt(42, vectorDimension);
-      }
-
-      if (vectorIvfLists == null) {
-        tableUpsert.setNull(43, Types.INTEGER);
-      } else {
-        tableUpsert.setInt(43, vectorIvfLists);
-      }
-
-      if (vectorIvfSampleSize == null) {
-        tableUpsert.setNull(44, Types.INTEGER);
-      } else {
-        tableUpsert.setInt(44, vectorIvfSampleSize);
-      }
-
-      if (vectorCentroidGeneration == null) {
-        tableUpsert.setNull(45, Types.BIGINT);
-      } else {
-        tableUpsert.setLong(45, vectorCentroidGeneration);
-      }
+      setVectorIndexUpsertParams(tableUpsert, clientVectorIndex);
 
       tableUpsert.execute();
 
@@ -4205,6 +4247,12 @@ public class MetaDataClient {
          * counter as NULL_COUNTER for extra safety.
          */
         EncodedCQCounter cqCounterToBe = tableType == PTableType.VIEW ? NULL_COUNTER : cqCounter;
+        PTable.VectorIndex serverVi =
+          result.getTable() != null ? result.getTable().getVectorIndex() : null;
+        PTable.VectorIndex vectorIndex =
+          clientVectorIndex != null && clientVectorIndex.getAlgorithm() != null
+            ? clientVectorIndex.mergeWith(serverVi)
+            : serverVi;
         PTable table = new PTableImpl.Builder().setType(tableType).setState(indexState)
           .setTimeStamp(timestamp != null ? timestamp : result.getMutationTime())
           .setIndexDisableTimestamp(0L).setSequenceNumber(PTable.INITIAL_SEQ_NUM)
@@ -4246,32 +4294,7 @@ public class MetaDataClient {
           .setTTL(ttl == null || ttl.equals(TTL_EXPRESSION_NOT_DEFINED)
             ? TTLExpressionFactory.create(ttlFromHierarchy)
             : TTLExpressionFactory.create(ttl))
-          .setRowKeyMatcher(rowKeyMatcher)
-          .setVectorIndexAlgorithm(
-            result.getTable() != null && result.getTable().getVectorIndexAlgorithm() != null
-              ? result.getTable().getVectorIndexAlgorithm()
-              : vectorIndexAlgorithm)
-          .setVectorDistanceMetric(
-            result.getTable() != null && result.getTable().getVectorDistanceMetric() != null
-              ? result.getTable().getVectorDistanceMetric()
-              : vectorDistanceMetric)
-          .setVectorDimension(
-            result.getTable() != null && result.getTable().getVectorDimension() != null
-              ? result.getTable().getVectorDimension()
-              : vectorDimension)
-          .setVectorIvfLists(
-            result.getTable() != null && result.getTable().getVectorIvfLists() != null
-              ? result.getTable().getVectorIvfLists()
-              : vectorIvfLists)
-          .setVectorIvfSampleSize(
-            result.getTable() != null && result.getTable().getVectorIvfSampleSize() != null
-              ? result.getTable().getVectorIvfSampleSize()
-              : vectorIvfSampleSize)
-          .setVectorCentroidGeneration(
-            result.getTable() != null && result.getTable().getVectorCentroidGeneration() != null
-              ? result.getTable().getVectorCentroidGeneration()
-              : vectorCentroidGeneration)
-          .build();
+          .setRowKeyMatcher(rowKeyMatcher).setVectorIndex(vectorIndex).build();
         result = new MetaDataMutationResult(code, result.getMutationTime(), table, true);
         addTableToCache(result, false);
         return table;
@@ -4418,6 +4441,57 @@ public class MetaDataClient {
         throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNEXPECTED_MUTATION_CODE)
           .setSchemaName(schemaName).setTableName(tableName).setMessage("mutation code: " + code)
           .build().buildException();
+    }
+  }
+
+  private static void setVectorIndexUpsertParams(PreparedStatement tableUpsert,
+    PTable.VectorIndex vi) throws SQLException {
+    setNullableString(tableUpsert, 40, vi != null ? vi.getAlgorithm() : null);
+    setNullableString(tableUpsert, 41, vi != null ? vi.getDistanceMetric() : null);
+    setNullableInt(tableUpsert, 42, vi != null ? vi.getDimension() : null);
+    setNullableInt(tableUpsert, 43, vi != null ? vi.getIvfLists() : null);
+    setNullableInt(tableUpsert, 44, vi != null ? vi.getIvfSampleSize() : null);
+    setNullableLong(tableUpsert, 45, vi != null ? vi.getCentroidGeneration() : null);
+    setNullableInt(tableUpsert, 46, vi != null ? vi.getHnswM() : null);
+    setNullableInt(tableUpsert, 47, vi != null ? vi.getHnswEfConstruction() : null);
+    setNullableDouble(tableUpsert, 48, vi != null ? vi.getHnswAlpha() : null);
+    setNullableString(tableUpsert, 49, vi != null ? vi.getQuantizationType() : null);
+    setNullableInt(tableUpsert, 50, vi != null ? vi.getPqSegments() : null);
+  }
+
+  private static void setNullableDouble(PreparedStatement ps, int paramIndex, Double val)
+    throws SQLException {
+    if (val != null) {
+      ps.setDouble(paramIndex, val);
+    } else {
+      ps.setNull(paramIndex, Types.DOUBLE);
+    }
+  }
+
+  private static void setNullableString(PreparedStatement ps, int paramIndex, String val)
+    throws SQLException {
+    if (val != null) {
+      ps.setString(paramIndex, val);
+    } else {
+      ps.setNull(paramIndex, Types.VARCHAR);
+    }
+  }
+
+  private static void setNullableInt(PreparedStatement ps, int paramIndex, Integer val)
+    throws SQLException {
+    if (val != null) {
+      ps.setInt(paramIndex, val);
+    } else {
+      ps.setNull(paramIndex, Types.INTEGER);
+    }
+  }
+
+  private static void setNullableLong(PreparedStatement ps, int paramIndex, Long val)
+    throws SQLException {
+    if (val != null) {
+      ps.setLong(paramIndex, val);
+    } else {
+      ps.setNull(paramIndex, Types.BIGINT);
     }
   }
 

@@ -104,6 +104,7 @@ import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.schema.TableRef;
 import org.apache.phoenix.schema.ValueSchema;
 import org.apache.phoenix.schema.ValueSchema.Field;
+import org.apache.phoenix.schema.VectorIndexType;
 import org.apache.phoenix.schema.transform.TransformMaintainer;
 import org.apache.phoenix.schema.tuple.BaseTuple;
 import org.apache.phoenix.schema.tuple.MultiKeyValueTuple;
@@ -176,9 +177,13 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
       if (indexState.isDisabled() || indexState == PIndexState.PENDING_ACTIVE) {
         return false;
       }
+      PTable.VectorIndex vi = index.getVectorIndex();
+      if (vi != null && vi.getType() == VectorIndexType.HNSW) {
+        return false;
+      }
       // Vector index row keys require trained centroids to determine cluster assignment.
       // Once centroids exist, index maintenance proceeds normally to capture concurrent writes.
-      return index.getVectorCentroidGeneration() != null;
+      return vi != null && vi.getCentroidGeneration() != null;
     }
     return !(indexState.isDisabled() || PIndexState.PENDING_ACTIVE == indexState);
   }
@@ -546,10 +551,11 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
     this.isCDCIndex = CDCUtil.isCDCIndex(index);
     this.indexConsistency = index.getIndexConsistency();
     if (index.isVectorIndex()) {
-      this.vectorAlgorithm = index.getVectorIndexAlgorithm();
-      this.distanceMetric = index.getVectorDistanceMetric();
-      this.vectorDimension = index.getVectorDimension();
-      this.centroidGeneration = index.getVectorCentroidGeneration();
+      PTable.VectorIndex vi = index.getVectorIndex();
+      this.vectorAlgorithm = vi != null ? vi.getAlgorithm() : null;
+      this.distanceMetric = vi != null ? vi.getDistanceMetric() : null;
+      this.vectorDimension = vi != null ? vi.getDimension() : null;
+      this.centroidGeneration = vi != null ? vi.getCentroidGeneration() : null;
     }
 
     // null check for b/w compatibility
@@ -2979,6 +2985,11 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
   /** Returns the vector indexing algorithm identifier, or null if not a vector index. */
   public String getVectorAlgorithm() {
     return vectorAlgorithm;
+  }
+
+  /** Returns the vector indexing algorithm type, or null if not a vector index. */
+  public VectorIndexType getVectorIndexType() {
+    return VectorIndexType.fromAlgorithm(vectorAlgorithm);
   }
 
   /** Returns true if this maintainer manages a VECTOR_GLOBAL index. */

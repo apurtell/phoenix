@@ -169,8 +169,8 @@ public class VectorIndexScanPlan extends ScanPlan {
       ? distanceMetric
       : (extracted != null && extracted.getSecond() != null
         ? extracted.getSecond()
-        : (table != null && table.getTable() != null
-          ? table.getTable().getVectorDistanceMetric()
+        : (table != null && table.getTable() != null && table.getTable().getVectorIndex() != null
+          ? table.getTable().getVectorIndex().getDistanceMetric()
           : null));
 
     this.queryVector = effectiveQueryVector != null ? effectiveQueryVector.clone() : null;
@@ -204,10 +204,9 @@ public class VectorIndexScanPlan extends ScanPlan {
       boolean viewIndexScoped =
         table != null && table.getTable() != null && table.getTable().getViewIndexId() != null;
       if (viewIndexScoped) {
-        LOGGER.warn(
-          "Vector index {} has a viewIndexId; centroid key ranges cannot be scoped and will "
-            + "fall back to a full index scan",
-          table.getTable().getName());
+        LOGGER
+          .warn("Vector index {} has a viewIndexId; centroid key ranges cannot be scoped and will "
+            + "fall back to a full index scan", table.getTable().getName());
       }
 
       Integer saltBuckets =
@@ -451,7 +450,9 @@ public class VectorIndexScanPlan extends ScanPlan {
       String tableName = table.getTable().getName().getString();
       // Prefer the generation recorded on the resolved index PTable to ensure external rebuilds
       // that update catalog metadata are observed.
-      Long generation = table.getTable().getVectorCentroidGeneration();
+      Long generation = table.getTable().getVectorIndex() != null
+        ? table.getTable().getVectorIndex().getCentroidGeneration()
+        : null;
       try {
         PhoenixConnection connection = context != null ? context.getConnection() : null;
         VectorCentroidCache cache = connection != null
@@ -1002,8 +1003,9 @@ public class VectorIndexScanPlan extends ScanPlan {
 
     int lists = cachedCentroids != null ? cachedCentroids.getCentroidCount() : 0;
     String metric = (getTableRef() != null && getTableRef().getTable() != null
-      && getTableRef().getTable().getVectorDistanceMetric() != null)
-        ? getTableRef().getTable().getVectorDistanceMetric()
+      && getTableRef().getTable().getVectorIndex() != null
+      && getTableRef().getTable().getVectorIndex().getDistanceMetric() != null)
+        ? getTableRef().getTable().getVectorIndex().getDistanceMetric()
         : this.distanceMetric;
 
     if (probing) {

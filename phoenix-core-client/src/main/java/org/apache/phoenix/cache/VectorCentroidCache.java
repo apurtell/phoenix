@@ -1125,8 +1125,9 @@ public class VectorCentroidCache {
 
   /**
    * Concurrency locks coordinating on-demand centroid loading, shared by write-path assignment
-   * ({@link #getCentroidsForWrite}) and query-side lookups ({@link #loadCentroids(String, long,
-   * Connection)}), so concurrent cache misses collapse into a single underlying read.
+   * ({@link #getCentroidsForWrite}) and query-side lookups
+   * ({@link #loadCentroids(String, long, Connection)}), so concurrent cache misses collapse into a
+   * single underlying read.
    */
   private final ConcurrentMap<CacheKey, Object> loadLocks = new ConcurrentHashMap<>();
 

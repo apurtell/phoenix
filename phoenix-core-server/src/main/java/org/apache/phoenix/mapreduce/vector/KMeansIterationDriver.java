@@ -996,8 +996,8 @@ public class KMeansIterationDriver {
    * instead of all of them duplicating the single worst-fit candidate.
    */
   @VisibleForTesting
-  static List<float[]> selectDistinctReseedVectors(List<WorstFitCandidate> candidates,
-    int maxCount, String metric) {
+  static List<float[]> selectDistinctReseedVectors(List<WorstFitCandidate> candidates, int maxCount,
+    String metric) {
     List<WorstFitCandidate> sorted = new ArrayList<>(candidates);
     sorted.sort((a, b) -> Double.compare(b.distance, a.distance));
     List<float[]> result = new ArrayList<>();

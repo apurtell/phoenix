@@ -205,10 +205,10 @@ public interface ConnectionQueryServices extends QueryServices, MetaDataMutated 
   /**
    * Returns whether every server that has responded to a live version handshake (see
    * {@link #getVersion}-style connection compatibility checks) reports a coprocessor jar that
-   * recognizes the vector index write-path guard. Unlike checking for the presence of vector
-   * index columns in the cached SYSTEM.CATALOG schema, this reflects the actual code running on
-   * the servers observed so far, so it can detect a rolling upgrade in progress where the schema
-   * has already been migrated but some region servers are still serving old coprocessor code.
+   * recognizes the vector index write-path guard. Unlike checking for the presence of vector index
+   * columns in the cached SYSTEM.CATALOG schema, this reflects the actual code running on the
+   * servers observed so far, so it can detect a rolling upgrade in progress where the schema has
+   * already been migrated but some region servers are still serving old coprocessor code.
    */
   boolean hasVectorIndexSupport();
 

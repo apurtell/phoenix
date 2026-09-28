@@ -243,15 +243,13 @@ public class VectorIndexRebuildTask extends BaseTask {
         "Vector column or expression not found for index " + indexName);
     }
 
-    int k = pIndexTable.getVectorIvfLists() != null && pIndexTable.getVectorIvfLists() > 0
-      ? pIndexTable.getVectorIvfLists()
-      : 4;
+    PTable.VectorIndex vi = pIndexTable.getVectorIndex();
+    int k = vi != null && vi.getIvfLists() != null && vi.getIvfLists() > 0 ? vi.getIvfLists() : 4;
     String distanceMetric =
-      pIndexTable.getVectorDistanceMetric() != null ? pIndexTable.getVectorDistanceMetric() : "L2";
-    int sampleSize =
-      pIndexTable.getVectorIvfSampleSize() != null && pIndexTable.getVectorIvfSampleSize() > 0
-        ? pIndexTable.getVectorIvfSampleSize()
-        : Math.max(k * 100, 1000);
+      vi != null && vi.getDistanceMetric() != null ? vi.getDistanceMetric() : "L2";
+    int sampleSize = vi != null && vi.getIvfSampleSize() != null && vi.getIvfSampleSize() > 0
+      ? vi.getIvfSampleSize()
+      : Math.max(k * 100, 1000);
 
     boolean localKMeans = conf.getBoolean(QueryServices.VECTOR_KMEANS_LOCAL_ATTRIB,
       QueryServicesOptions.DEFAULT_VECTOR_KMEANS_LOCAL);
@@ -266,8 +264,7 @@ public class VectorIndexRebuildTask extends BaseTask {
         Class<?> toolClass = Class.forName("org.apache.phoenix.mapreduce.vector.KMeansTool");
         Method trainMethod = toolClass.getMethod("trainDistributed", Configuration.class,
           String.class, String.class, int.class, int.class, KMeansConfig.class);
-        int dimension =
-          pIndexTable.getVectorDimension() != null ? pIndexTable.getVectorDimension() : 0;
+        int dimension = vi != null && vi.getDimension() != null ? vi.getDimension() : 0;
         kmeansResult = (KMeansResult) trainMethod.invoke(null, conf, fullDataTableName,
           vectorColName, dimension, k, kMeansConfig);
       } catch (Throwable t) {
@@ -317,13 +314,12 @@ public class VectorIndexRebuildTask extends BaseTask {
       int totalFailures = mainResult[1] + catchUpResult[1];
 
       if (totalFailures > 0) {
-        throw new SQLException("Migration failed with " + totalFailures + " errors out of "
-          + totalMigrated + " rows");
+        throw new SQLException(
+          "Migration failed with " + totalFailures + " errors out of " + totalMigrated + " rows");
       }
     } catch (Exception e) {
-      LOGGER.error(
-        "Vector index rebuild failed for {} while building generation {}; discarding it", indexName,
-        nextGen, e);
+      LOGGER.error("Vector index rebuild failed for {} while building generation {}; discarding it",
+        indexName, nextGen, e);
       try {
         // The new generation never went live (Step 6 has not run), so it is safe to discard it
         // entirely: this removes its centroid/scorecard rows and its BUILDING sentinel, so
@@ -363,8 +359,8 @@ public class VectorIndexRebuildTask extends BaseTask {
     String indexName = indexTable.getName().getString();
     String centroidColName =
       IndexUtil.getIndexColumnName(null, PhoenixDatabaseMetaData.CENTROID_ID);
-    String metric =
-      indexTable.getVectorDistanceMetric() != null ? indexTable.getVectorDistanceMetric() : "L2";
+    PTable.VectorIndex vi = indexTable.getVectorIndex();
+    String metric = vi != null && vi.getDistanceMetric() != null ? vi.getDistanceMetric() : "L2";
 
     List<String> indexColumnNames = new ArrayList<>();
     List<String> dataColumnExprs = new ArrayList<>();

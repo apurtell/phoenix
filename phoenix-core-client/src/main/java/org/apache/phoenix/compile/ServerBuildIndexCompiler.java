@@ -134,11 +134,11 @@ public class ServerBuildIndexCompiler {
       connection.getMutationState().commitDDLFence(dataTable);
       long rowCount = 0;
       String indexFullName = index.getName().getString();
-      String metric =
-        index.getVectorDistanceMetric() != null ? index.getVectorDistanceMetric() : "L2";
+      PTable.VectorIndex vi = index.getVectorIndex();
+      String metric = vi != null && vi.getDistanceMetric() != null ? vi.getDistanceMetric() : "L2";
       long generation =
-        index.getVectorCentroidGeneration() != null && index.getVectorCentroidGeneration() > 0L
-          ? index.getVectorCentroidGeneration()
+        vi != null && vi.getCentroidGeneration() != null && vi.getCentroidGeneration() > 0L
+          ? vi.getCentroidGeneration()
           : 1L;
       VectorCentroidCache centroidCache =
         VectorCentroidCache.getInstance(connection.getQueryServices().getConfiguration());

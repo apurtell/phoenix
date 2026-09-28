@@ -797,7 +797,8 @@ public class VectorCentroidTableIT extends ParallelStatsDisabledIT {
       PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
       PTable indexPTable = pconn.getTableNoCache(vectorIdx);
       assertNotNull(indexPTable);
-      assertEquals(Long.valueOf(idxGen2), indexPTable.getVectorCentroidGeneration());
+      assertNotNull(indexPTable.getVectorIndex());
+      assertEquals(Long.valueOf(idxGen2), indexPTable.getVectorIndex().getCentroidGeneration());
     }
   }
 }

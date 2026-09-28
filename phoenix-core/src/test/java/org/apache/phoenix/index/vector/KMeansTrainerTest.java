@@ -182,11 +182,11 @@ public class KMeansTrainerTest {
   }
 
   /**
-   * Regression test: post-split rebalancing must not leave a permanently empty "phantom"
-   * centroid. Uses a dataset of exactly duplicate points within the overloaded cluster so that
-   * k-means++ 2-way split initialization deterministically picks two identical-valued
-   * sub-centroids; every point then ties in distance between them, so the loser sub-centroid
-   * would receive zero points in every rebalance pass without empty-cluster re-seeding.
+   * Regression test: post-split rebalancing must not leave a permanently empty "phantom" centroid.
+   * Uses a dataset of exactly duplicate points within the overloaded cluster so that k-means++
+   * 2-way split initialization deterministically picks two identical-valued sub-centroids; every
+   * point then ties in distance between them, so the loser sub-centroid would receive zero points
+   * in every rebalance pass without empty-cluster re-seeding.
    */
   @Test
   public void testSplitRebalanceReseedsPhantomEmptyCentroid() {
@@ -209,8 +209,9 @@ public class KMeansTrainerTest {
     int[] clusterSizes = result.getClusterSizes();
     int total = 0;
     for (int size : clusterSizes) {
-      assertTrue("No split cluster should be permanently empty, got sizes "
-        + Arrays.toString(clusterSizes), size > 0);
+      assertTrue(
+        "No split cluster should be permanently empty, got sizes " + Arrays.toString(clusterSizes),
+        size > 0);
       total += size;
     }
     assertEquals(210, total);

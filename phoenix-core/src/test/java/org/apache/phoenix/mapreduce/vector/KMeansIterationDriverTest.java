@@ -30,10 +30,10 @@ public class KMeansIterationDriverTest {
 
   @Test
   public void testSelectDistinctReseedVectorsAssignsDistinctVectorsToMultipleEmptyClusters() {
-    List<WorstFitCandidate> candidates = Arrays.asList(
-      new WorstFitCandidate(new float[] { 1.0f, 1.0f }, 5.0),
-      new WorstFitCandidate(new float[] { 2.0f, 2.0f }, 15.0),
-      new WorstFitCandidate(new float[] { 3.0f, 3.0f }, 10.0));
+    List<WorstFitCandidate> candidates =
+      Arrays.asList(new WorstFitCandidate(new float[] { 1.0f, 1.0f }, 5.0),
+        new WorstFitCandidate(new float[] { 2.0f, 2.0f }, 15.0),
+        new WorstFitCandidate(new float[] { 3.0f, 3.0f }, 10.0));
 
     // Three empty clusters, three distinct mapper-local worst-fit candidates available: each
     // empty cluster must be re-seeded with a different vector, ordered most-severe first.
@@ -49,7 +49,8 @@ public class KMeansIterationDriverTest {
   }
 
   @Test
-  public void testSelectDistinctReseedVectorsExhaustsGracefullyWhenFewerCandidatesThanEmptyClusters() {
+  public void
+    testSelectDistinctReseedVectorsExhaustsGracefullyWhenFewerCandidatesThanEmptyClusters() {
     List<WorstFitCandidate> candidates =
       Collections.singletonList(new WorstFitCandidate(new float[] { 1.0f, 1.0f }, 5.0));
 

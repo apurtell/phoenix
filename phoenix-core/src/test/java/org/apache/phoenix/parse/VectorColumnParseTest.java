@@ -25,9 +25,12 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.phoenix.exception.SQLExceptionCode;
+import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
 import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.SortOrder;
@@ -327,6 +330,44 @@ public class VectorColumnParseTest {
     assertNull(indexStmt.getVectorMetric());
     assertNull(indexStmt.getVectorLists());
     assertNull(indexStmt.getVectorSampleSize());
+  }
+
+  @Test
+  public void testHnswPropertyExtraction() throws Exception {
+    String ddl =
+      "CREATE VECTOR INDEX idx ON t (v) WITH (algorithm='HNSW', metric='COSINE', dimension=128, "
+        + "M=16, ef_construction=64, alpha=1.25, quantization='PQ', pq_segments=4, pq_training_size=500)";
+    SQLParser parser = new SQLParser(ddl);
+    BindableStatement stmt = parser.parseStatement();
+    assertTrue("Expected CreateIndexStatement", stmt instanceof CreateIndexStatement);
+    CreateIndexStatement indexStmt = (CreateIndexStatement) stmt;
+    assertEquals("HNSW", CreateIndexStatement.getVectorAlgorithm(indexStmt.getProps()));
+    assertEquals("COSINE", CreateIndexStatement.getVectorMetric(indexStmt.getProps()));
+    assertEquals(Integer.valueOf(128),
+      CreateIndexStatement.getVectorDimension(indexStmt.getProps()));
+    assertEquals(Integer.valueOf(16), CreateIndexStatement.getHnswM(indexStmt.getProps()));
+    assertEquals(Integer.valueOf(64),
+      CreateIndexStatement.getHnswEfConstruction(indexStmt.getProps()));
+    assertEquals(Double.valueOf(1.25), CreateIndexStatement.getHnswAlpha(indexStmt.getProps()));
+    assertEquals("PQ", CreateIndexStatement.getQuantizationType(indexStmt.getProps()));
+    assertEquals(Integer.valueOf(4), CreateIndexStatement.getPqSegments(indexStmt.getProps()));
+    assertEquals(Integer.valueOf(500),
+      CreateIndexStatement.getPqTrainingSize(indexStmt.getProps()));
+
+    assertNotNull(indexStmt.getVectorIndexParams());
+    Map<String, Object> tableProps = new HashMap<>();
+    indexStmt.getVectorIndexParams().populateTableProps(tableProps);
+    assertEquals("HNSW", tableProps.get(PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM));
+    assertEquals("COSINE", tableProps.get(PhoenixDatabaseMetaData.VECTOR_DISTANCE_METRIC));
+    assertEquals(Integer.valueOf(128), tableProps.get(PhoenixDatabaseMetaData.VECTOR_DIMENSION));
+    assertEquals(Integer.valueOf(16), tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_M));
+    assertEquals(Integer.valueOf(64),
+      tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION));
+    assertEquals(Double.valueOf(1.25), tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA));
+    assertEquals("PQ", tableProps.get(PhoenixDatabaseMetaData.VECTOR_QUANTIZATION_TYPE));
+    assertEquals(Integer.valueOf(4), tableProps.get(PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS));
+    assertEquals(Integer.valueOf(500),
+      tableProps.get(PhoenixDatabaseMetaData.VECTOR_PQ_TRAINING_SIZE));
   }
 
   @Test

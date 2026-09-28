@@ -25,6 +25,7 @@ import org.apache.phoenix.cache.IndexMetaDataCache;
 import org.apache.phoenix.coprocessorclient.BaseScannerRegionObserverConstants;
 import org.apache.phoenix.coprocessorclient.BaseScannerRegionObserverConstants.ReplayWrite;
 import org.apache.phoenix.hbase.index.covered.IndexMetaData;
+import org.apache.phoenix.schema.VectorIndexType;
 import org.apache.phoenix.schema.transform.TransformMaintainer;
 import org.apache.phoenix.transaction.PhoenixTransactionContext;
 
@@ -35,6 +36,7 @@ public class PhoenixIndexMetaData implements IndexMetaData {
   private final boolean isImmutable;
   private final boolean hasNonPkColumns;
   private final boolean hasLocalIndexes;
+  private final VectorIndexType vectorIndexType;
 
   public static boolean isIndexRebuild(Map<String, byte[]> attributes) {
     return attributes.get(BaseScannerRegionObserverConstants.REPLAY_WRITES)
@@ -51,18 +53,23 @@ public class PhoenixIndexMetaData implements IndexMetaData {
     boolean isImmutable = true;
     boolean hasNonPkColumns = false;
     boolean hasLocalIndexes = false;
+    VectorIndexType vectorIndexType = null;
     for (IndexMaintainer maintainer : indexMetaDataCache.getIndexMaintainers()) {
       isImmutable &= maintainer.isImmutableRows();
       if (!(maintainer instanceof TransformMaintainer)) {
         hasNonPkColumns |= !maintainer.getIndexedColumns().isEmpty();
       }
       hasLocalIndexes |= maintainer.isLocalIndex();
+      if (maintainer.isVectorIndex() && vectorIndexType == null) {
+        vectorIndexType = maintainer.getVectorIndexType();
+      }
     }
     this.isImmutable = isImmutable;
     this.hasNonPkColumns = hasNonPkColumns;
     this.attributes = attributes;
     this.replayWrite = getReplayWrite(attributes);
     this.hasLocalIndexes = hasLocalIndexes;
+    this.vectorIndexType = vectorIndexType;
   }
 
   public PhoenixTransactionContext getTransactionContext() {
@@ -92,6 +99,14 @@ public class PhoenixIndexMetaData implements IndexMetaData {
 
   public boolean hasLocalIndexes() {
     return hasLocalIndexes;
+  }
+
+  public VectorIndexType getVectorIndexType() {
+    return vectorIndexType;
+  }
+
+  public boolean isVectorIndex() {
+    return vectorIndexType != null;
   }
 
   @Override

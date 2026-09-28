@@ -58,6 +58,8 @@ import org.apache.phoenix.hbase.index.util.KeyValueBuilder;
 import org.apache.phoenix.hbase.index.util.VersionUtil;
 import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
+import org.apache.phoenix.query.ConnectionQueryServices;
+import org.apache.phoenix.query.ConnectionQueryServices.Feature;
 import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.schema.ColumnFamilyNotFoundException;
 import org.apache.phoenix.schema.ColumnNotFoundException;
@@ -69,6 +71,7 @@ import org.apache.phoenix.schema.PNameFactory;
 import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.PTable.IndexType;
 import org.apache.phoenix.schema.PTable.LinkType;
+import org.apache.phoenix.schema.PTableKey;
 import org.apache.phoenix.schema.PTableRef;
 import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.schema.SequenceKey;
@@ -76,6 +79,7 @@ import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.schema.TTLExpression;
 import org.apache.phoenix.schema.TableNotFoundException;
 import org.apache.phoenix.schema.TableProperty;
+import org.apache.phoenix.schema.VectorIndexType;
 import org.apache.phoenix.schema.types.PBoolean;
 import org.apache.phoenix.schema.types.PDataType;
 import org.apache.phoenix.schema.types.PInteger;
@@ -262,7 +266,7 @@ public class MetaDataUtil {
   }
 
   public static boolean decodeHasIndexWALCodec(long version) {
-    return (version & 0xF) == 0;
+    return (version & 0x1) == 0;
   }
 
   // Bit 1 of the low byte (distinct from the WAL codec bit at bit 0) is always set by servers
@@ -276,6 +280,50 @@ public class MetaDataUtil {
 
   public static boolean decodeHasVectorIndexSupport(long version) {
     return (version & 0x2) != 0;
+  }
+
+  /**
+   * Checks whether the cluster represented by {@link ConnectionQueryServices} supports vector
+   * indexes of the specified {@link VectorIndexType}. If {@code type} is null, checks general
+   * vector index support via {@link Feature#VECTOR_INDEX}.
+   * @param services connection query services
+   * @param type     vector index type (e.g. IVF, HNSW)
+   * @return true if supported, false otherwise
+   */
+  public static boolean supportsVectorIndex(ConnectionQueryServices services,
+    VectorIndexType type) {
+    if (services == null || !services.supportsFeature(Feature.VECTOR_INDEX)) {
+      return false;
+    }
+    if (type == null) {
+      return true;
+    }
+    if (type == VectorIndexType.HNSW) {
+      try {
+        PTable sysCatalog = services.getMetaDataCache()
+          .getTableRef(new PTableKey(null, PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME)).getTable();
+        return sysCatalog.getColumnForColumnName(PhoenixDatabaseMetaData.VECTOR_HNSW_M) != null;
+      } catch (Exception e) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Checks whether the cluster represented by {@link ConnectionQueryServices} supports the
+   * specified vector index algorithm (e.g. "IVF", "HNSW").
+   * @param services  connection query services
+   * @param algorithm vector index algorithm name
+   * @return true if supported, false otherwise
+   */
+  public static boolean supportsVectorAlgorithm(ConnectionQueryServices services,
+    String algorithm) {
+    if (algorithm == null) {
+      return supportsVectorIndex(services, null);
+    }
+    VectorIndexType type = VectorIndexType.fromAlgorithm(algorithm);
+    return type != null && supportsVectorIndex(services, type);
   }
 
   // Given the encoded integer representing the client hbase version in the encoded version value.

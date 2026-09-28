@@ -763,22 +763,20 @@ public class IndexTool extends Configured implements Tool {
       String physicalIndexTable = pIndexTable.getPhysicalName().getString();
       final PhoenixConnection pConnection = connection.unwrap(PhoenixConnection.class);
 
+      PTable.VectorIndex vi = pIndexTable.getVectorIndex();
       long gen = (generation != null)
         ? generation
-        : (pIndexTable.getVectorCentroidGeneration() != null
-          && pIndexTable.getVectorCentroidGeneration() > 0
-            ? pIndexTable.getVectorCentroidGeneration()
-            : 1L);
+        : (vi != null && vi.getCentroidGeneration() != null && vi.getCentroidGeneration() > 0
+          ? vi.getCentroidGeneration()
+          : 1L);
 
       // Verify or auto-train centroids if needed
       List<byte[]> existingCentroids = CentroidManager.loadCentroids(pConnection, qIndexTable, gen);
       if (existingCentroids == null || existingCentroids.isEmpty()) {
-        int k = pIndexTable.getVectorIvfLists() != null && pIndexTable.getVectorIvfLists() > 0
-          ? pIndexTable.getVectorIvfLists()
-          : 4;
-        String distanceMetric = pIndexTable.getVectorDistanceMetric() != null
-          ? pIndexTable.getVectorDistanceMetric()
-          : "L2";
+        int k =
+          vi != null && vi.getIvfLists() != null && vi.getIvfLists() > 0 ? vi.getIvfLists() : 4;
+        String distanceMetric =
+          vi != null && vi.getDistanceMetric() != null ? vi.getDistanceMetric() : "L2";
 
         IndexMaintainer maintainer = pIndexTable.getIndexMaintainer(pDataTable, pConnection);
         // Resolve the vector expression to sample, either the indexed data table column
@@ -797,10 +795,9 @@ public class IndexTool extends Configured implements Tool {
         if (vectorColSqlExpr != null) {
           // Use declared sample size if specified, otherwise fall back to the default sample size
           // heuristic.
-          int sampleSize =
-            pIndexTable.getVectorIvfSampleSize() != null && pIndexTable.getVectorIvfSampleSize() > 0
-              ? pIndexTable.getVectorIvfSampleSize()
-              : Math.min(256 * k, 10000);
+          int sampleSize = vi != null && vi.getIvfSampleSize() != null && vi.getIvfSampleSize() > 0
+            ? vi.getIvfSampleSize()
+            : Math.min(256 * k, 10000);
           List<float[]> samples =
             KMeansTrainer.sampleVectors(pConnection, qDataTable, vectorColSqlExpr, sampleSize);
           if (samples != null && !samples.isEmpty()) {
@@ -873,9 +870,8 @@ public class IndexTool extends Configured implements Tool {
       PhoenixConfigurationUtil.setDisableIndexes(configuration, indexTable);
       PhoenixConfigurationUtil.setIsVectorIndex(configuration, true);
       PhoenixConfigurationUtil.setVectorCentroidGeneration(configuration, gen);
-      if (pIndexTable.getVectorDistanceMetric() != null) {
-        PhoenixConfigurationUtil.setVectorDistanceMetric(configuration,
-          pIndexTable.getVectorDistanceMetric());
+      if (vi != null && vi.getDistanceMetric() != null) {
+        PhoenixConfigurationUtil.setVectorDistanceMetric(configuration, vi.getDistanceMetric());
       }
       PhoenixConfigurationUtil.setVectorIndexInSelected(configuration, vectorIndexInSelected);
       configuration.setInt(PhoenixConfigurationUtil.VECTOR_NON_CENTROID_COL_COUNT,
@@ -1048,9 +1044,10 @@ public class IndexTool extends Configured implements Tool {
         // Synchronously reconcile the scorecard upon completion for foreground builds;
         // asynchronous rebuilds are reconciled during the periodic task's initial sweep.
         if (isForeground && pIndexTable != null && pIndexTable.isVectorIndex()) {
-          long gen = pIndexTable.getVectorCentroidGeneration() != null
-            ? pIndexTable.getVectorCentroidGeneration()
-            : 1L;
+          long gen = pIndexTable.getVectorIndex() != null
+            && pIndexTable.getVectorIndex().getCentroidGeneration() != null
+              ? pIndexTable.getVectorIndex().getCentroidGeneration()
+              : 1L;
           VectorIndexScorecard.reconcile(conn, qIndexTable, gen);
         }
         return 0;

@@ -574,11 +574,12 @@ public class VectorDataTypeTest {
   public void testPTableIsVectorIndexPredicate() throws Exception {
     PTable vectorTable = new PTableImpl.Builder().vectorIndexAlgorithm("IVF").build();
     assertTrue("Expected isVectorIndex to be true", vectorTable.isVectorIndex());
-    assertEquals("IVF", vectorTable.getVectorIndexAlgorithm());
+    assertNotNull(vectorTable.getVectorIndex());
+    assertEquals("IVF", vectorTable.getVectorIndex().getAlgorithm());
 
     PTable nonVectorTable = new PTableImpl.Builder().build();
     assertFalse("Expected isVectorIndex to be false", nonVectorTable.isVectorIndex());
-    assertNull(nonVectorTable.getVectorIndexAlgorithm());
+    assertNull(nonVectorTable.getVectorIndex());
   }
 
   @Test
@@ -588,12 +589,13 @@ public class VectorDataTypeTest {
       .vectorIvfSampleSize(2048).vectorCentroidGeneration(1001L).build();
 
     assertTrue(table.isVectorIndex());
-    assertEquals("IVF", table.getVectorIndexAlgorithm());
-    assertEquals("COSINE", table.getVectorDistanceMetric());
-    assertEquals(Integer.valueOf(128), table.getVectorDimension());
-    assertEquals(Integer.valueOf(64), table.getVectorIvfLists());
-    assertEquals(Integer.valueOf(2048), table.getVectorIvfSampleSize());
-    assertEquals(Long.valueOf(1001L), table.getVectorCentroidGeneration());
+    assertNotNull(table.getVectorIndex());
+    assertEquals("IVF", table.getVectorIndex().getAlgorithm());
+    assertEquals("COSINE", table.getVectorIndex().getDistanceMetric());
+    assertEquals(Integer.valueOf(128), table.getVectorIndex().getDimension());
+    assertEquals(Integer.valueOf(64), table.getVectorIndex().getIvfLists());
+    assertEquals(Integer.valueOf(2048), table.getVectorIndex().getIvfSampleSize());
+    assertEquals(Long.valueOf(1001L), table.getVectorIndex().getCentroidGeneration());
   }
 
   @Test
@@ -624,12 +626,13 @@ public class VectorDataTypeTest {
     PTable deserialized = PTableImpl.fromProto(proto);
     assertNotNull(deserialized);
     assertTrue(deserialized.isVectorIndex());
-    assertEquals("IVF", deserialized.getVectorIndexAlgorithm());
-    assertEquals("L2", deserialized.getVectorDistanceMetric());
-    assertEquals(Integer.valueOf(256), deserialized.getVectorDimension());
-    assertEquals(Integer.valueOf(32), deserialized.getVectorIvfLists());
-    assertEquals(Integer.valueOf(1024), deserialized.getVectorIvfSampleSize());
-    assertEquals(Long.valueOf(42L), deserialized.getVectorCentroidGeneration());
+    assertNotNull(deserialized.getVectorIndex());
+    assertEquals("IVF", deserialized.getVectorIndex().getAlgorithm());
+    assertEquals("L2", deserialized.getVectorIndex().getDistanceMetric());
+    assertEquals(Integer.valueOf(256), deserialized.getVectorIndex().getDimension());
+    assertEquals(Integer.valueOf(32), deserialized.getVectorIndex().getIvfLists());
+    assertEquals(Integer.valueOf(1024), deserialized.getVectorIndex().getIvfSampleSize());
+    assertEquals(Long.valueOf(42L), deserialized.getVectorIndex().getCentroidGeneration());
   }
 
   @Test
@@ -643,12 +646,13 @@ public class VectorDataTypeTest {
 
     PTable cloned = PTableImpl.builderFromExisting(original).build();
     assertTrue(cloned.isVectorIndex());
-    assertEquals("IVF", cloned.getVectorIndexAlgorithm());
-    assertEquals("INNER_PRODUCT", cloned.getVectorDistanceMetric());
-    assertEquals(Integer.valueOf(512), cloned.getVectorDimension());
-    assertEquals(Integer.valueOf(128), cloned.getVectorIvfLists());
-    assertEquals(Integer.valueOf(4096), cloned.getVectorIvfSampleSize());
-    assertEquals(Long.valueOf(777L), cloned.getVectorCentroidGeneration());
+    assertNotNull(cloned.getVectorIndex());
+    assertEquals("IVF", cloned.getVectorIndex().getAlgorithm());
+    assertEquals("INNER_PRODUCT", cloned.getVectorIndex().getDistanceMetric());
+    assertEquals(Integer.valueOf(512), cloned.getVectorIndex().getDimension());
+    assertEquals(Integer.valueOf(128), cloned.getVectorIndex().getIvfLists());
+    assertEquals(Integer.valueOf(4096), cloned.getVectorIndex().getIvfSampleSize());
+    assertEquals(Long.valueOf(777L), cloned.getVectorIndex().getCentroidGeneration());
   }
 
   @Test
@@ -659,12 +663,13 @@ public class VectorDataTypeTest {
 
     DelegateTable delegate = new DelegateTable(inner);
     assertTrue(delegate.isVectorIndex());
-    assertEquals("IVF", delegate.getVectorIndexAlgorithm());
-    assertEquals("COSINE", delegate.getVectorDistanceMetric());
-    assertEquals(Integer.valueOf(64), delegate.getVectorDimension());
-    assertEquals(Integer.valueOf(16), delegate.getVectorIvfLists());
-    assertEquals(Integer.valueOf(512), delegate.getVectorIvfSampleSize());
-    assertEquals(Long.valueOf(99L), delegate.getVectorCentroidGeneration());
+    assertNotNull(delegate.getVectorIndex());
+    assertEquals("IVF", delegate.getVectorIndex().getAlgorithm());
+    assertEquals("COSINE", delegate.getVectorIndex().getDistanceMetric());
+    assertEquals(Integer.valueOf(64), delegate.getVectorIndex().getDimension());
+    assertEquals(Integer.valueOf(16), delegate.getVectorIndex().getIvfLists());
+    assertEquals(Integer.valueOf(512), delegate.getVectorIndex().getIvfSampleSize());
+    assertEquals(Long.valueOf(99L), delegate.getVectorIndex().getCentroidGeneration());
   }
 
   @Test
@@ -690,12 +695,7 @@ public class VectorDataTypeTest {
     assertNotNull(deserialized);
     assertFalse("Deserialized non-vector table must not be a vector index",
       deserialized.isVectorIndex());
-    assertNull("vectorIndexAlgorithm must be null", deserialized.getVectorIndexAlgorithm());
-    assertNull("vectorDistanceMetric must be null", deserialized.getVectorDistanceMetric());
-    assertNull("vectorDimension must be null", deserialized.getVectorDimension());
-    assertNull("vectorIvfLists must be null", deserialized.getVectorIvfLists());
-    assertNull("vectorIvfSampleSize must be null", deserialized.getVectorIvfSampleSize());
-    assertNull("vectorCentroidGeneration must be null", deserialized.getVectorCentroidGeneration());
+    assertNull("vectorIndex must be null", deserialized.getVectorIndex());
   }
 
   @Test

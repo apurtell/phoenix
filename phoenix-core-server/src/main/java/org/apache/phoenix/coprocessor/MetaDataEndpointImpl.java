@@ -84,9 +84,14 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.USE_STATS_FOR_PARA
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_CENTROID_GENERATION_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_DIMENSION_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_DISTANCE_METRIC_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_HNSW_M_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_IVF_LISTS_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_IVF_SAMPLE_SIZE_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VECTOR_QUANTIZATION_TYPE_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_CONSTANT_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_INDEX_ID_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_INDEX_ID_DATA_TYPE_BYTES;
@@ -282,6 +287,7 @@ import org.apache.phoenix.schema.types.PBoolean;
 import org.apache.phoenix.schema.types.PBson;
 import org.apache.phoenix.schema.types.PChar;
 import org.apache.phoenix.schema.types.PDataType;
+import org.apache.phoenix.schema.types.PDouble;
 import org.apache.phoenix.schema.types.PInteger;
 import org.apache.phoenix.schema.types.PLong;
 import org.apache.phoenix.schema.types.PTinyint;
@@ -451,6 +457,16 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
     createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_IVF_SAMPLE_SIZE_BYTES);
   private static final Cell VECTOR_CENTROID_GENERATION_KV = createFirstOnRow(
     ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_CENTROID_GENERATION_BYTES);
+  private static final Cell VECTOR_HNSW_M_KV =
+    createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_HNSW_M_BYTES);
+  private static final Cell VECTOR_HNSW_EF_CONSTRUCTION_KV = createFirstOnRow(
+    ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_HNSW_EF_CONSTRUCTION_BYTES);
+  private static final Cell VECTOR_HNSW_ALPHA_KV =
+    createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_HNSW_ALPHA_BYTES);
+  private static final Cell VECTOR_QUANTIZATION_TYPE_KV =
+    createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_QUANTIZATION_TYPE_BYTES);
+  private static final Cell VECTOR_PQ_SEGMENTS_KV =
+    createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, VECTOR_PQ_SEGMENTS_BYTES);
 
   private static final Cell TTL_KV =
     createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, TTL_BYTES);
@@ -459,19 +475,21 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
   private static final Cell IS_STRICT_TTL_KV =
     createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, IS_STRICT_TTL_BYTES);
 
-  private static final List<Cell> TABLE_KV_COLUMNS = Lists.newArrayList(EMPTY_KEYVALUE_KV,
-    TABLE_TYPE_KV, TABLE_SEQ_NUM_KV, COLUMN_COUNT_KV, SALT_BUCKETS_KV, PK_NAME_KV,
-    DATA_TABLE_NAME_KV, INDEX_STATE_KV, IMMUTABLE_ROWS_KV, VIEW_EXPRESSION_KV,
-    DEFAULT_COLUMN_FAMILY_KV, DISABLE_WAL_KV, MULTI_TENANT_KV, VIEW_TYPE_KV, VIEW_INDEX_ID_KV,
-    VIEW_INDEX_ID_DATA_TYPE_BYTES_KV, INDEX_TYPE_KV, INDEX_DISABLE_TIMESTAMP_KV, STORE_NULLS_KV,
-    BASE_COLUMN_COUNT_KV, ROW_KEY_ORDER_OPTIMIZABLE_KV, TRANSACTIONAL_KV, TRANSACTION_PROVIDER_KV,
-    PHYSICAL_TABLE_NAME_KV, UPDATE_CACHE_FREQUENCY_KV, IS_NAMESPACE_MAPPED_KV,
-    AUTO_PARTITION_SEQ_KV, APPEND_ONLY_SCHEMA_KV, STORAGE_SCHEME_KV, ENCODING_SCHEME_KV,
-    USE_STATS_FOR_PARALLELIZATION_KV, LAST_DDL_TIMESTAMP_KV, CHANGE_DETECTION_ENABLED_KV,
-    SCHEMA_VERSION_KV, EXTERNAL_SCHEMA_ID_KV, STREAMING_TOPIC_NAME_KV, INDEX_WHERE_KV,
-    CDC_INCLUDE_KV, TTL_KV, ROW_KEY_MATCHER_KV, IS_STRICT_TTL_KV, INDEX_CONSISTENCY_KV,
-    VECTOR_INDEX_ALGORITHM_KV, VECTOR_DISTANCE_METRIC_KV, VECTOR_DIMENSION_KV, VECTOR_IVF_LISTS_KV,
-    VECTOR_IVF_SAMPLE_SIZE_KV, VECTOR_CENTROID_GENERATION_KV);
+  private static final List<Cell> TABLE_KV_COLUMNS =
+    Lists.newArrayList(EMPTY_KEYVALUE_KV, TABLE_TYPE_KV, TABLE_SEQ_NUM_KV, COLUMN_COUNT_KV,
+      SALT_BUCKETS_KV, PK_NAME_KV, DATA_TABLE_NAME_KV, INDEX_STATE_KV, IMMUTABLE_ROWS_KV,
+      VIEW_EXPRESSION_KV, DEFAULT_COLUMN_FAMILY_KV, DISABLE_WAL_KV, MULTI_TENANT_KV, VIEW_TYPE_KV,
+      VIEW_INDEX_ID_KV, VIEW_INDEX_ID_DATA_TYPE_BYTES_KV, INDEX_TYPE_KV, INDEX_DISABLE_TIMESTAMP_KV,
+      STORE_NULLS_KV, BASE_COLUMN_COUNT_KV, ROW_KEY_ORDER_OPTIMIZABLE_KV, TRANSACTIONAL_KV,
+      TRANSACTION_PROVIDER_KV, PHYSICAL_TABLE_NAME_KV, UPDATE_CACHE_FREQUENCY_KV,
+      IS_NAMESPACE_MAPPED_KV, AUTO_PARTITION_SEQ_KV, APPEND_ONLY_SCHEMA_KV, STORAGE_SCHEME_KV,
+      ENCODING_SCHEME_KV, USE_STATS_FOR_PARALLELIZATION_KV, LAST_DDL_TIMESTAMP_KV,
+      CHANGE_DETECTION_ENABLED_KV, SCHEMA_VERSION_KV, EXTERNAL_SCHEMA_ID_KV,
+      STREAMING_TOPIC_NAME_KV, INDEX_WHERE_KV, CDC_INCLUDE_KV, TTL_KV, ROW_KEY_MATCHER_KV,
+      IS_STRICT_TTL_KV, INDEX_CONSISTENCY_KV, VECTOR_INDEX_ALGORITHM_KV, VECTOR_DISTANCE_METRIC_KV,
+      VECTOR_DIMENSION_KV, VECTOR_IVF_LISTS_KV, VECTOR_IVF_SAMPLE_SIZE_KV,
+      VECTOR_CENTROID_GENERATION_KV, VECTOR_HNSW_M_KV, VECTOR_HNSW_EF_CONSTRUCTION_KV,
+      VECTOR_HNSW_ALPHA_KV, VECTOR_QUANTIZATION_TYPE_KV, VECTOR_PQ_SEGMENTS_KV);
 
   static {
     Collections.sort(TABLE_KV_COLUMNS, CellComparatorImpl.COMPARATOR);
@@ -544,6 +562,14 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
     TABLE_KV_COLUMNS.indexOf(VECTOR_IVF_SAMPLE_SIZE_KV);
   private static final int VECTOR_CENTROID_GENERATION_INDEX =
     TABLE_KV_COLUMNS.indexOf(VECTOR_CENTROID_GENERATION_KV);
+  private static final int VECTOR_HNSW_M_INDEX = TABLE_KV_COLUMNS.indexOf(VECTOR_HNSW_M_KV);
+  private static final int VECTOR_HNSW_EF_CONSTRUCTION_INDEX =
+    TABLE_KV_COLUMNS.indexOf(VECTOR_HNSW_EF_CONSTRUCTION_KV);
+  private static final int VECTOR_HNSW_ALPHA_INDEX = TABLE_KV_COLUMNS.indexOf(VECTOR_HNSW_ALPHA_KV);
+  private static final int VECTOR_QUANTIZATION_TYPE_INDEX =
+    TABLE_KV_COLUMNS.indexOf(VECTOR_QUANTIZATION_TYPE_KV);
+  private static final int VECTOR_PQ_SEGMENTS_INDEX =
+    TABLE_KV_COLUMNS.indexOf(VECTOR_PQ_SEGMENTS_KV);
   // KeyValues for Column
   private static final KeyValue DECIMAL_DIGITS_KV =
     createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, DECIMAL_DIGITS_BYTES);
@@ -1650,8 +1676,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (String) PVarchar.INSTANCE.toObject(vectorIndexAlgorithmKv.getValueArray(),
           vectorIndexAlgorithmKv.getValueOffset(), vectorIndexAlgorithmKv.getValueLength());
     }
+    PTable.VectorIndex oldVi = oldTable != null ? oldTable.getVectorIndex() : null;
     builder.setVectorIndexAlgorithm(vectorIndexAlgorithm != null ? vectorIndexAlgorithm
-      : oldTable != null ? oldTable.getVectorIndexAlgorithm()
+      : oldVi != null ? oldVi.getAlgorithm()
       : null);
 
     Cell vectorDistanceMetricKv = tableKeyValues[VECTOR_DISTANCE_METRIC_INDEX];
@@ -1662,7 +1689,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
           vectorDistanceMetricKv.getValueOffset(), vectorDistanceMetricKv.getValueLength());
     }
     builder.setVectorDistanceMetric(vectorDistanceMetric != null ? vectorDistanceMetric
-      : oldTable != null ? oldTable.getVectorDistanceMetric()
+      : oldVi != null ? oldVi.getDistanceMetric()
       : null);
 
     Cell vectorDimensionKv = tableKeyValues[VECTOR_DIMENSION_INDEX];
@@ -1671,9 +1698,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorDimension = (Integer) PInteger.INSTANCE.toObject(vectorDimensionKv.getValueArray(),
         vectorDimensionKv.getValueOffset(), vectorDimensionKv.getValueLength());
     }
-    builder.setVectorDimension(vectorDimension != null ? vectorDimension
-      : oldTable != null ? oldTable.getVectorDimension()
-      : null);
+    builder.setVectorDimension(
+      vectorDimension != null ? vectorDimension : oldVi != null ? oldVi.getDimension() : null);
 
     Cell vectorIvfListsKv = tableKeyValues[VECTOR_IVF_LISTS_INDEX];
     Integer vectorIvfLists = null;
@@ -1681,9 +1707,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorIvfLists = (Integer) PInteger.INSTANCE.toObject(vectorIvfListsKv.getValueArray(),
         vectorIvfListsKv.getValueOffset(), vectorIvfListsKv.getValueLength());
     }
-    builder.setVectorIvfLists(vectorIvfLists != null ? vectorIvfLists
-      : oldTable != null ? oldTable.getVectorIvfLists()
-      : null);
+    builder.setVectorIvfLists(
+      vectorIvfLists != null ? vectorIvfLists : oldVi != null ? oldVi.getIvfLists() : null);
 
     Cell vectorIvfSampleSizeKv = tableKeyValues[VECTOR_IVF_SAMPLE_SIZE_INDEX];
     Integer vectorIvfSampleSize = null;
@@ -1693,7 +1718,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
           vectorIvfSampleSizeKv.getValueOffset(), vectorIvfSampleSizeKv.getValueLength());
     }
     builder.setVectorIvfSampleSize(vectorIvfSampleSize != null ? vectorIvfSampleSize
-      : oldTable != null ? oldTable.getVectorIvfSampleSize()
+      : oldVi != null ? oldVi.getIvfSampleSize()
       : null);
 
     Cell vectorCentroidGenerationKv = tableKeyValues[VECTOR_CENTROID_GENERATION_INDEX];
@@ -1704,8 +1729,57 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
           vectorCentroidGenerationKv.getValueOffset(), vectorCentroidGenerationKv.getValueLength());
     }
     builder.setVectorCentroidGeneration(vectorCentroidGeneration != null ? vectorCentroidGeneration
-      : oldTable != null ? oldTable.getVectorCentroidGeneration()
+      : oldVi != null ? oldVi.getCentroidGeneration()
       : null);
+
+    Cell vectorHnswMKv = tableKeyValues[VECTOR_HNSW_M_INDEX];
+    Integer vectorHnswM = null;
+    if (vectorHnswMKv != null) {
+      vectorHnswM = (Integer) PInteger.INSTANCE.toObject(vectorHnswMKv.getValueArray(),
+        vectorHnswMKv.getValueOffset(), vectorHnswMKv.getValueLength());
+    }
+    builder
+      .setVectorHnswM(vectorHnswM != null ? vectorHnswM : oldVi != null ? oldVi.getHnswM() : null);
+
+    Cell vectorHnswEfConstructionKv = tableKeyValues[VECTOR_HNSW_EF_CONSTRUCTION_INDEX];
+    Integer vectorHnswEfConstruction = null;
+    if (vectorHnswEfConstructionKv != null) {
+      vectorHnswEfConstruction =
+        (Integer) PInteger.INSTANCE.toObject(vectorHnswEfConstructionKv.getValueArray(),
+          vectorHnswEfConstructionKv.getValueOffset(), vectorHnswEfConstructionKv.getValueLength());
+    }
+    builder.setVectorHnswEfConstruction(vectorHnswEfConstruction != null ? vectorHnswEfConstruction
+      : oldVi != null ? oldVi.getHnswEfConstruction()
+      : null);
+
+    Cell vectorHnswAlphaKv = tableKeyValues[VECTOR_HNSW_ALPHA_INDEX];
+    Double vectorHnswAlpha = null;
+    if (vectorHnswAlphaKv != null) {
+      vectorHnswAlpha = (Double) PDouble.INSTANCE.toObject(vectorHnswAlphaKv.getValueArray(),
+        vectorHnswAlphaKv.getValueOffset(), vectorHnswAlphaKv.getValueLength());
+    }
+    builder.setVectorHnswAlpha(
+      vectorHnswAlpha != null ? vectorHnswAlpha : oldVi != null ? oldVi.getHnswAlpha() : null);
+
+    Cell vectorQuantizationTypeKv = tableKeyValues[VECTOR_QUANTIZATION_TYPE_INDEX];
+    String vectorQuantizationType = null;
+    if (vectorQuantizationTypeKv != null) {
+      vectorQuantizationType =
+        (String) PVarchar.INSTANCE.toObject(vectorQuantizationTypeKv.getValueArray(),
+          vectorQuantizationTypeKv.getValueOffset(), vectorQuantizationTypeKv.getValueLength());
+    }
+    builder.setVectorQuantizationType(vectorQuantizationType != null ? vectorQuantizationType
+      : oldVi != null ? oldVi.getQuantizationType()
+      : null);
+
+    Cell vectorPqSegmentsKv = tableKeyValues[VECTOR_PQ_SEGMENTS_INDEX];
+    Integer vectorPqSegments = null;
+    if (vectorPqSegmentsKv != null) {
+      vectorPqSegments = (Integer) PInteger.INSTANCE.toObject(vectorPqSegmentsKv.getValueArray(),
+        vectorPqSegmentsKv.getValueOffset(), vectorPqSegmentsKv.getValueLength());
+    }
+    builder.setVectorPqSegments(
+      vectorPqSegments != null ? vectorPqSegments : oldVi != null ? oldVi.getPqSegments() : null);
 
     // Check the cell tag to see whether the view has modified this property
     final byte[] tagUseStatsForParallelization = (useStatsForParallelizationKv == null)
@@ -3280,7 +3354,10 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         .setSchemaName(schema).setTableName(parent).build().buildException();
     }
 
-    if (vectorIndexAlgorithm == null || !vectorIndexAlgorithm.trim().equalsIgnoreCase("IVF")) {
+    if (
+      vectorIndexAlgorithm == null || !(vectorIndexAlgorithm.trim().equalsIgnoreCase("IVF")
+        || vectorIndexAlgorithm.trim().equalsIgnoreCase("HNSW"))
+    ) {
       throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_INDEX_ALGORITHM)
         .setMessage("Unsupported vector index algorithm: " + vectorIndexAlgorithm).build()
         .buildException();

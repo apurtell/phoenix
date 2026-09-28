@@ -565,7 +565,8 @@ public class QueryOptimizer {
         return AddPlanResult.rejected(index, OptimizerReasons.REASON_NOT_A_VECTOR_SEARCH);
       }
       DistanceMetric queryMetric = VectorSearchUtil.getDistanceMetric(dataPlan.getOrderBy());
-      String indexMetric = index.getVectorDistanceMetric();
+      PTable.VectorIndex vi = index.getVectorIndex();
+      String indexMetric = vi != null ? vi.getDistanceMetric() : null;
       if (
         indexMetric != null && queryMetric != null
           && !VectorSearchUtil.isMetricCompatible(queryMetric, indexMetric)
@@ -576,9 +577,9 @@ public class QueryOptimizer {
       // dimension.
       Expression sourceVector = VectorSearchUtil.getSourceVectorExpression(dataPlan.getOrderBy());
       Integer queryDimension = sourceVector == null ? null : sourceVector.getMaxLength();
+      Integer indexDimension = vi != null ? vi.getDimension() : null;
       if (
-        queryDimension != null && index.getVectorDimension() != null
-          && !queryDimension.equals(index.getVectorDimension())
+        queryDimension != null && indexDimension != null && !queryDimension.equals(indexDimension)
       ) {
         return AddPlanResult.rejected(index, OptimizerReasons.REASON_VECTOR_DIMENSION_MISMATCH);
       }

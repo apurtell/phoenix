@@ -32,6 +32,7 @@ import java.io.DataInputStream;
 import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.util.Collections;
+import java.util.List;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.phoenix.coprocessor.generated.PTableProtos;
@@ -142,7 +143,8 @@ public class VectorIndexTypeTest {
     PTable deserialized = PTableImpl.fromProto(proto);
     assertNotNull(deserialized);
     assertEquals(IndexType.VECTOR_GLOBAL, deserialized.getIndexType());
-    assertEquals("IVF", deserialized.getVectorIndexAlgorithm());
+    assertNotNull(deserialized.getVectorIndex());
+    assertEquals("IVF", deserialized.getVectorIndex().getAlgorithm());
   }
 
   @Test
@@ -266,4 +268,175 @@ public class VectorIndexTypeTest {
     }
   }
 
+  @Test
+  public void testPTableVectorIndexType() throws Exception {
+    PTable ivfTable =
+      new PTableImpl.Builder().setType(PTableType.INDEX).setIndexType(IndexType.VECTOR_GLOBAL)
+        .setName(PNameFactory.newName("IDX_IVF")).setTableName(PNameFactory.newName("IDX_IVF"))
+        .setParentTableName(PNameFactory.newName("DATA_TBL")).setAllColumns(Collections.emptyList())
+        .setPkColumns(Collections.emptyList()).setIndexes(Collections.emptyList())
+        .setPhysicalNames(Collections.emptyList()).vectorIndexAlgorithm("IVF").build();
+    assertNotNull(ivfTable.getVectorIndex());
+    assertEquals("IVF", ivfTable.getVectorIndex().getAlgorithm());
+    assertEquals(VectorIndexType.IVF, ivfTable.getVectorIndex().getType());
+    assertTrue(ivfTable.isVectorIndex());
+
+    PTable hnswTable =
+      new PTableImpl.Builder().setType(PTableType.INDEX).setIndexType(IndexType.VECTOR_GLOBAL)
+        .setName(PNameFactory.newName("IDX_HNSW")).setTableName(PNameFactory.newName("IDX_HNSW"))
+        .setParentTableName(PNameFactory.newName("DATA_TBL")).setAllColumns(Collections.emptyList())
+        .setPkColumns(Collections.emptyList()).setIndexes(Collections.emptyList())
+        .setPhysicalNames(Collections.emptyList()).vectorIndexAlgorithm("HNSW").build();
+    assertNotNull(hnswTable.getVectorIndex());
+    assertEquals("HNSW", hnswTable.getVectorIndex().getAlgorithm());
+    assertEquals(VectorIndexType.HNSW, hnswTable.getVectorIndex().getType());
+    assertTrue(hnswTable.isVectorIndex());
+
+    PTable nonVectorTable = new PTableImpl.Builder().setType(PTableType.INDEX)
+      .setIndexType(IndexType.GLOBAL).setName(PNameFactory.newName("IDX_REGULAR"))
+      .setTableName(PNameFactory.newName("IDX_REGULAR"))
+      .setParentTableName(PNameFactory.newName("DATA_TBL")).setAllColumns(Collections.emptyList())
+      .setPkColumns(Collections.emptyList()).setIndexes(Collections.emptyList())
+      .setPhysicalNames(Collections.emptyList()).build();
+    assertNull(nonVectorTable.getVectorIndex());
+    assertFalse(nonVectorTable.isVectorIndex());
+  }
+
+  @Test
+  public void testIndexMaintainerAndPhoenixIndexMetaDataVectorIndexType() throws Exception {
+    RowKeySchema schema = new RowKeySchema.RowKeySchemaBuilder(0).build();
+
+    IndexMaintainer ivfMaintainer = new IndexMaintainer(schema, false);
+    ivfMaintainer.setVectorAlgorithm("IVF");
+    assertEquals(VectorIndexType.IVF, ivfMaintainer.getVectorIndexType());
+    assertTrue(ivfMaintainer.isVectorIndex());
+
+    IndexMaintainer hnswMaintainer = new IndexMaintainer(schema, false);
+    hnswMaintainer.setVectorAlgorithm("HNSW");
+    assertEquals(VectorIndexType.HNSW, hnswMaintainer.getVectorIndexType());
+    assertTrue(hnswMaintainer.isVectorIndex());
+
+    IndexMaintainer nonVectorMaintainer = new IndexMaintainer(schema, false);
+    assertNull(nonVectorMaintainer.getVectorIndexType());
+    assertFalse(nonVectorMaintainer.isVectorIndex());
+
+    org.apache.phoenix.cache.IndexMetaDataCache ivfCache =
+      new org.apache.phoenix.cache.IndexMetaDataCache() {
+        @Override
+        public void close() throws java.io.IOException {
+        }
+
+        @Override
+        public List<IndexMaintainer> getIndexMaintainers() {
+          return Collections.singletonList(ivfMaintainer);
+        }
+
+        @Override
+        public org.apache.phoenix.transaction.PhoenixTransactionContext getTransactionContext() {
+          return null;
+        }
+
+        @Override
+        public int getClientVersion() {
+          return 0;
+        }
+      };
+    org.apache.phoenix.index.PhoenixIndexMetaData ivfMeta =
+      new org.apache.phoenix.index.PhoenixIndexMetaData(ivfCache, Collections.emptyMap());
+    assertEquals(VectorIndexType.IVF, ivfMeta.getVectorIndexType());
+    assertTrue(ivfMeta.isVectorIndex());
+
+    org.apache.phoenix.cache.IndexMetaDataCache hnswCache =
+      new org.apache.phoenix.cache.IndexMetaDataCache() {
+        @Override
+        public void close() throws java.io.IOException {
+        }
+
+        @Override
+        public List<IndexMaintainer> getIndexMaintainers() {
+          return Collections.singletonList(hnswMaintainer);
+        }
+
+        @Override
+        public org.apache.phoenix.transaction.PhoenixTransactionContext getTransactionContext() {
+          return null;
+        }
+
+        @Override
+        public int getClientVersion() {
+          return 0;
+        }
+      };
+    org.apache.phoenix.index.PhoenixIndexMetaData hnswMeta =
+      new org.apache.phoenix.index.PhoenixIndexMetaData(hnswCache, Collections.emptyMap());
+    assertEquals(VectorIndexType.HNSW, hnswMeta.getVectorIndexType());
+    assertTrue(hnswMeta.isVectorIndex());
+
+    org.apache.phoenix.cache.IndexMetaDataCache nonVectorCache =
+      new org.apache.phoenix.cache.IndexMetaDataCache() {
+        @Override
+        public void close() throws java.io.IOException {
+        }
+
+        @Override
+        public List<IndexMaintainer> getIndexMaintainers() {
+          return Collections.singletonList(nonVectorMaintainer);
+        }
+
+        @Override
+        public org.apache.phoenix.transaction.PhoenixTransactionContext getTransactionContext() {
+          return null;
+        }
+
+        @Override
+        public int getClientVersion() {
+          return 0;
+        }
+      };
+    org.apache.phoenix.index.PhoenixIndexMetaData nonVectorMeta =
+      new org.apache.phoenix.index.PhoenixIndexMetaData(nonVectorCache, Collections.emptyMap());
+    assertNull(nonVectorMeta.getVectorIndexType());
+    assertFalse(nonVectorMeta.isVectorIndex());
+  }
+
+  @Test
+  public void testPTableVectorIndexInnerClass() throws Exception {
+    PTable.VectorIndex vi1 = new PTable.VectorIndex("IVF", "COSINE", 128, 64, 1000, 2L);
+    assertEquals("IVF", vi1.getAlgorithm());
+    assertEquals(VectorIndexType.IVF, vi1.getType());
+    assertEquals("COSINE", vi1.getDistanceMetric());
+    assertEquals(Integer.valueOf(128), vi1.getDimension());
+    assertEquals(Integer.valueOf(64), vi1.getIvfLists());
+    assertEquals(Integer.valueOf(1000), vi1.getIvfSampleSize());
+    assertEquals(Long.valueOf(2L), vi1.getCentroidGeneration());
+
+    PTable.VectorIndex vi2 =
+      new PTable.VectorIndex.Builder().setAlgorithm("IVF").setDistanceMetric("COSINE")
+        .setDimension(128).setIvfLists(64).setIvfSampleSize(1000).setCentroidGeneration(2L).build();
+    assertEquals(vi1, vi2);
+    assertEquals(vi1.hashCode(), vi2.hashCode());
+    assertEquals(vi1.toString(), vi2.toString());
+
+    PTable table =
+      new PTableImpl.Builder().setType(PTableType.INDEX).setIndexType(IndexType.VECTOR_GLOBAL)
+        .setName(PNameFactory.newName("IDX_TEST")).setTableName(PNameFactory.newName("IDX_TEST"))
+        .setParentTableName(PNameFactory.newName("DATA_TBL")).setAllColumns(Collections.emptyList())
+        .setPkColumns(Collections.emptyList()).setIndexes(Collections.emptyList())
+        .setPhysicalNames(Collections.emptyList()).setVectorIndex(vi1).build();
+    assertEquals(vi1, table.getVectorIndex());
+    assertTrue(table.isVectorIndex());
+  }
+
+  @Test
+  public void testFromAlgorithm() {
+    assertEquals(VectorIndexType.IVF, VectorIndexType.fromAlgorithm("IVF"));
+    assertEquals(VectorIndexType.IVF, VectorIndexType.fromAlgorithm("ivf"));
+    assertEquals(VectorIndexType.IVF, VectorIndexType.fromAlgorithm("  IVF  "));
+    assertEquals(VectorIndexType.HNSW, VectorIndexType.fromAlgorithm("HNSW"));
+    assertEquals(VectorIndexType.HNSW, VectorIndexType.fromAlgorithm("hnsw"));
+    assertEquals(VectorIndexType.HNSW, VectorIndexType.fromAlgorithm("  Hnsw \t"));
+    assertNull(VectorIndexType.fromAlgorithm(null));
+    assertNull(VectorIndexType.fromAlgorithm(""));
+    assertNull(VectorIndexType.fromAlgorithm("UNKNOWN"));
+  }
 }

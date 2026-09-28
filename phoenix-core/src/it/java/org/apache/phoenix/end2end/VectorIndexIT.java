@@ -322,11 +322,12 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
 
       PTable indexTable = PTableImpl.createFromProto(response.getTable());
       assertNotNull("Vector index table must exist in catalog", indexTable);
-      assertEquals("IVF", indexTable.getVectorIndexAlgorithm());
-      assertEquals("L2", indexTable.getVectorDistanceMetric());
-      assertEquals(Integer.valueOf(128), indexTable.getVectorDimension());
-      assertEquals(Integer.valueOf(16), indexTable.getVectorIvfLists());
-      assertEquals(Integer.valueOf(500), indexTable.getVectorIvfSampleSize());
+      assertNotNull(indexTable.getVectorIndex());
+      assertEquals("IVF", indexTable.getVectorIndex().getAlgorithm());
+      assertEquals("L2", indexTable.getVectorIndex().getDistanceMetric());
+      assertEquals(Integer.valueOf(128), indexTable.getVectorIndex().getDimension());
+      assertEquals(Integer.valueOf(16), indexTable.getVectorIndex().getIvfLists());
+      assertEquals(Integer.valueOf(500), indexTable.getVectorIndex().getIvfSampleSize());
     }
   }
 
@@ -345,11 +346,12 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
 
       PTable indexTable = PTableImpl.createFromProto(response.getTable());
       assertNotNull("Vector index on BSON column must exist in catalog", indexTable);
-      assertEquals("IVF", indexTable.getVectorIndexAlgorithm());
-      assertEquals("COSINE", indexTable.getVectorDistanceMetric());
-      assertEquals(Integer.valueOf(256), indexTable.getVectorDimension());
-      assertEquals(Integer.valueOf(32), indexTable.getVectorIvfLists());
-      assertEquals(Integer.valueOf(1000), indexTable.getVectorIvfSampleSize());
+      assertNotNull(indexTable.getVectorIndex());
+      assertEquals("IVF", indexTable.getVectorIndex().getAlgorithm());
+      assertEquals("COSINE", indexTable.getVectorIndex().getDistanceMetric());
+      assertEquals(Integer.valueOf(256), indexTable.getVectorIndex().getDimension());
+      assertEquals(Integer.valueOf(32), indexTable.getVectorIndex().getIvfLists());
+      assertEquals(Integer.valueOf(1000), indexTable.getVectorIndex().getIvfSampleSize());
     }
   }
 
@@ -522,11 +524,12 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       assertTrue("Table must be recognized as vector index", indexTable.isVectorIndex());
       assertEquals(IndexType.VECTOR_GLOBAL, indexTable.getIndexType());
       assertEquals(PIndexState.BUILDING, indexTable.getIndexState());
-      assertEquals("IVF", indexTable.getVectorIndexAlgorithm());
-      assertEquals("L2", indexTable.getVectorDistanceMetric());
-      assertEquals(Integer.valueOf(128), indexTable.getVectorDimension());
-      assertEquals(Integer.valueOf(16), indexTable.getVectorIvfLists());
-      assertEquals(Integer.valueOf(500), indexTable.getVectorIvfSampleSize());
+      assertNotNull(indexTable.getVectorIndex());
+      assertEquals("IVF", indexTable.getVectorIndex().getAlgorithm());
+      assertEquals("L2", indexTable.getVectorIndex().getDistanceMetric());
+      assertEquals(Integer.valueOf(128), indexTable.getVectorIndex().getDimension());
+      assertEquals(Integer.valueOf(16), indexTable.getVectorIndex().getIvfLists());
+      assertEquals(Integer.valueOf(500), indexTable.getVectorIndex().getIvfSampleSize());
 
       // Vector index row keys are prefixed with the centroid partition identifier followed by
       // data table primary key columns.
@@ -665,9 +668,10 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       PTable indexTable = pconn.getTableNoCache(indexName);
       assertNotNull(indexTable);
       assertEquals(PIndexState.BUILDING, indexTable.getIndexState());
-      assertEquals(Integer.valueOf(32), indexTable.getVectorDimension());
-      assertEquals(Integer.valueOf(4), indexTable.getVectorIvfLists());
-      assertEquals(Integer.valueOf(100), indexTable.getVectorIvfSampleSize());
+      assertNotNull(indexTable.getVectorIndex());
+      assertEquals(Integer.valueOf(32), indexTable.getVectorIndex().getDimension());
+      assertEquals(Integer.valueOf(4), indexTable.getVectorIndex().getIvfLists());
+      assertEquals(Integer.valueOf(100), indexTable.getVectorIndex().getIvfSampleSize());
     }
   }
 
@@ -1207,7 +1211,8 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
 
       PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
       PTable indexTable = pconn.getTableNoCache(indexName);
-      assertEquals(Integer.valueOf(BSON_DIM), indexTable.getVectorDimension());
+      assertNotNull(indexTable.getVectorIndex());
+      assertEquals(Integer.valueOf(BSON_DIM), indexTable.getVectorIndex().getDimension());
       // Ensure the maintainer indexes the functional expression rather than covered vector columns.
       IndexMaintainer maintainer =
         indexTable.getIndexMaintainer(pconn.getTableNoCache(tableName), pconn);
@@ -2883,7 +2888,8 @@ public class VectorIndexIT extends ParallelStatsDisabledIT {
       assertEquals(2L, CentroidManager.getGeneration(conn, indexName));
       pconn.removeTable(pconn.getTenantId(), indexName, null, HConstants.LATEST_TIMESTAMP);
       PTable pIndex = pconn.getTableNoCache(indexName);
-      assertEquals(Long.valueOf(2L), pIndex.getVectorCentroidGeneration());
+      assertNotNull(pIndex.getVectorIndex());
+      assertEquals(Long.valueOf(2L), pIndex.getVectorIndex().getCentroidGeneration());
     }
   }
 

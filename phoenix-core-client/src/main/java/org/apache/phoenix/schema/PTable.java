@@ -29,6 +29,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Set;
 import javax.annotation.Nullable;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
@@ -38,6 +39,7 @@ import org.apache.phoenix.hbase.index.covered.update.ColumnReference;
 import org.apache.phoenix.hbase.index.util.KeyValueBuilder;
 import org.apache.phoenix.index.IndexMaintainer;
 import org.apache.phoenix.jdbc.PhoenixConnection;
+import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
 import org.apache.phoenix.schema.transform.TransformMaintainer;
 import org.apache.phoenix.schema.types.IndexConsistency;
 import org.apache.phoenix.schema.types.PArrayDataType;
@@ -1065,32 +1067,307 @@ public interface PTable extends PMetaDataEntity {
    */
   byte[] getRowKeyMatcher();
 
-  /** Returns the vector index algorithm name if this table is a vector index, or null otherwise. */
-  String getVectorIndexAlgorithm();
-
-  /** Returns the vector distance metric if this table is a vector index, or null otherwise. */
-  String getVectorDistanceMetric();
-
-  /** Returns the vector dimension if this table is a vector index, or null otherwise. */
-  Integer getVectorDimension();
-
-  /**
-   * Returns the number of IVF partitions or lists if this table is an IVF vector index, or null
-   * otherwise.
-   */
-  Integer getVectorIvfLists();
-
-  /** Returns the training sample size if this table is an IVF vector index, or null otherwise. */
-  Integer getVectorIvfSampleSize();
-
-  /**
-   * Returns the active centroid generation ID if this table is a vector index, or null otherwise.
-   */
-  Long getVectorCentroidGeneration();
+  /** Returns the vector index metadata if this table is a vector index, or null otherwise. */
+  VectorIndex getVectorIndex();
 
   /** Returns true if this table is a vector index. */
   default boolean isVectorIndex() {
-    return getVectorIndexAlgorithm() != null;
+    return getVectorIndex() != null;
+  }
+
+  /** Encapsulates configuration and metadata for vector indexes. */
+  public static class VectorIndex {
+
+    private final String algorithm;
+    private final String distanceMetric;
+    private final Integer dimension;
+    private final Integer ivfLists;
+    private final Integer ivfSampleSize;
+    private final Long centroidGeneration;
+    private final Integer hnswM;
+    private final Integer hnswEfConstruction;
+    private final Double hnswAlpha;
+    private final String quantizationType;
+    private final Integer pqSegments;
+
+    public VectorIndex(String algorithm, String distanceMetric, Integer dimension, Integer ivfLists,
+      Integer ivfSampleSize, Long centroidGeneration) {
+      this(algorithm, distanceMetric, dimension, ivfLists, ivfSampleSize, centroidGeneration, null,
+        null, null, null, null);
+    }
+
+    public VectorIndex(String algorithm, String distanceMetric, Integer dimension, Integer ivfLists,
+      Integer ivfSampleSize, Long centroidGeneration, Integer hnswM, Integer hnswEfConstruction,
+      Double hnswAlpha, String quantizationType, Integer pqSegments) {
+      this.algorithm = algorithm;
+      this.distanceMetric = distanceMetric;
+      this.dimension = dimension;
+      this.ivfLists = ivfLists;
+      this.ivfSampleSize = ivfSampleSize;
+      this.centroidGeneration = centroidGeneration;
+      this.hnswM = hnswM;
+      this.hnswEfConstruction = hnswEfConstruction;
+      this.hnswAlpha = hnswAlpha;
+      this.quantizationType = quantizationType;
+      this.pqSegments = pqSegments;
+    }
+
+    public static VectorIndex fromTableProps(Map<String, Object> tableProps) {
+      if (tableProps == null) {
+        return null;
+      }
+      String algorithm = (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM);
+      String distanceMetric =
+        (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_DISTANCE_METRIC);
+      Object dimObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_DIMENSION);
+      Integer dimension = dimObj instanceof Number ? ((Number) dimObj).intValue() : null;
+      Object listsObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_IVF_LISTS);
+      Integer ivfLists = listsObj instanceof Number ? ((Number) listsObj).intValue() : null;
+      Object sampleObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_IVF_SAMPLE_SIZE);
+      Integer ivfSampleSize = sampleObj instanceof Number ? ((Number) sampleObj).intValue() : null;
+      Object genObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_CENTROID_GENERATION);
+      Long centroidGeneration = genObj instanceof Number ? ((Number) genObj).longValue() : null;
+      Object mObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_M);
+      Integer hnswM = mObj instanceof Number ? ((Number) mObj).intValue() : null;
+      Object efObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION);
+      Integer hnswEfConstruction = efObj instanceof Number ? ((Number) efObj).intValue() : null;
+      Object alphaObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA);
+      Double hnswAlpha = alphaObj instanceof Number ? ((Number) alphaObj).doubleValue() : null;
+      String quantizationType =
+        (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_QUANTIZATION_TYPE);
+      Object pqObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS);
+      Integer pqSegments = pqObj instanceof Number ? ((Number) pqObj).intValue() : null;
+
+      if (
+        algorithm == null && distanceMetric == null && dimension == null && ivfLists == null
+          && ivfSampleSize == null && centroidGeneration == null && hnswM == null
+          && hnswEfConstruction == null && hnswAlpha == null && quantizationType == null
+          && pqSegments == null
+      ) {
+        return null;
+      }
+      return new VectorIndex(algorithm, distanceMetric, dimension, ivfLists, ivfSampleSize,
+        centroidGeneration, hnswM, hnswEfConstruction, hnswAlpha, quantizationType, pqSegments);
+    }
+
+    /**
+     * Returns a new VectorIndex with fields from this instance taking precedence over the provided
+     * server instance.
+     */
+    public VectorIndex mergeWith(VectorIndex serverVi) {
+      if (serverVi == null) {
+        return this;
+      }
+      return new VectorIndex(this.algorithm != null ? this.algorithm : serverVi.algorithm,
+        this.distanceMetric != null ? this.distanceMetric : serverVi.distanceMetric,
+        this.dimension != null ? this.dimension : serverVi.dimension,
+        this.ivfLists != null ? this.ivfLists : serverVi.ivfLists,
+        this.ivfSampleSize != null ? this.ivfSampleSize : serverVi.ivfSampleSize,
+        this.centroidGeneration != null ? this.centroidGeneration : serverVi.centroidGeneration,
+        this.hnswM != null ? this.hnswM : serverVi.hnswM,
+        this.hnswEfConstruction != null ? this.hnswEfConstruction : serverVi.hnswEfConstruction,
+        this.hnswAlpha != null ? this.hnswAlpha : serverVi.hnswAlpha,
+        this.quantizationType != null ? this.quantizationType : serverVi.quantizationType,
+        this.pqSegments != null ? this.pqSegments : serverVi.pqSegments);
+    }
+
+    /** Returns the vector index algorithm name. */
+    public String getAlgorithm() {
+      return algorithm;
+    }
+
+    /** Returns the vector index algorithm type. */
+    public VectorIndexType getType() {
+      return VectorIndexType.fromAlgorithm(algorithm);
+    }
+
+    /** Returns the vector distance metric. */
+    public String getDistanceMetric() {
+      return distanceMetric;
+    }
+
+    /** Returns the vector dimension. */
+    public Integer getDimension() {
+      return dimension;
+    }
+
+    /** Returns the number of IVF partitions or lists if this is an IVF vector index. */
+    public Integer getIvfLists() {
+      return ivfLists;
+    }
+
+    /** Returns the training sample size if this is an IVF vector index. */
+    public Integer getIvfSampleSize() {
+      return ivfSampleSize;
+    }
+
+    /** Returns the active centroid generation ID. */
+    public Long getCentroidGeneration() {
+      return centroidGeneration;
+    }
+
+    /** Returns the HNSW maximum edge degree per node M. */
+    public Integer getHnswM() {
+      return hnswM;
+    }
+
+    /** Returns the HNSW search queue depth during construction ef_construction. */
+    public Integer getHnswEfConstruction() {
+      return hnswEfConstruction;
+    }
+
+    /** Returns the HNSW Vamana diversity parameter alpha. */
+    public Double getHnswAlpha() {
+      return hnswAlpha;
+    }
+
+    /** Returns the HNSW compression quantization type. */
+    public String getQuantizationType() {
+      return quantizationType;
+    }
+
+    /** Returns the HNSW PQ sub-vector segment count. */
+    public Integer getPqSegments() {
+      return pqSegments;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      VectorIndex that = (VectorIndex) o;
+      return Objects.equals(algorithm, that.algorithm)
+        && Objects.equals(distanceMetric, that.distanceMetric)
+        && Objects.equals(dimension, that.dimension) && Objects.equals(ivfLists, that.ivfLists)
+        && Objects.equals(ivfSampleSize, that.ivfSampleSize)
+        && Objects.equals(centroidGeneration, that.centroidGeneration)
+        && Objects.equals(hnswM, that.hnswM)
+        && Objects.equals(hnswEfConstruction, that.hnswEfConstruction)
+        && Objects.equals(hnswAlpha, that.hnswAlpha)
+        && Objects.equals(quantizationType, that.quantizationType)
+        && Objects.equals(pqSegments, that.pqSegments);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(algorithm, distanceMetric, dimension, ivfLists, ivfSampleSize,
+        centroidGeneration, hnswM, hnswEfConstruction, hnswAlpha, quantizationType, pqSegments);
+    }
+
+    @Override
+    public String toString() {
+      return "VectorIndex{" + "algorithm='" + algorithm + '\'' + ", distanceMetric='"
+        + distanceMetric + '\'' + ", dimension=" + dimension + ", ivfLists=" + ivfLists
+        + ", ivfSampleSize=" + ivfSampleSize + ", centroidGeneration=" + centroidGeneration
+        + ", hnswM=" + hnswM + ", hnswEfConstruction=" + hnswEfConstruction + ", hnswAlpha="
+        + hnswAlpha + ", quantizationType='" + quantizationType + '\'' + ", pqSegments="
+        + pqSegments + '}';
+    }
+
+    public static class Builder {
+      private String algorithm;
+      private String distanceMetric;
+      private Integer dimension;
+      private Integer ivfLists;
+      private Integer ivfSampleSize;
+      private Long centroidGeneration;
+      private Integer hnswM;
+      private Integer hnswEfConstruction;
+      private Double hnswAlpha;
+      private String quantizationType;
+      private Integer pqSegments;
+
+      public Builder() {
+      }
+
+      public Builder(VectorIndex copy) {
+        if (copy != null) {
+          this.algorithm = copy.algorithm;
+          this.distanceMetric = copy.distanceMetric;
+          this.dimension = copy.dimension;
+          this.ivfLists = copy.ivfLists;
+          this.ivfSampleSize = copy.ivfSampleSize;
+          this.centroidGeneration = copy.centroidGeneration;
+          this.hnswM = copy.hnswM;
+          this.hnswEfConstruction = copy.hnswEfConstruction;
+          this.hnswAlpha = copy.hnswAlpha;
+          this.quantizationType = copy.quantizationType;
+          this.pqSegments = copy.pqSegments;
+        }
+      }
+
+      public Builder setAlgorithm(String algorithm) {
+        this.algorithm = algorithm;
+        return this;
+      }
+
+      public Builder setDistanceMetric(String distanceMetric) {
+        this.distanceMetric = distanceMetric;
+        return this;
+      }
+
+      public Builder setDimension(Integer dimension) {
+        this.dimension = dimension;
+        return this;
+      }
+
+      public Builder setIvfLists(Integer ivfLists) {
+        this.ivfLists = ivfLists;
+        return this;
+      }
+
+      public Builder setIvfSampleSize(Integer ivfSampleSize) {
+        this.ivfSampleSize = ivfSampleSize;
+        return this;
+      }
+
+      public Builder setCentroidGeneration(Long centroidGeneration) {
+        this.centroidGeneration = centroidGeneration;
+        return this;
+      }
+
+      public Builder setHnswM(Integer hnswM) {
+        this.hnswM = hnswM;
+        return this;
+      }
+
+      public Builder setHnswEfConstruction(Integer hnswEfConstruction) {
+        this.hnswEfConstruction = hnswEfConstruction;
+        return this;
+      }
+
+      public Builder setHnswAlpha(Double hnswAlpha) {
+        this.hnswAlpha = hnswAlpha;
+        return this;
+      }
+
+      public Builder setQuantizationType(String quantizationType) {
+        this.quantizationType = quantizationType;
+        return this;
+      }
+
+      public Builder setPqSegments(Integer pqSegments) {
+        this.pqSegments = pqSegments;
+        return this;
+      }
+
+      public VectorIndex build() {
+        if (
+          algorithm == null && distanceMetric == null && dimension == null && ivfLists == null
+            && ivfSampleSize == null && centroidGeneration == null && hnswM == null
+            && hnswEfConstruction == null && hnswAlpha == null && quantizationType == null
+            && pqSegments == null
+        ) {
+          return null;
+        }
+        return new VectorIndex(algorithm, distanceMetric, dimension, ivfLists, ivfSampleSize,
+          centroidGeneration, hnswM, hnswEfConstruction, hnswAlpha, quantizationType, pqSegments);
+      }
+    }
   }
 
   /**

@@ -124,9 +124,15 @@ public enum SQLExceptionCode {
     "Vector index can only be created on a VECTOR or BSON column."),
   VECTOR_INDEX_DIMENSION_MISMATCH(308, "23106",
     "Vector index dimension does not match source column dimension."),
-  UNSUPPORTED_VECTOR_INDEX_ALGORITHM(309, "23107", "Unsupported vector index algorithm: "),
-  UNSUPPORTED_VECTOR_DISTANCE_METRIC(310, "23108", "Unsupported vector distance metric: "),
-  INVALID_VECTOR_INDEX_PARAMS(311, "23109", "Invalid vector index parameters: "),
+  UNSUPPORTED_VECTOR_INDEX_ALGORITHM(309, "23107", "Unsupported vector index algorithm."),
+  UNSUPPORTED_VECTOR_DISTANCE_METRIC(310, "23108", "Unsupported vector distance metric."),
+  INVALID_VECTOR_INDEX_PARAMS(311, "23109", "Invalid vector index parameters."),
+  UNSUPPORTED_VECTOR_QUANTIZATION_TYPE(312, "23110", "Unsupported vector quantization type."),
+  VECTOR_QUANTIZATION_DIMENSION_MISMATCH(313, "23111",
+    "Vector dimension is not evenly divisible by segments."),
+  VECTOR_ALGORITHM_PARAM_MISMATCH(314, "23112",
+    "Vector index parameter is not valid for the specified algorithm."),
+  HNSW_INCLUDE_NOT_SUPPORTED(315, "23113", "INCLUDE is not supported for HNSW vector indexes."),
   /**
    * Invalid Cursor State (errorcode 04, sqlstate 24)
    */

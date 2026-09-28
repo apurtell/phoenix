@@ -628,8 +628,9 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       pconn.removeTable(pconn.getTenantId(), indexName, null, HConstants.LATEST_TIMESTAMP);
       PTable pIndex = pconn.getTableNoCache(indexName);
       assertEquals(PIndexState.ACTIVE, pIndex.getIndexState());
-      assertEquals(Long.valueOf(1L), pIndex.getVectorCentroidGeneration());
-      assertEquals(Integer.valueOf(4), pIndex.getVectorIvfLists());
+      assertNotNull(pIndex.getVectorIndex());
+      assertEquals(Long.valueOf(1L), pIndex.getVectorIndex().getCentroidGeneration());
+      assertEquals(Integer.valueOf(4), pIndex.getVectorIndex().getIvfLists());
 
       // Verify centroids were trained on V (not V_OTHER): trained centroids must match V's clusters
       List<byte[]> rawCentroids = CentroidManager.loadCentroids(conn, indexName, 1L);
@@ -716,7 +717,8 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       pconn.removeTable(pconn.getTenantId(), indexName, null, HConstants.LATEST_TIMESTAMP);
       PTable pIndex = pconn.getTableNoCache(indexName);
       assertEquals(PIndexState.ACTIVE, pIndex.getIndexState());
-      assertEquals(Long.valueOf(2L), pIndex.getVectorCentroidGeneration());
+      assertNotNull(pIndex.getVectorIndex());
+      assertEquals(Long.valueOf(2L), pIndex.getVectorIndex().getCentroidGeneration());
 
       // Assert every index row's prefix equals gen-2 assignment (A-rows under 1, B-rows under 0)
       List<byte[]> rowKeys = VectorIndexTestUtil.getHBaseRowKeys(pconn, pIndex);
@@ -783,7 +785,8 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
       pconn.removeTable(pconn.getTenantId(), indexName, null, HConstants.LATEST_TIMESTAMP);
       PTable refreshed = pconn.getTableNoCache(indexName);
-      assertEquals(Long.valueOf(2L), refreshed.getVectorCentroidGeneration());
+      assertNotNull(refreshed.getVectorIndex());
+      assertEquals(Long.valueOf(2L), refreshed.getVectorIndex().getCentroidGeneration());
 
       // Verify query compilation evaluates against generation 2 centroids.
       try (PhoenixPreparedStatement pps =
