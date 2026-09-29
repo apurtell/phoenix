@@ -1075,6 +1075,12 @@ public interface PTable extends PMetaDataEntity {
     return getVectorIndex() != null;
   }
 
+  /** Returns the vector index algorithm if this table is a vector index, or null otherwise. */
+  default String getVectorIndexAlgorithm() {
+    VectorIndex vi = getVectorIndex();
+    return vi != null ? vi.getAlgorithm() : null;
+  }
+
   /** Encapsulates configuration and metadata for vector indexes. */
   public static class VectorIndex {
 

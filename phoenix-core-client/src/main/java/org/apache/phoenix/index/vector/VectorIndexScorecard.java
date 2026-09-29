@@ -270,7 +270,9 @@ public class VectorIndexScorecard {
     // severe single-hot-centroid skew.
     Collections.sort(clusterSizes);
     double medianSize = computeMedian(clusterSizes);
-    double skewRatio = medianSize > 0.0 ? (double) maxClusterSize / medianSize : 0.0;
+    double skewRatio = medianSize > 0.0
+      ? (double) maxClusterSize / medianSize
+      : (maxClusterSize > 0 ? Double.POSITIVE_INFINITY : 0.0);
 
     double sumSqDiff = 0.0;
     for (ScorecardRow row : rows) {

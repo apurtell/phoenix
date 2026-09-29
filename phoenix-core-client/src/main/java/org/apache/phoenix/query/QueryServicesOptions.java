@@ -248,7 +248,14 @@ public class QueryServicesOptions {
   public static final long DEFAULT_VECTOR_INDEX_REBUILD_MIN_INTERVAL_MS = 86400000L;
   public static final String DEFAULT_VECTOR_INDEX_REBUILD_PROBE_POLICY = "EXPAND";
   public static final double DEFAULT_VECTOR_INDEX_REBUILD_PROBE_FACTOR = 2.0;
+  public static final boolean DEFAULT_OPTIMIZER_VECTOR_HNSW_ENABLED = false;
   public static final int DEFAULT_HNSW_EF_SEARCH = 64;
+  public static final long DEFAULT_HNSW_OFFHEAP_MAX_BYTES = 2L * 1024 * 1024 * 1024; // 2 GB
+                                                                                     // baseline
+  public static final int DEFAULT_HNSW_BUILD_THREADS = Runtime.getRuntime().availableProcessors();
+  public static final int DEFAULT_HNSW_FLUSH_THRESHOLD = 10_000;
+  public static final long DEFAULT_HNSW_FLUSH_INTERVAL_MS = 300_000L;
+  public static final String DEFAULT_HNSW_SPLIT_REBUILD_PRIORITY = "NORMAL";
   public static final int DEFAULT_GROUPBY_ESTIMATED_DISTINCT_VALUES = 1000;
   public static final int DEFAULT_CLOCK_SKEW_INTERVAL = 2000;
   public static final boolean DEFAULT_INDEX_FAILURE_HANDLING_REBUILD = true; // auto rebuild on

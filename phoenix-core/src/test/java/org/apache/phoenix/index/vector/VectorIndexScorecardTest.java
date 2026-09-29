@@ -86,6 +86,25 @@ public class VectorIndexScorecardTest {
   }
 
   @Test
+  public void testSkewRatioTriggerWhenMedianIsZero() {
+    Configuration conf = HBaseConfiguration.create();
+    List<ScorecardRow> rows = new ArrayList<>();
+    // 4 centroids: 3 with 0 rows, 1 with 1200 rows.
+    // Total = 1200 >= 1000, median = 0, max = 1200, skew ratio = Infinity > 4.0
+    for (int i = 0; i < 3; i++) {
+      rows.add(new ScorecardRow("TEST_IDX", 1L, i, 0L, 0L, System.currentTimeMillis()));
+    }
+    rows.add(new ScorecardRow("TEST_IDX", 1L, 3, 1200L, 0L, System.currentTimeMillis()));
+
+    DriftEvaluationResult result = VectorIndexScorecard.evaluateRows(rows, conf);
+    assertTrue("Skewed index with zero median must trigger rebuild", result.shouldRebuild());
+    assertNotNull(result.getTriggerReason());
+    assertTrue("Reason should mention skew ratio",
+      result.getTriggerReason().contains("SKEW_RATIO_EXCEEDED"));
+    assertTrue(Double.isInfinite(result.getSkewRatio()));
+  }
+
+  @Test
   public void testSizeCvTrigger() {
     Configuration conf = HBaseConfiguration.create();
     List<ScorecardRow> rows = new ArrayList<>();

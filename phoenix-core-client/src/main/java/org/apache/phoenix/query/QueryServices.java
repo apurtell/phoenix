@@ -175,6 +175,16 @@ public interface QueryServices extends SQLCloseable {
   public static final String VECTOR_INDEX_REBUILD_PROBE_FACTOR_ATTRIB =
     "phoenix.vector.index.rebuild.probe.factor";
   public static final String HNSW_EF_SEARCH_ATTRIB = "phoenix.vector.hnsw.ef_search.default";
+  public static final String HNSW_OFFHEAP_MAX_BYTES_ATTRIB =
+    "phoenix.vector.hnsw.offheap.max.bytes";
+  public static final String HNSW_BUILD_THREADS_ATTRIB = "phoenix.vector.hnsw.build.threads";
+  public static final String HNSW_FLUSH_THRESHOLD_ATTRIB = "phoenix.vector.hnsw.flush.threshold";
+  public static final String HNSW_FLUSH_INTERVAL_MS_ATTRIB =
+    "phoenix.vector.hnsw.flush.interval.ms";
+  public static final String HNSW_SPLIT_REBUILD_PRIORITY_ATTRIB =
+    "phoenix.vector.hnsw.split.rebuild.priority";
+  public static final String OPTIMIZER_VECTOR_HNSW_ENABLED_ATTRIB =
+    "phoenix.optimizer.vector.hnsw.enabled";
   public static final String HA_GROUP_NAME_ATTRIB = "phoenix.ha.group";
   public static final String AUTO_UPGRADE_WHITELIST_ATTRIB = "phoenix.client.autoUpgradeWhiteList";
   // Mainly for testing to force spilling

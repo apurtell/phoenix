@@ -111,6 +111,9 @@ import org.apache.phoenix.hbase.index.metrics.MetricsIndexerSourceFactory;
 import org.apache.phoenix.hbase.index.table.HTableInterfaceReference;
 import org.apache.phoenix.hbase.index.util.GenericKeyValueBuilder;
 import org.apache.phoenix.hbase.index.util.ImmutableBytesPtr;
+import org.apache.phoenix.hbase.index.vector.HnswIndexManager;
+import org.apache.phoenix.hbase.index.vector.IvfIndexManager;
+import org.apache.phoenix.hbase.index.vector.VectorIndexManager;
 import org.apache.phoenix.hbase.index.write.IndexWriter;
 import org.apache.phoenix.hbase.index.write.LazyParallelWriterIndexCommitter;
 import org.apache.phoenix.index.IndexMaintainer;
@@ -118,6 +121,7 @@ import org.apache.phoenix.index.PhoenixIndexBuilderHelper;
 import org.apache.phoenix.index.PhoenixIndexMetaData;
 import org.apache.phoenix.index.vector.ScorecardAccumulator;
 import org.apache.phoenix.jdbc.HAGroupStoreManager;
+import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.query.KeyRange;
 import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.query.QueryServicesOptions;
@@ -131,6 +135,7 @@ import org.apache.phoenix.schema.PTableImpl;
 import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.schema.TTLExpressionFactory;
+import org.apache.phoenix.schema.VectorIndexType;
 import org.apache.phoenix.schema.transform.TransformMaintainer;
 import org.apache.phoenix.schema.tuple.MultiKeyValueTuple;
 import org.apache.phoenix.schema.types.PBoolean;
@@ -145,6 +150,7 @@ import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.IndexUtil;
 import org.apache.phoenix.util.MutationUtil;
 import org.apache.phoenix.util.PhoenixKeyValueUtil;
+import org.apache.phoenix.util.QueryUtil;
 import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.ServerIndexUtil;
 import org.apache.phoenix.util.ServerUtil.ConnectionType;
@@ -529,6 +535,35 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
   private static final int DEFAULT_ROWLOCK_WAIT_DURATION = 30000;
   private static final int DEFAULT_CONCURRENT_MUTATION_WAIT_DURATION_IN_MS = 100;
   private byte[] encodedRegionName;
+  private volatile VectorIndexManager vectorIndexManager;
+  private volatile boolean vectorManagerInitAttempted = false;
+  private volatile RegionCoprocessorEnvironment vectorEnv;
+
+  public VectorIndexManager getVectorIndexManager() {
+    return vectorIndexManager;
+  }
+
+  public void setVectorIndexManager(VectorIndexManager vectorIndexManager) {
+    this.vectorIndexManager = vectorIndexManager;
+  }
+
+  public HnswIndexManager getHnswIndexManager() {
+    return vectorIndexManager instanceof HnswIndexManager
+      ? (HnswIndexManager) vectorIndexManager
+      : null;
+  }
+
+  public void setHnswIndexManager(HnswIndexManager hnswIndexManager) {
+    this.vectorIndexManager = hnswIndexManager;
+  }
+
+  public HnswIndexManager getHnswGraphManager() {
+    return getHnswIndexManager();
+  }
+
+  public void setHnswGraphManager(HnswIndexManager hnswGraphManager) {
+    setHnswIndexManager(hnswGraphManager);
+  }
 
   @Override
   public Optional<RegionObserver> getRegionObserver() {
@@ -599,6 +634,9 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
           new IndexCDCConsumer(env, this.dataTableName, serverName, this.serializeCDCMutations);
         this.indexCDCConsumer.start();
       }
+      // Defer VectorIndexManager initialization to first mutation to avoid
+      // JDBC connection churn during bulk region opens (e.g. RegionServer restart).
+      this.vectorEnv = env;
     } catch (NoSuchMethodError ex) {
       disabled = true;
       LOG.error("Must be too early a version of HBase. Disabled coprocessor ", ex);
@@ -632,17 +670,140 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
     }
     this.stopped = true;
     String msg = "Indexer is being stopped";
-    this.builder.stop(msg);
-    this.preWriter.stop(msg);
-    this.postWriter.stop(msg);
+    if (this.builder != null) {
+      this.builder.stop(msg);
+    }
+    if (this.preWriter != null) {
+      this.preWriter.stop(msg);
+    }
+    if (this.postWriter != null && this.postWriter != this.preWriter) {
+      this.postWriter.stop(msg);
+    }
     if (this.indexCDCConsumer != null) {
       this.indexCDCConsumer.stop();
     }
-    try {
-      ScorecardAccumulator.getInstance().flush();
-    } catch (Exception ex) {
-      LOG.warn("Failed to flush scorecard accumulator on stop: {}", ex.getMessage());
+    if (this.vectorIndexManager != null) {
+      try {
+        this.vectorIndexManager.close();
+      } catch (Exception ex) {
+        LOG.warn("Failed to close VectorIndexManager on stop: {}", ex.getMessage(), ex);
+      }
+    } else {
+      try {
+        ScorecardAccumulator.getInstance().flush();
+      } catch (Exception ex) {
+        LOG.warn("Failed to flush scorecard accumulator on stop: {}", ex.getMessage());
+      }
     }
+  }
+
+  /**
+   * Ensures the VectorIndexManager is lazily initialized on first use. This avoids opening JDBC
+   * connections during {@code start()} which causes connection churn during bulk region opens.
+   * Thread safe via volatile double check.
+   */
+  private void ensureVectorManagerInitialized() {
+    if (vectorManagerInitAttempted) {
+      return;
+    }
+    synchronized (this) {
+      if (vectorManagerInitAttempted) {
+        return;
+      }
+      vectorManagerInitAttempted = true;
+      RegionCoprocessorEnvironment env = this.vectorEnv;
+      if (env != null) {
+        initializeVectorIndexManager(env);
+      }
+    }
+  }
+
+  /**
+   * Initializes VectorIndexManager when the region corresponds to a vector index or a base table
+   * containing a vector index (IVF or HNSW).
+   */
+  protected void initializeVectorIndexManager(RegionCoprocessorEnvironment env) {
+    try {
+      PTable table = resolvePTable(env);
+      PTable vectorTable = getVectorIndexTable(table);
+      if (vectorTable != null) {
+        VectorIndexType type = VectorIndexType.fromAlgorithm(vectorTable.getVectorIndexAlgorithm());
+        if (type != null) {
+          this.vectorIndexManager = VectorIndexManager.create(type, env, vectorTable);
+          this.vectorIndexManager.open();
+          LOG.info("Initialized {} for region {} of table {}",
+            vectorIndexManager.getClass().getSimpleName(), Bytes.toStringBinary(encodedRegionName),
+            dataTableName);
+        }
+      }
+    } catch (Exception ex) {
+      LOG.warn("Failed to initialize VectorIndexManager for table {}: {}", dataTableName,
+        ex.getMessage(), ex);
+    }
+  }
+
+  protected void initializeHnswGraphManager(RegionCoprocessorEnvironment env) {
+    initializeVectorIndexManager(env);
+  }
+
+  /**
+   * Resolves the PTable metadata for the current region's table.
+   */
+  protected PTable resolvePTable(RegionCoprocessorEnvironment env) {
+    if (
+      this.dataTableName == null || this.dataTableName.startsWith("SYSTEM.")
+        || this.dataTableName.startsWith("SYSTEM:")
+    ) {
+      return null;
+    }
+    try (PhoenixConnection conn =
+      QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(PhoenixConnection.class)) {
+      return conn.getTableNoCache(this.dataTableName);
+    } catch (Exception e) {
+      LOG.debug("Could not resolve PTable for {} during IndexRegionObserver.start: {}",
+        this.dataTableName, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Identifies if the table or any of its indexes is a vector index.
+   */
+  public static PTable getVectorIndexTable(PTable table) {
+    if (table == null) {
+      return null;
+    }
+    if (table.getVectorIndexAlgorithm() != null) {
+      return table;
+    }
+    if (table.getIndexes() != null) {
+      for (PTable index : table.getIndexes()) {
+        if (index.getVectorIndexAlgorithm() != null) {
+          return index;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Identifies if the table or any of its indexes is an HNSW vector index.
+   */
+  public static PTable getHnswIndexTable(PTable table) {
+    if (table == null) {
+      return null;
+    }
+    if ("HNSW".equalsIgnoreCase(table.getVectorIndexAlgorithm())) {
+      return table;
+    }
+    if (table.getIndexes() != null) {
+      for (PTable index : table.getIndexes()) {
+        if ("HNSW".equalsIgnoreCase(index.getVectorIndexAlgorithm())) {
+          return index;
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -1393,6 +1554,15 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
     Put currentDataRowState, Put nextDataRowState, long ts, byte[] encodedRegionName,
     byte[] emptyColumnValue, List<Pair<IndexMaintainer, HTableInterfaceReference>> indexTables,
     ListMultimap<HTableInterfaceReference, Mutation> indexUpdates) throws IOException {
+    generateIndexMutationsForRow(rowKeyPtr, currentDataRowState, nextDataRowState, ts,
+      encodedRegionName, emptyColumnValue, indexTables, indexUpdates, null);
+  }
+
+  public static void generateIndexMutationsForRow(ImmutableBytesPtr rowKeyPtr,
+    Put currentDataRowState, Put nextDataRowState, long ts, byte[] encodedRegionName,
+    byte[] emptyColumnValue, List<Pair<IndexMaintainer, HTableInterfaceReference>> indexTables,
+    ListMultimap<HTableInterfaceReference, Mutation> indexUpdates,
+    VectorIndexManager vectorIndexManager) throws IOException {
     for (Pair<IndexMaintainer, HTableInterfaceReference> pair : indexTables) {
       IndexMaintainer indexMaintainer = pair.getFirst();
       HTableInterfaceReference hTableInterfaceReference = pair.getSecond();
@@ -1462,8 +1632,23 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
           }
         }
         if (indexMaintainer.isVectorIndex()) {
-          updateVectorScorecardSafely(indexMaintainer, currentDataRowState, nextDataRowState,
-            nextDataRowVG, indexPut, isVectorUnchanged, indexRowKeyForCurrentDataRow, ts);
+          if (vectorIndexManager != null) {
+            vectorIndexManager.onMutation(indexMaintainer, currentDataRowState, nextDataRowState,
+              nextDataRowVG, indexPut, indexRowKeyForCurrentDataRow, isVectorUnchanged, ts);
+          } else {
+            // Fallback for when VectorIndexManager was not initialized (e.g. PTable not resolved).
+            // For IVF, call scorecard accumulation directly via the static method.
+            // For HNSW, the in-memory graph builder is required; mutations cannot be processed.
+            VectorIndexType type = indexMaintainer.getVectorIndexType();
+            if (type == null || type == VectorIndexType.IVF) {
+              IvfIndexManager.updateVectorScorecardSafely(indexMaintainer, currentDataRowState,
+                nextDataRowState, nextDataRowVG, indexPut, isVectorUnchanged,
+                indexRowKeyForCurrentDataRow, ts);
+            } else {
+              LOG.warn("HNSW VectorIndexManager not initialized; mutation for index {} dropped",
+                indexMaintainer.getLogicalIndexName());
+            }
+          }
         }
       } else if (
         currentDataRowState != null
@@ -1486,112 +1671,22 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
           indexUpdates.put(hTableInterfaceReference, indexMaintainer
             .buildRowDeleteMutation(priorIndexRowKey, IndexMaintainer.DeleteType.ALL_VERSIONS, ts));
           if (indexMaintainer.isVectorIndex()) {
-            updateVectorScorecardSafely(indexMaintainer, currentDataRowState, null, null, null,
-              false, priorIndexRowKey, ts);
+            if (vectorIndexManager != null) {
+              vectorIndexManager.onMutation(indexMaintainer, currentDataRowState, null, null, null,
+                priorIndexRowKey, false, ts);
+            } else {
+              VectorIndexType type = indexMaintainer.getVectorIndexType();
+              if (type == null || type == VectorIndexType.IVF) {
+                IvfIndexManager.updateVectorScorecardSafely(indexMaintainer, currentDataRowState,
+                  null, null, null, false, priorIndexRowKey, ts);
+              } else {
+                LOG.warn(
+                  "HNSW VectorIndexManager not initialized; delete mutation for index {} dropped",
+                  indexMaintainer.getLogicalIndexName());
+              }
+            }
           }
         }
-      }
-    }
-  }
-
-  /**
-   * Best-effort scorecard update that catches exceptions to avoid failing the primary index
-   * mutation.
-   */
-  private static void updateVectorScorecardSafely(IndexMaintainer indexMaintainer,
-    Put currentDataRowState, Put nextDataRowState, ValueGetter nextDataRowVG, Put indexPut,
-    boolean isVectorUnchanged, byte[] indexRowKeyForCurrentDataRow, long ts) {
-    try {
-      updateVectorScorecard(indexMaintainer, currentDataRowState, nextDataRowState, nextDataRowVG,
-        indexPut, isVectorUnchanged, indexRowKeyForCurrentDataRow, ts);
-    } catch (Throwable t) {
-      LOG.warn("Vector scorecard maintenance failed for index {}; counters will be corrected by "
-        + "reconciliation.", indexMaintainer.getLogicalIndexName(), t);
-    }
-  }
-
-  private static void updateVectorScorecard(IndexMaintainer indexMaintainer,
-    Put currentDataRowState, Put nextDataRowState, ValueGetter nextDataRowVG, Put indexPut,
-    boolean isVectorUnchanged, byte[] indexRowKeyForCurrentDataRow, long ts) {
-    if (!indexMaintainer.isVectorIndex()) {
-      return;
-    }
-    String indexName = indexMaintainer.getLogicalIndexName();
-    Long genLong = indexMaintainer.getVectorCentroidGeneration();
-    long generationId = genLong != null ? genLong : 1L;
-
-    if (nextDataRowState != null && currentDataRowState == null) {
-      // Insert: increment cluster size on assigned centroid
-      if (indexPut != null) {
-        Integer centroidId = indexMaintainer.extractCentroidId(indexPut.getRow());
-        if (centroidId == null && nextDataRowVG != null) {
-          centroidId = indexMaintainer.getCentroidId(nextDataRowVG, ts);
-        }
-        if (centroidId != null) {
-          ScorecardAccumulator.getInstance().accumulate(indexName, generationId, centroidId, 1L,
-            0L);
-          MetricsIndexerSourceFactory.getInstance().getMetricsVectorIndexSource()
-            .incrementVectorCentroidAssignments(indexName);
-        }
-      }
-    } else if (nextDataRowState != null && currentDataRowState != null) {
-      if (isVectorUnchanged) {
-        // Update: vector unchanged
-        return;
-      }
-      if (indexPut != null && indexRowKeyForCurrentDataRow != null) {
-        if (Bytes.compareTo(indexPut.getRow(), indexRowKeyForCurrentDataRow) != 0) {
-          // Update: centroid changed; update cluster sizes and increment reassign count
-          Integer priorCentroidId = indexMaintainer.extractCentroidId(indexRowKeyForCurrentDataRow);
-          if (priorCentroidId == null) {
-            priorCentroidId = indexMaintainer
-              .getCentroidId(new IndexUtil.SimpleValueGetter(currentDataRowState), ts);
-          }
-          Integer arrivingCentroidId = indexMaintainer.extractCentroidId(indexPut.getRow());
-          if (arrivingCentroidId == null && nextDataRowVG != null) {
-            arrivingCentroidId = indexMaintainer.getCentroidId(nextDataRowVG, ts);
-          }
-          if (priorCentroidId != null) {
-            ScorecardAccumulator.getInstance().accumulate(indexName, generationId, priorCentroidId,
-              -1L, 0L);
-          }
-          if (arrivingCentroidId != null) {
-            ScorecardAccumulator.getInstance().accumulate(indexName, generationId,
-              arrivingCentroidId, 1L, 1L);
-            MetricsIndexerSourceFactory.getInstance().getMetricsVectorIndexSource()
-              .incrementVectorCentroidAssignments(indexName);
-            MetricsIndexerSourceFactory.getInstance().getMetricsVectorIndexSource()
-              .incrementVectorCentroidReassignments(indexName);
-          }
-        }
-        // Update: vector changed within same centroid
-      } else if (indexPut != null && indexRowKeyForCurrentDataRow == null) {
-        // Insert: vector added to existing row
-        Integer arrivingCentroidId = indexMaintainer.extractCentroidId(indexPut.getRow());
-        if (arrivingCentroidId == null && nextDataRowVG != null) {
-          arrivingCentroidId = indexMaintainer.getCentroidId(nextDataRowVG, ts);
-        }
-        if (arrivingCentroidId != null) {
-          ScorecardAccumulator.getInstance().accumulate(indexName, generationId, arrivingCentroidId,
-            1L, 0L);
-          MetricsIndexerSourceFactory.getInstance().getMetricsVectorIndexSource()
-            .incrementVectorCentroidAssignments(indexName);
-        }
-      }
-      // Vector removals that emit no index mutation are reconciled during periodic sweeps.
-    } else if (nextDataRowState == null && currentDataRowState != null) {
-      // Delete: decrement cluster size on prior centroid
-      Integer priorCentroidId = null;
-      if (indexRowKeyForCurrentDataRow != null) {
-        priorCentroidId = indexMaintainer.extractCentroidId(indexRowKeyForCurrentDataRow);
-      }
-      if (priorCentroidId == null) {
-        priorCentroidId =
-          indexMaintainer.getCentroidId(new IndexUtil.SimpleValueGetter(currentDataRowState), ts);
-      }
-      if (priorCentroidId != null) {
-        ScorecardAccumulator.getInstance().accumulate(indexName, generationId, priorCentroidId, -1L,
-          0L);
       }
     }
   }
@@ -1627,8 +1722,10 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
         continue;
       }
       ListMultimap<HTableInterfaceReference, Mutation> idxUpdates = ArrayListMultimap.create();
+      ensureVectorManagerInitialized();
       generateIndexMutationsForRow(rowKeyPtr, currentDataRowState, nextDataRowState, ts,
-        encodedRegionName, QueryConstants.UNVERIFIED_BYTES, indexTables, idxUpdates);
+        encodedRegionName, QueryConstants.UNVERIFIED_BYTES, indexTables, idxUpdates,
+        this.vectorIndexManager);
       for (Map.Entry<HTableInterfaceReference, Mutation> idxUpdate : idxUpdates.entries()) {
         context.indexUpdates.put(idxUpdate.getKey(),
           new Pair<>(idxUpdate.getValue(), rowKeyPtr.get()));
