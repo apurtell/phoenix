@@ -71,6 +71,19 @@ class VectorIndexTestUtil {
     conn.commit();
   }
 
+  /** Removes {@code SYSTEM.VECTOR_GRAPH_SEGMENT} rows for the specified indexes. */
+  static void deleteGraphSegmentRows(Connection conn, Collection<String> indexNames)
+    throws SQLException {
+    try (PreparedStatement ps = conn.prepareStatement("DELETE FROM "
+      + PhoenixDatabaseMetaData.SYSTEM_VECTOR_GRAPH_SEGMENT_NAME + " WHERE INDEX_NAME = ?")) {
+      for (String indexName : indexNames) {
+        ps.setString(1, indexName);
+        ps.executeUpdate();
+      }
+    }
+    conn.commit();
+  }
+
   static void activateWithKnownCentroids(Connection conn, String tableName, String indexName,
     List<float[]> centroids, long generation) throws SQLException {
     CentroidManager.persistCentroidsFromFloatList(conn, indexName, generation, centroids);

@@ -35,6 +35,10 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.client.Admin;
+import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
+import org.apache.hadoop.hbase.client.MobCompactPartitionPolicy;
+import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
@@ -629,6 +633,195 @@ public class HnswIndexDdlIT extends ParallelStatsDisabledIT {
         MetaDataUtil.supportsVectorIndex(pconn.getQueryServices(), VectorIndexType.HNSW));
       assertTrue("Cluster must support HNSW via MetaDataUtil.supportsVectorAlgorithm",
         MetaDataUtil.supportsVectorAlgorithm(pconn.getQueryServices(), "HNSW"));
+    }
+  }
+
+  @Test
+  public void testServerSideValidationOnGetTableAndDropTable() throws Exception {
+    String tableName = "T_SRV_VAL_" + generateUniqueName();
+    String indexName = "IDX_SRV_VAL_" + generateUniqueName();
+
+    try (Connection conn = DriverManager.getConnection(getUrl());
+      Statement stmt = conn.createStatement()) {
+      stmt.execute(
+        "CREATE TABLE " + tableName + " (ID VARCHAR NOT NULL PRIMARY KEY, V VECTOR(FLOAT, 4))");
+      stmt.execute("CREATE VECTOR INDEX " + indexName + " ON " + tableName + " (V) "
+        + "WITH (algorithm = 'HNSW', metric = 'COSINE', dimension = 4, M = 16)");
+
+      PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
+
+      // Verify that corrupting VECTOR_HNSW_M to an out-of-range value (e.g. 100) directly in
+      // SYSTEM.CATALOG is caught during server-side getTable
+      String corruptSql =
+        "UPSERT INTO SYSTEM.CATALOG (TENANT_ID, TABLE_SCHEM, TABLE_NAME, COLUMN_NAME, COLUMN_FAMILY, VECTOR_HNSW_M) "
+          + "VALUES (NULL, NULL, ?, NULL, NULL, 100)";
+      try (PreparedStatement ps = conn.prepareStatement(corruptSql)) {
+        ps.setString(1, indexName);
+        ps.executeUpdate();
+      }
+      conn.commit();
+
+      pconn.getQueryServices().clearCache();
+
+      try {
+        pconn.getTable(new PTableKey(null, indexName));
+        fail("Server-side getTable must fail with INVALID_VECTOR_INDEX_PARAMS for corrupted M=100");
+      } catch (SQLException e) {
+        assertEquals(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS.getErrorCode(), e.getErrorCode());
+      }
+
+      // Verify that dropTable succeeds even with corrupted metadata (warn-only validation).
+      // This ensures operators can clean up indexes without first repairing catalog corruption.
+      stmt.execute("DROP INDEX " + indexName + " ON " + tableName);
+    }
+  }
+
+  @Test
+  public void testServerSideCrossContaminationValidation() throws Exception {
+    String tableName = "T_SRV_CROSS_" + generateUniqueName();
+    String indexName = "IDX_SRV_CROSS_" + generateUniqueName();
+
+    try (Connection conn = DriverManager.getConnection(getUrl());
+      Statement stmt = conn.createStatement()) {
+      stmt.execute(
+        "CREATE TABLE " + tableName + " (ID VARCHAR NOT NULL PRIMARY KEY, V VECTOR(FLOAT, 4))");
+      stmt.execute("CREATE VECTOR INDEX " + indexName + " ON " + tableName + " (V) "
+        + "WITH (algorithm = 'HNSW', metric = 'COSINE', dimension = 4, M = 16)");
+
+      PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
+
+      // Corrupt catalog by adding IVF lists to an HNSW index
+      String corruptSql =
+        "UPSERT INTO SYSTEM.CATALOG (TENANT_ID, TABLE_SCHEM, TABLE_NAME, COLUMN_NAME, COLUMN_FAMILY, VECTOR_IVF_LISTS) "
+          + "VALUES (NULL, NULL, ?, NULL, NULL, 10)";
+      try (PreparedStatement ps = conn.prepareStatement(corruptSql)) {
+        ps.setString(1, indexName);
+        ps.executeUpdate();
+      }
+      conn.commit();
+
+      pconn.getQueryServices().clearCache();
+
+      try {
+        pconn.getTable(new PTableKey(null, indexName));
+        fail(
+          "Server-side getTable must fail with VECTOR_ALGORITHM_PARAM_MISMATCH for HNSW with IVF lists");
+      } catch (SQLException e) {
+        assertEquals(SQLExceptionCode.VECTOR_ALGORITHM_PARAM_MISMATCH.getErrorCode(),
+          e.getErrorCode());
+      }
+    }
+  }
+
+  @Test
+  public void testHnswIndexColumnFamilyMobConfiguration() throws Exception {
+    String tableName = "T_HNSW_MOB_" + generateUniqueName();
+    String indexName = "IDX_HNSW_MOB_" + generateUniqueName();
+
+    try (Connection conn = DriverManager.getConnection(getUrl());
+      Statement stmt = conn.createStatement()) {
+      stmt.execute(
+        "CREATE TABLE " + tableName + " (ID VARCHAR NOT NULL PRIMARY KEY, V VECTOR(FLOAT, 4))");
+      stmt.execute("CREATE VECTOR INDEX " + indexName + " ON " + tableName + " (V) "
+        + "WITH (algorithm = 'HNSW', metric = 'COSINE', dimension = 4, M = 16)");
+
+      PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
+      PTable indexTable = pconn.getTable(new PTableKey(null, indexName));
+      assertNotNull("Index table must exist in client catalog", indexTable);
+
+      try (Admin admin = pconn.getQueryServices().getAdmin()) {
+        TableDescriptor desc = admin.getDescriptor(
+          org.apache.hadoop.hbase.TableName.valueOf(indexTable.getPhysicalName().getBytes()));
+        assertNotNull("HBase TableDescriptor must exist", desc);
+
+        byte[] segmentFamily = indexTable.getDefaultFamilyName() != null
+          ? indexTable.getDefaultFamilyName().getBytes()
+          : QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES;
+        ColumnFamilyDescriptor cfd = desc.getColumnFamily(segmentFamily);
+        assertNotNull("Segment column family descriptor must exist", cfd);
+        assertTrue("HNSW index segment column family must have MOB enabled", cfd.isMobEnabled());
+        assertEquals("HNSW index segment column family must have MOB threshold 0", 0L,
+          cfd.getMobThreshold());
+        assertEquals("HNSW index segment column family must have monthly compact partition policy",
+          MobCompactPartitionPolicy.MONTHLY, cfd.getMobCompactPartitionPolicy());
+      }
+    }
+  }
+
+  @Test
+  public void testHnswIndexColumnFamilyMobConfigurationAsync() throws Exception {
+    String tableName = "T_HNSW_MOB_ASYNC_" + generateUniqueName();
+    String indexName = "IDX_HNSW_MOB_ASYNC_" + generateUniqueName();
+
+    try (Connection conn = DriverManager.getConnection(getUrl());
+      Statement stmt = conn.createStatement()) {
+      stmt.execute(
+        "CREATE TABLE " + tableName + " (ID VARCHAR NOT NULL PRIMARY KEY, V VECTOR(FLOAT, 4))");
+      stmt.execute("CREATE VECTOR INDEX " + indexName + " ON " + tableName + " (V) ASYNC "
+        + "WITH (algorithm = 'HNSW', metric = 'L2', dimension = 4, M = 32)");
+
+      PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
+      PTable indexTable = pconn.getTable(new PTableKey(null, indexName));
+      assertNotNull("Async index table must exist in client catalog", indexTable);
+
+      try (Admin admin = pconn.getQueryServices().getAdmin()) {
+        TableDescriptor desc = admin.getDescriptor(
+          org.apache.hadoop.hbase.TableName.valueOf(indexTable.getPhysicalName().getBytes()));
+        assertNotNull("HBase TableDescriptor must exist", desc);
+
+        byte[] segmentFamily = indexTable.getDefaultFamilyName() != null
+          ? indexTable.getDefaultFamilyName().getBytes()
+          : QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES;
+        ColumnFamilyDescriptor cfd = desc.getColumnFamily(segmentFamily);
+        assertNotNull("Segment column family descriptor must exist", cfd);
+        assertTrue("Async HNSW index segment column family must have MOB enabled",
+          cfd.isMobEnabled());
+        assertEquals("Async HNSW index segment column family must have MOB threshold 0", 0L,
+          cfd.getMobThreshold());
+        assertEquals(
+          "Async HNSW index segment column family must have monthly compact partition policy",
+          MobCompactPartitionPolicy.MONTHLY, cfd.getMobCompactPartitionPolicy());
+      }
+    }
+  }
+
+  @Test
+  public void testNonHnswIndexDoesNotEnableMob() throws Exception {
+    String tableName = "T_NON_HNSW_" + generateUniqueName();
+    String stdIndexName = "IDX_STD_" + generateUniqueName();
+    String ivfIndexName = "IDX_IVF_" + generateUniqueName();
+
+    try (Connection conn = DriverManager.getConnection(getUrl());
+      Statement stmt = conn.createStatement()) {
+      stmt.execute("CREATE TABLE " + tableName
+        + " (ID VARCHAR NOT NULL PRIMARY KEY, V VECTOR(FLOAT, 4), K VARCHAR)");
+      stmt.execute("CREATE INDEX " + stdIndexName + " ON " + tableName + " (K)");
+      stmt.execute("CREATE VECTOR INDEX " + ivfIndexName + " ON " + tableName + " (V) "
+        + "WITH (algorithm = 'IVF', metric = 'L2', dimension = 4, lists = 4, sample_size = 100)");
+
+      PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
+
+      try (Admin admin = pconn.getQueryServices().getAdmin()) {
+        PTable stdTable = pconn.getTable(new PTableKey(null, stdIndexName));
+        TableDescriptor stdDesc = admin.getDescriptor(
+          org.apache.hadoop.hbase.TableName.valueOf(stdTable.getPhysicalName().getBytes()));
+        byte[] stdFamily = stdTable.getDefaultFamilyName() != null
+          ? stdTable.getDefaultFamilyName().getBytes()
+          : QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES;
+        ColumnFamilyDescriptor stdCfd = stdDesc.getColumnFamily(stdFamily);
+        assertNotNull(stdCfd);
+        assertFalse("Standard secondary index must not have MOB enabled", stdCfd.isMobEnabled());
+
+        PTable ivfTable = pconn.getTable(new PTableKey(null, ivfIndexName));
+        TableDescriptor ivfDesc = admin.getDescriptor(
+          org.apache.hadoop.hbase.TableName.valueOf(ivfTable.getPhysicalName().getBytes()));
+        byte[] ivfFamily = ivfTable.getDefaultFamilyName() != null
+          ? ivfTable.getDefaultFamilyName().getBytes()
+          : QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES;
+        ColumnFamilyDescriptor ivfCfd = ivfDesc.getColumnFamily(ivfFamily);
+        assertNotNull(ivfCfd);
+        assertFalse("IVF vector index must not have MOB enabled", ivfCfd.isMobEnabled());
+      }
     }
   }
 }

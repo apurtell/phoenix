@@ -804,6 +804,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         done.run(builder.build());
         return;
       }
+      if (table.isVectorIndex()) {
+        validateVectorIndexMetadata(table.getVectorIndex());
+      }
       getCoprocessorHost().preGetTable(Bytes.toString(tenantId),
         SchemaUtil.getTableName(schemaName, tableName),
         TableName.valueOf(table.getPhysicalName().getBytes()));
@@ -1676,11 +1679,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (String) PVarchar.INSTANCE.toObject(vectorIndexAlgorithmKv.getValueArray(),
           vectorIndexAlgorithmKv.getValueOffset(), vectorIndexAlgorithmKv.getValueLength());
     }
-    PTable.VectorIndex oldVi = oldTable != null ? oldTable.getVectorIndex() : null;
-    builder.setVectorIndexAlgorithm(vectorIndexAlgorithm != null ? vectorIndexAlgorithm
-      : oldVi != null ? oldVi.getAlgorithm()
-      : null);
-
     Cell vectorDistanceMetricKv = tableKeyValues[VECTOR_DISTANCE_METRIC_INDEX];
     String vectorDistanceMetric = null;
     if (vectorDistanceMetricKv != null) {
@@ -1688,9 +1686,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (String) PVarchar.INSTANCE.toObject(vectorDistanceMetricKv.getValueArray(),
           vectorDistanceMetricKv.getValueOffset(), vectorDistanceMetricKv.getValueLength());
     }
-    builder.setVectorDistanceMetric(vectorDistanceMetric != null ? vectorDistanceMetric
-      : oldVi != null ? oldVi.getDistanceMetric()
-      : null);
 
     Cell vectorDimensionKv = tableKeyValues[VECTOR_DIMENSION_INDEX];
     Integer vectorDimension = null;
@@ -1698,8 +1693,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorDimension = (Integer) PInteger.INSTANCE.toObject(vectorDimensionKv.getValueArray(),
         vectorDimensionKv.getValueOffset(), vectorDimensionKv.getValueLength());
     }
-    builder.setVectorDimension(
-      vectorDimension != null ? vectorDimension : oldVi != null ? oldVi.getDimension() : null);
 
     Cell vectorIvfListsKv = tableKeyValues[VECTOR_IVF_LISTS_INDEX];
     Integer vectorIvfLists = null;
@@ -1707,8 +1700,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorIvfLists = (Integer) PInteger.INSTANCE.toObject(vectorIvfListsKv.getValueArray(),
         vectorIvfListsKv.getValueOffset(), vectorIvfListsKv.getValueLength());
     }
-    builder.setVectorIvfLists(
-      vectorIvfLists != null ? vectorIvfLists : oldVi != null ? oldVi.getIvfLists() : null);
 
     Cell vectorIvfSampleSizeKv = tableKeyValues[VECTOR_IVF_SAMPLE_SIZE_INDEX];
     Integer vectorIvfSampleSize = null;
@@ -1717,9 +1708,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (Integer) PInteger.INSTANCE.toObject(vectorIvfSampleSizeKv.getValueArray(),
           vectorIvfSampleSizeKv.getValueOffset(), vectorIvfSampleSizeKv.getValueLength());
     }
-    builder.setVectorIvfSampleSize(vectorIvfSampleSize != null ? vectorIvfSampleSize
-      : oldVi != null ? oldVi.getIvfSampleSize()
-      : null);
 
     Cell vectorCentroidGenerationKv = tableKeyValues[VECTOR_CENTROID_GENERATION_INDEX];
     Long vectorCentroidGeneration = null;
@@ -1728,9 +1716,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (Long) PLong.INSTANCE.toObject(vectorCentroidGenerationKv.getValueArray(),
           vectorCentroidGenerationKv.getValueOffset(), vectorCentroidGenerationKv.getValueLength());
     }
-    builder.setVectorCentroidGeneration(vectorCentroidGeneration != null ? vectorCentroidGeneration
-      : oldVi != null ? oldVi.getCentroidGeneration()
-      : null);
 
     Cell vectorHnswMKv = tableKeyValues[VECTOR_HNSW_M_INDEX];
     Integer vectorHnswM = null;
@@ -1738,8 +1723,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorHnswM = (Integer) PInteger.INSTANCE.toObject(vectorHnswMKv.getValueArray(),
         vectorHnswMKv.getValueOffset(), vectorHnswMKv.getValueLength());
     }
-    builder
-      .setVectorHnswM(vectorHnswM != null ? vectorHnswM : oldVi != null ? oldVi.getHnswM() : null);
 
     Cell vectorHnswEfConstructionKv = tableKeyValues[VECTOR_HNSW_EF_CONSTRUCTION_INDEX];
     Integer vectorHnswEfConstruction = null;
@@ -1748,9 +1731,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (Integer) PInteger.INSTANCE.toObject(vectorHnswEfConstructionKv.getValueArray(),
           vectorHnswEfConstructionKv.getValueOffset(), vectorHnswEfConstructionKv.getValueLength());
     }
-    builder.setVectorHnswEfConstruction(vectorHnswEfConstruction != null ? vectorHnswEfConstruction
-      : oldVi != null ? oldVi.getHnswEfConstruction()
-      : null);
 
     Cell vectorHnswAlphaKv = tableKeyValues[VECTOR_HNSW_ALPHA_INDEX];
     Double vectorHnswAlpha = null;
@@ -1758,8 +1738,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorHnswAlpha = (Double) PDouble.INSTANCE.toObject(vectorHnswAlphaKv.getValueArray(),
         vectorHnswAlphaKv.getValueOffset(), vectorHnswAlphaKv.getValueLength());
     }
-    builder.setVectorHnswAlpha(
-      vectorHnswAlpha != null ? vectorHnswAlpha : oldVi != null ? oldVi.getHnswAlpha() : null);
 
     Cell vectorQuantizationTypeKv = tableKeyValues[VECTOR_QUANTIZATION_TYPE_INDEX];
     String vectorQuantizationType = null;
@@ -1768,9 +1746,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (String) PVarchar.INSTANCE.toObject(vectorQuantizationTypeKv.getValueArray(),
           vectorQuantizationTypeKv.getValueOffset(), vectorQuantizationTypeKv.getValueLength());
     }
-    builder.setVectorQuantizationType(vectorQuantizationType != null ? vectorQuantizationType
-      : oldVi != null ? oldVi.getQuantizationType()
-      : null);
 
     Cell vectorPqSegmentsKv = tableKeyValues[VECTOR_PQ_SEGMENTS_INDEX];
     Integer vectorPqSegments = null;
@@ -1778,8 +1753,61 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
       vectorPqSegments = (Integer) PInteger.INSTANCE.toObject(vectorPqSegmentsKv.getValueArray(),
         vectorPqSegmentsKv.getValueOffset(), vectorPqSegmentsKv.getValueLength());
     }
-    builder.setVectorPqSegments(
-      vectorPqSegments != null ? vectorPqSegments : oldVi != null ? oldVi.getPqSegments() : null);
+
+    PTable.VectorIndex oldVi = oldTable != null ? oldTable.getVectorIndex() : null;
+    String effectiveAlgorithm = vectorIndexAlgorithm != null ? vectorIndexAlgorithm
+      : oldVi != null ? oldVi.getAlgorithm()
+      : null;
+    String effectiveDistanceMetric = vectorDistanceMetric != null ? vectorDistanceMetric
+      : oldVi != null ? oldVi.getDistanceMetric()
+      : null;
+    Integer effectiveDimension =
+      vectorDimension != null ? vectorDimension : oldVi != null ? oldVi.getDimension() : null;
+    Integer effectiveIvfLists =
+      vectorIvfLists != null ? vectorIvfLists : oldVi != null ? oldVi.getIvfLists() : null;
+    Integer effectiveIvfSampleSize = vectorIvfSampleSize != null ? vectorIvfSampleSize
+      : oldVi != null ? oldVi.getIvfSampleSize()
+      : null;
+    Long effectiveCentroidGeneration = vectorCentroidGeneration != null ? vectorCentroidGeneration
+      : oldVi != null ? oldVi.getCentroidGeneration()
+      : null;
+    Integer effectiveHnswM =
+      vectorHnswM != null ? vectorHnswM : oldVi != null ? oldVi.getHnswM() : null;
+    Integer effectiveHnswEfConstruction =
+      vectorHnswEfConstruction != null ? vectorHnswEfConstruction
+        : oldVi != null ? oldVi.getHnswEfConstruction()
+        : null;
+    Double effectiveHnswAlpha =
+      vectorHnswAlpha != null ? vectorHnswAlpha : oldVi != null ? oldVi.getHnswAlpha() : null;
+    String effectiveQuantizationType = vectorQuantizationType != null ? vectorQuantizationType
+      : oldVi != null ? oldVi.getQuantizationType()
+      : null;
+    Integer effectivePqSegments =
+      vectorPqSegments != null ? vectorPqSegments : oldVi != null ? oldVi.getPqSegments() : null;
+
+    boolean isVectorTable = effectiveAlgorithm != null || effectiveDimension != null
+      || effectiveDistanceMetric != null || effectiveHnswM != null
+      || effectiveHnswEfConstruction != null || effectiveHnswAlpha != null
+      || effectiveQuantizationType != null || effectivePqSegments != null
+      || effectiveIvfLists != null || effectiveIvfSampleSize != null;
+    if (isVectorTable) {
+      if (tableType != PTableType.INDEX) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_INDEX_ALGORITHM)
+          .setMessage("Vector index metadata can only be applied to INDEX table type").build()
+          .buildException();
+      }
+      validateVectorIndexMetadata(effectiveAlgorithm, effectiveDistanceMetric, effectiveDimension,
+        effectiveIvfLists, effectiveIvfSampleSize, effectiveHnswM, effectiveHnswEfConstruction,
+        effectiveHnswAlpha, effectiveQuantizationType, effectivePqSegments);
+    }
+
+    PTable.VectorIndex vi = new PTable.VectorIndex.Builder().setAlgorithm(effectiveAlgorithm)
+      .setDistanceMetric(effectiveDistanceMetric).setDimension(effectiveDimension)
+      .setIvfLists(effectiveIvfLists).setIvfSampleSize(effectiveIvfSampleSize)
+      .setCentroidGeneration(effectiveCentroidGeneration).setHnswM(effectiveHnswM)
+      .setHnswEfConstruction(effectiveHnswEfConstruction).setHnswAlpha(effectiveHnswAlpha)
+      .setQuantizationType(effectiveQuantizationType).setPqSegments(effectivePqSegments).build();
+    builder.setVectorIndex(vi);
 
     // Check the cell tag to see whether the view has modified this property
     final byte[] tagUseStatsForParallelization = (useStatsForParallelizationKv == null)
@@ -3279,7 +3307,122 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
     }
   }
 
-  private void validateVectorIndexMetadata(List<Mutation> tableMetadata, Put tableHeaderPut,
+  static void validateVectorIndexMetadata(PTable.VectorIndex vi) throws SQLException {
+    if (
+      vi != null && (vi.getAlgorithm() != null || vi.getDimension() != null
+        || vi.getDistanceMetric() != null || vi.getHnswM() != null
+        || vi.getHnswEfConstruction() != null || vi.getHnswAlpha() != null
+        || vi.getQuantizationType() != null || vi.getPqSegments() != null
+        || vi.getIvfLists() != null || vi.getIvfSampleSize() != null)
+    ) {
+      validateVectorIndexMetadata(vi.getAlgorithm(), vi.getDistanceMetric(), vi.getDimension(),
+        vi.getIvfLists(), vi.getIvfSampleSize(), vi.getHnswM(), vi.getHnswEfConstruction(),
+        vi.getHnswAlpha(), vi.getQuantizationType(), vi.getPqSegments());
+    }
+  }
+
+  static void validateVectorIndexMetadata(String vectorIndexAlgorithm, String vectorDistanceMetric,
+    Integer vectorDimension, Integer vectorIvfLists, Integer vectorIvfSampleSize,
+    Integer vectorHnswM, Integer vectorHnswEfConstruction, Double vectorHnswAlpha,
+    String vectorQuantizationType, Integer vectorPqSegments) throws SQLException {
+    if (
+      vectorIndexAlgorithm == null || !(vectorIndexAlgorithm.trim().equalsIgnoreCase("IVF")
+        || vectorIndexAlgorithm.trim().equalsIgnoreCase("HNSW"))
+    ) {
+      throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_INDEX_ALGORITHM)
+        .setMessage("Unsupported vector index algorithm: " + vectorIndexAlgorithm).build()
+        .buildException();
+    }
+
+    boolean validMetric =
+      vectorDistanceMetric != null && (vectorDistanceMetric.trim().equalsIgnoreCase("L2")
+        || vectorDistanceMetric.trim().equalsIgnoreCase("COSINE")
+        || vectorDistanceMetric.trim().equalsIgnoreCase("INNER_PRODUCT"));
+    if (!validMetric) {
+      throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_DISTANCE_METRIC)
+        .setMessage("Unsupported vector distance metric: " + vectorDistanceMetric).build()
+        .buildException();
+    }
+
+    if (vectorDimension != null && vectorDimension <= 0) {
+      throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+        .setMessage("Invalid vector index dimension: " + vectorDimension).build().buildException();
+    }
+
+    String algoTrimmed = vectorIndexAlgorithm.trim();
+    if ("IVF".equalsIgnoreCase(algoTrimmed)) {
+      if (
+        vectorHnswM != null || vectorHnswEfConstruction != null || vectorHnswAlpha != null
+          || vectorQuantizationType != null || vectorPqSegments != null
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.VECTOR_ALGORITHM_PARAM_MISMATCH)
+          .setMessage("Vector index parameter is not valid for the specified algorithm: "
+            + vectorIndexAlgorithm)
+          .build().buildException();
+      }
+      if (
+        vectorIvfLists == null || vectorIvfLists <= 0 || vectorIvfSampleSize == null
+          || vectorIvfSampleSize < vectorIvfLists
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("Invalid vector index parameters: lists=" + vectorIvfLists + ", sample_size="
+            + vectorIvfSampleSize)
+          .build().buildException();
+      }
+    } else if ("HNSW".equalsIgnoreCase(algoTrimmed)) {
+      if (vectorIvfLists != null || vectorIvfSampleSize != null) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.VECTOR_ALGORITHM_PARAM_MISMATCH)
+          .setMessage("Vector index parameter is not valid for the specified algorithm: "
+            + vectorIndexAlgorithm)
+          .build().buildException();
+      }
+      if (vectorHnswM != null && (vectorHnswM < 4 || vectorHnswM > 64)) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("M must be an integer between 4 and 64, but was: " + vectorHnswM).build()
+          .buildException();
+      }
+      if (
+        vectorHnswEfConstruction != null
+          && (vectorHnswEfConstruction < 16 || vectorHnswEfConstruction > 512)
+      ) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("ef_construction must be an integer between 16 and 512, but was: "
+            + vectorHnswEfConstruction)
+          .build().buildException();
+      }
+      if (vectorHnswAlpha != null && (vectorHnswAlpha < 1.0 || vectorHnswAlpha > 2.0)) {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+          .setMessage("alpha must be a double between 1.0 and 2.0, but was: " + vectorHnswAlpha)
+          .build().buildException();
+      }
+      if (vectorQuantizationType != null) {
+        String upperQ = vectorQuantizationType.trim().toUpperCase();
+        if (!upperQ.equals("NONE") && !upperQ.equals("SQ8") && !upperQ.equals("PQ")) {
+          throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_QUANTIZATION_TYPE)
+            .setMessage("Unsupported vector quantization type: " + vectorQuantizationType
+              + ". Supported types are NONE, SQ8, and PQ.")
+            .build().buildException();
+        }
+      }
+      if (vectorPqSegments != null) {
+        if (vectorPqSegments < 1 || vectorPqSegments > 256) {
+          throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
+            .setMessage(
+              "pq_segments must be an integer between 1 and 256, but was: " + vectorPqSegments)
+            .build().buildException();
+        }
+        if (vectorDimension != null && vectorDimension % vectorPqSegments != 0) {
+          throw new SQLExceptionInfo.Builder(
+            SQLExceptionCode.VECTOR_QUANTIZATION_DIMENSION_MISMATCH)
+              .setMessage("Vector dimension " + vectorDimension
+                + " is not evenly divisible by pq_segments " + vectorPqSegments)
+              .build().buildException();
+        }
+      }
+    }
+  }
+
+  void validateVectorIndexMetadata(List<Mutation> tableMetadata, Put tableHeaderPut,
     PTable parentTable, PTableType tableType, IndexType indexType, byte[] schemaName,
     byte[] parentTableName, byte[] tableName) throws SQLException {
     String hbaseVersion = VersionInfo.getVersion();
@@ -3331,8 +3474,56 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         (Integer) PInteger.INSTANCE.toObject(ptr.get(), ptr.getOffset(), ptr.getLength());
     }
 
+    Integer vectorHnswM = null;
+    if (
+      tableHeaderPut != null && MetaDataUtil.getMutationValue(tableHeaderPut,
+        PhoenixDatabaseMetaData.VECTOR_HNSW_M_BYTES, kvBuilder, ptr)
+    ) {
+      vectorHnswM =
+        (Integer) PInteger.INSTANCE.toObject(ptr.get(), ptr.getOffset(), ptr.getLength());
+    }
+
+    Integer vectorHnswEfConstruction = null;
+    if (
+      tableHeaderPut != null && MetaDataUtil.getMutationValue(tableHeaderPut,
+        PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION_BYTES, kvBuilder, ptr)
+    ) {
+      vectorHnswEfConstruction =
+        (Integer) PInteger.INSTANCE.toObject(ptr.get(), ptr.getOffset(), ptr.getLength());
+    }
+
+    Double vectorHnswAlpha = null;
+    if (
+      tableHeaderPut != null && MetaDataUtil.getMutationValue(tableHeaderPut,
+        PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA_BYTES, kvBuilder, ptr)
+    ) {
+      vectorHnswAlpha =
+        (Double) PDouble.INSTANCE.toObject(ptr.get(), ptr.getOffset(), ptr.getLength());
+    }
+
+    String vectorQuantizationType = null;
+    if (
+      tableHeaderPut != null && MetaDataUtil.getMutationValue(tableHeaderPut,
+        PhoenixDatabaseMetaData.VECTOR_QUANTIZATION_TYPE_BYTES, kvBuilder, ptr)
+    ) {
+      vectorQuantizationType =
+        (String) PVarchar.INSTANCE.toObject(ptr.get(), ptr.getOffset(), ptr.getLength());
+    }
+
+    Integer vectorPqSegments = null;
+    if (
+      tableHeaderPut != null && MetaDataUtil.getMutationValue(tableHeaderPut,
+        PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS_BYTES, kvBuilder, ptr)
+    ) {
+      vectorPqSegments =
+        (Integer) PInteger.INSTANCE.toObject(ptr.get(), ptr.getOffset(), ptr.getLength());
+    }
+
     boolean isVectorIndex = (indexType == IndexType.VECTOR_GLOBAL) || (vectorIndexAlgorithm != null)
-      || (vectorDimension != null) || (vectorDistanceMetric != null);
+      || (vectorDimension != null) || (vectorDistanceMetric != null) || (vectorHnswM != null)
+      || (vectorHnswEfConstruction != null) || (vectorHnswAlpha != null)
+      || (vectorQuantizationType != null) || (vectorPqSegments != null) || (vectorIvfLists != null)
+      || (vectorIvfSampleSize != null);
 
     if (!isVectorIndex) {
       return;
@@ -3354,36 +3545,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         .setSchemaName(schema).setTableName(parent).build().buildException();
     }
 
-    if (
-      vectorIndexAlgorithm == null || !(vectorIndexAlgorithm.trim().equalsIgnoreCase("IVF")
-        || vectorIndexAlgorithm.trim().equalsIgnoreCase("HNSW"))
-    ) {
-      throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_INDEX_ALGORITHM)
-        .setMessage("Unsupported vector index algorithm: " + vectorIndexAlgorithm).build()
-        .buildException();
-    }
-
-    boolean validMetric =
-      vectorDistanceMetric != null && (vectorDistanceMetric.trim().equalsIgnoreCase("L2")
-        || vectorDistanceMetric.trim().equalsIgnoreCase("COSINE")
-        || vectorDistanceMetric.trim().equalsIgnoreCase("INNER_PRODUCT"));
-    if (!validMetric) {
-      throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_DISTANCE_METRIC)
-        .setMessage("Unsupported vector distance metric: " + vectorDistanceMetric).build()
-        .buildException();
-    }
-
-    if ("IVF".equalsIgnoreCase(vectorIndexAlgorithm.trim())) {
-      if (
-        vectorIvfLists == null || vectorIvfLists <= 0 || vectorIvfSampleSize == null
-          || vectorIvfSampleSize < vectorIvfLists
-      ) {
-        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
-          .setMessage("Invalid vector index parameters: lists=" + vectorIvfLists + ", sample_size="
-            + vectorIvfSampleSize)
-          .build().buildException();
-      }
-    }
+    validateVectorIndexMetadata(vectorIndexAlgorithm, vectorDistanceMetric, vectorDimension,
+      vectorIvfLists, vectorIvfSampleSize, vectorHnswM, vectorHnswEfConstruction, vectorHnswAlpha,
+      vectorQuantizationType, vectorPqSegments);
 
     // Identify the indexed vector column among the column mutations. Covered columns may also
     // have vector types, but only the primary indexed column defines the indexing expression.
@@ -3486,6 +3650,53 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         throw new SQLExceptionInfo.Builder(SQLExceptionCode.INVALID_VECTOR_INDEX_PARAMS)
           .setMessage("Vector dimension must be specified and positive for BSON column").build()
           .buildException();
+      }
+    }
+
+    if ("HNSW".equalsIgnoreCase(vectorIndexAlgorithm.trim())) {
+      if (vectorQuantizationType != null && "SQ8".equalsIgnoreCase(vectorQuantizationType.trim())) {
+        if (sourceColumn.getDataType() != PVectorFloat.INSTANCE) {
+          throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNSUPPORTED_VECTOR_QUANTIZATION_TYPE)
+            .setMessage(
+              "Scalar quantization (SQ8) is only supported for single-precision vector columns (VECTOR(FLOAT, dim)), found: "
+                + sourceColumn.getDataType().getSqlTypeName())
+            .build().buildException();
+        }
+      }
+      if (vectorPqSegments != null) {
+        Integer colDim = sourceColumn.getMaxLength();
+        int dim = vectorDimension != null ? vectorDimension : (colDim != null ? colDim : 0);
+        if (dim > 0 && dim % vectorPqSegments != 0) {
+          throw new SQLExceptionInfo.Builder(
+            SQLExceptionCode.VECTOR_QUANTIZATION_DIMENSION_MISMATCH)
+              .setMessage("Vector dimension " + dim + " is not evenly divisible by pq_segments "
+                + vectorPqSegments)
+              .build().buildException();
+        }
+      }
+      for (Mutation mutation : tableMetadata) {
+        byte[][] colRowKeyMetaData = new byte[5][];
+        int nCols = SchemaUtil.getVarChars(mutation.getRow(), colRowKeyMetaData);
+        if (
+          nCols >= 5 && colRowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX] != null
+            && colRowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX] != null
+        ) {
+          byte[] colTableName = colRowKeyMetaData[PhoenixDatabaseMetaData.TABLE_NAME_INDEX];
+          if (tableName == null || Bytes.compareTo(colTableName, tableName) == 0) {
+            String colName =
+              Bytes.toString(colRowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX]);
+            byte[] familyName = colRowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX];
+            if (
+              familyName != null && familyName.length > 0 && colName != null && !colName.isEmpty()
+            ) {
+              if (vectorColName == null || !colName.equals(vectorColName)) {
+                throw new SQLExceptionInfo.Builder(SQLExceptionCode.HNSW_INCLUDE_NOT_SUPPORTED)
+                  .setMessage("INCLUDE is not supported for HNSW vector indexes: " + colName)
+                  .build().buildException();
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -3646,6 +3857,16 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
         done.run(builder.build());
         return;
+      }
+      if (loadedTable.isVectorIndex()) {
+        try {
+          validateVectorIndexMetadata(loadedTable.getVectorIndex());
+        } catch (SQLException e) {
+          LOGGER.warn(
+            "Vector index metadata validation failed during dropTable for {}.{}, "
+              + "proceeding with drop anyway: {}",
+            Bytes.toString(schemaName), Bytes.toString(tableOrViewName), e.getMessage());
+        }
       }
       getCoprocessorHost().preDropTable(Bytes.toString(tenantIdBytes),
         SchemaUtil.getTableName(schemaName, tableOrViewName),

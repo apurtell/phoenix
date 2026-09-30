@@ -490,4 +490,9 @@ public class DelegateTable implements PTable {
   public boolean isVectorIndex() {
     return delegate.isVectorIndex();
   }
+
+  @Override
+  public String getVectorIndexAlgorithm() {
+    return delegate.getVectorIndexAlgorithm();
+  }
 }

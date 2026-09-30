@@ -199,6 +199,7 @@ import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.Delete;
+import org.apache.hadoop.hbase.client.MobCompactPartitionPolicy;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Scan;
@@ -1767,6 +1768,10 @@ public class MetaDataClient {
         applyIvfIndexSchema(allPkColumns, columnDefs);
       } else if (isVectorIndex && vectorIndexType == VectorIndexType.HNSW) {
         applyHnswIndexSchema(allPkColumns, columnDefs);
+        commonFamilyProps.put(ColumnFamilyDescriptorBuilder.IS_MOB, "true");
+        commonFamilyProps.put(ColumnFamilyDescriptorBuilder.MOB_THRESHOLD, "0");
+        commonFamilyProps.put(ColumnFamilyDescriptorBuilder.MOB_COMPACT_PARTITION_POLICY,
+          MobCompactPartitionPolicy.MONTHLY.name());
       }
       List<ColumnDef> vectorColDefs = isVectorIndex ? new ArrayList<ColumnDef>() : null;
 
@@ -2031,6 +2036,11 @@ public class MetaDataClient {
     // Vector indexes bypass standard index table population during creation and
     // remain in BUILDING state until centroid training and row assignment complete.
     if (statement.getIndexType() == IndexType.VECTOR_GLOBAL || table.isVectorIndex()) {
+      if (
+        table.getVectorIndex() != null && table.getVectorIndex().getType() == VectorIndexType.HNSW
+      ) {
+        applyHnswMobConfiguration(table);
+      }
       if (statement.isAsync()) {
         if (ValidateLastDDLTimestampUtil.getValidateLastDdlTimestampEnabled(connection)) {
           connection.removeTable(connection.getTenantId(), dataTable.getName().getString(), null,
@@ -2165,6 +2175,51 @@ public class MetaDataClient {
     // columns].
   }
 
+  /**
+   * Configures the index table column family storing graph segment cells with MOB enabled, a
+   * threshold of 0 bytes, and monthly compact partition policy.
+   * @param indexTable the HNSW vector index table
+   */
+  private void applyHnswMobConfiguration(PTable indexTable) throws SQLException {
+    if (
+      indexTable == null || indexTable.getVectorIndex() == null
+        || indexTable.getVectorIndex().getType() != VectorIndexType.HNSW
+    ) {
+      return;
+    }
+    org.apache.hadoop.hbase.TableName physicalTableName =
+      org.apache.hadoop.hbase.TableName.valueOf(indexTable.getPhysicalName().getBytes());
+    byte[] segmentFamily = indexTable.getDefaultFamilyName() != null
+      ? indexTable.getDefaultFamilyName().getBytes()
+      : QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES;
+    try (Admin admin = connection.getQueryServices().getAdmin()) {
+      if (!admin.tableExists(physicalTableName)) {
+        return;
+      }
+      TableDescriptor tableDesc = admin.getDescriptor(physicalTableName);
+      ColumnFamilyDescriptor currentCf = tableDesc.getColumnFamily(segmentFamily);
+      if (currentCf == null && tableDesc.getColumnFamilies().length > 0) {
+        currentCf = tableDesc.getColumnFamilies()[0];
+        segmentFamily = currentCf.getName();
+      }
+      if (
+        currentCf != null && currentCf.isMobEnabled() && currentCf.getMobThreshold() == 0L
+          && currentCf.getMobCompactPartitionPolicy() == MobCompactPartitionPolicy.MONTHLY
+      ) {
+        return;
+      }
+      ColumnFamilyDescriptorBuilder cfBuilder = currentCf != null
+        ? ColumnFamilyDescriptorBuilder.newBuilder(currentCf)
+        : ColumnFamilyDescriptorBuilder.newBuilder(segmentFamily);
+      cfBuilder.setMobEnabled(true);
+      cfBuilder.setMobThreshold(0);
+      cfBuilder.setMobCompactPartitionPolicy(MobCompactPartitionPolicy.MONTHLY);
+      admin.modifyColumnFamily(physicalTableName, cfBuilder.build());
+    } catch (IOException e) {
+      throw ClientUtil.parseServerException(e);
+    }
+  }
+
   private MutationState buildVectorIndex(PTable index, TableRef dataTableRef,
     CreateIndexStatement statement) throws SQLException {
     PTable dataTable = dataTableRef.getTable();
@@ -2174,6 +2229,7 @@ public class MetaDataClient {
     VectorIndexType algorithmType =
       vi != null && vi.getType() != null ? vi.getType() : statement.getVectorIndexType();
     if (algorithmType == VectorIndexType.HNSW) {
+      // MOB configuration was already applied by the caller before dispatching to buildVectorIndex.
       LOGGER.info(
         "Bypassing synchronous centroid training and activation for HNSW vector index {}. "
           + "The index is initialized in {} state and will be populated asynchronously via IndexTool.",
@@ -4705,6 +4761,7 @@ public class MetaDataClient {
 
     if (isVector) {
       deleteVectorCentroids(fullIndexName);
+      deleteVectorGraphSegments(fullIndexName);
     }
     return state;
   }
@@ -4869,6 +4926,7 @@ public class MetaDataClient {
               for (PTable index : table.getIndexes()) {
                 if (index.isVectorIndex() || index.getIndexType() == IndexType.VECTOR_GLOBAL) {
                   deleteVectorCentroids(index.getName().getString());
+                  deleteVectorGraphSegments(index.getName().getString());
                 }
               }
             } else if (
@@ -4876,6 +4934,7 @@ public class MetaDataClient {
                 && (table.isVectorIndex() || table.getIndexType() == IndexType.VECTOR_GLOBAL)
             ) {
               deleteVectorCentroids(table.getName().getString());
+              deleteVectorGraphSegments(table.getName().getString());
             }
             boolean dropMetaData = connection.getQueryServices().getProps()
               .getBoolean(DROP_METADATA_ATTRIB, DEFAULT_DROP_METADATA);
@@ -5005,6 +5064,28 @@ public class MetaDataClient {
     } catch (Exception e) {
       LOGGER.warn("Could not delete vector centroids for index {}; SYSTEM.VECTOR_CENTROID rows "
         + "for this index may need manual cleanup.", fullIndexName, e);
+    }
+  }
+
+  private void deleteVectorGraphSegments(String fullIndexName) {
+    try {
+      boolean wasAutoCommit = connection.getAutoCommit();
+      try {
+        connection.setAutoCommit(true);
+        String deleteSql = "DELETE FROM " + PhoenixDatabaseMetaData.SYSTEM_VECTOR_GRAPH_SEGMENT_NAME
+          + " WHERE " + PhoenixDatabaseMetaData.INDEX_NAME + " = ?";
+        try (PreparedStatement ps = connection.prepareStatement(deleteSql)) {
+          ps.setString(1, fullIndexName);
+          ps.executeUpdate();
+        }
+      } finally {
+        connection.setAutoCommit(wasAutoCommit);
+      }
+    } catch (Exception e) {
+      LOGGER.warn(
+        "Could not delete vector graph segments for index {}; SYSTEM.VECTOR_GRAPH_SEGMENT rows "
+          + "for this index may need manual cleanup.",
+        fullIndexName, e);
     }
   }
 

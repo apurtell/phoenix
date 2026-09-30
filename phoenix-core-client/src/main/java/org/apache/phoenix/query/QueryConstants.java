@@ -40,6 +40,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_NAME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_QUALIFIER;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_QUALIFIER_COUNTER;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.COLUMN_SIZE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.CONSTRUCTION_TIME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.CURRENT_VALUE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.CYCLE_FLAG;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.DATA_TABLE_NAME;
@@ -92,6 +93,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.MIN_VALUE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.MULTI_TENANT;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.NEW_METADATA;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.NEW_PHYS_TABLE_NAME;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.NODE_COUNT;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.NO_OF_RESULTS_ITERATED;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.NULLABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.NUM_ARGS;
@@ -117,6 +119,9 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.QUERY_STATUS;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REASSIGN_COUNT;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REBUILD_STATE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REF_GENERATION;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REGION_ENCODED_NAME;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REGION_END_KEY;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REGION_START_KEY;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.REMARKS;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.RETURN_TYPE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.ROW_KEY_MATCHER;
@@ -126,6 +131,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SCHEMA_VERSION;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SCOPE_CATALOG;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SCOPE_SCHEMA;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SCOPE_TABLE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SEGMENT_ROW_KEY;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SELF_REFERENCING_COL_NAME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SEQUENCE_NAME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SEQUENCE_SCHEMA;
@@ -154,6 +160,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_STATS_TABLE
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_TASK_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_TRANSFORM_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_VECTOR_CENTROID_TABLE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_VECTOR_GRAPH_SEGMENT_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_NAME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_SCHEM;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_SEQ_NUM;
@@ -651,6 +658,19 @@ public interface QueryConstants {
       + LAST_REBUILD_TIME + " BIGINT," + LAST_SCORECARD_UPDATE + " BIGINT,\n" + "CONSTRAINT "
       + SYSTEM_TABLE_PK_NAME + " PRIMARY KEY (" + INDEX_NAME + "," + GENERATION_ID + ","
       + CENTROID_ID + "))\n" + HConstants.VERSIONS + "=%s,\n"
+      + ColumnFamilyDescriptorBuilder.KEEP_DELETED_CELLS + "=%s,\n" + TRANSACTIONAL + "="
+      + Boolean.FALSE;
+
+  String CREATE_VECTOR_GRAPH_SEGMENT_METADATA =
+    "CREATE TABLE " + SYSTEM_CATALOG_SCHEMA + ".\"" + SYSTEM_VECTOR_GRAPH_SEGMENT_TABLE + "\"(\n" +
+    // PK columns
+      INDEX_NAME + " VARCHAR NOT NULL," + REGION_START_KEY + " VARBINARY_ENCODED NOT NULL,"
+      + GENERATION_ID + " BIGINT NOT NULL,\n" +
+      // Non-PK columns
+      REGION_END_KEY + " VARBINARY," + REGION_ENCODED_NAME + " VARCHAR," + SEGMENT_ROW_KEY
+      + " VARBINARY," + NODE_COUNT + " BIGINT," + CONSTRUCTION_TIME + " BIGINT," + REBUILD_STATE
+      + " CHAR(1),\n" + "CONSTRAINT " + SYSTEM_TABLE_PK_NAME + " PRIMARY KEY (" + INDEX_NAME + ","
+      + REGION_START_KEY + "," + GENERATION_ID + "))\n" + HConstants.VERSIONS + "=%s,\n"
       + ColumnFamilyDescriptorBuilder.KEEP_DELETED_CELLS + "=%s,\n" + TRANSACTIONAL + "="
       + Boolean.FALSE;
 }

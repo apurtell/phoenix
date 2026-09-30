@@ -583,8 +583,29 @@ public class PhoenixDatabaseMetaData implements DatabaseMetaData {
   public static final String REBUILD_STATE_ACTIVE = "A";
   public static final String REBUILD_STATE_BUILDING = "B";
   public static final String REBUILD_STATE_RETIRED = "R";
+  public static final String REBUILD_STATE_COMPLETE = "C";
   public static final String TRIGGER_REASON_CREATE_INDEX = "CREATE_INDEX";
   public static final String TRIGGER_REASON_INDEX_TOOL = "INDEX_TOOL";
+
+  public static final String SYSTEM_VECTOR_GRAPH_SEGMENT_TABLE = "VECTOR_GRAPH_SEGMENT";
+  public static final String SYSTEM_VECTOR_GRAPH_SEGMENT_NAME =
+    SchemaUtil.getTableName(SYSTEM_CATALOG_SCHEMA, SYSTEM_VECTOR_GRAPH_SEGMENT_TABLE);
+  public static final byte[] SYSTEM_VECTOR_GRAPH_SEGMENT_NAME_BYTES =
+    Bytes.toBytes(SYSTEM_VECTOR_GRAPH_SEGMENT_NAME);
+  public static final TableName SYSTEM_VECTOR_GRAPH_SEGMENT_HBASE_TABLE_NAME =
+    TableName.valueOf(SYSTEM_VECTOR_GRAPH_SEGMENT_NAME);
+  public static final String REGION_START_KEY = "REGION_START_KEY";
+  public static final byte[] REGION_START_KEY_BYTES = Bytes.toBytes(REGION_START_KEY);
+  public static final String REGION_END_KEY = "REGION_END_KEY";
+  public static final byte[] REGION_END_KEY_BYTES = Bytes.toBytes(REGION_END_KEY);
+  public static final String REGION_ENCODED_NAME = "REGION_ENCODED_NAME";
+  public static final byte[] REGION_ENCODED_NAME_BYTES = Bytes.toBytes(REGION_ENCODED_NAME);
+  public static final String SEGMENT_ROW_KEY = "SEGMENT_ROW_KEY";
+  public static final byte[] SEGMENT_ROW_KEY_BYTES = Bytes.toBytes(SEGMENT_ROW_KEY);
+  public static final String NODE_COUNT = "NODE_COUNT";
+  public static final byte[] NODE_COUNT_BYTES = Bytes.toBytes(NODE_COUNT);
+  public static final String CONSTRUCTION_TIME = "CONSTRUCTION_TIME";
+  public static final byte[] CONSTRUCTION_TIME_BYTES = Bytes.toBytes(CONSTRUCTION_TIME);
 
   public static final String QUERY_ID = "QUERY_ID";
   public static final String USER = "USER";

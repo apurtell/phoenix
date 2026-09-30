@@ -1125,35 +1125,61 @@ public interface PTable extends PMetaDataEntity {
       String algorithm = (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_INDEX_ALGORITHM);
       String distanceMetric =
         (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_DISTANCE_METRIC);
-      Object dimObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_DIMENSION);
-      Integer dimension = dimObj instanceof Number ? ((Number) dimObj).intValue() : null;
-      Object listsObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_IVF_LISTS);
-      Integer ivfLists = listsObj instanceof Number ? ((Number) listsObj).intValue() : null;
-      Object sampleObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_IVF_SAMPLE_SIZE);
-      Integer ivfSampleSize = sampleObj instanceof Number ? ((Number) sampleObj).intValue() : null;
-      Object genObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_CENTROID_GENERATION);
-      Long centroidGeneration = genObj instanceof Number ? ((Number) genObj).longValue() : null;
-      Object mObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_M);
-      Integer hnswM = mObj instanceof Number ? ((Number) mObj).intValue() : null;
-      Object efObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION);
-      Integer hnswEfConstruction = efObj instanceof Number ? ((Number) efObj).intValue() : null;
-      Object alphaObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA);
-      Double hnswAlpha = alphaObj instanceof Number ? ((Number) alphaObj).doubleValue() : null;
+      Integer dimension = parseInteger(tableProps.get(PhoenixDatabaseMetaData.VECTOR_DIMENSION));
+      Integer ivfLists = parseInteger(tableProps.get(PhoenixDatabaseMetaData.VECTOR_IVF_LISTS));
+      Integer ivfSampleSize =
+        parseInteger(tableProps.get(PhoenixDatabaseMetaData.VECTOR_IVF_SAMPLE_SIZE));
+      Long centroidGeneration =
+        parseLong(tableProps.get(PhoenixDatabaseMetaData.VECTOR_CENTROID_GENERATION));
+      Integer hnswM = parseInteger(tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_M));
+      Integer hnswEfConstruction =
+        parseInteger(tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_EF_CONSTRUCTION));
+      Double hnswAlpha = parseDouble(tableProps.get(PhoenixDatabaseMetaData.VECTOR_HNSW_ALPHA));
       String quantizationType =
         (String) tableProps.get(PhoenixDatabaseMetaData.VECTOR_QUANTIZATION_TYPE);
-      Object pqObj = tableProps.get(PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS);
-      Integer pqSegments = pqObj instanceof Number ? ((Number) pqObj).intValue() : null;
+      Integer pqSegments = parseInteger(tableProps.get(PhoenixDatabaseMetaData.VECTOR_PQ_SEGMENTS));
 
-      if (
-        algorithm == null && distanceMetric == null && dimension == null && ivfLists == null
-          && ivfSampleSize == null && centroidGeneration == null && hnswM == null
-          && hnswEfConstruction == null && hnswAlpha == null && quantizationType == null
-          && pqSegments == null
-      ) {
-        return null;
+      return new Builder().setAlgorithm(algorithm).setDistanceMetric(distanceMetric)
+        .setDimension(dimension).setIvfLists(ivfLists).setIvfSampleSize(ivfSampleSize)
+        .setCentroidGeneration(centroidGeneration).setHnswM(hnswM)
+        .setHnswEfConstruction(hnswEfConstruction).setHnswAlpha(hnswAlpha)
+        .setQuantizationType(quantizationType).setPqSegments(pqSegments).build();
+    }
+
+    private static Integer parseInteger(Object obj) {
+      if (obj instanceof Number) {
+        return ((Number) obj).intValue();
+      } else if (obj instanceof String) {
+        try {
+          return Integer.valueOf((String) obj);
+        } catch (NumberFormatException ignored) {
+        }
       }
-      return new VectorIndex(algorithm, distanceMetric, dimension, ivfLists, ivfSampleSize,
-        centroidGeneration, hnswM, hnswEfConstruction, hnswAlpha, quantizationType, pqSegments);
+      return null;
+    }
+
+    private static Long parseLong(Object obj) {
+      if (obj instanceof Number) {
+        return ((Number) obj).longValue();
+      } else if (obj instanceof String) {
+        try {
+          return Long.valueOf((String) obj);
+        } catch (NumberFormatException ignored) {
+        }
+      }
+      return null;
+    }
+
+    private static Double parseDouble(Object obj) {
+      if (obj instanceof Number) {
+        return ((Number) obj).doubleValue();
+      } else if (obj instanceof String) {
+        try {
+          return Double.valueOf((String) obj);
+        } catch (NumberFormatException ignored) {
+        }
+      }
+      return null;
     }
 
     /**
@@ -1164,17 +1190,41 @@ public interface PTable extends PMetaDataEntity {
       if (serverVi == null) {
         return this;
       }
-      return new VectorIndex(this.algorithm != null ? this.algorithm : serverVi.algorithm,
-        this.distanceMetric != null ? this.distanceMetric : serverVi.distanceMetric,
-        this.dimension != null ? this.dimension : serverVi.dimension,
-        this.ivfLists != null ? this.ivfLists : serverVi.ivfLists,
-        this.ivfSampleSize != null ? this.ivfSampleSize : serverVi.ivfSampleSize,
-        this.centroidGeneration != null ? this.centroidGeneration : serverVi.centroidGeneration,
-        this.hnswM != null ? this.hnswM : serverVi.hnswM,
-        this.hnswEfConstruction != null ? this.hnswEfConstruction : serverVi.hnswEfConstruction,
-        this.hnswAlpha != null ? this.hnswAlpha : serverVi.hnswAlpha,
-        this.quantizationType != null ? this.quantizationType : serverVi.quantizationType,
-        this.pqSegments != null ? this.pqSegments : serverVi.pqSegments);
+      Builder builder = new Builder(serverVi);
+      if (this.algorithm != null) {
+        builder.setAlgorithm(this.algorithm);
+      }
+      if (this.distanceMetric != null) {
+        builder.setDistanceMetric(this.distanceMetric);
+      }
+      if (this.dimension != null) {
+        builder.setDimension(this.dimension);
+      }
+      if (this.ivfLists != null) {
+        builder.setIvfLists(this.ivfLists);
+      }
+      if (this.ivfSampleSize != null) {
+        builder.setIvfSampleSize(this.ivfSampleSize);
+      }
+      if (this.centroidGeneration != null) {
+        builder.setCentroidGeneration(this.centroidGeneration);
+      }
+      if (this.hnswM != null) {
+        builder.setHnswM(this.hnswM);
+      }
+      if (this.hnswEfConstruction != null) {
+        builder.setHnswEfConstruction(this.hnswEfConstruction);
+      }
+      if (this.hnswAlpha != null) {
+        builder.setHnswAlpha(this.hnswAlpha);
+      }
+      if (this.quantizationType != null) {
+        builder.setQuantizationType(this.quantizationType);
+      }
+      if (this.pqSegments != null) {
+        builder.setPqSegments(this.pqSegments);
+      }
+      return builder.build();
     }
 
     /** Returns the vector index algorithm name. */
@@ -1306,9 +1356,21 @@ public interface PTable extends PMetaDataEntity {
         }
       }
 
+      public String getAlgorithm() {
+        return algorithm;
+      }
+
       public Builder setAlgorithm(String algorithm) {
         this.algorithm = algorithm;
         return this;
+      }
+
+      public Builder algorithm(String algorithm) {
+        return setAlgorithm(algorithm);
+      }
+
+      public String getDistanceMetric() {
+        return distanceMetric;
       }
 
       public Builder setDistanceMetric(String distanceMetric) {
@@ -1316,9 +1378,25 @@ public interface PTable extends PMetaDataEntity {
         return this;
       }
 
+      public Builder distanceMetric(String distanceMetric) {
+        return setDistanceMetric(distanceMetric);
+      }
+
+      public Integer getDimension() {
+        return dimension;
+      }
+
       public Builder setDimension(Integer dimension) {
         this.dimension = dimension;
         return this;
+      }
+
+      public Builder dimension(Integer dimension) {
+        return setDimension(dimension);
+      }
+
+      public Integer getIvfLists() {
+        return ivfLists;
       }
 
       public Builder setIvfLists(Integer ivfLists) {
@@ -1326,9 +1404,25 @@ public interface PTable extends PMetaDataEntity {
         return this;
       }
 
+      public Builder ivfLists(Integer ivfLists) {
+        return setIvfLists(ivfLists);
+      }
+
+      public Integer getIvfSampleSize() {
+        return ivfSampleSize;
+      }
+
       public Builder setIvfSampleSize(Integer ivfSampleSize) {
         this.ivfSampleSize = ivfSampleSize;
         return this;
+      }
+
+      public Builder ivfSampleSize(Integer ivfSampleSize) {
+        return setIvfSampleSize(ivfSampleSize);
+      }
+
+      public Long getCentroidGeneration() {
+        return centroidGeneration;
       }
 
       public Builder setCentroidGeneration(Long centroidGeneration) {
@@ -1336,9 +1430,25 @@ public interface PTable extends PMetaDataEntity {
         return this;
       }
 
+      public Builder centroidGeneration(Long centroidGeneration) {
+        return setCentroidGeneration(centroidGeneration);
+      }
+
+      public Integer getHnswM() {
+        return hnswM;
+      }
+
       public Builder setHnswM(Integer hnswM) {
         this.hnswM = hnswM;
         return this;
+      }
+
+      public Builder hnswM(Integer hnswM) {
+        return setHnswM(hnswM);
+      }
+
+      public Integer getHnswEfConstruction() {
+        return hnswEfConstruction;
       }
 
       public Builder setHnswEfConstruction(Integer hnswEfConstruction) {
@@ -1346,9 +1456,25 @@ public interface PTable extends PMetaDataEntity {
         return this;
       }
 
+      public Builder hnswEfConstruction(Integer hnswEfConstruction) {
+        return setHnswEfConstruction(hnswEfConstruction);
+      }
+
+      public Double getHnswAlpha() {
+        return hnswAlpha;
+      }
+
       public Builder setHnswAlpha(Double hnswAlpha) {
         this.hnswAlpha = hnswAlpha;
         return this;
+      }
+
+      public Builder hnswAlpha(Double hnswAlpha) {
+        return setHnswAlpha(hnswAlpha);
+      }
+
+      public String getQuantizationType() {
+        return quantizationType;
       }
 
       public Builder setQuantizationType(String quantizationType) {
@@ -1356,9 +1482,21 @@ public interface PTable extends PMetaDataEntity {
         return this;
       }
 
+      public Builder quantizationType(String quantizationType) {
+        return setQuantizationType(quantizationType);
+      }
+
+      public Integer getPqSegments() {
+        return pqSegments;
+      }
+
       public Builder setPqSegments(Integer pqSegments) {
         this.pqSegments = pqSegments;
         return this;
+      }
+
+      public Builder pqSegments(Integer pqSegments) {
+        return setPqSegments(pqSegments);
       }
 
       public VectorIndex build() {

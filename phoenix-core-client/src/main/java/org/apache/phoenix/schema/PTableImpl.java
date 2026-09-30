@@ -770,7 +770,6 @@ public class PTableImpl implements PTable {
     }
 
     public Builder setVectorIndex(VectorIndex vectorIndex) {
-      this.vectorIndex = vectorIndex;
       if (vectorIndex != null) {
         setVectorIndexAlgorithm(vectorIndex.getAlgorithm());
         setVectorDistanceMetric(vectorIndex.getDistanceMetric());
@@ -784,6 +783,7 @@ public class PTableImpl implements PTable {
         setVectorQuantizationType(vectorIndex.getQuantizationType());
         setVectorPqSegments(vectorIndex.getPqSegments());
       }
+      this.vectorIndex = vectorIndex;
       return this;
     }
 
@@ -796,6 +796,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_INDEX_ALGORITHM, vectorIndexAlgorithm);
       }
       this.vectorIndexAlgorithm = vectorIndexAlgorithm;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -808,6 +809,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_DISTANCE_METRIC, vectorDistanceMetric);
       }
       this.vectorDistanceMetric = vectorDistanceMetric;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -820,6 +822,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_DIMENSION, String.valueOf(vectorDimension));
       }
       this.vectorDimension = vectorDimension;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -832,6 +835,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_IVF_LISTS, String.valueOf(vectorIvfLists));
       }
       this.vectorIvfLists = vectorIvfLists;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -844,6 +848,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_IVF_SAMPLE_SIZE, String.valueOf(vectorIvfSampleSize));
       }
       this.vectorIvfSampleSize = vectorIvfSampleSize;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -856,6 +861,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_CENTROID_GENERATION, String.valueOf(vectorCentroidGeneration));
       }
       this.vectorCentroidGeneration = vectorCentroidGeneration;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -868,6 +874,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_HNSW_M, String.valueOf(vectorHnswM));
       }
       this.vectorHnswM = vectorHnswM;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -880,6 +887,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_HNSW_EF_CONSTRUCTION, String.valueOf(vectorHnswEfConstruction));
       }
       this.vectorHnswEfConstruction = vectorHnswEfConstruction;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -892,6 +900,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_HNSW_ALPHA, String.valueOf(vectorHnswAlpha));
       }
       this.vectorHnswAlpha = vectorHnswAlpha;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -904,6 +913,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_QUANTIZATION_TYPE, vectorQuantizationType);
       }
       this.vectorQuantizationType = vectorQuantizationType;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -916,6 +926,7 @@ public class PTableImpl implements PTable {
         propertyValues.put(VECTOR_PQ_SEGMENTS, String.valueOf(vectorPqSegments));
       }
       this.vectorPqSegments = vectorPqSegments;
+      this.vectorIndex = null;
       return this;
     }
 
@@ -1216,10 +1227,13 @@ public class PTableImpl implements PTable {
         || builder.vectorHnswAlpha != null || builder.vectorQuantizationType != null
         || builder.vectorPqSegments != null
     ) {
-      this.vectorIndex = new VectorIndex(builder.vectorIndexAlgorithm, builder.vectorDistanceMetric,
-        builder.vectorDimension, builder.vectorIvfLists, builder.vectorIvfSampleSize,
-        builder.vectorCentroidGeneration, builder.vectorHnswM, builder.vectorHnswEfConstruction,
-        builder.vectorHnswAlpha, builder.vectorQuantizationType, builder.vectorPqSegments);
+      this.vectorIndex = new VectorIndex.Builder().setAlgorithm(builder.vectorIndexAlgorithm)
+        .setDistanceMetric(builder.vectorDistanceMetric).setDimension(builder.vectorDimension)
+        .setIvfLists(builder.vectorIvfLists).setIvfSampleSize(builder.vectorIvfSampleSize)
+        .setCentroidGeneration(builder.vectorCentroidGeneration).setHnswM(builder.vectorHnswM)
+        .setHnswEfConstruction(builder.vectorHnswEfConstruction)
+        .setHnswAlpha(builder.vectorHnswAlpha).setQuantizationType(builder.vectorQuantizationType)
+        .setPqSegments(builder.vectorPqSegments).build();
     } else {
       this.vectorIndex = null;
     }
@@ -2315,18 +2329,41 @@ public class PTableImpl implements PTable {
         || table.hasVectorHnswEfConstruction() || table.hasVectorHnswAlpha()
         || table.hasVectorQuantizationType() || table.hasVectorPqSegments()
     ) {
-      vectorIndex =
-        new VectorIndex(table.hasVectorIndexAlgorithm() ? table.getVectorIndexAlgorithm() : null,
-          table.hasVectorDistanceMetric() ? table.getVectorDistanceMetric() : null,
-          table.hasVectorDimension() ? table.getVectorDimension() : null,
-          table.hasVectorIvfLists() ? table.getVectorIvfLists() : null,
-          table.hasVectorIvfSampleSize() ? table.getVectorIvfSampleSize() : null,
-          table.hasVectorCentroidGeneration() ? table.getVectorCentroidGeneration() : null,
-          table.hasVectorHnswM() ? table.getVectorHnswM() : null,
-          table.hasVectorHnswEfConstruction() ? table.getVectorHnswEfConstruction() : null,
-          table.hasVectorHnswAlpha() ? table.getVectorHnswAlpha() : null,
-          table.hasVectorQuantizationType() ? table.getVectorQuantizationType() : null,
-          table.hasVectorPqSegments() ? table.getVectorPqSegments() : null);
+      VectorIndex.Builder viBuilder = new VectorIndex.Builder();
+      if (table.hasVectorIndexAlgorithm()) {
+        viBuilder.setAlgorithm(table.getVectorIndexAlgorithm());
+      }
+      if (table.hasVectorDistanceMetric()) {
+        viBuilder.setDistanceMetric(table.getVectorDistanceMetric());
+      }
+      if (table.hasVectorDimension()) {
+        viBuilder.setDimension(table.getVectorDimension());
+      }
+      if (table.hasVectorIvfLists()) {
+        viBuilder.setIvfLists(table.getVectorIvfLists());
+      }
+      if (table.hasVectorIvfSampleSize()) {
+        viBuilder.setIvfSampleSize(table.getVectorIvfSampleSize());
+      }
+      if (table.hasVectorCentroidGeneration()) {
+        viBuilder.setCentroidGeneration(table.getVectorCentroidGeneration());
+      }
+      if (table.hasVectorHnswM()) {
+        viBuilder.setHnswM(table.getVectorHnswM());
+      }
+      if (table.hasVectorHnswEfConstruction()) {
+        viBuilder.setHnswEfConstruction(table.getVectorHnswEfConstruction());
+      }
+      if (table.hasVectorHnswAlpha()) {
+        viBuilder.setHnswAlpha(table.getVectorHnswAlpha());
+      }
+      if (table.hasVectorQuantizationType()) {
+        viBuilder.setQuantizationType(table.getVectorQuantizationType());
+      }
+      if (table.hasVectorPqSegments()) {
+        viBuilder.setPqSegments(table.getVectorPqSegments());
+      }
+      vectorIndex = viBuilder.build();
     }
     IndexConsistency indexConsistency = null;
     if (tableType == PTableType.INDEX) {
@@ -2774,6 +2811,10 @@ public class PTableImpl implements PTable {
         // SYSTEM.CDC_STREAM.PARTITION_END_KEY
         || (tableName.equalsIgnoreCase(PhoenixDatabaseMetaData.SYSTEM_CDC_STREAM_TABLE) && column
           .getName().getString().equalsIgnoreCase(PhoenixDatabaseMetaData.PARTITION_END_KEY))
+        // SYSTEM.VECTOR_GRAPH_SEGMENT.REGION_START_KEY
+        || (tableName.equalsIgnoreCase(PhoenixDatabaseMetaData.SYSTEM_VECTOR_GRAPH_SEGMENT_TABLE)
+          && column.getName().getString()
+            .equalsIgnoreCase(PhoenixDatabaseMetaData.REGION_START_KEY))
     ) {
       return new PColumnImpl(column.getName(), column.getFamilyName(), PVarbinary.INSTANCE,
         column.getMaxLength(), column.getScale(), column.isNullable(), column.getPosition(),
