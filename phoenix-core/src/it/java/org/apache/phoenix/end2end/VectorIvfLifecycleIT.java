@@ -955,10 +955,6 @@ public class VectorIvfLifecycleIT extends ParallelStatsDisabledIT {
       try {
         Configuration conf = HBaseConfiguration.create(pconn.getQueryServices().getConfiguration());
         conf.setBoolean(QueryServices.VECTOR_KMEANS_LOCAL_ATTRIB, true);
-        // rebuild() reports failure by returning a FAIL TaskResult rather than propagating the
-        // exception -- it runs under TaskRegionObserver, whose contract is a TaskResult, and every
-        // other failure path in VectorIndexRebuildTask returns FAIL the same way. The abandoned
-        // generation is discarded before it returns so isRebuildInProgress() does not stay wedged.
         TaskRegionObserver.TaskResult result =
           VectorIndexRebuildTask.rebuild(pconn, conf, normalizedIndex, true, "TEST_ABORT");
         assertNotNull("rebuild must return a result", result);

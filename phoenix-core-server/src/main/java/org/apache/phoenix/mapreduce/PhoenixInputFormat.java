@@ -261,7 +261,7 @@ public class PhoenixInputFormat<T extends DBWritable> extends InputFormat<NullWr
     }
   }
 
-  void setupParallelScansFromQueryPlan(QueryPlan queryPlan) {
+  protected void setupParallelScansFromQueryPlan(QueryPlan queryPlan) {
     setupParallelScansWithScanGrouper(queryPlan, MapReduceParallelScanGrouper.getInstance());
   }
 

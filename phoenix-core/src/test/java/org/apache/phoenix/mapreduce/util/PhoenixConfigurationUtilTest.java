@@ -337,4 +337,5 @@ public class PhoenixConfigurationUtilTest extends BaseConnectionlessQueryTest {
     sourceTable = PhoenixConfigurationUtil.getIndexToolSourceTable(conf);
     Assert.assertEquals(sourceTable, SourceTable.DATA_TABLE_SOURCE);
   }
+
 }

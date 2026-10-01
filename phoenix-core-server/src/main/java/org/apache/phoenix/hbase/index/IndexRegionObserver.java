@@ -536,10 +536,10 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
   private static final int DEFAULT_CONCURRENT_MUTATION_WAIT_DURATION_IN_MS = 100;
   private byte[] encodedRegionName;
   private volatile VectorIndexManager vectorIndexManager;
-  private volatile boolean vectorManagerInitAttempted = false;
   private volatile RegionCoprocessorEnvironment vectorEnv;
 
   public VectorIndexManager getVectorIndexManager() {
+    ensureVectorManagerInitialized();
     return vectorIndexManager;
   }
 
@@ -548,6 +548,7 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
   }
 
   public HnswIndexManager getHnswIndexManager() {
+    ensureVectorManagerInitialized();
     return vectorIndexManager instanceof HnswIndexManager
       ? (HnswIndexManager) vectorIndexManager
       : null;
@@ -634,8 +635,7 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
           new IndexCDCConsumer(env, this.dataTableName, serverName, this.serializeCDCMutations);
         this.indexCDCConsumer.start();
       }
-      // Defer VectorIndexManager initialization to first mutation to avoid
-      // JDBC connection churn during bulk region opens (e.g. RegionServer restart).
+      // Defer vector index manager initialization to postOpen() when stores are open.
       this.vectorEnv = env;
     } catch (NoSuchMethodError ex) {
       disabled = true;
@@ -697,20 +697,26 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
     }
   }
 
+  @Override
+  public void postOpen(ObserverContext<RegionCoprocessorEnvironment> c) {
+    if (c != null && c.getEnvironment() != null) {
+      this.vectorEnv = c.getEnvironment();
+    }
+    ensureVectorManagerInitialized();
+  }
+
   /**
-   * Ensures the VectorIndexManager is lazily initialized on first use. This avoids opening JDBC
-   * connections during {@code start()} which causes connection churn during bulk region opens.
-   * Thread safe via volatile double check.
+   * Ensures the VectorIndexManager is initialized on demand or region open. Thread safe via
+   * volatile double check.
    */
   private void ensureVectorManagerInitialized() {
-    if (vectorManagerInitAttempted) {
+    if (vectorIndexManager != null) {
       return;
     }
     synchronized (this) {
-      if (vectorManagerInitAttempted) {
+      if (vectorIndexManager != null) {
         return;
       }
-      vectorManagerInitAttempted = true;
       RegionCoprocessorEnvironment env = this.vectorEnv;
       if (env != null) {
         initializeVectorIndexManager(env);
@@ -725,15 +731,29 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
   protected void initializeVectorIndexManager(RegionCoprocessorEnvironment env) {
     try {
       PTable table = resolvePTable(env);
-      PTable vectorTable = getVectorIndexTable(table);
-      if (vectorTable != null) {
-        VectorIndexType type = VectorIndexType.fromAlgorithm(vectorTable.getVectorIndexAlgorithm());
-        if (type != null) {
-          this.vectorIndexManager = VectorIndexManager.create(type, env, vectorTable);
-          this.vectorIndexManager.open();
-          LOG.info("Initialized {} for region {} of table {}",
-            vectorIndexManager.getClass().getSimpleName(), Bytes.toStringBinary(encodedRegionName),
-            dataTableName);
+      if (table != null) {
+        PTable vectorTable = getVectorIndexTable(table);
+        if (vectorTable != null) {
+          VectorIndexType type =
+            VectorIndexType.fromAlgorithm(vectorTable.getVectorIndexAlgorithm());
+          if (type != null) {
+            // Publish vectorIndexManager only after successful open.
+            VectorIndexManager manager = VectorIndexManager.create(type, env, vectorTable);
+            try {
+              manager.open();
+            } catch (Exception openEx) {
+              try {
+                manager.close();
+              } catch (Exception closeEx) {
+                openEx.addSuppressed(closeEx);
+              }
+              throw openEx;
+            }
+            this.vectorIndexManager = manager;
+            LOG.info("Initialized {} for region {} of table {}",
+              vectorIndexManager.getClass().getSimpleName(),
+              Bytes.toStringBinary(encodedRegionName), dataTableName);
+          }
         }
       }
     } catch (Exception ex) {
@@ -760,8 +780,7 @@ public class IndexRegionObserver implements RegionCoprocessor, RegionObserver {
       QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(PhoenixConnection.class)) {
       return conn.getTableNoCache(this.dataTableName);
     } catch (Exception e) {
-      LOG.debug("Could not resolve PTable for {} during IndexRegionObserver.start: {}",
-        this.dataTableName, e.getMessage());
+      LOG.debug("Could not resolve PTable for {}: {}", this.dataTableName, e.getMessage());
       return null;
     }
   }

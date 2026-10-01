@@ -145,6 +145,28 @@ public final class PhoenixConfigurationUtil {
   public static final String VECTOR_NON_CENTROID_COL_COUNT =
     "phoenix.vector.non.centroid.col.count";
 
+  public static final String VECTOR_ALGORITHM = "phoenix.vector.algorithm";
+  public static final String DEFAULT_VECTOR_ALGORITHM = "IVF";
+
+  public static final String HNSW_M = "phoenix.vector.hnsw.m";
+  public static final int DEFAULT_HNSW_M = 16;
+
+  public static final String HNSW_EF_CONSTRUCTION = "phoenix.vector.hnsw.ef_construction";
+  public static final int DEFAULT_HNSW_EF_CONSTRUCTION = 100;
+
+  public static final String HNSW_ALPHA = "phoenix.vector.hnsw.alpha";
+  public static final double DEFAULT_HNSW_ALPHA = 1.2;
+
+  public static final String VECTOR_DIMENSION = "phoenix.vector.dimension";
+  public static final int DEFAULT_VECTOR_DIMENSION = 128;
+
+  public static final String HNSW_QUANTIZATION_TYPE = "phoenix.vector.hnsw.quantization.type";
+
+  public static final String HNSW_PQ_SEGMENTS = "phoenix.vector.hnsw.pq.segments";
+  public static final int DEFAULT_HNSW_PQ_SEGMENTS = 0;
+
+  public static final String HNSW_PQ_CODEBOOK_PATH = "phoenix.vector.hnsw.pq.codebook.path";
+
   public static final boolean DEFAULT_SHOULD_FIX_UNVERIFIED_TRANSFORM = false;
 
   public static final String SCRUTINY_OUTPUT_FORMAT = "phoenix.mr.scrutiny.output.format";
@@ -813,6 +835,98 @@ public final class PhoenixConfigurationUtil {
   public static int getVectorIndexInSelected(Configuration configuration) {
     Preconditions.checkNotNull(configuration);
     return configuration.getInt(VECTOR_INDEX_IN_SELECTED, -1);
+  }
+
+  public static void setVectorAlgorithm(Configuration configuration, String algo) {
+    Preconditions.checkNotNull(configuration);
+    if (algo != null) {
+      configuration.set(VECTOR_ALGORITHM, algo);
+    } else {
+      configuration.unset(VECTOR_ALGORITHM);
+    }
+  }
+
+  public static String getVectorAlgorithm(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.get(VECTOR_ALGORITHM, DEFAULT_VECTOR_ALGORITHM);
+  }
+
+  public static void setHnswM(Configuration configuration, int m) {
+    Preconditions.checkNotNull(configuration);
+    configuration.setInt(HNSW_M, m);
+  }
+
+  public static int getHnswM(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.getInt(HNSW_M, DEFAULT_HNSW_M);
+  }
+
+  public static void setHnswEfConstruction(Configuration configuration, int efConstruction) {
+    Preconditions.checkNotNull(configuration);
+    configuration.setInt(HNSW_EF_CONSTRUCTION, efConstruction);
+  }
+
+  public static int getHnswEfConstruction(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.getInt(HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_EF_CONSTRUCTION);
+  }
+
+  public static void setHnswAlpha(Configuration configuration, double alpha) {
+    Preconditions.checkNotNull(configuration);
+    configuration.setDouble(HNSW_ALPHA, alpha);
+  }
+
+  public static double getHnswAlpha(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.getDouble(HNSW_ALPHA, DEFAULT_HNSW_ALPHA);
+  }
+
+  public static void setVectorDimension(Configuration configuration, int dimension) {
+    Preconditions.checkNotNull(configuration);
+    configuration.setInt(VECTOR_DIMENSION, dimension);
+  }
+
+  public static int getVectorDimension(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.getInt(VECTOR_DIMENSION, DEFAULT_VECTOR_DIMENSION);
+  }
+
+  public static void setHnswQuantizationType(Configuration configuration, String quantizationType) {
+    Preconditions.checkNotNull(configuration);
+    if (quantizationType != null) {
+      configuration.set(HNSW_QUANTIZATION_TYPE, quantizationType);
+    } else {
+      configuration.unset(HNSW_QUANTIZATION_TYPE);
+    }
+  }
+
+  public static String getHnswQuantizationType(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.get(HNSW_QUANTIZATION_TYPE);
+  }
+
+  public static void setHnswPqSegments(Configuration configuration, int pqSegments) {
+    Preconditions.checkNotNull(configuration);
+    configuration.setInt(HNSW_PQ_SEGMENTS, pqSegments);
+  }
+
+  public static int getHnswPqSegments(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.getInt(HNSW_PQ_SEGMENTS, DEFAULT_HNSW_PQ_SEGMENTS);
+  }
+
+  public static void setHnswPqCodebookPath(Configuration configuration, String path) {
+    Preconditions.checkNotNull(configuration);
+    if (path != null) {
+      configuration.set(HNSW_PQ_CODEBOOK_PATH, path);
+    } else {
+      configuration.unset(HNSW_PQ_CODEBOOK_PATH);
+    }
+  }
+
+  public static String getHnswPqCodebookPath(Configuration configuration) {
+    Preconditions.checkNotNull(configuration);
+    return configuration.get(HNSW_PQ_CODEBOOK_PATH);
   }
 
   public static void setIndexToolSourceTable(Configuration configuration,

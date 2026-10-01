@@ -84,6 +84,71 @@ class VectorIndexTestUtil {
     conn.commit();
   }
 
+  /**
+   * Inserts deterministic unit-normalized vectors into the specified base table with IDs [0,
+   * numVectors). Returns a map of string row key to float[] vector.
+   */
+  static Map<String, float[]> insertDeterministicVectors(Connection conn, String tableName,
+    int numVectors, int dimension) throws SQLException {
+    return insertDeterministicVectors(conn, tableName, numVectors, dimension, 42L);
+  }
+
+  static Map<String, float[]> insertDeterministicVectors(Connection conn, String tableName,
+    int numVectors, int dimension, long seed) throws SQLException {
+    Random rng = new Random(seed);
+    Map<String, float[]> vectors = new LinkedHashMap<>();
+    String upsertSql = "UPSERT INTO " + tableName + " (ID, V) VALUES (?, ?)";
+    try (PreparedStatement ps = conn.prepareStatement(upsertSql)) {
+      boolean isInteger = true;
+      try {
+        if (ps.getParameterMetaData() != null) {
+          int type = ps.getParameterMetaData().getParameterType(1);
+          if (
+            type != java.sql.Types.INTEGER && type != java.sql.Types.BIGINT
+              && type != java.sql.Types.SMALLINT && type != java.sql.Types.TINYINT
+          ) {
+            isInteger = false;
+          }
+        }
+      } catch (Exception ignored) {
+      }
+
+      for (int i = 0; i < numVectors; i++) {
+        float[] vec = new float[dimension];
+        double norm = 0.0;
+        for (int d = 0; d < dimension; d++) {
+          vec[d] = (float) rng.nextGaussian();
+          norm += vec[d] * vec[d];
+        }
+        norm = Math.sqrt(norm);
+        if (norm > 0) {
+          for (int d = 0; d < dimension; d++) {
+            vec[d] /= (float) norm;
+          }
+        }
+        String idStr = String.valueOf(i);
+        vectors.put(idStr, vec);
+
+        if (isInteger) {
+          ps.setInt(1, i);
+        } else {
+          ps.setString(1, idStr);
+        }
+        Float[] boxed = new Float[dimension];
+        for (int d = 0; d < dimension; d++) {
+          boxed[d] = vec[d];
+        }
+        ps.setArray(2, conn.createArrayOf("FLOAT", boxed));
+        ps.executeUpdate();
+        if ((i + 1) % 250 == 0) {
+          conn.commit();
+        }
+      }
+      conn.commit();
+    }
+    return vectors;
+  }
+
   static void activateWithKnownCentroids(Connection conn, String tableName, String indexName,
     List<float[]> centroids, long generation) throws SQLException {
     CentroidManager.persistCentroidsFromFloatList(conn, indexName, generation, centroids);

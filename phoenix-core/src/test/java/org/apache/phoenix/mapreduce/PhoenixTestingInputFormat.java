@@ -30,7 +30,7 @@ import org.apache.phoenix.iterate.TestingMapReduceParallelScanGrouper;
 public class PhoenixTestingInputFormat<T extends DBWritable> extends PhoenixInputFormat<T> {
 
   @Override
-  void setupParallelScansFromQueryPlan(QueryPlan queryPlan) {
+  protected void setupParallelScansFromQueryPlan(QueryPlan queryPlan) {
     setupParallelScansWithScanGrouper(queryPlan, TestingMapReduceParallelScanGrouper.getInstance());
   }
 

@@ -72,6 +72,7 @@ import org.apache.phoenix.hbase.index.AbstractValueGetter;
 import org.apache.phoenix.hbase.index.ValueGetter;
 import org.apache.phoenix.hbase.index.covered.update.ColumnReference;
 import org.apache.phoenix.hbase.index.util.IndexManagementUtil;
+import org.apache.phoenix.hbase.index.vector.HnswIndexManager;
 import org.apache.phoenix.index.IndexMaintainer;
 import org.apache.phoenix.index.vector.CentroidManager;
 import org.apache.phoenix.index.vector.KMeansConfig;
@@ -89,6 +90,9 @@ import org.apache.phoenix.mapreduce.util.ColumnInfoToStringEncoderDecoder;
 import org.apache.phoenix.mapreduce.util.ConnectionUtil;
 import org.apache.phoenix.mapreduce.util.PhoenixConfigurationUtil;
 import org.apache.phoenix.mapreduce.util.PhoenixMapReduceUtil;
+import org.apache.phoenix.mapreduce.vector.HnswGraphBuildInputFormat;
+import org.apache.phoenix.mapreduce.vector.HnswGraphBuildMapper;
+import org.apache.phoenix.mapreduce.vector.HnswPqCodebookTrainer;
 import org.apache.phoenix.parse.HintNode.Hint;
 import org.apache.phoenix.query.ConnectionQueryServices;
 import org.apache.phoenix.query.QueryConstants;
@@ -101,6 +105,7 @@ import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.PTable.IndexType;
 import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.schema.TableRef;
+import org.apache.phoenix.schema.VectorIndexType;
 import org.apache.phoenix.schema.types.PVarchar;
 import org.apache.phoenix.util.ByteUtil;
 import org.apache.phoenix.util.ColumnInfo;
@@ -501,6 +506,33 @@ public class IndexTool extends Configured implements Tool {
     return sourceTable;
   }
 
+  @VisibleForTesting
+  public void setPIndexTable(PTable pIndexTable) {
+    this.pIndexTable = pIndexTable;
+    if (pIndexTable != null) {
+      this.indexTable = pIndexTable.getTableName().getString();
+      this.schemaName =
+        pIndexTable.getSchemaName() != null ? pIndexTable.getSchemaName().getString() : null;
+      this.qIndexTable = SchemaUtil.getQualifiedTableName(this.schemaName, this.indexTable);
+      this.indexTableWithSchema =
+        SchemaUtil.getQualifiedPhoenixTableName(this.schemaName, this.indexTable);
+    }
+  }
+
+  @VisibleForTesting
+  public void setPDataTable(PTable pDataTable) {
+    this.pDataTable = pDataTable;
+    if (pDataTable != null) {
+      this.dataTable = pDataTable.getTableName().getString();
+      if (this.schemaName == null && pDataTable.getSchemaName() != null) {
+        this.schemaName = pDataTable.getSchemaName().getString();
+      }
+      this.qDataTable = SchemaUtil.getQualifiedTableName(this.schemaName, this.dataTable);
+      this.dataTableWithSchema =
+        SchemaUtil.getQualifiedPhoenixTableName(this.schemaName, this.dataTable);
+    }
+  }
+
   class JobFactory {
     Connection connection;
     Configuration configuration;
@@ -759,11 +791,15 @@ public class IndexTool extends Configured implements Tool {
       return configureSubmittableJobUsingDirectApi(job);
     }
 
-    private Job configureJobForVectorIndex() throws Exception {
+    @VisibleForTesting
+    Job configureJobForVectorIndex() throws Exception {
+      PTable.VectorIndex vi = pIndexTable.getVectorIndex();
+      if (vi != null && VectorIndexType.HNSW.name().equalsIgnoreCase(vi.getAlgorithm())) {
+        return configureJobForHnswIndex(vi);
+      }
       String physicalIndexTable = pIndexTable.getPhysicalName().getString();
       final PhoenixConnection pConnection = connection.unwrap(PhoenixConnection.class);
 
-      PTable.VectorIndex vi = pIndexTable.getVectorIndex();
       long gen = (generation != null)
         ? generation
         : (vi != null && vi.getCentroidGeneration() != null && vi.getCentroidGeneration() > 0
@@ -781,17 +817,7 @@ public class IndexTool extends Configured implements Tool {
         IndexMaintainer maintainer = pIndexTable.getIndexMaintainer(pDataTable, pConnection);
         // Resolve the vector expression to sample, either the indexed data table column
         // or the functional expression recorded in the index definition.
-        String vectorColSqlExpr =
-          maintainer != null ? maintainer.getIndexedVectorColumnName(pDataTable) : null;
-        if (vectorColSqlExpr != null) {
-          vectorColSqlExpr = '"' + vectorColSqlExpr + '"';
-        } else {
-          PColumn indexVectorCol = IndexUtil.findVectorColumn(pIndexTable);
-          String expressionStr = indexVectorCol == null ? null : indexVectorCol.getExpressionStr();
-          if (expressionStr != null && !expressionStr.trim().isEmpty()) {
-            vectorColSqlExpr = expressionStr;
-          }
-        }
+        String vectorColSqlExpr = resolveVectorColumnExpression(maintainer, pConnection);
         if (vectorColSqlExpr != null) {
           // Use declared sample size if specified, otherwise fall back to the default sample size
           // heuristic.
@@ -909,6 +935,201 @@ public class IndexTool extends Configured implements Tool {
 
       job.setMapperClass(PhoenixIndexImportDirectMapper.class);
       return configureSubmittableJobUsingDirectApi(job);
+    }
+
+    @VisibleForTesting
+    String resolveVectorColumnExpression(IndexMaintainer maintainer,
+      PhoenixConnection pConnection) {
+      String vectorColSqlExpr =
+        maintainer != null ? maintainer.getIndexedVectorColumnName(pDataTable) : null;
+      if (vectorColSqlExpr != null) {
+        vectorColSqlExpr = '"' + vectorColSqlExpr + '"';
+      } else {
+        PColumn indexVectorCol = IndexUtil.findVectorColumn(pIndexTable);
+        String expressionStr = indexVectorCol == null ? null : indexVectorCol.getExpressionStr();
+        if (expressionStr != null && !expressionStr.trim().isEmpty()) {
+          vectorColSqlExpr = expressionStr;
+        }
+      }
+      return vectorColSqlExpr;
+    }
+
+    @VisibleForTesting
+    Job configureJobForHnswIndex(PTable.VectorIndex vi) throws Exception {
+      String physicalIndexTable = pIndexTable.getPhysicalName().getString();
+      final PhoenixConnection pConnection = connection.unwrap(PhoenixConnection.class);
+
+      // 1. Extract parameters
+      int m = vi.getHnswM() != null ? vi.getHnswM() : HnswIndexManager.DEFAULT_M;
+      int efConstruction = vi.getHnswEfConstruction() != null
+        ? vi.getHnswEfConstruction()
+        : HnswIndexManager.DEFAULT_EF_CONSTRUCTION;
+      double alpha = vi.getHnswAlpha() != null ? vi.getHnswAlpha() : HnswIndexManager.DEFAULT_ALPHA;
+      int dimension = vi.getDimension() != null ? vi.getDimension() : 0;
+      String distanceMetric = vi.getDistanceMetric() != null ? vi.getDistanceMetric() : "COSINE";
+      String quantizationType = vi.getQuantizationType();
+      int pqSegments = vi.getPqSegments() != null ? vi.getPqSegments() : 0;
+
+      // 2. Resolve vector column expression for scanning base table
+      IndexMaintainer maintainer = pIndexTable.getIndexMaintainer(pDataTable, pConnection);
+      String vectorColSqlExpr = resolveVectorColumnExpression(maintainer, pConnection);
+
+      // 3. Compile DDL to get select query and index column metadata
+      final PostIndexDDLCompiler ddlCompiler =
+        new PostIndexDDLCompiler(pConnection, new TableRef(pDataTable));
+      ddlCompiler.compile(pIndexTable);
+      final List<String> indexColumns = ddlCompiler.getIndexColumnNames();
+      final String selectQuery = ddlCompiler.getSelectQuery();
+      final String upsertQuery =
+        QueryUtil.constructUpsertStatement(indexTableWithSchema, indexColumns, Hint.NO_INDEX);
+
+      // 4. Resolve vector column index in the select list
+      String indexedVectorColName =
+        maintainer != null ? maintainer.getIndexedVectorColumnName(pDataTable) : null;
+
+      boolean isSalted = pIndexTable.getBucketNum() != null;
+      boolean isMultiTenant = pConnection.getTenantId() != null && pIndexTable.isMultiTenant();
+      boolean isViewIndex = pIndexTable.getViewIndexId() != null;
+      int posOffset = (isSalted ? 1 : 0) + (isMultiTenant ? 1 : 0) + (isViewIndex ? 1 : 0);
+
+      int vectorIndexInSelected = -1;
+      int colIdx = 0;
+      List<PColumn> indexPKColumns = pIndexTable.getPKColumns();
+      for (int i = posOffset; i < indexPKColumns.size(); i++) {
+        PColumn col = indexPKColumns.get(i);
+        if (col.getDataType() != null && col.getDataType().isVectorType()) {
+          vectorIndexInSelected = colIdx;
+        }
+        colIdx++;
+      }
+      for (PColumnFamily family : pIndexTable.getColumnFamilies()) {
+        for (PColumn col : family.getColumns()) {
+          if (col.getViewConstant() == null) {
+            if (col.getDataType() != null && col.getDataType().isVectorType()) {
+              String colDataName = IndexUtil.getDataColumnName(col.getName().getString());
+              if (indexedVectorColName == null || indexedVectorColName.equals(colDataName)) {
+                vectorIndexInSelected = colIdx;
+              }
+            }
+            colIdx++;
+          }
+        }
+      }
+
+      // 5. Set HNSW-specific configuration keys
+      configuration.set(PhoenixConfigurationUtil.UPSERT_STATEMENT, upsertQuery);
+      PhoenixConfigurationUtil.setIsVectorIndex(configuration, true);
+      PhoenixConfigurationUtil.setVectorAlgorithm(configuration, "HNSW");
+      PhoenixConfigurationUtil.setHnswM(configuration, m);
+      PhoenixConfigurationUtil.setHnswEfConstruction(configuration, efConstruction);
+      PhoenixConfigurationUtil.setHnswAlpha(configuration, alpha);
+      PhoenixConfigurationUtil.setVectorDimension(configuration, dimension);
+      PhoenixConfigurationUtil.setVectorDistanceMetric(configuration, distanceMetric);
+      PhoenixConfigurationUtil.setHnswQuantizationType(configuration, quantizationType);
+      PhoenixConfigurationUtil.setHnswPqSegments(configuration, pqSegments);
+      PhoenixConfigurationUtil.setPhysicalTableName(configuration, physicalIndexTable);
+      PhoenixConfigurationUtil.setIndexToolIndexTableName(configuration, qIndexTable);
+      PhoenixConfigurationUtil.setIndexToolDataTableName(configuration, qDataTable);
+      PhoenixConfigurationUtil.setDisableIndexes(configuration, indexTable);
+      PhoenixConfigurationUtil.setVectorIndexInSelected(configuration, vectorIndexInSelected);
+      PhoenixConfigurationUtil.setUpsertColumnNames(configuration,
+        indexColumns.toArray(new String[indexColumns.size()]));
+      if (tenantId != null) {
+        PhoenixConfigurationUtil.setTenantId(configuration, tenantId);
+      }
+      final List<ColumnInfo> columnMetadataList =
+        PhoenixRuntime.generateColumnInfo(pConnection, indexTableWithSchema, indexColumns);
+      ColumnInfoToStringEncoderDecoder.encode(configuration, columnMetadataList);
+
+      // 6. Set mapper memory and task timeout based on dimension and estimated region size
+      long estimatedRegionVectorCount = estimateRegionVectorCount(pConnection);
+      long estimatedMemoryMb = estimateMapperMemory(dimension, estimatedRegionVectorCount);
+      configuration.setLong("mapreduce.map.memory.mb", estimatedMemoryMb);
+      configuration.set("mapreduce.map.java.opts",
+        String.format("-Xmx%dm", (long) (estimatedMemoryMb * 0.8)));
+      configuration.setLong("mapreduce.task.timeout", 3600000L);
+
+      Path targetOutputPath = outputPath;
+      if (targetOutputPath == null && configuration.get(FileOutputFormat.OUTDIR) != null) {
+        targetOutputPath = new Path(configuration.get(FileOutputFormat.OUTDIR));
+      }
+      if (targetOutputPath != null) {
+        fs = targetOutputPath.getFileSystem(configuration);
+        fs.delete(targetOutputPath, true);
+      }
+
+      // 7. Build and configure the MapReduce Job
+      final String jobName =
+        String.format(INDEX_JOB_NAME_TEMPLATE, schemaName, dataTable, indexTable);
+      final Job job = Job.getInstance(configuration, jobName);
+      job.setJarByClass(IndexTool.class);
+
+      // 8. Product Quantization codebook training (if PQ)
+      if ("PQ".equalsIgnoreCase(quantizationType)) {
+        trainAndDistributePqCodebook(job, pConnection, vectorColSqlExpr, dimension, pqSegments,
+          targetOutputPath);
+      }
+
+      // Use HnswGraphBuildInputFormat for strict 1:1 region-aligned splits
+      PhoenixMapReduceUtil.setInput(job, PhoenixIndexDBWritable.class,
+        HnswGraphBuildInputFormat.class, dataTableWithSchema, selectQuery);
+
+      TableMapReduceUtil.initCredentials(job);
+      job.setMapperClass(HnswGraphBuildMapper.class);
+      job.setMapOutputKeyClass(ImmutableBytesWritable.class);
+
+      if (outputPath != null) {
+        FileOutputFormat.setOutputPath(job, outputPath);
+      }
+
+      return configureSubmittableJobUsingDirectApi(job);
+    }
+
+    private void trainAndDistributePqCodebook(Job job, PhoenixConnection pConnection,
+      String vectorColSqlExpr, int dimension, int pqSegments, Path targetOutputPath)
+      throws Exception {
+      int sampleSize = Math.min(pqSegments * HnswPqCodebookTrainer.DEFAULT_CLUSTER_COUNT, 50000);
+      if (sampleSize <= 0) {
+        sampleSize = 4096;
+      }
+      Path codebookDir = (targetOutputPath != null)
+        ? new Path(targetOutputPath.getParent(), targetOutputPath.getName() + "_pq_codebook")
+        : new Path(FileSystem.get(configuration).getWorkingDirectory(),
+          "tmp/" + qIndexTable.replace(':', '_') + "_codebook");
+      Path codebookPath = new Path(codebookDir, "_pq_codebook");
+
+      HnswPqCodebookTrainer.serializeCodebook(HnswPqCodebookTrainer.trainCodebook(pConnection,
+        qDataTable, vectorColSqlExpr, dimension, pqSegments, sampleSize), codebookPath,
+        configuration);
+      HnswPqCodebookTrainer.distributeCodebook(job, codebookPath, configuration);
+    }
+
+    private long estimateRegionVectorCount(PhoenixConnection pConnection) {
+      try {
+        if (pDataTable != null && pDataTable.getPhysicalName() != null) {
+          TableName hDataName = TableName.valueOf(pDataTable.getPhysicalName().getBytes());
+          try (
+            org.apache.hadoop.hbase.client.Connection tempHConn =
+              getTemporaryHConnection(pConnection);
+            RegionLocator regionLocator = tempHConn.getRegionLocator(hDataName)) {
+            byte[][] startKeys = regionLocator.getStartKeys();
+            if (startKeys != null && startKeys.length > 0) {
+              return 200000L;
+            }
+          }
+        }
+      } catch (Throwable t) {
+        LOGGER.warn("Could not estimate region vector count: " + t.getMessage());
+      }
+      return 200000L;
+    }
+
+    private long estimateMapperMemory(int dimension, long estimatedRegionVectorCount) {
+      long bytesPerVector = (long) dimension * 4L + (16L * 4L) + 64L;
+      long totalBytes =
+        (long) (estimatedRegionVectorCount * bytesPerVector * 1.5) + (512L * 1024L * 1024L);
+      long memoryMb = totalBytes / (1024L * 1024L);
+      return Math.max(2048L, Math.min(memoryMb, 8192L));
     }
 
     private Job configureJobForServerBuildIndex() throws Exception {
@@ -1044,11 +1265,11 @@ public class IndexTool extends Configured implements Tool {
         // Synchronously reconcile the scorecard upon completion for foreground builds;
         // asynchronous rebuilds are reconciled during the periodic task's initial sweep.
         if (isForeground && pIndexTable != null && pIndexTable.isVectorIndex()) {
-          long gen = pIndexTable.getVectorIndex() != null
-            && pIndexTable.getVectorIndex().getCentroidGeneration() != null
-              ? pIndexTable.getVectorIndex().getCentroidGeneration()
-              : 1L;
-          VectorIndexScorecard.reconcile(conn, qIndexTable, gen);
+          PTable.VectorIndex vi = pIndexTable.getVectorIndex();
+          if (vi != null && VectorIndexType.IVF.name().equalsIgnoreCase(vi.getAlgorithm())) {
+            long gen = vi.getCentroidGeneration() != null ? vi.getCentroidGeneration() : 1L;
+            VectorIndexScorecard.reconcile(conn, qIndexTable, gen);
+          }
         }
         return 0;
       } else {

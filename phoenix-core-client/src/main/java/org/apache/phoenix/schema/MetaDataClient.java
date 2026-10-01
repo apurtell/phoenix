@@ -1767,7 +1767,8 @@ public class MetaDataClient {
       if (isVectorIndex && vectorIndexType == VectorIndexType.IVF) {
         applyIvfIndexSchema(allPkColumns, columnDefs);
       } else if (isVectorIndex && vectorIndexType == VectorIndexType.HNSW) {
-        applyHnswIndexSchema(allPkColumns, columnDefs);
+        // HNSW graph indexes store vectors and adjacency in off-heap segments and MOB;
+        // no centroid column is needed in the primary key.
         commonFamilyProps.put(ColumnFamilyDescriptorBuilder.IS_MOB, "true");
         commonFamilyProps.put(ColumnFamilyDescriptorBuilder.MOB_THRESHOLD, "0");
         commonFamilyProps.put(ColumnFamilyDescriptorBuilder.MOB_COMPACT_PARTITION_POLICY,
@@ -2147,35 +2148,6 @@ public class MetaDataClient {
   }
 
   /**
-   * Applies the schema and primary key layout specific to Hierarchical Navigable Small World (HNSW)
-   * graph-based vector indexes.
-   * <p>
-   * Unlike row-based IVF indexes, HNSW vector indexes store graph adjacency structures and vector
-   * embeddings within off-heap JVector segments and MOB storage rather than row-based cluster
-   * postings lists. Consequently, no synthetic centroid identifier column is prepended to the
-   * physical row key.
-   * <p>
-   * The physical primary key layout for an HNSW index table consists strictly of:
-   *
-   * <pre>
-   *   [salt?][view_index_id?][tenant_id?][base table PK columns]
-   * </pre>
-   *
-   * Vector ordinal-to-primary-key mappings and vector coordinates are encapsulated directly within
-   * the JVector index segments. The index table row key mirrors the base table primary key
-   * structure (prefixed by optional salt buckets, view index prefix, or tenant ID), facilitating
-   * direct point lookups and region-aligned scans without centroid indirection.
-   * @param allPkColumns list of primary key column definitions in constraint order
-   * @param columnDefs   list of all table column definitions
-   */
-  private static void applyHnswIndexSchema(List<ColumnDefInPkConstraint> allPkColumns,
-    List<ColumnDef> columnDefs) {
-    // HNSW graph indexes do not require centroid columns in the physical row key.
-    // The primary key consists solely of [salt?][view_index_id?][tenant_id?][base table PK
-    // columns].
-  }
-
-  /**
    * Configures the index table column family storing graph segment cells with MOB enabled, a
    * threshold of 0 bytes, and monthly compact partition policy.
    * @param indexTable the HNSW vector index table
@@ -2186,6 +2158,15 @@ public class MetaDataClient {
         || indexTable.getVectorIndex().getType() != VectorIndexType.HNSW
     ) {
       return;
+    }
+    if (connection.getQueryServices() instanceof ConnectionlessQueryServicesImpl) {
+      return;
+    }
+    if (connection.getQueryServices() instanceof DelegateQueryServices) {
+      DelegateQueryServices services = (DelegateQueryServices) connection.getQueryServices();
+      if (services.getDelegate() instanceof ConnectionlessQueryServicesImpl) {
+        return;
+      }
     }
     org.apache.hadoop.hbase.TableName physicalTableName =
       org.apache.hadoop.hbase.TableName.valueOf(indexTable.getPhysicalName().getBytes());
@@ -2215,6 +2196,9 @@ public class MetaDataClient {
       cfBuilder.setMobThreshold(0);
       cfBuilder.setMobCompactPartitionPolicy(MobCompactPartitionPolicy.MONTHLY);
       admin.modifyColumnFamily(physicalTableName, cfBuilder.build());
+    } catch (UnsupportedOperationException e) {
+      // Connectionless query services does not support Admin; ignore in connectionless mode
+      return;
     } catch (IOException e) {
       throw ClientUtil.parseServerException(e);
     }
@@ -4754,6 +4738,10 @@ public class MetaDataClient {
         isVector = true;
       }
     } catch (TableNotFoundException ignored) {
+    } catch (SQLException e) {
+      LOGGER.warn("Could not load table metadata for index {} during dropIndex: {}", fullIndexName,
+        e.getMessage());
+      isVector = true;
     }
 
     MutationState state = dropTable(schemaName, tableName, parentTableName, PTableType.INDEX,
@@ -4877,6 +4865,14 @@ public class MetaDataClient {
       if (!ifExists && !e.isThrownToForceReReadForTransformingTable()) {
         if (tableType == PTableType.INDEX)
           throw new IndexNotFoundException(e.getSchemaName(), e.getTableName(), e.getTimeStamp());
+        throw e;
+      }
+    } catch (SQLException e) {
+      if (tableType == PTableType.INDEX) {
+        LOGGER.warn(
+          "Could not load table metadata for index {} during dropTable, proceeding with drop: {}",
+          fullTableName, e.getMessage());
+      } else {
         throw e;
       }
     }

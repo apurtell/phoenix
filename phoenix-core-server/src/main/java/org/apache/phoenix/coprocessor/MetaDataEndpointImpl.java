@@ -1796,9 +1796,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
           .setMessage("Vector index metadata can only be applied to INDEX table type").build()
           .buildException();
       }
-      validateVectorIndexMetadata(effectiveAlgorithm, effectiveDistanceMetric, effectiveDimension,
-        effectiveIvfLists, effectiveIvfSampleSize, effectiveHnswM, effectiveHnswEfConstruction,
-        effectiveHnswAlpha, effectiveQuantizationType, effectivePqSegments);
+      try {
+        validateVectorIndexMetadata(effectiveAlgorithm, effectiveDistanceMetric, effectiveDimension,
+          effectiveIvfLists, effectiveIvfSampleSize, effectiveHnswM, effectiveHnswEfConstruction,
+          effectiveHnswAlpha, effectiveQuantizationType, effectivePqSegments);
+      } catch (SQLException e) {
+        LOGGER.warn("Invalid vector index metadata in catalog cells: {}", e.getMessage());
+      }
     }
 
     PTable.VectorIndex vi = new PTable.VectorIndex.Builder().setAlgorithm(effectiveAlgorithm)

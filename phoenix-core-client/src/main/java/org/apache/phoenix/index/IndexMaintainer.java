@@ -128,6 +128,8 @@ import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.TransactionUtil;
 import org.apache.phoenix.util.TrustedByteArrayOutputStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.phoenix.thirdparty.com.google.common.base.Preconditions;
 import org.apache.phoenix.thirdparty.com.google.common.base.Predicate;
@@ -146,6 +148,7 @@ import org.apache.phoenix.thirdparty.com.google.common.collect.Sets;
  */
 public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
 
+  private static final Logger LOGGER = LoggerFactory.getLogger(IndexMaintainer.class);
   private static final int EXPRESSION_NOT_PRESENT = -1;
   private static final int ESTIMATED_EXPRESSION_SIZE = 8;
 
@@ -179,7 +182,7 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
       }
       PTable.VectorIndex vi = index.getVectorIndex();
       if (vi != null && vi.getType() == VectorIndexType.HNSW) {
-        return false;
+        return true;
       }
       // Vector index row keys require trained centroids to determine cluster assignment.
       // Once centroids exist, index maintenance proceeds normally to capture concurrent writes.
@@ -855,7 +858,7 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
 
   public byte[] buildRowKey(ValueGetter valueGetter, ImmutableBytesWritable rowKeyPtr,
     byte[] regionStartKey, byte[] regionEndKey, long ts, byte[] encodedRegionName) {
-    if (vectorAlgorithm != null) {
+    if (vectorAlgorithm != null && usesCentroidPrefixedRowKey()) {
       return buildVectorRowKey(valueGetter, rowKeyPtr, ts);
     }
     if (isCDCIndex && encodedRegionName == null) {
@@ -1221,12 +1224,8 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
         return false;
       }
       ValueGetter vg = new IndexUtil.SimpleValueGetter(dataRowState);
-      ImmutableBytesWritable ptr = new ImmutableBytesWritable();
-      if (vectorExpressionOrdinal >= 0 && vectorExpressionOrdinal < indexedExpressions.size()) {
-        Expression vecExpr = indexedExpressions.get(vectorExpressionOrdinal);
-        vecExpr.evaluate(new ValueGetterTuple(vg, HConstants.LATEST_TIMESTAMP), ptr);
-      }
-      if (ptr.get() == null || ptr.getLength() == 0) {
+      ImmutableBytesWritable ptr = getVectorValue(vg, HConstants.LATEST_TIMESTAMP);
+      if (ptr == null || ptr.get() == null || ptr.getLength() == 0) {
         return false;
       }
     }
@@ -1346,7 +1345,7 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
       Integer scaleToBe;
       if (indexField == null) {
         Expression e = expressionItr.next();
-        if (isVectorIndex() && i == 0) {
+        if (isVectorIndex() && usesCentroidPrefixedRowKey() && i == 0) {
           isNullableToBe = false;
           dataTypeToBe = PInteger.INSTANCE;
           sortOrderToBe = descIndexColumnBitSet.get(i) ? SortOrder.DESC : SortOrder.ASC;
@@ -1446,12 +1445,15 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
     boolean verified, byte[] encodedRegionName, boolean isVectorUnchanged) throws IOException {
     byte[] indexRowKey;
     ImmutableBytesWritable vectorValue = null;
-    if (vectorAlgorithm != null) {
+    if (vectorAlgorithm != null && usesCentroidPrefixedRowKey()) {
       // Reuse the evaluated vector expression across row key centroid calculation and the
       // functional vector column value to avoid redundant evaluations.
       vectorValue = getVectorValue(valueGetter, ts);
       indexRowKey = buildVectorRowKey(valueGetter, dataRowKeyPtr, ts, vectorValue);
     } else {
+      if (vectorAlgorithm != null) {
+        vectorValue = getVectorValue(valueGetter, ts);
+      }
       indexRowKey = this.buildRowKey(valueGetter, dataRowKeyPtr, regionStartKey, regionEndKey, ts,
         encodedRegionName);
     }
@@ -2992,6 +2994,11 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
     return VectorIndexType.fromAlgorithm(vectorAlgorithm);
   }
 
+  /** Returns true if this index's row keys are centroid-prefixed. */
+  private boolean usesCentroidPrefixedRowKey() {
+    return getVectorIndexType() == VectorIndexType.IVF || hasCentroidColumn();
+  }
+
   /** Returns true if this maintainer manages a VECTOR_GLOBAL index. */
   public boolean isVectorIndex() {
     return vectorAlgorithm != null;
@@ -3073,6 +3080,13 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
       PDataType type = coveredVectorColumnTypes.get(ref);
       if (type != null) {
         return type instanceof PVectorDouble;
+      }
+    }
+    if (ref == null && coveredVectorColumnTypes != null && !coveredVectorColumnTypes.isEmpty()) {
+      for (PDataType type : coveredVectorColumnTypes.values()) {
+        if (type instanceof PVectorDouble) {
+          return true;
+        }
       }
     }
     KeyValueColumnExpression kve = getIndexedVectorKeyValueExpression();
@@ -3175,19 +3189,33 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
 
   /** Evaluates and returns the vector column value for the current row state. */
   public ImmutableBytesWritable getVectorValue(ValueGetter valueGetter, long ts) {
-    if (
-      valueGetter == null || vectorExpressionOrdinal < 0
-        || vectorExpressionOrdinal >= indexedExpressions.size()
-    ) {
+    if (valueGetter == null) {
       return null;
     }
-    ImmutableBytesWritable ptr = new ImmutableBytesWritable();
-    Expression vectorExpression = indexedExpressions.get(vectorExpressionOrdinal);
-    vectorExpression.evaluate(new ValueGetterTuple(valueGetter, ts), ptr);
-    if (ptr.get() == null || ptr.getLength() == 0) {
-      return null;
+    if (vectorExpressionOrdinal >= 0 && vectorExpressionOrdinal < indexedExpressions.size()) {
+      ImmutableBytesWritable ptr = new ImmutableBytesWritable();
+      Expression vectorExpression = indexedExpressions.get(vectorExpressionOrdinal);
+      vectorExpression.evaluate(new ValueGetterTuple(valueGetter, ts), ptr);
+      if (ptr.get() != null && ptr.getLength() > 0) {
+        return ptr;
+      }
     }
-    return ptr;
+    if (coveredVectorColumnTypes != null && !coveredVectorColumnTypes.isEmpty()) {
+      for (ColumnReference ref : coveredVectorColumnTypes.keySet()) {
+        try {
+          ImmutableBytesWritable ptr = valueGetter.getLatestValue(ref, ts);
+          if (
+            ptr != null && ptr != ValueGetter.HIDDEN_BY_DELETE && ptr.get() != null
+              && ptr.getLength() > 0
+          ) {
+            return ptr;
+          }
+        } catch (IOException e) {
+          LOGGER.warn("Failed to retrieve covered vector value for column {}", ref, e);
+        }
+      }
+    }
+    return null;
   }
 
   /** Evaluates whether the indexed vector value is unchanged between two row mutation states. */
@@ -3282,7 +3310,7 @@ public class IndexMaintainer implements Writable, Iterable<ColumnReference> {
    * this is not a vector index or the key cannot be decoded.
    */
   public Integer extractCentroidId(byte[] indexRowKey) {
-    if (indexRowKey == null || !isVectorIndex()) {
+    if (indexRowKey == null || !isVectorIndex() || !hasCentroidColumn()) {
       return null;
     }
     int offset = 0;
