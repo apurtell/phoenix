@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Runs the Phoenix vector index harness from a source build. Build the harness and copy its
+# runtime dependencies first:
+#
+#   mvn package -DskipTests -DPhoenixPatchProcess -Pharness-dist -pl phoenix-vector-harness -am
+#
+# Environment:
+#   JAVA_HOME          Java installation; java on the PATH if unset
+#   HBASE_CONF_DIR     directory of the cluster's hbase-site.xml, put first on the classpath
+#   HARNESS_CLASSPATH  extra classpath entries, put before the harness jars
+#   HARNESS_OPTS       extra JVM options, such as -Xmx16g
+#   HARNESS_SIMD       true to resolve the incubating vector API module (JDK 17 and later), which
+#                      the SIMD distance kernels of a -Pjava21 build need
+#   HARNESS_LOG4J      log4j2 configuration file; conf/log4j2.properties of the module if unset
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+module="$(cd "$here/.." && pwd)"
+java="java"
+if [ -n "${JAVA_HOME:-}" ]; then
+  java="$JAVA_HOME/bin/java"
+fi
+
+jar=""
+for f in "$module"/target/phoenix-vector-harness-*.jar; do
+  case "$f" in
+    *-tests.jar|*-sources.jar) ;;
+    *) [ -f "$f" ] && jar="$f" ;;
+  esac
+done
+if [ -z "$jar" ] || [ ! -d "$module/target/lib" ]; then
+  echo "Build the harness first:" >&2
+  echo "  mvn package -DskipTests -DPhoenixPatchProcess -Pharness-dist -pl phoenix-vector-harness -am" >&2
+  exit 2
+fi
+
+classpath="$jar:$module/target/lib/*"
+if [ -n "${HBASE_CONF_DIR:-}" ]; then
+  classpath="$HBASE_CONF_DIR:$classpath"
+fi
+if [ -n "${HARNESS_CLASSPATH:-}" ]; then
+  classpath="$HARNESS_CLASSPATH:$classpath"
+fi
+
+version="$("$java" -version 2>&1 | awk -F '"' '/version/ { print $2; exit }')"
+major="${version%%.*}"
+if [ "$major" = "1" ]; then
+  major="$(echo "$version" | cut -d. -f2)"
+fi
+
+opts=()
+if [ "$major" -ge 11 ]; then
+  # The module flags of the HBase and Phoenix launchers.
+  opts+=(-Dorg.apache.hbase.thirdparty.io.netty.tryReflectionSetAccessible=true
+    --add-modules jdk.unsupported
+    --add-opens java.base/java.nio=ALL-UNNAMED
+    --add-opens java.base/sun.nio.ch=ALL-UNNAMED
+    --add-opens java.base/java.lang=ALL-UNNAMED
+    --add-opens java.base/jdk.internal.ref=ALL-UNNAMED
+    --add-opens java.base/java.lang.reflect=ALL-UNNAMED
+    --add-opens java.base/java.util=ALL-UNNAMED
+    --add-opens java.base/java.util.concurrent=ALL-UNNAMED
+    --add-exports java.base/jdk.internal.misc=ALL-UNNAMED
+    --add-exports java.security.jgss/sun.security.krb5=ALL-UNNAMED
+    --add-exports java.base/sun.net.dns=ALL-UNNAMED
+    --add-exports java.base/sun.net.util=ALL-UNNAMED)
+fi
+if [ "$major" -ge 17 ]; then
+  opts+=(--add-opens java.base/jdk.internal.util.random=ALL-UNNAMED)
+fi
+if [ "${HARNESS_SIMD:-false}" = "true" ]; then
+  opts+=(--add-modules jdk.incubator.vector)
+fi
+
+log4j="${HARNESS_LOG4J:-$module/conf/log4j2.properties}"
+
+# HARNESS_OPTS is split on whitespace on purpose, so that it can hold several options.
+# shellcheck disable=SC2086
+exec "$java" "${opts[@]}" ${HARNESS_OPTS:-} "-Dlog4j2.configurationFile=file:$log4j" \
+  -cp "$classpath" org.apache.phoenix.vectorharness.VectorHarness "$@"

@@ -53,6 +53,7 @@
     <module>phoenix-core-server</module>
     <module>phoenix-core</module>
     <module>phoenix-pherf</module>
+    <module>phoenix-vector-harness</module>
     <module>phoenix-tracing-webapp</module>
     <!-- shaded artifact and assembly modules are added in shade-and-assembly profile -->
   </modules>
@@ -379,6 +380,11 @@
       <dependency>
         <groupId>org.apache.phoenix</groupId>
         <artifactId>phoenix-pherf</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.phoenix</groupId>
+        <artifactId>phoenix-vector-harness</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
