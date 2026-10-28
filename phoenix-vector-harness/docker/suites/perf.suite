@@ -1,0 +1,104 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# bin/vh-suite runs this file. Each line is one step: an id, an action and its arguments.
+# Whitespace separates the words, and the runner does not interpret quotes.
+# "@name" is the run id SESSION-name, so a resumed session finds the runs of earlier steps.
+# The steps of one table pass the same overrides, so every phase sees the same settings.
+
+# The performance suite measures the full-scale profiles in the schema VH_PERF.
+# It takes more than one day. Run the groups one at a time with --only if the time is short.
+# The SIFT and GloVe HDF5 files must be in VH_DATA before the suite starts. scripts/fetch-data.sh
+# puts them there.
+
+setup-reset          cluster reset --yes
+setup-up             cluster up
+setup-verify         cluster verify
+
+# SIFT1M: exact search, IVF and HNSW with SQ8 on the same corpus and the same shared settings.
+# The exact run is the baseline of the group. It shows where a filtered search with an index is
+# not faster than a full scan.
+# The exact chain uses the HNSW profile with --variant exact. Exact search ignores the index
+# settings, and the two SIFT profiles have the same other settings.
+# The IVF steps also pass p1-ivf. It removes the probes=all point, because the exact run
+# measures the full scan.
+p1-exact-load        harness load sift1m-hnsw-sq8 --variant exact --overrides p1-common
+p1-exact-build       harness build-index sift1m-hnsw-sq8 --variant exact --overrides p1-common
+p1-exact-truth       harness truth sift1m-hnsw-sq8 --variant exact --overrides p1-common
+p1-exact-run         harness run sift1m-hnsw-sq8 --variant exact --overrides p1-common --run-id @p1-exact
+p1-exact-check       check @p1-exact wrapper simd errors freshness recall-exact
+p1-ivf-load          harness load sift1m-ivf --overrides p1-common --overrides p1-ivf
+p1-ivf-build         harness build-index sift1m-ivf --overrides p1-common --overrides p1-ivf
+p1-ivf-truth         harness truth sift1m-ivf --overrides p1-common --overrides p1-ivf
+p1-ivf-run           harness run sift1m-ivf --overrides p1-common --overrides p1-ivf --run-id @p1-ivf
+p1-ivf-check         check @p1-ivf wrapper simd errors freshness probe-rise gc saturation client-bound tail published warnings build-rate read-skew statistics
+p1-ivf-qps           needs=p1-exact-run check @p1-ivf qps-vs-exact:@p1-exact
+p1-ivf-work          needs=p1-exact-run check @p1-ivf rows-vs-exact:@p1-exact rpcs-vs-exact:@p1-exact
+p1-hnsw-load         harness load sift1m-hnsw-sq8 --overrides p1-common
+p1-hnsw-build        harness build-index sift1m-hnsw-sq8 --overrides p1-common
+p1-hnsw-truth        harness truth sift1m-hnsw-sq8 --overrides p1-common
+p1-hnsw-run          harness run sift1m-hnsw-sq8 --overrides p1-common --run-id @p1-hnsw
+p1-hnsw-check        check @p1-hnsw wrapper simd errors freshness restriction uncovered gc saturation client-bound tail offheap published warnings build-rate rebuild-queue fsck statistics
+p1-hnsw-qps          needs=p1-exact-run check @p1-hnsw qps-vs-exact:@p1-exact
+p1-hnsw-work         needs=p1-exact-run check @p1-hnsw rows-vs-exact:@p1-exact rpcs-vs-exact:@p1-exact
+p1-compare           needs=p1-exact-run,p1-ivf-run,p1-hnsw-run harness report - --run-id @p1-exact --compare @p1-ivf --compare @p1-hnsw
+
+# SIMD A/B: the p1 runs again with the scalar distance code on the servers and in the harness.
+# A change of VH_RS_SIMD recreates the region server containers. HDFS and the data stay.
+p5-scalar-up         cluster VH_RS_SIMD=0 up
+p5-scalar-verify     cluster VH_RS_SIMD=0 verify
+p5-ivf-run           needs=p5-scalar-up,p5-scalar-verify,p1-ivf-build,p1-ivf-truth harness VH_RS_SIMD=0 run sift1m-ivf --overrides p1-common --overrides p1-ivf --no-simd --run-id @p5-ivf-nosimd
+p5-ivf-check         needs=p1-ivf-run check @p5-ivf-nosimd wrapper no-simd errors freshness simd-ab:@p1-ivf
+p5-hnsw-run          needs=p5-scalar-up,p5-scalar-verify,p1-hnsw-build,p1-hnsw-truth harness VH_RS_SIMD=0 run sift1m-hnsw-sq8 --overrides p1-common --no-simd --run-id @p5-hnsw-nosimd
+p5-hnsw-check        needs=p1-hnsw-run check @p5-hnsw-nosimd wrapper no-simd errors freshness simd-ab:@p1-hnsw
+p5-simd-up           cluster VH_RS_SIMD=1 up
+p5-simd-verify       cluster verify
+
+# GloVe-100: a hard angular corpus with a published ground truth.
+p2-glove-load        harness load glove100-hnsw --overrides p2
+p2-glove-build       harness build-index glove100-hnsw --overrides p2
+p2-glove-truth       harness truth glove100-hnsw --overrides p2
+p2-glove-run         harness run glove100-hnsw --overrides p2 --run-id @p2-glove
+p2-glove-check       check @p2-glove wrapper errors freshness published recall:^ef=256$:0.90 restriction offheap tail
+
+# Streaming ingest at full scale with disruptions.
+p4-stream-load       harness load streaming-hnsw
+p4-stream-build      harness build-index streaming-hnsw
+p4-stream-truth      harness truth streaming-hnsw
+p4-stream-run        harness run streaming-hnsw --run-id @p4-stream
+p4-stream-check      check @p4-stream wrapper freshness:validity mttr fsck rebuild-queue overflow recall-samples gc
+
+# Multi-tenant RAG at full scale. The indexes must beat exact search by a clear factor.
+p3-exact-load        harness load rag-1m-768 --variant exact
+p3-exact-build       harness build-index rag-1m-768 --variant exact
+p3-exact-truth       harness truth rag-1m-768 --variant exact
+p3-exact-run         harness run rag-1m-768 --variant exact --run-id @p3-exact
+p3-exact-check       check @p3-exact wrapper errors freshness recall-exact
+p3-ivf-load          harness load rag-1m-768 --variant ivf
+p3-ivf-build         harness build-index rag-1m-768 --variant ivf
+p3-ivf-truth         harness truth rag-1m-768 --variant ivf
+p3-ivf-run           harness run rag-1m-768 --variant ivf --run-id @p3-ivf
+p3-ivf-check         needs=p3-exact-run check @p3-ivf wrapper errors freshness families gc saturation tail qps-vs-exact:@p3-exact read-skew
+p3-ivf-work          needs=p3-exact-run check @p3-ivf rows-vs-exact:@p3-exact rpcs-vs-exact:@p3-exact
+p3-hnsw-load         harness load rag-1m-768 --variant hnsw
+p3-hnsw-build        harness build-index rag-1m-768 --variant hnsw
+p3-hnsw-truth        harness truth rag-1m-768 --variant hnsw
+p3-hnsw-run          harness run rag-1m-768 --variant hnsw --run-id @p3-hnsw
+p3-hnsw-check        needs=p3-exact-run check @p3-hnsw wrapper errors freshness families restriction offheap gc saturation tail fsck qps-vs-exact:@p3-exact
+p3-hnsw-work         needs=p3-exact-run check @p3-hnsw rows-vs-exact:@p3-exact rpcs-vs-exact:@p3-exact
+p3-compare           needs=p3-exact-run,p3-ivf-run,p3-hnsw-run harness report - --run-id @p3-exact --compare @p3-ivf --compare @p3-hnsw

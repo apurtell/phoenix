@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  Client HBase settings for the harness. The client directory holds this file as hbase-site.xml.
+  It also holds the core, hdfs, mapred and yarn site files.
+  The harness passes only phoenix and hbase keys from a profile to the connection.
+  Every other client key must be in these files.
+  Do not set hbase.client.registry.impl. With that key, the client reads the URL hosts as masters.
+-->
+<configuration>
+  <property>
+    <name>hbase.zookeeper.quorum</name>
+    <value>${VH_ZK_QUORUM}</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.clientPort</name>
+    <value>${VH_ZK_CLIENT}</value>
+  </property>
+  <property>
+    <name>zookeeper.znode.parent</name>
+    <value>${VH_ZK_ZNODE}</value>
+  </property>
+  <!-- The storage footprint report reads the table directories under the root directory. -->
+  <property>
+    <name>hbase.rootdir</name>
+    <value>${VH_HBASE_ROOTDIR}</value>
+  </property>
+
+  <!-- Long timeouts cover exact scans of large tables and HNSW build polls. -->
+  <property>
+    <name>hbase.rpc.timeout</name>
+    <value>${VH_RPC_TIMEOUT_MS}</value>
+  </property>
+  <property>
+    <name>hbase.client.scanner.timeout.period</name>
+    <value>${VH_SCANNER_TIMEOUT_MS}</value>
+  </property>
+
+  <!-- The servers use the same value. -->
+  <property>
+    <name>phoenix.schema.isNamespaceMappingEnabled</name>
+    <value>false</value>
+  </property>
+  <!--
+    The servers use the same value. The value applies to each table without its own
+    UPDATE_CACHE_FREQUENCY, and a new table stores it.
+  -->
+  <property>
+    <name>phoenix.default.update.cache.frequency</name>
+    <value>${VH_UPDATE_CACHE_FREQUENCY_MS}</value>
+  </property>
+  <!--
+    The servers use the same value. With the value false, the client reads no statistics, and the
+    query plans get no size estimates.
+  -->
+  <property>
+    <name>phoenix.stats.collection.enabled</name>
+    <value>${VH_STATISTICS_COLLECTION}</value>
+  </property>
+
+  <!--
+    The server-side index build job replaces the client timeouts and retries with these values.
+    The values are the product defaults. They are here so that a tuning change has one place.
+  -->
+  <property>
+    <name>phoenix.index.rebuild.rpc.timeout</name>
+    <value>1800000</value>
+  </property>
+  <property>
+    <name>phoenix.index.rebuild.client.scanner.timeout</name>
+    <value>1800000</value>
+  </property>
+  <property>
+    <name>phoenix.index.rebuild.rpc.retries.counter</name>
+    <value>5</value>
+  </property>
+</configuration>

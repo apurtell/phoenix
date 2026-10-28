@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  Server HBase settings for the master, the region servers, ZooKeeper, and the tools container.
+  Server-side Phoenix connections read this file too, so it also holds the client keys.
+  The product defaults stay in effect for every Phoenix vector query setting and for HNSW splits.
+  The max lookback age also keeps its default.
+-->
+<configuration>
+  <!-- Cluster layout. Without distributed mode, a region server exits and the master starts its own ZooKeeper. -->
+  <property>
+    <name>hbase.cluster.distributed</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>hbase.rootdir</name>
+    <value>${VH_HBASE_ROOTDIR}</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.quorum</name>
+    <value>${VH_ZK_QUORUM}</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.clientPort</name>
+    <value>${VH_ZK_CLIENT}</value>
+  </property>
+  <property>
+    <name>zookeeper.znode.parent</name>
+    <value>${VH_ZK_ZNODE}</value>
+  </property>
+
+  <!-- ZooKeeper server. The data directory is a named volume. -->
+  <property>
+    <name>hbase.zookeeper.property.dataDir</name>
+    <value>${VH_ZK_DIR}</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.4lw.commands.whitelist</name>
+    <value>srvr,ruok,mntr,stat</value>
+  </property>
+  <!-- All clients connect from the same address on the host network, so the per-address limit is off. -->
+  <property>
+    <name>hbase.zookeeper.property.maxClientCnxns</name>
+    <value>${VH_ZK_MAX_CLIENT_CNXNS}</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.autopurge.snapRetainCount</name>
+    <value>3</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.autopurge.purgeInterval</name>
+    <value>1</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.admin.enableServer</name>
+    <value>false</value>
+  </property>
+
+  <!--
+    Host names. The master and the region servers use localhost.
+    The region server names then agree with the master and with the block locations.
+  -->
+  <property>
+    <name>hbase.master.hostname</name>
+    <value>localhost</value>
+  </property>
+  <property>
+    <name>hbase.unsafe.regionserver.hostname</name>
+    <value>localhost</value>
+  </property>
+
+  <!-- Ports. Each region server instance has its own ports from the port table. -->
+  <property>
+    <name>hbase.master.port</name>
+    <value>${VH_MASTER_RPC}</value>
+  </property>
+  <property>
+    <name>hbase.master.info.port</name>
+    <value>${VH_MASTER_INFO}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.port</name>
+    <value>${VH_RS_RPC}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.info.port</name>
+    <value>${VH_RS_INFO}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.info.port.auto</name>
+    <value>false</value>
+  </property>
+  <!-- The master waits for all region servers, so the system regions spread at startup. -->
+  <property>
+    <name>hbase.master.wait.on.regionservers.mintostart</name>
+    <value>${VH_GROUP_SIZE}</value>
+  </property>
+
+  <!--
+    Phoenix server components. Mutable indexes need the indexed WAL codec on every region server.
+    The scheduler gives index, metadata and server calls their own queues.
+    The endpoint serves uncovered index scans.
+  -->
+  <property>
+    <name>hbase.regionserver.wal.codec</name>
+    <value>org.apache.hadoop.hbase.regionserver.wal.IndexedWALEditCodec</value>
+  </property>
+  <property>
+    <name>hbase.region.server.rpc.scheduler.factory.class</name>
+    <value>org.apache.hadoop.hbase.ipc.PhoenixRpcSchedulerFactory</value>
+  </property>
+  <property>
+    <name>hbase.coprocessor.regionserver.classes</name>
+    <value>org.apache.phoenix.coprocessor.PhoenixRegionServerEndpoint</value>
+  </property>
+  <!-- The client must use the same value. -->
+  <property>
+    <name>phoenix.schema.isNamespaceMappingEnabled</name>
+    <value>false</value>
+  </property>
+  <!--
+    The client must use the same value. The value applies to each table without its own
+    UPDATE_CACHE_FREQUENCY, for example during index maintenance and an automatic IVF rebuild.
+  -->
+  <property>
+    <name>phoenix.default.update.cache.frequency</name>
+    <value>${VH_UPDATE_CACHE_FREQUENCY_MS}</value>
+  </property>
+  <!--
+    The statistics mode sets this switch. The value false stops the collection during compactions
+    and UPDATE STATISTICS.
+  -->
+  <property>
+    <name>phoenix.stats.collection.enabled</name>
+    <value>${VH_STATISTICS_COLLECTION}</value>
+  </property>
+  <!-- A short task interval starts reconcile and asynchronous rebuild tasks sooner. -->
+  <property>
+    <name>phoenix.task.handling.interval.ms</name>
+    <value>${VH_TASK_INTERVAL_MS}</value>
+  </property>
+  <!-- The HNSW budget is the smaller of this value and half of the direct memory. -->
+  <property>
+    <name>phoenix.vector.hnsw.offheap.max.bytes</name>
+    <value>${VH_HNSW_OFFHEAP_MAX_BYTES}</value>
+  </property>
+  <!-- One pool on each region server runs the data row lookups of uncovered index scans. -->
+  <property>
+    <name>phoenix.uncovered.index.threads.max</name>
+    <value>${VH_UNCOVERED_INDEX_THREADS_MAX}</value>
+  </property>
+
+  <!--
+    Memory. The block cache and the memstore leave heap for the on-heap HNSW rebuild.
+    No off-heap bucket cache is set, because it would reduce the HNSW budget.
+  -->
+  <property>
+    <name>hfile.block.cache.size</name>
+    <value>0.30</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.global.memstore.size</name>
+    <value>0.35</value>
+  </property>
+
+  <!--
+    The IVF first-build layout splits regions in rounds. Each round waits until the server
+    archives the compacted files. A short discharger interval makes each round fast.
+  -->
+  <property>
+    <name>hbase.hfile.compaction.discharger.interval</name>
+    <value>10000</value>
+  </property>
+
+  <!-- Timeouts. The scanner lease is a server setting. Long timeouts cover slow first index opens. -->
+  <property>
+    <name>hbase.rpc.timeout</name>
+    <value>${VH_RPC_TIMEOUT_MS}</value>
+  </property>
+  <property>
+    <name>hbase.client.scanner.timeout.period</name>
+    <value>${VH_SCANNER_TIMEOUT_MS}</value>
+  </property>
+
+  <!-- The balancer runs often, so regions return quickly after a region server restart. -->
+  <property>
+    <name>hbase.balancer.period</name>
+    <value>${VH_BALANCER_PERIOD}</value>
+  </property>
+</configuration>

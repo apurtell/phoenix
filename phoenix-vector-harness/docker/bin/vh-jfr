@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script controls JDK Flight Recorder in the JVM of one container through jcmd.
+# jcmd comes from the JDK of the role, so it always matches the JVM version.
+# With VH_JFR=1 every JVM already runs a continuous recording with the name "vh".
+# The dump command then writes the last 30 minutes of that recording to a file.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG <target> start [-n NAME] [-s SETTINGS] [-d DURATION] [-o PATH]
+       $VH_PROG <target> dump  [-n NAME] [-o PATH]
+       $VH_PROG <target> stop  [-n NAME] [-o PATH]
+       $VH_PROG <target> check
+
+  target       A service (rs1, master, nn, ...), harness, or a container name or id
+  -n NAME      Recording name (default vh, the continuous recording of VH_JFR=1)
+  -s SETTINGS  default or profile (default profile)
+  -d DURATION  Stop the recording after this time, for example 120s or 10m
+  -o PATH      Output path in the container (default: the jfr directory of the instance)
+EOF
+}
+
+main() {
+  [ $# -ge 2 ] || {
+    usage >&2
+    exit 2
+  }
+  local target="$1" action="$2"
+  shift 2
+  local name=vh settings=profile duration="" out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) name="${2:?-n needs a name}"; shift 2 ;;
+      -s) settings="${2:?-s needs settings}"; shift 2 ;;
+      -d) duration="${2:?-d needs a duration}"; shift 2 ;;
+      -o) out="${2:?-o needs a path}"; shift 2 ;;
+      *) vh_die "unknown option $1" ;;
+    esac
+  done
+  case "$action" in
+    start | dump | stop | check) ;;
+    *) vh_die "unknown action '$action'; use start, dump, stop or check" ;;
+  esac
+
+  vh_resolve_jvm "$target" || vh_die "cannot find the JVM of '$target'"
+  local jhome dir
+  jhome="$(vh_role_value "$VH_T_ROLE" "$VH_T_INDEX" JAVA_HOME)"
+  dir="$(vh_role_value "$VH_T_ROLE" "$VH_T_INDEX" VH_JFR_DIR)"
+  if [ -z "$out" ]; then
+    out="$dir/$VH_T_INST-$name-$(vh_ts).jfr"
+  fi
+  vh_docker exec -u "$VH_EXEC_USER" "$VH_T_CID" mkdir -p "$(dirname "$out")"
+
+  local -a args
+  case "$action" in
+    start)
+      args=(JFR.start "name=$name" "settings=$settings" "filename=$out" disk=true)
+      [ -z "$duration" ] || args+=("duration=$duration")
+      ;;
+    dump) args=(JFR.dump "name=$name" "filename=$out") ;;
+    stop) args=(JFR.stop "name=$name" "filename=$out") ;;
+    check) args=(JFR.check) ;;
+  esac
+  vh_docker exec -u "$VH_EXEC_USER" "$VH_T_CID" "$jhome/bin/jcmd" "$VH_T_PID" "${args[@]}"
+  case "$action" in
+    start | dump | stop) vh_host_path "$out" ;;
+  esac
+}
+
+main "$@"

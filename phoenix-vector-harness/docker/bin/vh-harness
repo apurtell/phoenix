@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script runs one harness phase in a new harness container and observes the cluster
+# during the phase.
+# The script always gives the harness the local JDBC URL, the output directory of the suite,
+# the HTTP metrics mode and the schema of the suite. The profile files do not have these values.
+# Around the phase, the script records the restart count and the OOM state of each container,
+# samples docker stats, and keeps the warnings of the HBase logs.
+# A restart that the schedule does not explain, or an OOM kill, makes the phase fail.
+# Each phase writes these records to out/<suite>/docker/<id> next to the harness output.
+
+set -euo pipefail
+
+# The heap settings of the caller win over the heap of the profile, so keep them before the
+# defaults fill them in.
+vh_caller_heap="${VH_HARNESS_HEAP:-}"
+vh_caller_mem="${VH_HARNESS_MEM:-}"
+
+# shellcheck source-path=SCRIPTDIR source-path=SCRIPTDIR/.. source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+# shellcheck source=suites/lib/common.sh
+. "$VH_ROOT/suites/lib/common.sh"
+
+usage() {
+  # shellcheck disable=SC2031 # The shared library sets the value once at load time. No subshell changes it here.
+  cat <<EOF
+usage: $VH_PROG <phase> <profile> [options] [-- HARNESS_ARGS...]
+
+  phase                load | build-index | truth | run | report
+  profile              A profile of the image (smoke, sift1m-ivf, sift1m-hnsw-sq8, rag-1m-768,
+                       streaming-hnsw, drift-ivf, glove100-hnsw), a file /work/profiles/NAME.properties
+                       ($VH_WORK/profiles on the host), or "-" for a report without a profile
+
+  --variant V          exact | ivf | hnsw; sets run.variant
+  --suite S            Output group below $VH_WORK/out (default VH_SUITE=$VH_SUITE)
+  --schema NAME        Phoenix schema (default: VH_SMOKE, VH_FUNC, VH_PERF, or VH_<SUITE>)
+  --overrides FILE     One -Dkey=value per line. A bare name resolves in suites/overrides. Repeatable.
+  --run-id ID          run: the id of the new run. report: the run to report (default latest).
+  --compare ID         report: a run to compare with. Repeatable.
+  --force              report: compare runs that are not comparable
+  --heap SIZE          Harness heap (default VH_HARNESS_HEAP, else a value for the profile)
+  --direct SIZE        Harness direct memory (default VH_HARNESS_DIRECT=$VH_HARNESS_DIRECT)
+  --no-simd            Run the harness without the incubating vector module
+  --jvm-profile E[:S]  Run async-profiler event E for S seconds (default 60) on rs1-3 and the harness.
+                       The run phase starts the profiler at the first steady stage.
+  --at T ACTION SVC    At T after the first steady stage: "kill" sends SIGKILL to the daemon of SVC,
+                       "restart" stops and starts SVC. A region server moves its regions away first,
+                       and they move back after the start. T is a duration such as 6m or 90s. Repeatable.
+  --collect MODE       failure (default) | always | never: write a vh-collect bundle after the phase
+  --dry-run            Print the harness command and exit
+
+The harness runs the statistics mode of the cluster, VH_STATISTICS=$VH_STATISTICS. A profile or an
+override with another table.statistics value is a usage error.
+
+Exit codes: the exit code of the harness (0 ok, 1 failed, 2 usage); 3 when the harness passed
+but a container restarted without a reason or was OOM-killed; 2 for a usage error of this script.
+EOF
+}
+
+# Profile heaps for full-scale runs. Large overlays and k-means samples live in the client heap.
+profile_heap() {
+  case "$1" in
+    rag-1m-768) echo 12g ;;
+    streaming-hnsw | drift-ivf) echo 10g ;;
+    sift1m-ivf | sift1m-hnsw-sq8 | glove100-hnsw) echo 8g ;;
+    *) echo "" ;;
+  esac
+}
+
+# Prints the schema of a suite.
+suite_schema() {
+  case "$1" in
+    smoke) echo VH_SMOKE ;;
+    functional) echo VH_FUNC ;;
+    perf) echo VH_PERF ;;
+    *) echo "VH_$(vhs_ident "$1")" ;;
+  esac
+}
+
+# Resolves an argument file name. A bare name refers to suites/overrides.
+resolve_overrides() {
+  local f="$1"
+  case "$f" in
+    */*) ;;
+    *.args) f="$VH_ROOT/suites/overrides/$f" ;;
+    *) f="$VH_ROOT/suites/overrides/$f.args" ;;
+  esac
+  [ -f "$f" ] || vh_usage_die "no such overrides file: $1"
+  echo "$f"
+}
+
+vh_usage_die() {
+  printf '%s: ERROR: %s\n' "$VH_PROG" "$*" >&2
+  exit 2
+}
+
+# Prints the effective value of a setting: the extra arguments win over the overrides files,
+# and the overrides files win over the profile.
+effective() {
+  local key="$1" v="" line
+  if [ -n "$HOST_PROFILE" ]; then
+    v="$(vhs_prop "$HOST_PROFILE" "$key")"
+  fi
+  for line in ${HARNESS_D[@]+"${HARNESS_D[@]}"}; do
+    case "$line" in
+      "-D$key="*) v="${line#-D"$key"=}" ;;
+    esac
+  done
+  printf '%s' "$v"
+}
+
+# Counts the restart disruptions of a schedule such as 1m:split,5m:restart.
+count_restarts() {
+  printf '%s' "$1" | tr ',' '\n' | awk -F: '$NF ~ /^[ \t]*restart[ \t]*$/ { n++ } END { print n + 0 }'
+}
+
+# Counts the steady windows of a run from a rate list such as 20,50,100. Each rate has its own
+# window, and each window replays the disruption schedule. Without a list, the run has one window.
+count_windows() {
+  printf '%s' "$1" | tr ',' '\n' | awk 'NF { n++ } END { print (n > 0 ? n : 1) }'
+}
+
+# Counts the restarts that the harness skips, because a steady window ends before they start.
+# The manifests of the run give the skipped disruptions. The harness writes one run without
+# repetitions, and one run per repetition otherwise. A stale run of the other layout thus does
+# not count.
+skipped_restarts() {
+  local reps="$1" n=0 k d
+  local -a dirs=()
+  if ! command -v jq >/dev/null 2>&1; then
+    vh_warn "jq is missing; the restart count ignores skipped restarts"
+    echo 0
+    return
+  fi
+  if [ "$reps" -le 1 ]; then
+    dirs=("$RUNS_DIR/$RUN_ID")
+  else
+    for k in $(seq 1 "$reps"); do
+      dirs+=("$RUNS_DIR/$RUN_ID-r$k")
+    done
+  fi
+  for d in "${dirs[@]}"; do
+    [ -f "$d/manifest.json" ] || continue
+    k="$(jq '[.stages.steady[]?.skipped_disruptions[]? | select(test(":restart$"))] | length' \
+      "$d/manifest.json" 2>/dev/null)" || k=0
+    case "$k" in
+      '' | *[!0-9]*) k=0 ;;
+    esac
+    n=$((n + k))
+  done
+  echo "$n"
+}
+
+# Writes one line per daemon: service, restart count, OOM state, status and exit code.
+snapshot() {
+  local out="$1" svc cid
+  : >"$out"
+  for svc in $VH_DAEMON_SERVICES; do
+    cid="$(vh_svc_cids -a "$svc" | head -n 1)"
+    if [ -z "$cid" ]; then
+      echo "$svc - - missing -" >>"$out"
+      continue
+    fi
+    printf '%s %s\n' "$svc" "$(vh_docker inspect -f \
+      '{{.RestartCount}} {{.State.OOMKilled}} {{.State.Status}} {{.State.ExitCode}}' "$cid")" >>"$out"
+  done
+}
+
+# Samples docker stats of the project containers and the harness container into a CSV file.
+# CPU is in percent of one core. Memory is in MiB.
+stats_loop() {
+  local out="$1" interval="$2" stop="$3" now i
+  echo "wall_ms,service,container,cpu_pct,mem_used_mib,mem_limit_mib,mem_pct,pids" >"$out"
+  while [ ! -e "$stop" ]; do
+    now="$(vhs_now_s)"
+    vh_docker stats --no-stream \
+      --format '{{.Name}}	{{.CPUPerc}}	{{.MemUsage}}	{{.MemPerc}}	{{.PIDs}}' 2>/dev/null |
+      awk -F '\t' -v now="$now" -v proj="$VH_PROJECT-" -v hname="$HNAME" '
+        function mib(s,    n, u) {
+          gsub(/[ \t]/, "", s)
+          n = s + 0
+          u = s
+          sub(/^[0-9.]+/, "", u)
+          if (u == "KiB" || u == "kB" || u == "KB") return n / 1024
+          if (u == "MiB" || u == "MB") return n
+          if (u == "GiB" || u == "GB") return n * 1024
+          if (u == "TiB" || u == "TB") return n * 1048576
+          return n / 1048576
+        }
+        {
+          name = $1
+          if (name == hname) {
+            svc = "harness"
+          } else if (index(name, proj) == 1) {
+            svc = substr(name, length(proj) + 1)
+            if (svc ~ /-run-/) sub(/-run-.*/, "", svc); else sub(/-[0-9]+$/, "", svc)
+          } else {
+            next
+          }
+          cpu = $2; sub(/%/, "", cpu)
+          split($3, m, "/")
+          pct = $4; sub(/%/, "", pct)
+          printf "%s000,%s,%s,%s,%.1f,%.1f,%s,%s\n", now, svc, name, cpu, mib(m[1]), mib(m[2]), pct, $5
+        }' >>"$out" || true
+    i=0
+    while [ "$i" -lt "$interval" ] && [ ! -e "$stop" ]; do
+      sleep 1
+      i=$((i + 1))
+    done
+  done
+}
+
+# Prints the wall time in ms of the first steady stage of the run.
+# For other phases the anchor is the start of the phase. Fails when the phase ends first.
+anchor_ms() {
+  if [ "$PHASE" != run ]; then
+    echo "${START_S}000"
+    return 0
+  fi
+  local f ms
+  while [ ! -e "$DONE" ]; do
+    for f in "$RUNS_DIR/$RUN_ID/events.csv" "$RUNS_DIR/$RUN_ID-r1/events.csv"; do
+      [ -f "$f" ] || continue
+      ms="$(vhs_csv "$f" | awk -F '\t' "$VHS_HDR"' $col["kind"] == "stage" && $col["detail"] ~ /^steady@/ { print $col["wall_ms"]; exit }')"
+      if [ -n "$ms" ]; then
+        echo "$ms"
+        return 0
+      fi
+    done
+    sleep 2
+  done
+  return 1
+}
+
+# Waits until the anchor plus an offset, then applies one action. Records the result in actions.csv.
+at_action() {
+  local offset="$1" action="$2" svc="$3" anchor target rc
+  if ! anchor="$(anchor_ms)"; then
+    echo "$(vhs_now_s)000,-,$offset,$action,$svc,not-reached" >>"$HDIR/actions.csv"
+    return 0
+  fi
+  target=$((anchor / 1000 + offset))
+  while [ "$(vhs_now_s)" -lt "$target" ]; do
+    if [ -e "$DONE" ]; then
+      echo "$(vhs_now_s)000,$anchor,$offset,$action,$svc,phase-ended" >>"$HDIR/actions.csv"
+      return 0
+    fi
+    sleep 1
+  done
+  vh_log "at +${offset}s of the steady state: $action $svc"
+  rc=0
+  case "$action" in
+    kill) "$VH_ROOT/bin/vh-cluster" kill "$svc" >>"$HDIR/actions.log" 2>&1 || rc=$? ;;
+    restart) "$VH_ROOT/bin/vh-cluster" restart "$svc" >>"$HDIR/actions.log" 2>&1 || rc=$? ;;
+  esac
+  echo "$(vhs_now_s)000,$anchor,$offset,$action,$svc,rc=$rc" >>"$HDIR/actions.csv"
+}
+
+# Starts async-profiler on the region servers and the harness at the anchor.
+jvm_profile() {
+  local event="$1" secs="$2" t
+  if [ "$PHASE" = run ]; then
+    anchor_ms >/dev/null || return 0
+  else
+    sleep 15
+  fi
+  [ -e "$DONE" ] && return 0
+  for t in rs1 rs2 rs3 "$HNAME"; do
+    "$VH_ROOT/bin/vh-profile" "$t" record -e "$event" -d "$secs" -f html \
+      >"$HDIR/profile-${t}.log" 2>&1 &
+  done
+  wait
+}
+
+# Keeps the warning and error lines of the HBase daemons since the start of the phase.
+keep_logs() {
+  local svc cid
+  for svc in master rs1 rs2 rs3; do
+    cid="$(vh_svc_cids -a "$svc" | head -n 1)"
+    [ -n "$cid" ] || continue
+    vh_docker logs --since "$START_S" "$cid" 2>&1 |
+      grep -E ' (WARN|ERROR|FATAL) |OutOfMemoryError|MaxDirectMemorySize' |
+      tail -n 5000 >"$HDIR/log-$svc.txt" || true
+  done
+}
+
+# Records the die and OOM events of the project containers during the phase.
+keep_events() {
+  vh_docker events --since "$START_S" --until "$(vhs_now_s)" \
+    --filter "label=com.docker.compose.project=$VH_PROJECT" \
+    --filter type=container --filter event=die --filter event=oom \
+    --format '{{.Time}}	{{index .Actor.Attributes "com.docker.compose.service"}}	{{.Action}}	{{index .Actor.Attributes "exitCode"}}' \
+    >"$HDIR/docker-events.tsv" 2>/dev/null || true
+}
+
+# Compares the two snapshots and prints one anomaly per line.
+anomalies() {
+  local expected="$1" tolerance="$2"
+  awk -v exp_rs="$expected" -v tol="$tolerance" '
+    FNR == NR { before[$1] = $2; next }
+    {
+      svc = $1
+      if ($4 != "running") print svc " is " $4 " (exit " $5 ")"
+      if ($3 == "true") print svc " was OOM-killed"
+      if (before[svc] == "-" || $2 == "-") next
+      d = $2 - before[svc]
+      if (svc ~ /^rs[0-9]+$/) { rs += d; next }
+      if (d > 0) print svc " restarted " d " time(s)"
+    }
+    END {
+      if (rs < exp_rs || rs > exp_rs + tol) {
+        printf "region servers restarted %d time(s), the schedule explains %d", rs, exp_rs
+        if (tol > 0) printf " to %d", exp_rs + tol
+        print ""
+      }
+    }' "$HDIR/inspect-before.txt" "$HDIR/inspect-after.txt"
+  awk -F '\t' '$3 == "oom" { print $2 " had an OOM event" }' "$HDIR/docker-events.tsv" 2>/dev/null |
+    sort -u
+}
+
+BG_PIDS=""
+cleanup() {
+  local p
+  [ -n "${DONE:-}" ] && touch "$DONE" 2>/dev/null
+  for p in $BG_PIDS; do
+    kill "$p" 2>/dev/null || true
+  done
+}
+
+on_signal() {
+  vh_warn "interrupted; stopping $HNAME"
+  vh_docker stop -t 30 "$HNAME" >/dev/null 2>&1 || true
+  cleanup
+  exit 130
+}
+
+main() {
+  [ $# -ge 1 ] || {
+    usage >&2
+    exit 2
+  }
+  case "$1" in
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+  esac
+  [ $# -ge 2 ] || vh_usage_die "name a phase and a profile"
+  PHASE="$1"
+  local profile="$2"
+  shift 2
+  case "$PHASE" in
+    load | build-index | truth | run | report) ;;
+    *) vh_usage_die "unknown phase '$PHASE'" ;;
+  esac
+
+  local variant="" suite="$VH_SUITE" schema="" run_id="" force=0 heap="" direct="" simd=""
+  local jprof="" collect=failure dry=0 f line
+  local -a compare=() at_list=() extra=()
+  HARNESS_D=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --variant) variant="${2:?--variant needs a value}"; shift 2 ;;
+      --suite) suite="${2:?--suite needs a value}"; shift 2 ;;
+      --schema) schema="${2:?--schema needs a value}"; shift 2 ;;
+      --overrides)
+        f="$(resolve_overrides "${2:?--overrides needs a file}")"
+        while IFS= read -r line; do
+          case "$line" in
+            -D?*=*) HARNESS_D+=("$line") ;;
+            *) vh_usage_die "$f: not a -Dkey=value line: $line" ;;
+          esac
+        done <<EOF
+$(vhs_args_lines "$f")
+EOF
+        shift 2
+        ;;
+      --run-id) run_id="${2:?--run-id needs a value}"; shift 2 ;;
+      --compare) compare+=("${2:?--compare needs a run id}"); shift 2 ;;
+      --force) force=1; shift ;;
+      --heap) heap="${2:?--heap needs a size}"; shift 2 ;;
+      --direct) direct="${2:?--direct needs a size}"; shift 2 ;;
+      --no-simd) simd=false; shift ;;
+      --jvm-profile) jprof="${2:?--jvm-profile needs an event}"; shift 2 ;;
+      --at)
+        [ $# -ge 4 ] || vh_usage_die "--at needs a time, an action and a service"
+        vhs_duration_s "$2" >/dev/null || vh_usage_die "--at: bad duration '$2'"
+        case "$3" in
+          kill | restart) ;;
+          *) vh_usage_die "--at: the action is kill or restart, not '$3'" ;;
+        esac
+        vh_is_daemon "$4" || vh_usage_die "--at: '$4' is not a daemon service"
+        at_list+=("$(vhs_duration_s "$2") $3 $4")
+        shift 4
+        ;;
+      --collect)
+        collect="${2:?--collect needs a mode}"
+        case "$collect" in
+          failure | always | never) ;;
+          *) vh_usage_die "--collect: use failure, always or never" ;;
+        esac
+        shift 2
+        ;;
+      --dry-run) dry=1; shift ;;
+      --)
+        shift
+        extra=("$@")
+        break
+        ;;
+      *) vh_usage_die "unknown option '$1'" ;;
+    esac
+  done
+  for line in ${extra[@]+"${extra[@]}"}; do
+    case "$line" in
+      -D?*=*) HARNESS_D+=("$line") ;;
+    esac
+  done
+
+  # The profile in the container, and the same file on the host when the host has it.
+  local cprofile="" pname=""
+  HOST_PROFILE=""
+  case "$profile" in
+    -)
+      [ "$PHASE" = report ] || vh_usage_die "only the report phase runs without a profile"
+      pname=report
+      ;;
+    /work/profiles/*)
+      cprofile="$profile"
+      HOST_PROFILE="$VH_WORK/profiles/${profile#/work/profiles/}"
+      [ -f "$HOST_PROFILE" ] || vh_usage_die "no such profile on the host: $HOST_PROFILE"
+      ;;
+    /*) cprofile="$profile" ;;
+    */*) vh_usage_die "a profile path must be absolute in the container: $profile" ;;
+    *)
+      pname="${profile%.properties}"
+      cprofile="/opt/vector-harness/profiles/$pname.properties"
+      HOST_PROFILE="$VH_REPO/phoenix-vector-harness/profiles/$pname.properties"
+      [ -f "$HOST_PROFILE" ] || vh_usage_die "no profile '$pname' in $VH_REPO/phoenix-vector-harness/profiles"
+      ;;
+  esac
+  if [ -z "$pname" ]; then
+    pname="$(basename "$cprofile" .properties)"
+  fi
+  # A published corpus below /data must be in VH_DATA. This check fails before any container
+  # starts, and it names the script that fetches the file.
+  local csource cpath
+  csource="$(effective corpus.source | tr '[:upper:]' '[:lower:]')"
+  cpath="$(effective corpus.path)"
+  if [ "$PHASE" != report ] && [ -n "$csource" ] && [ "$csource" != synthetic ]; then
+    case "$cpath" in
+      /data/*)
+        [ -e "$VH_DATA/${cpath#/data/}" ] ||
+          vh_die "$cpath is not in VH_DATA ($VH_DATA/${cpath#/data/}); $VH_ROOT/scripts/fetch-data.sh fetches the ANN-Benchmarks files"
+        ;;
+    esac
+  fi
+  [ -n "$schema" ] || schema="$(suite_schema "$suite")"
+  # The harness runs the statistics mode of the cluster. A profile or an override with the other
+  # mode fails here, before any container starts. The harness also checks the live servers.
+  local smode=""
+  if [ "$PHASE" != report ]; then
+    smode="$(effective table.statistics | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    if [ -n "$smode" ] && [ "$smode" != "$VH_STATISTICS" ]; then
+      vh_usage_die "table.statistics=$smode does not match VH_STATISTICS=$VH_STATISTICS of the cluster; deploy the cluster with VH_STATISTICS=$smode, or remove the setting"
+    fi
+    smode="$VH_STATISTICS"
+  fi
+  local nvariant="${variant:-$(effective run.variant)}"
+  nvariant="${nvariant:-default}"
+
+  # Ids. A run uses its run id for the docker records too, so the two directories pair up.
+  local ts
+  ts="$(date -u +%Y%m%dt%H%M%S)"
+  if [ "$PHASE" = run ]; then
+    [ -n "$run_id" ] || run_id="$(vhs_run_id "$nvariant-$pname-$ts")"
+    RUN_ID="$run_id"
+    DOCKER_ID="$run_id"
+  elif [ "$PHASE" = report ]; then
+    RUN_ID="${run_id:-latest}"
+    DOCKER_ID="$(vhs_run_id "report-$RUN_ID-$ts")"
+  else
+    RUN_ID=""
+    DOCKER_ID="$(vhs_run_id "$PHASE-$nvariant-$pname-$ts")"
+  fi
+  HNAME="vh-harness-$DOCKER_ID"
+  local out_c="/work/out/$suite"
+  RUNS_DIR="$VH_WORK/out/$suite/runs"
+  HDIR="$VH_WORK/out/$suite/docker/$DOCKER_ID"
+  local hdir_c="$out_c/docker/$DOCKER_ID"
+
+  # Memory. An explicit size wins, then the caller environment, then the profile table.
+  local user_heap="$vh_caller_heap" user_mem="$vh_caller_mem"
+  if [ -f "$VH_ROOT/env/local.env" ]; then
+    grep -q '^VH_HARNESS_HEAP=' "$VH_ROOT/env/local.env" && user_heap=local
+    grep -q '^VH_HARNESS_MEM=' "$VH_ROOT/env/local.env" && user_mem=local
+  fi
+  if [ -n "$heap" ]; then
+    VH_HARNESS_HEAP="$heap"
+  elif [ -z "$user_heap" ] && [ -n "$(profile_heap "$pname")" ]; then
+    VH_HARNESS_HEAP="$(profile_heap "$pname")"
+  fi
+  if [ -n "$direct" ]; then
+    VH_HARNESS_DIRECT="$direct"
+  fi
+  local hm dm
+  hm="$(vhs_size_mib "$VH_HARNESS_HEAP")" || vh_usage_die "bad heap size $VH_HARNESS_HEAP"
+  dm="$(vhs_size_mib "$VH_HARNESS_DIRECT")" || vh_usage_die "bad direct size $VH_HARNESS_DIRECT"
+  if [ -z "$user_mem" ]; then
+    # The limit covers the heap, the direct memory and about 1 GiB of JVM overhead.
+    VH_HARNESS_MEM="$((hm + dm + 1024))m"
+  fi
+  [ -z "$simd" ] || VH_HARNESS_SIMD="$simd"
+  VH_RUN_DIR="$hdir_c"
+  export VH_HARNESS_HEAP VH_HARNESS_DIRECT VH_HARNESS_MEM VH_HARNESS_SIMD VH_RUN_DIR
+
+  # Restarts that the schedule explains. Each steady window of each repetition replays it.
+  local expected=0 tolerance=0 reps=1 a
+  if [ "$PHASE" = run ]; then
+    expected="$(count_restarts "$(effective disruption.schedule)")"
+    reps="$(effective run.repetitions)"
+    case "$reps" in
+      '' | *[!0-9]*) reps=1 ;;
+    esac
+    [ "$reps" -ge 1 ] || reps=1
+    expected=$((expected * $(count_windows "$(effective query.rate.values)") * reps))
+  fi
+  for a in ${at_list[@]+"${at_list[@]}"}; do
+    case "$a" in
+      *" kill rs"*) expected=$((expected + 1)) ;;
+      *" restart rs"*) tolerance=$((tolerance + 1)) ;;
+    esac
+  done
+
+  # The harness command.
+  local -a cmd=("$PHASE")
+  [ -z "$cprofile" ] || cmd+=(--config "$cprofile")
+  # shellcheck disable=SC2031 # The port table sets the URL once at load time. No subshell changes it here.
+  cmd+=(--url "$VH_JDBC_URL" "-Drun.output.dir=$out_c" -Dobserve.jmx.mode=http
+    "-Dtable.schema=$schema")
+  [ -z "$variant" ] || cmd+=("-Drun.variant=$variant")
+  [ -z "$smode" ] || cmd+=("-Dtable.statistics=$smode")
+  case "$PHASE" in
+    run) cmd+=(--run-id "$RUN_ID") ;;
+    report) [ -z "$run_id" ] || cmd+=(--run-id "$run_id") ;;
+  esac
+  [ "$force" = 0 ] || cmd+=(--force)
+  for line in ${HARNESS_D[@]+"${HARNESS_D[@]}"}; do
+    cmd+=("$line")
+  done
+  for line in ${extra[@]+"${extra[@]}"}; do
+    case "$line" in
+      -D?*=*) ;;
+      *) cmd+=("$line") ;;
+    esac
+  done
+  # The compare option takes every following word, so it comes last.
+  if [ ${#compare[@]} -gt 0 ]; then
+    cmd+=(--compare "${compare[@]}")
+  fi
+
+  local -a run=(--profile client run --rm --no-deps -T --name "$HNAME"
+    -e "VH_RUN_DIR=$VH_RUN_DIR" -e "VH_HARNESS_HEAP=$VH_HARNESS_HEAP"
+    -e "VH_HARNESS_DIRECT=$VH_HARNESS_DIRECT" -e "VH_HARNESS_SIMD=$VH_HARNESS_SIMD"
+    harness)
+  if [ "$dry" = 1 ]; then
+    echo "VH_HARNESS_MEM=$VH_HARNESS_MEM docker compose ${run[*]} ${cmd[*]}"
+    return 0
+  fi
+
+  vh_require_image
+  vh_prepare_dirs
+  # The JVM does not create the directory of its GC log, so the directory must exist first.
+  mkdir -p "$HDIR" "$RUNS_DIR"
+  DONE="$HDIR/.done"
+  rm -f "$DONE"
+  START_S="$(vhs_now_s)"
+  {
+    echo "phase=$PHASE"
+    echo "profile=$pname"
+    echo "variant=$nvariant"
+    echo "suite=$suite"
+    echo "schema=$schema"
+    echo "statistics=$smode"
+    echo "run_id=$RUN_ID"
+    echo "docker_id=$DOCKER_ID"
+    echo "container=$HNAME"
+    echo "harness_heap=$VH_HARNESS_HEAP"
+    echo "harness_direct=$VH_HARNESS_DIRECT"
+    echo "harness_mem=$VH_HARNESS_MEM"
+    echo "harness_cpus=$VH_HARNESS_CPUS"
+    echo "harness_simd=$VH_HARNESS_SIMD"
+    echo "vm_cpus=$(vh_docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)"
+    echo "scheduled_rs_restarts=$expected"
+    echo "start_s=$START_S"
+  } >"$HDIR/wrapper.env"
+  printf '%s\n' "${cmd[@]}" >"$HDIR/harness-args.txt"
+  snapshot "$HDIR/inspect-before.txt"
+  echo "wall_ms,anchor_ms,offset_s,action,service,result" >"$HDIR/actions.csv"
+
+  trap cleanup EXIT
+  trap on_signal INT TERM
+  stats_loop "$HDIR/docker-stats.csv" "$VH_STATS_INTERVAL" "$DONE" &
+  BG_PIDS="$BG_PIDS $!"
+  for a in ${at_list[@]+"${at_list[@]}"}; do
+    # shellcheck disable=SC2086 # The entry holds three words: offset, action and service.
+    at_action $a &
+    BG_PIDS="$BG_PIDS $!"
+  done
+  if [ -n "$jprof" ]; then
+    local ev="${jprof%%:*}" secs=60
+    case "$jprof" in
+      *:*) secs="${jprof#*:}" ;;
+    esac
+    jvm_profile "$ev" "$secs" &
+    BG_PIDS="$BG_PIDS $!"
+  fi
+
+  vh_log "$PHASE $pname variant=$nvariant suite=$suite schema=$schema id=$DOCKER_ID heap=$VH_HARNESS_HEAP"
+  local rc=0
+  set +e
+  vh_compose "${run[@]}" "${cmd[@]}" 2>&1 | tee "$HDIR/harness.log"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  touch "$DONE"
+
+  # Wait for an action that is in progress, so the snapshot after the phase sees its result.
+  local p
+  for p in $BG_PIDS; do
+    wait "$p" 2>/dev/null || true
+  done
+  BG_PIDS=""
+  snapshot "$HDIR/inspect-after.txt"
+  keep_events
+  keep_logs
+  # A restart that the harness skips does not happen, so the schedule does not explain it.
+  local found skipped=0
+  if [ "$PHASE" = run ]; then
+    skipped="$(skipped_restarts "$reps")"
+    expected=$((expected - skipped))
+    [ "$expected" -ge 0 ] || expected=0
+  fi
+  found="$(anomalies "$expected" "$tolerance")"
+  {
+    echo "skipped_rs_restarts=$skipped"
+    echo "expected_rs_restarts=$expected"
+    echo "end_s=$(vhs_now_s)"
+    echo "exit=$rc"
+    echo "anomalies=$(printf '%s' "$found" | tr '\n' ';')"
+  } >>"$HDIR/wrapper.env"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found" | while IFS= read -r line; do vh_warn "$line"; done
+  fi
+  if [ "$collect" = always ] || { [ "$collect" = failure ] && { [ "$rc" != 0 ] || [ -n "$found" ]; }; }; then
+    local mins=$((($(vhs_now_s) - START_S) / 60 + 2))
+    "$VH_ROOT/bin/vh-collect" -o "$HDIR/collect" --since "${mins}m" >"$HDIR/collect.log" 2>&1 ||
+      vh_warn "vh-collect failed; see $HDIR/collect.log"
+  fi
+  vh_log "records in $HDIR"
+  if [ "$rc" != 0 ]; then
+    exit "$rc"
+  fi
+  if [ -n "$found" ]; then
+    exit 3
+  fi
+}
+
+main "$@"

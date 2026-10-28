@@ -1,0 +1,65 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# The three variants of the scale suite share these settings, so that their results compare.
+# The variants differ only in settings that the report lets comparable runs change.
+
+# Size. The synthetic corpus holds out no rows, so the load writes every row of corpus.rows.
+# The pre-split gives 4 regions with even key ranges. Thus each region holds about 100 000 rows.
+# The mutations of the steady state change this count by less than 1 %.
+-Dcorpus.rows=400000
+-Dtable.regions=4
+
+# Filters. The HNSW probe reads its region without restriction in two cases. The candidates that
+# it needs reach one tenth of the region rows, or they are more than 10 000.
+# At 100 000 rows in each region, the two limits are equal.
+# Thus the break-even pass rate is k / 10 000: 0.001 for k=10 and 0.01 for k=100.
+# The selectivity list holds the break-even point of each k. The other points are a factor of
+# 10 or 100 away from it.
+# The recall sampler and the validity stage use only the first k, so k=10 comes first.
+-Dquery.k.values=10,100
+-Dquery.filter.selectivity=0.001,0.01,0.1
+
+# The harness rejects a selectivity that no range of the vocabulary gives within 5 %.
+# The vocabularies have uniform weights, so 1000 terms give 0.001 with one term.
+# The 100 terms of the smoke profile cannot give 0.001.
+-Dcorpus.filter.categories=1000
+-Dcorpus.filter.sources=1000
+
+# IVF. With 256 lists, each list holds about 1600 rows. The full-scale profiles hold about
+# 1000 rows in each list.
+# The probe points include the points of the probe check in thresholds.properties.
+# The steady state uses the square root of the effective list count, about 16 probes.
+# The build can make a few more or fewer lists than ivf.lists. Then the default probe count can
+# differ from 16, and the sweep adds it as one more point.
+-Divf.lists=256
+-Divf.sample_size=20000
+-Dquery.ivf.probe.values=4,16,64,all
+
+# Load sizing. No earlier run measured the capacity of these tables.
+# An exact query reads every row, so it costs about 20 times a smoke query.
+# Thus the smoke frontier gives an exact capacity of about 15 to 25 queries per second.
+# The quiesced sampler stops the writes while it scores. Each sample runs 10 queries for each
+# family and layout, which is 200 queries. A long interval keeps the sampler rate low.
+# The offered rate and the sampler together keep the exact steady state below one half of the
+# capacity. The steady state is long enough for about six samples.
+-Dquery.rate.per_sec=4
+-Drecall.sample.queries=10
+-Drecall.sample.interval=60s
+-Dsteady_state.warmup=30s
+-Dsteady_state.duration=6m

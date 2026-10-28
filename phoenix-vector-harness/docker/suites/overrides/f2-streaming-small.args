@@ -1,0 +1,39 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# The streaming HNSW profile at a size that fits the functional suite.
+# The disruptions occur while the stream writes, so the rebuild queue and the overflow
+# path both get load.
+-Dcorpus.rows=200000
+-Dingest.stream.rate.per_sec=2000
+-Dmutation.rate.per_sec=100
+-Dsteady_state.warmup=30s
+-Dsteady_state.duration=12m
+-Ddisruption.schedule=2m:split,4m:compact,6m:move,7m:merge,8m:restart
+-Dobserve.fsck.interval=2m
+
+# Load sizing. With 100 mutations/s the table sustains about 30 q/s, and without mutations the
+# host is full at about 49 q/s. The offered rate and the sampler use about 40 % of 30 q/s.
+# The load stays below one half, because the scan cost per query rises as the run deletes rows.
+# Each sample is a burst on as many workers as the queries use, so it scores few queries often.
+# More workers keep the queries and the mutations below their thread limits during a restart.
+-Dquery.rate.per_sec=8
+-Dquery.threads=16
+-Drecall.sample.queries=5
+-Drecall.sample.interval=15s
+-Dmutation.threads=8

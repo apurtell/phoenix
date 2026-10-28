@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script prepares HDFS for HBase, YARN and the harness. It is the one-shot hdfs-init role.
+# It waits until the name node leaves safe mode and all data nodes are live.
+# Then it creates the shared directories. A second run changes nothing, so a restart is safe.
+# The /tmp directories get the sticky mode 1777, because jobs of any user write there.
+# The history server reads job history under /mr-history.
+# IndexTool and the index check tools write their output under the home directory /user/vh.
+
+set -euo pipefail
+
+if [ -z "${VH_INST:-}" ]; then
+  : "${VH_ROLE:=hdfs-init}"
+  # shellcheck source=SCRIPTDIR/../lib/ports.sh
+  . /opt/vh/lib/ports.sh
+  # shellcheck source=SCRIPTDIR/../lib/roles.sh
+  . /opt/vh/lib/roles.sh
+fi
+
+timeout="${VH_READY_TIMEOUT:-900}"
+deadline=$((SECONDS + timeout))
+out="$(mktemp)"
+trap 'rm -f "$out"' EXIT
+
+log() { echo "vh-hdfs-init: $*" >&2; }
+
+# Runs a check until it passes or the deadline is reached.
+# On timeout, the last output of the check goes to the log.
+wait_for() {
+  local what="$1"
+  shift
+  log "waiting for $what"
+  until "$@" >"$out" 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      log "timed out after ${timeout}s waiting for $what; last output:"
+      tail -n 20 "$out" >&2
+      exit 1
+    fi
+    sleep 3
+  done
+  log "ready: $what"
+}
+
+safemode_off() {
+  hdfs dfsadmin -safemode get | grep 'Safe mode is OFF'
+}
+
+datanodes_live() {
+  local n
+  n="$(hdfs dfsadmin -report -live | sed -n 's/^Live datanodes (\([0-9]*\)).*/\1/p')"
+  echo "live data nodes: ${n:-0}"
+  [ "${n:-0}" -ge "$VH_GROUP_SIZE" ]
+}
+
+wait_for "name node out of safe mode" safemode_off
+wait_for "$VH_GROUP_SIZE live data nodes" datanodes_live
+
+hdfs dfs -mkdir -p /hbase /tmp /tmp/logs /tmp/hadoop-yarn/staging /user/vh \
+  /mr-history /mr-history/done /mr-history/tmp
+hdfs dfs -chmod 1777 /tmp /tmp/logs /tmp/hadoop-yarn/staging /mr-history/tmp
+log "HDFS directories are ready"
+hdfs dfs -ls / /user /mr-history >&2

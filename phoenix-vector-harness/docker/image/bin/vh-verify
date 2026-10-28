@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script checks that the running cluster has the configuration that the harness expects.
+# It reads the web endpoints of the daemons, so by default it does not start a JVM.
+# Any container on the host network can run it, for example tools or cluster-ready.
+# Each check prints one line that starts with "ok:", "warn:" or "FAIL:".
+# The exit code is 1 if any check fails.
+#
+# The checks cover these topics:
+#   the Phoenix server jar and the rendered HBase site file
+#   the master view of the region servers and the regions in transition
+#   the JVM of each HBase daemon: Java 21, the vector module, and direct memory on region servers
+#   the live Phoenix settings of each region server
+#   the live data nodes, the active node managers, and the history server
+#   the statistics mode of the cluster
+#
+# The option --guideposts SCHEMA also checks the statistics rows of the tables in SCHEMA.
+# This check starts one HBase shell JVM. Use it after the harness builds the indexes.
+# Docker-level checks, such as restart policies and container logs, run on the host.
+
+set -euo pipefail
+
+if [ -z "${VH_INST:-}" ]; then
+  : "${VH_ROLE:=tools}"
+  # shellcheck source=SCRIPTDIR/../lib/ports.sh
+  . /opt/vh/lib/ports.sh
+  # shellcheck source=SCRIPTDIR/../lib/roles.sh
+  . /opt/vh/lib/roles.sh
+fi
+
+fails=0
+ok() { echo "ok: $*"; }
+warn() { echo "warn: $*"; }
+fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
+
+# Prints the JSON of a local URL, or nothing if the request fails.
+get() {
+  curl -fsS --max-time 10 "$1" 2>/dev/null || true
+}
+
+# Prints one value of a JMX bean. The filter applies to the first bean of the query.
+jmx() {
+  local port="$1" query="$2" filter="$3"
+  get "http://localhost:$port/jmx?qry=$query" | jq -r ".beans[0] | $filter" 2>/dev/null || true
+}
+
+# Prints the live value of one configuration key of an HBase daemon.
+conf_value() {
+  local port="$1" key="$2"
+  get "http://localhost:$port/conf?format=json" \
+    | jq -r --arg k "$key" '.properties[] | select(.key == $k) | .value' 2>/dev/null || true
+}
+
+# Compares a value with the expected value.
+expect() {
+  local what="$1" got="$2" want="$3"
+  if [ "$got" = "$want" ]; then
+    ok "$what = $got"
+  else
+    fail "$what = '${got}', expected '$want'"
+  fi
+}
+
+check_server_jar() {
+  local jars=() j
+  for j in "$VH_HBASE_HOME"/lib/phoenix-server-hbase-2.6-*.jar; do
+    [ -f "$j" ] && jars+=("$j")
+  done
+  if [ "${#jars[@]}" -eq 1 ]; then
+    ok "Phoenix server jar ${jars[0]##*/}"
+  else
+    fail "expected one phoenix-server-hbase-2.6 jar in $VH_HBASE_HOME/lib, found ${#jars[@]}"
+  fi
+}
+
+# Prints the value of one property in a rendered site file.
+site_value() {
+  local site="$1" key="$2"
+  sed -n "/<name>${key//./\\.}<\\/name>/{n;s/.*<value>\\(.*\\)<\\/value>.*/\\1/p;}" "$site" 2>/dev/null || true
+}
+
+check_rendered_site() {
+  local site="$VH_HBASE_CONF/hbase-site.xml"
+  expect "rendered $site hbase.cluster.distributed" "$(site_value "$site" hbase.cluster.distributed)" true
+}
+
+# The servers and the clients must use the same statistics mode. Otherwise UPDATE STATISTICS
+# fails, or the plans do not match the mode. The site files belong to this container, so they
+# check only the image templates. The live values of the master and the region servers are the
+# real check.
+check_statistics_mode() {
+  local site
+  ok "statistics mode VH_STATISTICS=${VH_STATISTICS:-off}"
+  for site in "$VH_HBASE_CONF/hbase-site.xml" "$VH_CLIENT_CONF/hbase-site.xml"; do
+    expect "this container $site phoenix.stats.collection.enabled" \
+      "$(site_value "$site" phoenix.stats.collection.enabled)" "$VH_STATISTICS_COLLECTION"
+  done
+  expect "master phoenix.stats.collection.enabled" \
+    "$(conf_value "$VH_MASTER_INFO" phoenix.stats.collection.enabled)" "$VH_STATISTICS_COLLECTION"
+}
+
+# Checks the statistics rows of the tables in one schema. A row key of SYSTEM.STATS starts with
+# the physical table name and a zero byte. A real guidepost has a second zero byte before its key.
+# An empty marker has no second zero byte. Statistics on must give real guideposts for each IVF
+# index table. An HNSW index shares the HBase table of its data table, so the data table rows are
+# its rows, and they are only reported. Statistics off must give no rows, and a row gives a warning.
+check_guideposts() {
+  local schema="$1" out rows name n g
+  out="$(printf "scan 'SYSTEM.STATS', {ROWPREFIXFILTER => '%s.', FILTER => \"FirstKeyOnlyFilter() AND KeyOnlyFilter()\"}\n" \
+    "$schema" | hbase shell -n 2>&1)" || {
+    fail "scan of SYSTEM.STATS for schema $schema failed: $(printf '%s' "$out" | tail -n 1)"
+    return
+  }
+  # The shell prints a row key with \x00 for each zero byte. The output has one line per row:
+  # the physical name, a tab, and 1 for a real guidepost or 0 for an empty marker.
+  rows="$(printf '%s\n' "$out" | awk '
+    index($0, " column=") {
+      key = substr($0, 1, index($0, " column=") - 1)
+      sub(/^[ \t]+/, "", key)
+      sep = index(key, "\\x00")
+      if (sep == 0) next
+      name = substr(key, 1, sep - 1)
+      rest = substr(key, sep + 4)
+      print name "\t" (index(rest, "\\x00") > 0 ? 1 : 0)
+    }')"
+  if [ "${VH_STATISTICS:-off}" = off ]; then
+    if [ -n "$rows" ]; then
+      warn "SYSTEM.STATS has $(printf '%s\n' "$rows" | wc -l | tr -d ' ') rows for schema $schema, but statistics are off"
+    else
+      ok "SYSTEM.STATS has no rows for schema $schema"
+    fi
+    return
+  fi
+  if [ -z "$rows" ]; then
+    fail "SYSTEM.STATS has no rows for schema $schema; build the index first"
+    return
+  fi
+  if ! printf '%s\n' "$rows" | cut -f 1 | grep -q '_VIDX$'; then
+    warn "SYSTEM.STATS has no rows for an IVF index of schema $schema; an HNSW index has none"
+  fi
+  while IFS=$'\t' read -r name n g; do
+    case "$name" in
+      *_VIDX)
+        if [ "$g" -gt 0 ]; then
+          ok "$name has $g guideposts in $n statistics rows"
+        else
+          fail "$name has only empty statistics markers ($n rows)"
+        fi
+        ;;
+      *) ok "data table $name has $g guideposts in $n statistics rows" ;;
+    esac
+  done < <(printf '%s\n' "$rows" | awk -F '\t' '{ n[$1]++; g[$1] += $2 }
+    END { for (t in n) print t "\t" n[t] "\t" g[t] }' | sort)
+}
+
+check_master() {
+  local p="$VH_MASTER_INFO" live port
+  expect "master active" "$(jmx "$p" 'Hadoop:service=HBase,name=Master,sub=Server' '."tag.isActiveMaster"')" true
+  expect "master numRegionServers" \
+    "$(jmx "$p" 'Hadoop:service=HBase,name=Master,sub=Server' '.numRegionServers')" "$VH_GROUP_SIZE"
+  expect "master numDeadRegionServers" \
+    "$(jmx "$p" 'Hadoop:service=HBase,name=Master,sub=Server' '.numDeadRegionServers')" 0
+  expect "master ritCount" \
+    "$(jmx "$p" 'Hadoop:service=HBase,name=Master,sub=AssignmentManager' '.ritCount')" 0
+  live="$(jmx "$p" 'Hadoop:service=HBase,name=Master,sub=Server' '."tag.liveRegionServers"')"
+  for port in $VH_RS_RPC_ALL; do
+    case ";$live" in
+      *";localhost,$port,"*) ok "region server localhost,$port is live" ;;
+      *) fail "region server localhost,$port is not in the live list '$live'" ;;
+    esac
+  done
+}
+
+# Checks the JVM of one HBase daemon through its runtime bean.
+# want_vector is 1 if the daemon must load the vector module.
+check_jvm() {
+  local name="$1" port="$2" want_vector="$3" want_direct="$4" bean args spec
+  bean="$(get "http://localhost:$port/jmx?qry=java.lang:type=Runtime")"
+  spec="$(echo "$bean" | jq -r '.beans[0].SpecVersion // empty' 2>/dev/null || true)"
+  expect "$name Java version" "$spec" 21
+  args="$(echo "$bean" | jq -r '.beans[0].InputArguments // [] | join(" ")' 2>/dev/null || true)"
+  case "$args" in
+    *jdk.incubator.vector*)
+      ok "$name loads jdk.incubator.vector"
+      ;;
+    *)
+      if [ "$want_vector" = 1 ]; then
+        fail "$name does not load jdk.incubator.vector"
+      else
+        warn "$name runs without jdk.incubator.vector, because VH_RS_SIMD=0"
+      fi
+      ;;
+  esac
+  if [ "$want_direct" = 1 ]; then
+    case "$args" in
+      *-XX:MaxDirectMemorySize=*)
+        ok "$name sets $(echo "$args" | grep -o -- '-XX:MaxDirectMemorySize=[^ ]*' | tail -n 1)"
+        ;;
+      *) fail "$name has no -XX:MaxDirectMemorySize" ;;
+    esac
+  fi
+}
+
+check_region_server() {
+  local name="$1" port="$2" simd=1 coproc
+  [ "${VH_RS_SIMD:-1}" = 0 ] && simd=0
+  check_jvm "$name" "$port" "$simd" 1
+  expect "$name hbase.cluster.distributed" "$(conf_value "$port" hbase.cluster.distributed)" true
+  expect "$name hbase.regionserver.wal.codec" "$(conf_value "$port" hbase.regionserver.wal.codec)" \
+    org.apache.hadoop.hbase.regionserver.wal.IndexedWALEditCodec
+  expect "$name hbase.region.server.rpc.scheduler.factory.class" \
+    "$(conf_value "$port" hbase.region.server.rpc.scheduler.factory.class)" \
+    org.apache.hadoop.hbase.ipc.PhoenixRpcSchedulerFactory
+  expect "$name phoenix.vector.hnsw.offheap.max.bytes" \
+    "$(conf_value "$port" phoenix.vector.hnsw.offheap.max.bytes)" "$VH_HNSW_OFFHEAP_MAX_BYTES"
+  expect "$name phoenix.default.update.cache.frequency" \
+    "$(conf_value "$port" phoenix.default.update.cache.frequency)" "$VH_UPDATE_CACHE_FREQUENCY_MS"
+  expect "$name phoenix.uncovered.index.threads.max" \
+    "$(conf_value "$port" phoenix.uncovered.index.threads.max)" "$VH_UNCOVERED_INDEX_THREADS_MAX"
+  expect "$name phoenix.stats.collection.enabled" \
+    "$(conf_value "$port" phoenix.stats.collection.enabled)" "$VH_STATISTICS_COLLECTION"
+  coproc="$(conf_value "$port" hbase.coprocessor.regionserver.classes)"
+  case ",$coproc," in
+    *,org.apache.phoenix.coprocessor.PhoenixRegionServerEndpoint,*)
+      ok "$name loads PhoenixRegionServerEndpoint" ;;
+    *) fail "$name hbase.coprocessor.regionserver.classes = '$coproc'" ;;
+  esac
+}
+
+check_hdfs() {
+  expect "name node live data nodes" \
+    "$(jmx "$VH_NN_HTTP" 'Hadoop:service=NameNode,name=FSNamesystemState' '.NumLiveDataNodes')" \
+    "$VH_GROUP_SIZE"
+  expect "name node safe mode" \
+    "$(jmx "$VH_NN_HTTP" 'Hadoop:service=NameNode,name=NameNodeInfo' \
+      'if .Safemode == "" then "off" else .Safemode end')" off
+}
+
+check_yarn() {
+  local m
+  m="$(get "http://localhost:$VH_RM_WEB/ws/v1/cluster/metrics")"
+  expect "resource manager active nodes" \
+    "$(echo "$m" | jq -r '.clusterMetrics.activeNodes // empty' 2>/dev/null || true)" "$VH_GROUP_SIZE"
+  expect "resource manager unhealthy nodes" \
+    "$(echo "$m" | jq -r '.clusterMetrics.unhealthyNodes // empty' 2>/dev/null || true)" 0
+  if get "http://localhost:$VH_JHS_WEB/ws/v1/history/info" | jq -e '.historyInfo' >/dev/null 2>&1; then
+    ok "history server answers on port $VH_JHS_WEB"
+  else
+    fail "history server does not answer on port $VH_JHS_WEB"
+  fi
+}
+
+usage() {
+  echo "usage: vh-verify [--guideposts SCHEMA]" >&2
+  exit 2
+}
+
+main() {
+  local i=1 port schema=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --guideposts)
+        # The schema goes into a quoted shell command, so it must be a plain identifier.
+        [ $# -ge 2 ] && [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || usage
+        schema="$2"
+        shift
+        ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  check_server_jar
+  check_rendered_site
+  check_statistics_mode
+  check_master
+  check_jvm master "$VH_MASTER_INFO" 1 0
+  for port in $VH_RS_INFO_ALL; do
+    check_region_server "rs$i" "$port"
+    i=$((i + 1))
+  done
+  check_hdfs
+  check_yarn
+  [ -z "$schema" ] || check_guideposts "$schema"
+  if [ "$fails" -gt 0 ]; then
+    echo "vh-verify: $fails checks failed" >&2
+    return 1
+  fi
+  echo "vh-verify: all checks passed" >&2
+}
+
+main "$@"

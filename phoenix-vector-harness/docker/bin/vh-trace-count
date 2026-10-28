@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script turns async-profiler method trace recordings into call counts per method.
+# A recording with --trace holds one jdk.MethodTrace event for each traced call.
+# The script counts these events. It never adds their durations, because a sum of times is not a count.
+# A count is deterministic work, so it stays valid on a noisy host where timings do not.
+# The work runs in a new tools container, which has the JDK and the async-profiler converter.
+# That container has its own memory limit, so a large recording takes no memory from a daemon.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG [-q QUERIES] FILE.jfr...
+
+  FILE.jfr     A JFR recording with method traces, below \$VH_WORK/logs, out or prof.
+               A container path such as /var/log/vh/rs1/prof/NAME.jfr is also valid.
+               The counts of all files add up, for example one file for each region server.
+  -q QUERIES   The number of queries in the trace window. Then per_query is count / QUERIES.
+
+The output is a TSV with the columns method, count and per_query, highest count first.
+The count of a method is the number of its trace events. Overloads share one row.
+Record a trace with: bin/vh-profile rs1 record -d 60 -f jfr -- --trace CLASS.METHOD
+A target with a latency threshold, such as CLASS.METHOD:5ms, records only the slower calls.
+After the recording, bin/vh-profile SERVICE metrics must show samples_skipped_total 0.
+Otherwise async-profiler skipped events, and the counts are too low.
+EOF
+}
+
+# Prints the script that runs in the tools container.
+# The program name is the name of the script. The arguments are the JDK home, the async-profiler
+# home, the query count (0 for none) and the container paths of the recordings.
+container_script() {
+  cat <<'EOF'
+set -euo pipefail
+prog="$0"
+jhome="$1"
+asprof_home="$2"
+queries="$3"
+shift 3
+err() { printf '%s: ERROR: %s\n' "$prog" "$*" >&2; }
+warn() { printf '%s: WARN: %s\n' "$prog" "$*" >&2; }
+note() { printf '%s: %s\n' "$prog" "$*" >&2; }
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+: >"$tmp/counts"
+for f in "$@"; do
+  if [ ! -r "$f" ]; then
+    err "cannot read $f"
+    exit 1
+  fi
+  # The JDK summary counts the events of each type. Its count is the reference for the check below.
+  want="$("$jhome/bin/jfr" summary "$f" |
+    awk '$1 == "jdk.MethodTrace" { n += $2 } END { printf "%.0f\n", n }')"
+  # async-profiler stores each trace target as an active setting with the name "trace".
+  "$jhome/bin/jfr" print --events jdk.ActiveSetting "$f" |
+    awk '/^ *name = / { t = ($3 == "\"trace\"") }
+      t && /^ *value = / { v = $0; sub(/^ *value = "/, "", v); sub(/"$/, "", v); print v; t = 0 }' |
+    LC_ALL=C sort -u >"$tmp/targets"
+  if [ ! -s "$tmp/targets" ] && [ "$want" = 0 ]; then
+    err "$f has no method trace; record it with: vh-profile SERVICE record -f jfr -- --trace CLASS.METHOD"
+    exit 1
+  fi
+  while IFS= read -r t; do
+    note "$f: trace target $t"
+    # A latency threshold after the last colon keeps only the slower calls.
+    case "$t" in
+      *:*)
+        case "${t##*:}" in
+          0 | 0[a-z]*) ;;
+          *) warn "the target $t has a latency threshold, so its count holds only the calls at or above it" ;;
+        esac
+        ;;
+    esac
+  done <"$tmp/targets"
+  if [ "$want" = 0 ]; then
+    warn "$f has no jdk.MethodTrace events; the traced methods had no calls in the window"
+    continue
+  fi
+  # Without --total, each collapsed stack carries the number of its events, not their durations.
+  # The traced method is the leaf frame. The script removes the suffix of the frame type, so the
+  # compiled, inlined and interpreted calls of one method share one row.
+  JAVA_HOME="$jhome" "$asprof_home/bin/jfrconv" --trace --dot --norm -o collapsed \
+    "$f" "$tmp/stacks" >/dev/null
+  awk 'NF == 0 { next }
+    {
+      c = $NF
+      s = substr($0, 1, length($0) - length($NF) - 1)
+      n = split(s, fr, ";")
+      m = n > 0 ? fr[n] : ""
+      sub(/_\[[a-z0-9]+\]$/, "", m)
+      if (m == "") m = "[no stack]"
+      printf "%s\t%s\n", m, c
+    }' "$tmp/stacks" >"$tmp/one"
+  # Each event must be in exactly one stack. A difference shows that the converter lost events.
+  got="$(awk -F '\t' '{ n += $2 } END { printf "%.0f\n", n }' "$tmp/one")"
+  if [ "$got" != "$want" ]; then
+    err "$f: the stacks hold $got trace events, but the recording has $want"
+    exit 1
+  fi
+  note "$f: $want trace events"
+  cat "$tmp/one" >>"$tmp/counts"
+done
+printf 'method\tcount\tper_query\n'
+awk -F '\t' -v q="$queries" '
+  { s[$1] += $2 }
+  END {
+    for (m in s) {
+      if (q > 0) printf "%s\t%.0f\t%.4f\n", m, s[m], s[m] / q
+      else printf "%s\t%.0f\t-\n", m, s[m]
+    }
+  }' "$tmp/counts" | LC_ALL=C sort -t "$(printf '\t')" -k2,2nr -k1,1
+EOF
+}
+
+main() {
+  local queries=0 qarg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h | --help | help)
+        usage
+        return 0
+        ;;
+      -q) qarg="${2:?-q needs a query count}"; shift 2 ;;
+      --)
+        shift
+        break
+        ;;
+      -*) vh_die "unknown option $1" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || {
+    usage >&2
+    return 2
+  }
+  if [ -n "$qarg" ]; then
+    case "$qarg" in
+      *[!0-9]*) vh_die "-q needs a whole number of queries, not '$qarg'" ;;
+    esac
+    # A long number overflows the shell arithmetic, and a count of zero gives no ratio.
+    [ ${#qarg} -le 15 ] || vh_die "-q $qarg is too large"
+    queries=$((10#$qarg))
+    [ "$queries" -gt 0 ] || vh_die "-q needs a query count above 0"
+  fi
+
+  local f cpath
+  local -a paths=()
+  for f in "$@"; do
+    cpath="$(vh_container_path "$f")" ||
+      vh_die "$f is not a file below $VH_WORK/logs, $VH_WORK/out or $VH_WORK/prof"
+    paths+=("$cpath")
+  done
+
+  vh_require_image
+  vh_prepare_dirs
+  local jhome asprof_home
+  jhome="$(vh_role_value tools 1 JAVA_HOME)"
+  asprof_home="$(vh_role_value tools 1 VH_ASPROF_HOME)"
+  # No TTY, so the TSV keeps plain line ends. The container reads no input, so the input of
+  # the caller stays free for a loop that calls this script.
+  vh_compose run --rm --no-deps -T tools bash -c "$(container_script)" \
+    "$VH_PROG" "$jhome" "$asprof_home" "$queries" "${paths[@]}" </dev/null
+}
+
+main "$@"

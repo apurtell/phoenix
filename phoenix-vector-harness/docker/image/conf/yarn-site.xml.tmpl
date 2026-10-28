@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  YARN settings for the resource manager, the node managers, the history server, and clients.
+  Each node manager instance has its own ports, so its node ID stays the same across restarts.
+  The resource limits keep three node managers inside the memory budget of the Docker VM.
+-->
+<configuration>
+  <!-- Resource manager. -->
+  <property>
+    <name>yarn.resourcemanager.hostname</name>
+    <value>localhost</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.scheduler.address</name>
+    <value>localhost:${VH_RM_SCHEDULER}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.resource-tracker.address</name>
+    <value>localhost:${VH_RM_TRACKER}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.address</name>
+    <value>localhost:${VH_RM_RPC}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.admin.address</name>
+    <value>localhost:${VH_RM_ADMIN}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.webapp.address</name>
+    <value>0.0.0.0:${VH_RM_WEB}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.webapp.https.address</name>
+    <value>0.0.0.0:${VH_RM_WEB_HTTPS}</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.minimum-allocation-mb</name>
+    <value>${VH_YARN_MIN_ALLOC_MB}</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.maximum-allocation-mb</name>
+    <value>${VH_YARN_MAX_ALLOC_MB}</value>
+  </property>
+
+  <!--
+    Node manager. The host name is localhost, so the node ID does not use the VM address.
+    A fixed RPC port prevents lost ghost nodes after a restart.
+  -->
+  <property>
+    <name>yarn.nodemanager.hostname</name>
+    <value>localhost</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.address</name>
+    <value>localhost:${VH_NM_RPC}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.localizer.address</name>
+    <value>localhost:${VH_NM_LOCALIZER}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.webapp.address</name>
+    <value>0.0.0.0:${VH_NM_WEB}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.webapp.https.address</name>
+    <value>0.0.0.0:${VH_NM_WEB_HTTPS}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.collector-service.address</name>
+    <value>localhost:${VH_NM_COLLECTOR}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.amrmproxy.address</name>
+    <value>localhost:${VH_NM_AMRM}</value>
+  </property>
+  <!--
+    Each node manager has its own shuffle port. The mapred-site file sets the same value,
+    because the shuffle service reads its port after the MapReduce defaults load.
+  -->
+  <property>
+    <name>mapreduce.shuffle.port</name>
+    <value>${VH_NM_SHUFFLE}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.aux-services</name>
+    <value>mapreduce_shuffle</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.aux-services.mapreduce_shuffle.class</name>
+    <value>org.apache.hadoop.mapred.ShuffleHandler</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.local-dirs</name>
+    <value>${VH_NM_LOCAL_DIRS}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.log-dirs</name>
+    <value>${VH_NM_LOG_DIRS}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.resource.memory-mb</name>
+    <value>${VH_NM_MEMORY_MB}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.resource.cpu-vcores</name>
+    <value>${VH_NM_VCORES}</value>
+  </property>
+  <!-- JDK 17 on arm64 reserves much virtual memory. The physical memory check stays on. -->
+  <property>
+    <name>yarn.nodemanager.vmem-check-enabled</name>
+    <value>false</value>
+  </property>
+  <!-- The VM disk can fill up during large loads. The default limit marks the nodes unhealthy too early. -->
+  <property>
+    <name>yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage</name>
+    <value>98</value>
+  </property>
+  <!-- Task containers get the framework home, so the default application classpath resolves. -->
+  <property>
+    <name>yarn.nodemanager.env-whitelist</name>
+    <value>JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_HOME,PATH,LANG,TZ,HADOOP_MAPRED_HOME</value>
+  </property>
+
+  <!-- Log aggregation lets "yarn logs" read task logs from the tools container. -->
+  <property>
+    <name>yarn.log-aggregation-enable</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>yarn.log.server.url</name>
+    <value>http://localhost:${VH_JHS_WEB}/jobhistory/logs</value>
+  </property>
+</configuration>

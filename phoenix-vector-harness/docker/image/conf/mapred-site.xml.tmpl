@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  MapReduce settings. The node managers and the history server read this file.
+  The copy in the client directory decides the job settings, because the client submits the job.
+  Profiles cannot set these keys, because the harness passes only phoenix and hbase keys.
+-->
+<configuration>
+  <property>
+    <name>mapreduce.framework.name</name>
+    <value>yarn</value>
+  </property>
+
+  <!-- The framework home gives the default application classpath to the AM and the tasks. -->
+  <property>
+    <name>yarn.app.mapreduce.am.env</name>
+    <value>HADOOP_MAPRED_HOME=${VH_HADOOP_HOME}</value>
+  </property>
+  <property>
+    <name>mapreduce.map.env</name>
+    <value>HADOOP_MAPRED_HOME=${VH_HADOOP_HOME}</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.env</name>
+    <value>HADOOP_MAPRED_HOME=${VH_HADOOP_HOME}</value>
+  </property>
+
+  <!--
+    The containers are small, so they fit into the node manager memory.
+    Tasks run HBase and Phoenix code on JDK 17, so they get the module flags of the HBase launcher.
+    YARN itself opens only java.lang.
+  -->
+  <property>
+    <name>yarn.app.mapreduce.am.resource.mb</name>
+    <value>768</value>
+  </property>
+  <property>
+    <name>yarn.app.mapreduce.am.command-opts</name>
+    <value>-Xmx512m -Djava.net.preferIPv4Stack=true -Dorg.apache.hbase.thirdparty.io.netty.tryReflectionSetAccessible=true --add-modules jdk.unsupported --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/jdk.internal.ref=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/jdk.internal.util.random=ALL-UNNAMED --add-exports java.base/jdk.internal.misc=ALL-UNNAMED --add-exports java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-exports java.base/sun.net.dns=ALL-UNNAMED --add-exports java.base/sun.net.util=ALL-UNNAMED</value>
+  </property>
+  <property>
+    <name>mapreduce.map.memory.mb</name>
+    <value>1024</value>
+  </property>
+  <property>
+    <name>mapreduce.map.java.opts</name>
+    <value>-Xmx768m -Djava.net.preferIPv4Stack=true -Dorg.apache.hbase.thirdparty.io.netty.tryReflectionSetAccessible=true --add-modules jdk.unsupported --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/jdk.internal.ref=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/jdk.internal.util.random=ALL-UNNAMED --add-exports java.base/jdk.internal.misc=ALL-UNNAMED --add-exports java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-exports java.base/sun.net.dns=ALL-UNNAMED --add-exports java.base/sun.net.util=ALL-UNNAMED</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.memory.mb</name>
+    <value>1024</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.java.opts</name>
+    <value>-Xmx768m -Djava.net.preferIPv4Stack=true -Dorg.apache.hbase.thirdparty.io.netty.tryReflectionSetAccessible=true --add-modules jdk.unsupported --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/jdk.internal.ref=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/jdk.internal.util.random=ALL-UNNAMED --add-exports java.base/jdk.internal.misc=ALL-UNNAMED --add-exports java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-exports java.base/sun.net.dns=ALL-UNNAMED --add-exports java.base/sun.net.util=ALL-UNNAMED</value>
+  </property>
+  <!--
+    The tasks use the framework jars first. The jobs ship their own jackson jars.
+    If a task fails with NoSuchMethodError, set mapreduce.job.classloader to true.
+    The other choice is mapreduce.job.user.classpath.first set to true.
+    Use "yarn logs" to read the task logs.
+  -->
+
+  <!--
+    The shuffle service of each node manager reads its port from this file.
+    The MapReduce defaults load after yarn-site, so a value only in yarn-site has no effect.
+    Without this value, all node managers bind the same default port.
+  -->
+  <property>
+    <name>mapreduce.shuffle.port</name>
+    <value>${VH_NM_SHUFFLE}</value>
+  </property>
+
+  <!-- History server. Its directories are on HDFS under /mr-history, which the HDFS init step creates. -->
+  <property>
+    <name>mapreduce.jobhistory.address</name>
+    <value>localhost:${VH_JHS_RPC}</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.admin.address</name>
+    <value>localhost:${VH_JHS_ADMIN}</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.webapp.address</name>
+    <value>0.0.0.0:${VH_JHS_WEB}</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.webapp.https.address</name>
+    <value>0.0.0.0:${VH_JHS_WEB_HTTPS}</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.done-dir</name>
+    <value>/mr-history/done</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.intermediate-done-dir</name>
+    <value>/mr-history/tmp</value>
+  </property>
+</configuration>
