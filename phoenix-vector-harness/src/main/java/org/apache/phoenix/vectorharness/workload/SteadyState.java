@@ -298,8 +298,12 @@ public final class SteadyState {
           continue;
         }
         String key = q.layout().id() + "|" + q.condition().family() + "|" + q.k();
-        Measurement m = measurements.computeIfAbsent(key, x -> new Measurement(stage,
-          q.layout().id(), q.condition().family(), q.k(), sweep.label(), sweep.value()));
+        Measurement m = measurements.computeIfAbsent(key, x -> {
+          Measurement created = new Measurement(stage, q.layout().id(), q.condition().family(),
+            q.k(), sweep.label(), sweep.value());
+          created.coverage(rc.variant().coverage(q.layout(), q.condition().attribute()).id());
+          return created;
+        });
         m.record(r, null);
         window.recordNanos(r.latencyNanos());
         if (r.failed()) {

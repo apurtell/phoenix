@@ -22,12 +22,18 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import org.apache.phoenix.vectorharness.config.Metric;
+import org.apache.phoenix.vectorharness.config.Setting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Base class for published benchmark corpora, overlaying synthetic relational attributes onto
- * static vector datasets and providing mutation vectors from held out partitions or perturbations.
+ * static vector datasets. Inserts and moves take real, unseen vectors from a held-out partition.
+ * Local re-embeddings perturb the current vector of the row.
  */
 public abstract class PublishedCorpus implements Corpus {
+
+  private static final Logger LOG = LoggerFactory.getLogger(PublishedCorpus.class);
 
   /** Relative Gaussian noise scale for local vector perturbations. */
   static final double LOCAL_NOISE = 0.02;
@@ -56,6 +62,33 @@ public abstract class PublishedCorpus implements Corpus {
 
   /** Returns the count of available held out vectors. */
   protected abstract long heldOutCount();
+
+  /**
+   * Returns the count of rows to load from a published corpus. The count never exceeds the request,
+   * and it never includes the held-out tail.
+   * @param available the row count of the published corpus
+   * @param requested the configured row count; 0 or more than available requests all rows
+   * @param holdout   the row count of the tail that supplies new vectors
+   * @param source    the corpus location for log and error messages
+   * @throws IllegalArgumentException if the tail leaves no rows to load
+   */
+  static long loadedRows(long available, long requested, long holdout, Object source) {
+    long n = requested <= 0 || requested > available ? available : requested;
+    if (holdout <= 0) {
+      return n;
+    }
+    long limit = available - holdout;
+    if (limit <= 0) {
+      throw new IllegalArgumentException(Setting.CORPUS_HOLDOUT_ROWS.key() + "=" + holdout
+        + " holds out all " + available + " rows of " + source + ", so no rows remain to load");
+    }
+    if (n > limit) {
+      LOG.info("Loading {} of the {} rows of {}; the last {} rows supply the new vectors", limit,
+        available, source, holdout);
+      return limit;
+    }
+    return n;
+  }
 
   /** Returns the held-out vector at index {@code i}. */
   protected abstract float[] heldOutVector(long i);
@@ -158,17 +191,36 @@ public abstract class PublishedCorpus implements Corpus {
     return out;
   }
 
-  /** Generates mutation vectors by sampling held-out partitions or perturbing base vectors. */
+  /**
+   * Takes the vectors of inserts and moves from the held-out partition. The draw index of the
+   * operation selects the held-out row, so the row does not depend on thread timing. Distinct draw
+   * indexes give distinct rows, and no held-out row is a loaded row. A draw past the partition
+   * fails, and configuration validation prevents this case.
+   */
   private final class HeldOutMutations implements MutationVectors {
 
-    @Override
-    public Embedding insert(long ordinal, double minutes) {
-      SplitMix64 rnd = streams.at(RandomStreams.MUTATIONS, 1, ordinal);
-      long held = heldOutCount();
-      if (held > 0) {
-        return new Embedding(heldOutVector(Math.floorMod(ordinal - rows, held)), -1);
+    private float[] heldOut(long draw) {
+      if (draw < 0) {
+        throw new IllegalArgumentException(
+          "A new vector of " + description() + " needs a draw index, but the index is " + draw);
       }
-      return new Embedding(perturbed(vector(rnd.nextLong(rows)), rnd), -1);
+      long held = heldOutCount();
+      if (draw >= held) {
+        throw new IllegalStateException(
+          "Draw " + draw + " is past the " + held + " held-out rows of " + description()
+            + "; raise " + Setting.CORPUS_HOLDOUT_ROWS.key() + " or lower the mutation volume");
+      }
+      return heldOutVector(draw);
+    }
+
+    @Override
+    public boolean finite() {
+      return true;
+    }
+
+    @Override
+    public Embedding insert(long ordinal, long draw, double minutes) {
+      return new Embedding(heldOut(draw), -1);
     }
 
     @Override
@@ -178,13 +230,8 @@ public abstract class PublishedCorpus implements Corpus {
     }
 
     @Override
-    public Embedding move(long ordinal, int cluster, long seq, double minutes) {
-      SplitMix64 rnd = streams.at(RandomStreams.MUTATIONS, 3, seq);
-      long held = heldOutCount();
-      if (held > 0) {
-        return new Embedding(heldOutVector(rnd.nextLong(held)), -1);
-      }
-      return new Embedding(perturbed(vector(rnd.nextLong(rows)), rnd), -1);
+    public Embedding move(long ordinal, int cluster, long seq, long draw, double minutes) {
+      return new Embedding(heldOut(draw), -1);
     }
 
     @Override

@@ -125,6 +125,29 @@ public class TexmexCorpusTest {
     return open(dir, null, rows, 42L);
   }
 
+  private static TexmexCorpus openHeldOut(Path dir, long rows, long holdout) throws IOException {
+    RandomStreams streams = new RandomStreams(42L);
+    return TexmexCorpus.open(dir, null, rows, holdout, streams, attributes(streams));
+  }
+
+  /**
+   * Asserts that inserts and moves with the draw index fail, because it is past the held-out rows.
+   */
+  private static void assertHeldOutExhausted(MutationVectors m, long draw) {
+    try {
+      m.insert(Long.MAX_VALUE, draw, 0.0);
+      fail("an insert past the held-out rows must fail");
+    } catch (IllegalStateException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
+    }
+    try {
+      m.move(1, -1, 0, draw, 0.0);
+      fail("a move past the held-out rows must fail");
+    } catch (IllegalStateException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
+    }
+  }
+
   private static boolean contains(List<float[]> list, float[] v) {
     for (float[] x : list) {
       if (Arrays.equals(x, v)) {
@@ -331,22 +354,28 @@ public class TexmexCorpusTest {
     try (TexmexCorpus c = open(corpusDir("sift", true, true), 0)) {
       MutationVectors m = c.mutations();
       for (int j = 0; j < LEARN; j++) {
-        Embedding e = m.insert(BASE + j, 0.0);
+        Embedding e = m.insert(BASE + j, j, 0.0);
         assertEquals(-1, e.cluster());
         assertArrayEquals(learn.get(j), e.vector(), 0.0f);
       }
-      // Inserts exceeding learn partition size wrap modulo partition length
-      assertArrayEquals(learn.get(0), m.insert(BASE + LEARN, 0.0).vector(), 0.0f);
-      assertArrayEquals(learn.get(3), m.insert(BASE + 2 * LEARN + 3, 5.0).vector(), 0.0f);
+      assertHeldOutExhausted(m, LEARN);
+      assertEquals(0.25, m.moveProbability(0.25, 100.0), 0.0);
+    }
+    try (TexmexCorpus c = open(corpusDir("sift", true, true), 0)) {
+      MutationVectors m = c.mutations();
       Set<String> moved = new HashSet<>();
-      for (long seq = 0; seq < 100; seq++) {
-        Embedding e = m.move(1, -1, seq, 0.0);
+      for (long seq = 0; seq < LEARN; seq++) {
+        Embedding e = m.move(1, -1, seq, seq, 0.0);
         assertEquals(-1, e.cluster());
         assertTrue(contains(learn, e.vector()));
         moved.add(Arrays.toString(e.vector()));
       }
-      assertTrue(moved.size() > 10);
-      assertEquals(0.25, m.moveProbability(0.25, 100.0), 0.0);
+      assertEquals(LEARN, moved.size());
+    }
+    // The learn file supplies the new vectors, so the corpus loads all base rows.
+    try (TexmexCorpus c = openHeldOut(corpusDir("sift", true, true), 0, 50)) {
+      assertEquals(BASE, c.rows());
+      assertTrue(c.publishedNeighbors() != null);
     }
   }
 
@@ -355,36 +384,28 @@ public class TexmexCorpusTest {
     try (TexmexCorpus c = open(corpusDir("sift", false, false), 150)) {
       MutationVectors m = c.mutations();
       for (int j = 0; j < 50; j++) {
-        assertArrayEquals(base.get(150 + j), m.insert(150 + j, 0.0).vector(), 0.0f);
+        assertArrayEquals(base.get(150 + j), m.insert(150 + j, j, 0.0).vector(), 0.0f);
       }
-      assertArrayEquals(base.get(150), m.insert(200, 0.0).vector(), 0.0f);
-      for (long seq = 0; seq < 50; seq++) {
-        float[] v = m.move(3, -1, seq, 0.0).vector();
-        assertTrue(contains(base.subList(150, 200), v));
+      assertHeldOutExhausted(m, 50);
+    }
+    // Without a learn file, the tail of the base rows supplies the new vectors.
+    try (TexmexCorpus c = openHeldOut(corpusDir("sift", true, false), 0, 50)) {
+      assertEquals(BASE - 50, c.rows());
+      assertNull(c.publishedNeighbors());
+      MutationVectors m = c.mutations();
+      for (int j = 0; j < 50; j++) {
+        float[] v = m.move(3, -1, j, j, 0.0).vector();
+        assertArrayEquals(base.get(BASE - 50 + j), v, 0.0f);
+        assertFalse(contains(base.subList(0, BASE - 50), v));
       }
+      assertHeldOutExhausted(m, 50);
     }
   }
 
   @Test
-  public void testMutationsPerturbLoadedRowsWithoutHeldOutVectors() throws IOException {
+  public void testMutationsFailWithoutHeldOutVectors() throws IOException {
     try (TexmexCorpus c = open(corpusDir("sift", false, false), 0)) {
-      MutationVectors m = c.mutations();
-      for (long ordinal = BASE; ordinal < BASE + 50; ordinal++) {
-        float[] v = m.insert(ordinal, 0.0).vector();
-        assertEquals(DIM, v.length);
-        assertFalse(contains(base, v));
-        // Close to one loaded row: the noise is 2% of the RMS element, about 0.02 * 58 per
-        // element
-        double nearest = Double.MAX_VALUE;
-        for (float[] b : base) {
-          nearest = Math.min(nearest, Metric.L2.distance(v, b));
-        }
-        assertTrue("nearest " + nearest, nearest < 4 * 0.02 * 60 * Math.sqrt(DIM));
-        assertArrayEquals(v, m.insert(ordinal, 0.0).vector(), 0.0f);
-      }
-      float[] moved = m.move(1, -1, 7, 0.0).vector();
-      assertFalse(contains(base, moved));
-      assertArrayEquals(moved, m.move(1, -1, 7, 0.0).vector(), 0.0f);
+      assertHeldOutExhausted(c.mutations(), 0);
     }
   }
 
@@ -439,7 +460,7 @@ public class TexmexCorpusTest {
         }
       }
       assertEquals(4, c.panel(100).size());
-      assertEquals(bytes.get(12)[3], c.mutations().insert(42, 0.0).vector()[3], 0.0f);
+      assertEquals(bytes.get(10)[3], c.mutations().insert(42, 0, 0.0).vector()[3], 0.0f);
     }
   }
 

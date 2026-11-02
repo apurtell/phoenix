@@ -755,8 +755,8 @@ public class SyntheticCorpusTest {
     SyntheticCorpus b = spec().dim(32).build();
     Set<String> distinct = new HashSet<>();
     for (long i = 0; i < 200; i++) {
-      Embedding x = a.mutations().insert(2000 + i, 0.0);
-      Embedding y = b.mutations().insert(2000 + i, 0.0);
+      Embedding x = a.mutations().insert(2000 + i, -1, 0.0);
+      Embedding y = b.mutations().insert(2000 + i, -1, 0.0);
       assertArrayEquals(x.vector(), y.vector(), 0.0f);
       assertEquals(x.cluster(), y.cluster());
       assertEquals(32, x.vector().length);
@@ -765,8 +765,8 @@ public class SyntheticCorpusTest {
       distinct.add(Arrays.toString(x.vector()));
     }
     assertEquals(200, distinct.size());
-    assertEquals(1.0, norm(spec().normalize(true).build().mutations().insert(5000, 0.0).vector()),
-      1e-5);
+    assertEquals(1.0,
+      norm(spec().normalize(true).build().mutations().insert(5000, -1, 0.0).vector()), 1e-5);
   }
 
   @Test
@@ -883,11 +883,11 @@ public class SyntheticCorpusTest {
     for (int k = 0; k < 8; k++) {
       Set<Integer> targets = new HashSet<>();
       for (long seq = 0; seq < 100; seq++) {
-        Embedding e = m.move(1, k, seq, 0.0);
+        Embedding e = m.move(1, k, seq, -1, 0.0);
         assertNotEquals(k, e.cluster());
         assertTrue(e.cluster() >= 0 && e.cluster() < 8);
         assertEquals(e.cluster(), nearestCenter(c, e.vector(), 8));
-        Embedding again = spec().dim(32).zipf(2.0).build().mutations().move(1, k, seq, 0.0);
+        Embedding again = spec().dim(32).zipf(2.0).build().mutations().move(1, k, seq, -1, 0.0);
         assertEquals(e.cluster(), again.cluster());
         assertArrayEquals(e.vector(), again.vector(), 0.0f);
         targets.add(e.cluster());
@@ -896,7 +896,7 @@ public class SyntheticCorpusTest {
     }
     // With only one cluster, moved rows remain in the same cluster
     SyntheticCorpus one = spec().clusters(1).build();
-    assertEquals(0, one.mutations().move(1, 0, 3, 0.0).cluster());
+    assertEquals(0, one.mutations().move(1, 0, 3, -1, 0.0).cluster());
   }
 
   @Test
@@ -914,7 +914,7 @@ public class SyntheticCorpusTest {
     assertEquals(8, active.size());
     for (int from : active) {
       for (long seq = 0; seq < 300; seq++) {
-        Embedding e = c.mutations().move(1, from, seq, minutes);
+        Embedding e = c.mutations().move(1, from, seq, -1, minutes);
         assertNotEquals(from, e.cluster());
         assertTrue("moved from " + from + " into retired " + e.cluster(),
           active.contains(e.cluster()));
@@ -963,8 +963,8 @@ public class SyntheticCorpusTest {
     SyntheticCorpus c = spec().dim(32).drift(DriftMode.MIGRATE, rate).build();
     double expectedShift = rate * 10.0 * SyntheticCorpus.TIGHTEST_RADIUS * Math.sqrt(32);
     for (long ordinal = 2000; ordinal < 2050; ordinal++) {
-      Embedding before = c.mutations().insert(ordinal, 0.0);
-      Embedding after = c.mutations().insert(ordinal, 10.0);
+      Embedding before = c.mutations().insert(ordinal, -1, 0.0);
+      Embedding after = c.mutations().insert(ordinal, -1, 10.0);
       assertEquals(before.cluster(), after.cluster());
       float[] dir = c.component(after.cluster()).driftDir;
       assertEquals(1.0, norm(dir), 1e-5);
@@ -977,8 +977,8 @@ public class SyntheticCorpusTest {
     // Zero drift rate implies time-invariant distributions
     SyntheticCorpus still = spec().dim(32).build();
     assertNull(still.component(0).driftDir);
-    assertArrayEquals(still.mutations().insert(2000, 0.0).vector(),
-      still.mutations().insert(2000, 10.0).vector(), 0.0f);
+    assertArrayEquals(still.mutations().insert(2000, -1, 0.0).vector(),
+      still.mutations().insert(2000, -1, 10.0).vector(), 0.0f);
   }
 
   @Test
@@ -1052,13 +1052,13 @@ public class SyntheticCorpusTest {
     }
     // After full turnover, all inserts draw from newly spawned components
     for (long ordinal = 2000; ordinal < 2200; ordinal++) {
-      Embedding e = c.mutations().insert(ordinal, 20.0);
+      Embedding e = c.mutations().insert(ordinal, -1, 20.0);
       assertTrue(e.cluster() >= 8 && e.cluster() < 16);
       assertEquals(e.cluster(), nearestCenter(c, e.vector(), 16));
     }
     // Prior to turnover, no inserts draw from spawned components
     for (long ordinal = 2000; ordinal < 2200; ordinal++) {
-      assertTrue(c.mutations().insert(ordinal, 0.0).cluster() < 8);
+      assertTrue(c.mutations().insert(ordinal, -1, 0.0).cluster() < 8);
     }
     // Moves at half turnover select only from active, non-retired component slots
     Set<Integer> retired = new HashSet<>();
@@ -1074,7 +1074,7 @@ public class SyntheticCorpusTest {
     }
     assertEquals(4, retired.size());
     for (long seq = 0; seq < 200; seq++) {
-      Embedding e = c.mutations().move(1, 0, seq, 10.0);
+      Embedding e = c.mutations().move(1, 0, seq, -1, 10.0);
       assertFalse(retired.contains(e.cluster()));
       assertNotEquals(0, e.cluster());
     }

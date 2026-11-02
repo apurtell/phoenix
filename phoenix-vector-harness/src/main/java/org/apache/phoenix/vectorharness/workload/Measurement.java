@@ -57,6 +57,7 @@ public final class Measurement {
   private volatile PlanClass planClass;
   private volatile PlanClass expected;
   private volatile String lastError;
+  private volatile String coverage;
 
   public Measurement(String stage, String layout, String family, int k, String sweep,
     int sweepValue) {
@@ -93,6 +94,15 @@ public final class Measurement {
     this.plan = text;
     this.planClass = actual;
     this.expected = expectedClass;
+  }
+
+  /** Records how the index serves the filter of this group, for example covered or uncovered. */
+  public void coverage(String id) {
+    this.coverage = id;
+  }
+
+  public String coverage() {
+    return coverage;
   }
 
   public void probeRowsRead(double rows) {
@@ -178,6 +188,7 @@ public final class Measurement {
     m.put("stage", stage);
     m.put("layout", layout);
     m.put("family", family);
+    m.put("coverage", coverage);
     m.put("k", k);
     m.put("sweep", sweep);
     m.put("sweep_value", sweepValue);
@@ -221,12 +232,12 @@ public final class Measurement {
 
   /** Column headers for frontier CSV exports. */
   public static String[] csvColumns() {
-    return new String[] { "stage", "layout", "family", "k", "sweep", "sweep_value", "queries",
-      "errors", "p50_ms", "p95_ms", "p99_ms", "p999_ms", "mean_ms", "throughput_qps", "recall",
-      "recall_low", "recall_high", "precision", "completeness", "recall1_at_k", "mrr", "ndcg",
-      "distance_ratio", "range_precision", "range_recall", "read_amplification", "rpc_fan_out",
-      "rpcs_per_query", "rows_scanned", "hnsw_probe_rows_read", "plan_class", "expected_plan",
-      "plan_discrepancy" };
+    return new String[] { "stage", "layout", "family", "coverage", "k", "sweep", "sweep_value",
+      "queries", "errors", "p50_ms", "p95_ms", "p99_ms", "p999_ms", "mean_ms", "throughput_qps",
+      "recall", "recall_low", "recall_high", "precision", "completeness", "recall1_at_k", "mrr",
+      "ndcg", "distance_ratio", "range_precision", "range_recall", "read_amplification",
+      "rpc_fan_out", "rpcs_per_query", "rows_scanned", "hnsw_probe_rows_read", "plan_class",
+      "expected_plan", "plan_discrepancy" };
   }
 
   /** Formats a summary map as a frontier CSV row. */
@@ -234,16 +245,17 @@ public final class Measurement {
   public static Object[] csvRow(Map<String, Object> s) {
     Map<String, Object> lat = (Map<String, Object>) s.get("latency");
     Map<String, Object> acc = (Map<String, Object>) s.get("accuracy");
-    return new Object[] { s.get("stage"), s.get("layout"), s.get("family"), s.get("k"),
-      s.get("sweep"), s.get("sweep_value"), s.get("queries"), s.get("errors"), lat.get("p50_ms"),
-      lat.get("p95_ms"), lat.get("p99_ms"), lat.get("p999_ms"), lat.get("mean_ms"),
-      s.get("throughput_qps"), est(acc, "recall", "mean"), est(acc, "recall", "low"),
-      est(acc, "recall", "high"), est(acc, "precision", "mean"), est(acc, "completeness", "mean"),
-      est(acc, "recall1_at_k", "mean"), est(acc, "mrr", "mean"), est(acc, "ndcg", "mean"),
-      est(acc, "distance_ratio", "mean"), est(acc, "range_precision", "mean"),
-      est(acc, "range_recall", "mean"), s.get("read_amplification"), s.get("rpc_fan_out"),
-      s.get("rpcs_per_query"), s.get("rows_scanned"), s.get("hnsw_probe_rows_read"),
-      s.get("plan_class"), s.get("expected_plan"), s.get("plan_discrepancy") };
+    return new Object[] { s.get("stage"), s.get("layout"), s.get("family"), s.get("coverage"),
+      s.get("k"), s.get("sweep"), s.get("sweep_value"), s.get("queries"), s.get("errors"),
+      lat.get("p50_ms"), lat.get("p95_ms"), lat.get("p99_ms"), lat.get("p999_ms"),
+      lat.get("mean_ms"), s.get("throughput_qps"), est(acc, "recall", "mean"),
+      est(acc, "recall", "low"), est(acc, "recall", "high"), est(acc, "precision", "mean"),
+      est(acc, "completeness", "mean"), est(acc, "recall1_at_k", "mean"), est(acc, "mrr", "mean"),
+      est(acc, "ndcg", "mean"), est(acc, "distance_ratio", "mean"),
+      est(acc, "range_precision", "mean"), est(acc, "range_recall", "mean"),
+      s.get("read_amplification"), s.get("rpc_fan_out"), s.get("rpcs_per_query"),
+      s.get("rows_scanned"), s.get("hnsw_probe_rows_read"), s.get("plan_class"),
+      s.get("expected_plan"), s.get("plan_discrepancy") };
   }
 
   @SuppressWarnings("unchecked")

@@ -20,6 +20,7 @@ package org.apache.phoenix.vectorharness.corpus;
 import java.io.IOException;
 import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.config.Metric;
+import org.apache.phoenix.vectorharness.config.Setting;
 
 /** Factory for instantiating corpus implementations from profile configuration. */
 public final class CorpusFactory {
@@ -44,13 +45,31 @@ public final class CorpusFactory {
           config.driftMode(), config.driftRate(), metric, attributes);
       }
       case TEXMEX:
-        return TexmexCorpus.open(config.corpusPath(), config.corpusName(), config.rows(), streams,
-          attributes);
+        return checkHeldOut(config, TexmexCorpus.open(config.corpusPath(), config.corpusName(),
+          config.rows(), config.holdoutRows(), streams, attributes));
       case HDF5:
-        return Hdf5Corpus.open(config.corpusPath(), config.rows(), streams, attributes);
+        return checkHeldOut(config, Hdf5Corpus.open(config.corpusPath(), config.rows(),
+          config.holdoutRows(), streams, attributes));
       default:
         throw new IllegalArgumentException("Unknown corpus source " + config.corpusSource());
     }
+  }
+
+  /**
+   * Fails when the held-out rows of a published corpus cannot supply the planned new vectors. The
+   * check runs before any table changes, so the run stops early with a clear message.
+   */
+  static PublishedCorpus checkHeldOut(HarnessConfig config, PublishedCorpus corpus) {
+    long planned = config.plannedNewVectors();
+    long held = corpus.heldOutCount();
+    if (held < planned) {
+      String message = corpus.description() + " holds out " + held
+        + " rows, but the steady state can draw " + planned + " new vectors; raise "
+        + Setting.CORPUS_HOLDOUT_ROWS.key() + " or lower corpus.rows";
+      corpus.close();
+      throw new IllegalArgumentException(message);
+    }
+    return corpus;
   }
 
   /** Resolves the effective distance metric between profile settings and corpus defaults. */

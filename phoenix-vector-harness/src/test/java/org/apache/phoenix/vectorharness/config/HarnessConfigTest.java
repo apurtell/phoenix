@@ -258,6 +258,7 @@ public class HarnessConfigTest {
     m.put("corpusPath", c.corpusPath());
     m.put("corpusName", c.corpusName());
     m.put("rows", c.rows());
+    m.put("holdoutRows", c.holdoutRows());
     m.put("dim", c.dim());
     m.put("clusters", c.clusters());
     m.put("clusterZipf", c.clusterZipf());
@@ -929,5 +930,76 @@ public class HarnessConfigTest {
       assertTrue(e.getMessage().contains("sideways"));
       assertTrue(e.getMessage().contains("birth_death"));
     }
+  }
+
+  // Held-out tail of published corpora
+
+  private static HarnessConfig published(String... kv) {
+    List<String> all = new ArrayList<>(
+      Arrays.asList("corpus.source", "hdf5", "corpus.path", "/data/x.hdf5", "steady_state.warmup",
+        "1m", "steady_state.duration", "10m", "query.rate.values", "50,100,200"));
+    all.addAll(Arrays.asList(kv));
+    return config(all.toArray(new String[0]));
+  }
+
+  @Test
+  public void testHoldoutIsZeroWhenTheRunWritesNoNewVectors() {
+    assertEquals(0L, published().holdoutRows());
+    assertEquals(0L, published().plannedNewVectors());
+    // Attribute updates and local re-embeddings reuse the row, so they need no new vector.
+    HarnessConfig updates = published("mutation.rate.per_sec", "100", "mutation.mix", "0,1,0",
+      "mutation.update.move_fraction", "0");
+    assertEquals(0L, updates.plannedNewVectors());
+    assertEquals(0L, updates.holdoutRows());
+    assertTrue(updates.validate().isEmpty());
+  }
+
+  @Test
+  public void testAutoHoldoutCoversThePlannedVolume() {
+    HarnessConfig c = published("mutation.rate.per_sec", "100");
+    // Three windows of 660 seconds at 100 operations per second, with 30% inserts.
+    long planned = c.plannedNewVectors();
+    double mean = 0.3 * 66_001;
+    long window = (long) Math.ceil(mean + 5 * Math.sqrt(mean * 0.7));
+    assertEquals(3 * window, planned);
+    assertEquals(70_000L, c.holdoutRows());
+    assertTrue(c.validate().isEmpty());
+    // Moves also take new vectors: half of the updates that do not change attributes.
+    HarnessConfig moves = published("mutation.rate.per_sec", "100", "mutation.mix", "0,1,0",
+      "mutation.update.attribute_fraction", "0", "mutation.update.move_fraction", "0.5");
+    assertTrue(moves.plannedNewVectors() > 3 * 33_000);
+    assertTrue(moves.plannedNewVectors() < 3 * 34_000);
+    // A small volume still holds out one full step.
+    HarnessConfig small = published("mutation.rate.per_sec", "1", "steady_state.duration", "1m",
+      "query.rate.values", "10");
+    assertTrue(small.plannedNewVectors() > 0);
+    assertEquals(HarnessConfig.HOLDOUT_STEP, small.holdoutRows());
+  }
+
+  @Test
+  public void testExplicitHoldoutMustCoverThePlannedVolume() {
+    HarnessConfig enough =
+      published("mutation.rate.per_sec", "100", "corpus.holdout.rows", "100000");
+    assertEquals(100_000L, enough.holdoutRows());
+    assertTrue(enough.validate().isEmpty());
+    HarnessConfig tooSmall =
+      published("mutation.rate.per_sec", "100", "corpus.holdout.rows", "1000");
+    List<String> problems = tooSmall.validate();
+    assertEquals(problems.toString(), 1, problems.size());
+    assertTrue(problems.get(0), problems.get(0).startsWith("corpus.holdout.rows=1000 is smaller"));
+    // A synthetic corpus generates new vectors, so the tail does not apply.
+    assertTrue(
+      config("mutation.rate.per_sec", "100", "corpus.holdout.rows", "0").validate().isEmpty());
+    // An explicit tail also applies to a read-only run.
+    assertEquals(5L, published("corpus.holdout.rows", "5").holdoutRows());
+  }
+
+  @Test
+  public void testInvalidHoldoutFailsValidation() {
+    assertTrue(published("corpus.holdout.rows", "-1").validate().toString()
+      .contains("corpus.holdout.rows: must not be negative"));
+    assertTrue(published("corpus.holdout.rows", "many").validate().toString()
+      .contains("corpus.holdout.rows: not an integer"));
+    assertEquals(0L, published("corpus.holdout.rows", "AUTO").holdoutRows());
   }
 }

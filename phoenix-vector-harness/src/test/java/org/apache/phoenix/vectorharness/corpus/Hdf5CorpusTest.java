@@ -35,9 +35,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.config.Metric;
 import org.junit.Rule;
 import org.junit.Test;
@@ -114,6 +116,23 @@ public class Hdf5CorpusTest {
     return Hdf5Corpus.open(p, rows, streams, attributes(streams));
   }
 
+  private static Hdf5Corpus openHeldOut(Path p, long rows, long holdout) throws IOException {
+    RandomStreams streams = new RandomStreams(42L);
+    return Hdf5Corpus.open(p, rows, holdout, streams, attributes(streams));
+  }
+
+  /**
+   * Asserts that an insert with the draw index fails, because the index is past the held-out rows.
+   */
+  private static void assertHeldOutExhausted(MutationVectors m, long draw) {
+    try {
+      m.insert(Long.MAX_VALUE, draw, 0.0);
+      fail("an insert past the held-out rows must fail");
+    } catch (IllegalStateException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
+    }
+  }
+
   private static Hdf5Corpus openBlocks(Path p, long rows, long seed) throws IOException {
     RandomStreams streams = new RandomStreams(seed);
     return Hdf5Corpus.open(p, rows, streams, attributes(streams), false);
@@ -133,7 +152,7 @@ public class Hdf5CorpusTest {
     try (Hdf5Corpus c = open(p, 0, 42L)) {
       assertSame(Metric.COSINE, c.definedMetric());
       assertEquals("hdf5:glove-6-angular", c.sourceName());
-      assertEquals("hdf5:glove-6-angular rows=120 dim=6 queries=9 distance=angular",
+      assertEquals("hdf5:glove-6-angular rows=120 held_out=0 dim=6 queries=9 distance=angular",
         c.description());
       assertEquals(DIM, c.dim());
       assertEquals(120L, c.rows());
@@ -283,21 +302,101 @@ public class Hdf5CorpusTest {
       assertEquals("120", c.parameters().get("train.count"));
       MutationVectors m = c.mutations();
       for (int j = 0; j < 20; j++) {
-        Embedding e = m.insert(100 + j, 0.0);
+        Embedding e = m.insert(100 + j, j, 0.0);
         assertEquals(-1, e.cluster());
         assertArrayEquals(train[100 + j], e.vector(), 0.0f);
       }
-      assertArrayEquals(train[100], m.insert(120, 0.0).vector(), 0.0f);
-      for (long seq = 0; seq < 20; seq++) {
-        float[] v = m.move(1, -1, seq, 0.0).vector();
-        boolean found = false;
-        for (int j = 100; j < 120; j++) {
-          found |= Arrays.equals(train[j], v);
-        }
-        assertTrue(found);
+      assertHeldOutExhausted(m, 20);
+    }
+    try (Hdf5Corpus c = open(p, 100, 42L)) {
+      MutationVectors m = c.mutations();
+      // Inserts and moves share the held-out rows, and the draw index selects the row.
+      for (int j = 0; j < 20; j++) {
+        float[] v =
+          j % 2 == 0 ? m.move(1, -1, j, j, 0.0).vector() : m.insert(100 + j, j, 0.0).vector();
+        assertArrayEquals(train[100 + j], v, 0.0f);
       }
+      assertHeldOutExhausted(m, 20);
     }
     try (Hdf5Corpus c = open(p, 500, 42L)) {
+      assertEquals(120L, c.rows());
+      assertTrue(c.publishedNeighbors() != null);
+    }
+  }
+
+  @Test
+  public void testHoldoutTailIsNotLoaded() throws IOException {
+    Path p = standard("euclidean");
+    try (Hdf5Corpus c = openHeldOut(p, 0, 30)) {
+      assertEquals(90L, c.rows());
+      assertEquals(30L, c.heldOutCount());
+      assertNull(c.publishedNeighbors());
+      assertEquals("90", c.parameters().get("rows"));
+      assertTrue(c.description(), c.description().contains("held_out=30"));
+      MutationVectors m = c.mutations();
+      for (int j = 0; j < 30; j++) {
+        float[] v = m.insert(90 + j, j, 0.0).vector();
+        assertArrayEquals(train[90 + j], v, 0.0f);
+        for (long i = 0; i < c.rows(); i++) {
+          assertFalse(Arrays.equals(c.vector(i), v));
+        }
+      }
+      assertHeldOutExhausted(m, 30);
+    }
+    // The tail limits a larger request, and a smaller request keeps its prefix.
+    try (Hdf5Corpus c = openHeldOut(p, 100, 30)) {
+      assertEquals(90L, c.rows());
+    }
+    try (Hdf5Corpus c = openHeldOut(p, 50, 30)) {
+      assertEquals(50L, c.rows());
+      assertEquals(70L, c.heldOutCount());
+    }
+    // Without a tail, a read-only run loads all rows and keeps the published truth.
+    try (Hdf5Corpus c = openHeldOut(p, 0, 0)) {
+      assertEquals(120L, c.rows());
+      assertTrue(c.publishedNeighbors() != null);
+      assertHeldOutExhausted(c.mutations(), 0);
+    }
+    try (Hdf5Corpus c = openHeldOut(p, 0, 120)) {
+      fail("a tail of all rows leaves nothing to load, but loaded " + c.rows());
+    } catch (IllegalArgumentException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
+    }
+  }
+
+  @Test
+  public void testFactoryHoldsOutTheConfiguredTail() throws IOException {
+    Path p = standard("euclidean");
+    Properties props = new Properties();
+    props.setProperty("corpus.source", "hdf5");
+    props.setProperty("corpus.path", p.toString());
+    props.setProperty("corpus.rows", "0");
+    props.setProperty("mutation.rate.per_sec", "0.1");
+    props.setProperty("steady_state.warmup", "1m");
+    props.setProperty("steady_state.duration", "1m");
+    props.setProperty("corpus.holdout.rows", "20");
+    HarnessConfig config = HarnessConfig.of("t", props);
+    assertEquals(13L, config.plannedNewVectors());
+    try (Corpus c = CorpusFactory.open(config)) {
+      assertEquals(100L, c.rows());
+      assertNull(c.publishedNeighbors());
+    }
+    props.setProperty("corpus.holdout.rows", "10");
+    try (Corpus c = CorpusFactory.open(HarnessConfig.of("t", props))) {
+      fail("a tail below the planned volume must fail, but loaded " + c.rows());
+    } catch (IllegalArgumentException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("holds out 10 rows"));
+    }
+    // The automatic tail of 10,000 rows is larger than the whole file.
+    props.setProperty("corpus.holdout.rows", "auto");
+    try (Corpus c = CorpusFactory.open(HarnessConfig.of("t", props))) {
+      fail("a tail of all rows must fail, but loaded " + c.rows());
+    } catch (IllegalArgumentException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("no rows remain"));
+    }
+    // A read-only run loads all rows and keeps the published truth.
+    props.setProperty("mutation.rate.per_sec", "0");
+    try (Corpus c = CorpusFactory.open(HarnessConfig.of("t", props))) {
       assertEquals(120L, c.rows());
       assertTrue(c.publishedNeighbors() != null);
     }
@@ -308,9 +407,8 @@ public class Hdf5CorpusTest {
     Path p = standard("angular");
     try (Hdf5Corpus c = open(p, 0, 42L)) {
       MutationVectors m = c.mutations();
-      for (long ordinal = 120; ordinal < 140; ordinal++) {
-        assertEquals(1.0, norm(m.insert(ordinal, 0.0).vector()), 1e-5);
-      }
+      // Without held-out rows, inserts fail; they never make perturbed copies of loaded rows.
+      assertHeldOutExhausted(m, 0);
       float[] local = m.reembedLocal(3, -1, c.vector(3), 9, 0.0).vector();
       assertEquals(1.0, norm(local), 1e-5);
       assertTrue(Metric.COSINE.distance(local, c.vector(3)) < 0.05);
@@ -432,9 +530,11 @@ public class Hdf5CorpusTest {
           assertArrayEquals(train[(int) i], m.vector(i), 0.0f);
           assertArrayEquals(b.vector(i), m.vector(i), 0.0f);
         }
-        for (long ordinal = m.rows(); ordinal < m.rows() + 30; ordinal++) {
-          assertArrayEquals(b.mutations().insert(ordinal, 0.0).vector(),
-            m.mutations().insert(ordinal, 0.0).vector(), 0.0f);
+        assertEquals(b.heldOutCount(), m.heldOutCount());
+        for (long ordinal = m.rows(); ordinal < m.rows() + m.heldOutCount(); ordinal++) {
+          long draw = ordinal - m.rows();
+          assertArrayEquals(b.mutations().insert(ordinal, draw, 0.0).vector(),
+            m.mutations().insert(ordinal, draw, 0.0).vector(), 0.0f);
         }
       }
     }

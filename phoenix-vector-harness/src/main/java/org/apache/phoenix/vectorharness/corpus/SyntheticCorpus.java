@@ -561,7 +561,7 @@ public final class SyntheticCorpus implements Corpus {
     private static final long MOVE = 3;
 
     @Override
-    public Embedding insert(long ordinal, double minutes) {
+    public Embedding insert(long ordinal, long draw, double minutes) {
       SplitMix64 rnd = streams.at(RandomStreams.MUTATIONS, INSERT, ordinal);
       int c = sampleActive(rnd, minutes);
       return new Embedding(component(c).point(rnd, minutes), c);
@@ -582,7 +582,7 @@ public final class SyntheticCorpus implements Corpus {
     }
 
     @Override
-    public Embedding move(long ordinal, int cluster, long seq, double minutes) {
+    public Embedding move(long ordinal, int cluster, long seq, long draw, double minutes) {
       SplitMix64 rnd = streams.at(RandomStreams.MUTATIONS, MOVE, seq);
       int c = sampleActive(rnd, minutes);
       for (int attempt = 0; c == cluster && attempt < 16; attempt++) {

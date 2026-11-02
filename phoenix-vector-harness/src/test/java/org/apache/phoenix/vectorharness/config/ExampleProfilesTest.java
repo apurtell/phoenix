@@ -100,6 +100,27 @@ public class ExampleProfilesTest {
   }
 
   @Test
+  public void testSiftProfilesHoldOutATailForNewVectors() throws Exception {
+    for (String profile : new String[] { "sift1m-hnsw-sq8", "sift1m-ivf" }) {
+      Path path = Paths.get("profiles", profile + ".properties");
+      HarnessConfig c = HarnessConfig.load(path, new Properties());
+      assertEquals(100_000L, c.holdoutRows());
+      assertTrue(profile, c.plannedNewVectors() > 0);
+      assertTrue(profile, c.plannedNewVectors() <= c.holdoutRows());
+      // The shorter steady state of the perf suite keeps the same tail and the same corpus.
+      Properties shorter = new Properties();
+      shorter.setProperty("steady_state.duration", "5m");
+      HarnessConfig p1 = HarnessConfig.load(path, shorter);
+      assertEquals(c.holdoutRows(), p1.holdoutRows());
+      assertTrue(profile, p1.plannedNewVectors() < c.plannedNewVectors());
+      assertTrue(p1.validate().isEmpty());
+    }
+    HarnessConfig glove =
+      HarnessConfig.load(Paths.get("profiles", "glove100-hnsw.properties"), new Properties());
+    assertEquals(0L, glove.holdoutRows());
+  }
+
+  @Test
   public void testComparableSiftProfiles() throws Exception {
     HarnessConfig hnsw =
       HarnessConfig.load(Paths.get("profiles", "sift1m-hnsw-sq8.properties"), new Properties());

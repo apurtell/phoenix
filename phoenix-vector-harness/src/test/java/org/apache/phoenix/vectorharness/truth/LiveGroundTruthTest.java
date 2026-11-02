@@ -165,7 +165,7 @@ public class LiveGroundTruthTest {
 
     void insert() {
       long o = live.allocateOrdinal();
-      Embedding e = corpus.mutations().insert(o, 0.0);
+      Embedding e = corpus.mutations().insert(o, -1, 0.0);
       commit(o, e.vector(), corpus.attributes(o), e.cluster());
     }
 
@@ -214,7 +214,7 @@ public class LiveGroundTruthTest {
 
     void move(long o) {
       LiveCorpus.RowState s = live.get(o);
-      Embedding e = corpus.mutations().move(o, s.cluster(), ++seq, 0.0);
+      Embedding e = corpus.mutations().move(o, s.cluster(), ++seq, -1, 0.0);
       commit(o, e.vector(), s.attributes(), e.cluster());
     }
 

@@ -28,6 +28,7 @@ import org.apache.phoenix.vectorharness.config.QueryShape;
 import org.apache.phoenix.vectorharness.config.TableLayout;
 import org.apache.phoenix.vectorharness.observe.PlanClass;
 import org.apache.phoenix.vectorharness.result.EventLog;
+import org.apache.phoenix.vectorharness.truth.QueryCondition;
 import org.apache.phoenix.vectorharness.workload.Schema;
 
 /**
@@ -81,5 +82,12 @@ public final class ExactVariant implements IndexVariant {
   @Override
   public PlanClass expectedPlan(QueryShape shape, boolean multiTenant) {
     return PlanClass.EXACT;
+  }
+
+  @Override
+  public FilterCoverage coverage(TableLayout layout, QueryCondition.Attribute attribute) {
+    return attribute == QueryCondition.Attribute.NONE
+      ? FilterCoverage.NONE
+      : FilterCoverage.NO_INDEX;
   }
 }

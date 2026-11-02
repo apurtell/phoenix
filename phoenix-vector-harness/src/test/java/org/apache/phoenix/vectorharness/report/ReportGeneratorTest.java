@@ -22,6 +22,8 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -105,6 +107,55 @@ public class ReportGeneratorTest {
       .comparability(
         Arrays.asList(run("x", "false", null, false), run("y", "false", 400000L, false)))
       .isEmpty());
+  }
+
+  /** Writes a run whose frontier.csv holds the given lines after the header. */
+  private RunResult frontierRun(String id, String header, String... lines) throws IOException {
+    Map<String, Object> m = new LinkedHashMap<>();
+    Map<String, Object> run = new LinkedHashMap<>();
+    run.put("id", id);
+    run.put("variant", id);
+    m.put("run", run);
+    Path dir = tmp.getRoot().toPath().resolve(id);
+    Json.write(dir.resolve("manifest.json"), m);
+    StringBuilder csv = new StringBuilder(header).append('\n');
+    for (String l : lines) {
+      csv.append(l).append('\n');
+    }
+    Files.write(dir.resolve("frontier.csv"), csv.toString().getBytes(StandardCharsets.UTF_8));
+    return RunResult.read(dir);
+  }
+
+  @Test
+  public void testCoverageTagShowsTheRealCoverageOfEachRun() throws IOException {
+    String header = "stage,layout,family,coverage,k,sweep,recall,p50_ms,p99_ms";
+    RunResult ivf =
+      frontierRun("ivf", header, "frontier,corpus,covered_filter@0.1,covered,10,probes=1,0.95,1,2",
+        "frontier,profile,covered_filter@0.1,uncovered,10,probes=1,0.95,1,2",
+        "frontier,corpus,unfiltered,none,10,probes=1,0.95,1,2");
+    RunResult hnsw =
+      frontierRun("hnsw", header, "frontier,corpus,covered_filter@0.1,local,10,ef=16,0.95,1,2",
+        "frontier,profile,covered_filter@0.1,local,10,ef=16,0.95,1,2");
+    RunResult legacy = frontierRun("legacy", "stage,layout,family,k,sweep,recall,p50_ms,p99_ms",
+      "frontier,profile,covered_filter@0.1,10,probes=1,0.95,1,2");
+    List<RunResult> one = Arrays.asList(ivf);
+    assertEquals(" [uncovered]",
+      ReportGenerator.coverageTag(one, "profile covered_filter@0.1 k=10"));
+    assertEquals(" [covered]", ReportGenerator.coverageTag(one, "corpus covered_filter@0.1 k=10"));
+    assertEquals("", ReportGenerator.coverageTag(one, "corpus unfiltered k=10"));
+    assertEquals(" [ivf:uncovered, hnsw:local]",
+      ReportGenerator.coverageTag(Arrays.asList(ivf, hnsw), "profile covered_filter@0.1 k=10"));
+    assertEquals(" [local]",
+      ReportGenerator.coverageTag(Arrays.asList(hnsw), "corpus covered_filter@0.1 k=10"));
+    assertEquals("",
+      ReportGenerator.coverageTag(Arrays.asList(legacy), "profile covered_filter@0.1 k=10"));
+    // The group key stays the same, so the runs still match by group.
+    assertEquals(ReportGenerator.groups(Arrays.asList(ivf)).subList(0, 2),
+      ReportGenerator.groups(Arrays.asList(hnsw)));
+    String report = new ReportGenerator().summary(ivf);
+    assertTrue(report, report.contains("profile covered_filter@0.1 k=10 [uncovered]"));
+    assertTrue(report, report.contains("corpus covered_filter@0.1 k=10 [covered]"));
+    assertFalse(report, report.contains("corpus unfiltered k=10 ["));
   }
 
   @Test

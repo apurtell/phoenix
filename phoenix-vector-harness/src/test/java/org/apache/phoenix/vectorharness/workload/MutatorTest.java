@@ -17,27 +17,53 @@
  */
 package org.apache.phoenix.vectorharness.workload;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.lang.reflect.Proxy;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.corpus.Corpus;
 import org.apache.phoenix.vectorharness.corpus.CorpusFactory;
+import org.apache.phoenix.vectorharness.corpus.SplitMix64;
+import org.apache.phoenix.vectorharness.corpus.VecsFile;
 import org.apache.phoenix.vectorharness.truth.LiveCorpus;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 public class MutatorTest {
+
+  /** Rows of the published test corpus. The last {@link #HELD_OUT} rows supply new vectors. */
+  private static final int BASE = 400;
+  private static final int HELD_OUT = 150;
+  private static final long WINDOW_NANOS = 60_000_000_000L;
+  /** Throttle slots of one window at one operation per second. */
+  private static final int SLOTS = 61;
+
+  @Rule
+  public TemporaryFolder tmp = new TemporaryFolder();
 
   private final AtomicBoolean failCommit = new AtomicBoolean();
   private final AtomicBoolean failStatement = new AtomicBoolean();
@@ -48,6 +74,7 @@ public class MutatorTest {
   private Corpus corpus;
   private LiveCorpus live;
   private RowWriter writer;
+  private List<float[]> base;
 
   /** Mock Connection proxy that can simulate statement or commit failures. */
   private Connection connection() {
@@ -200,6 +227,167 @@ public class MutatorTest {
     other.beginWindow(60_000_000_000L);
     for (long seq = 0; seq < 200; seq++) {
       assertEquals(m.choose(seq), other.choose(seq));
+    }
+  }
+
+  /** Writes a small texmex corpus and returns a configuration with two steady windows. */
+  private HarnessConfig published() throws Exception {
+    Path dir = tmp.newFolder().toPath();
+    base = new ArrayList<>();
+    SplitMix64 rnd = new SplitMix64(9L);
+    for (int i = 0; i < BASE; i++) {
+      float[] v = new float[4];
+      for (int j = 0; j < v.length; j++) {
+        v[j] = (float) rnd.nextGaussian();
+      }
+      base.add(v);
+    }
+    VecsFile.writeFvecs(dir.resolve("sift_base.fvecs"), base);
+    VecsFile.writeFvecs(dir.resolve("sift_query.fvecs"), base.subList(0, 5));
+    Properties p = new Properties();
+    p.setProperty("corpus.source", "texmex");
+    p.setProperty("corpus.path", dir.toString());
+    p.setProperty("corpus.rows", Integer.toString(BASE));
+    p.setProperty("corpus.holdout.rows", Integer.toString(HELD_OUT));
+    p.setProperty("mutation.rate.per_sec", "1");
+    p.setProperty("mutation.update.move_fraction", "0.5");
+    p.setProperty("steady_state.warmup", "30s");
+    p.setProperty("steady_state.duration", "30s");
+    p.setProperty("query.rate.values", "10,20");
+    HarnessConfig c = HarnessConfig.of("t", p);
+    assertTrue(c.validate().toString(), c.validate().isEmpty());
+    return c;
+  }
+
+  /**
+   * Runs the operations of both windows with two threads in a shuffled order and records the draw
+   * index of each (window, seq). A real run applies the operations in the order of thread timing.
+   */
+  private static Map<String, Long> draws(HarnessConfig c, Corpus published, long shuffleSeed)
+    throws InterruptedException {
+    Mutator m = new Mutator(c, published, new LiveCorpus(published, published.rows()), null,
+      new WriteGate(), null);
+    Map<String, Long> draws = new ConcurrentHashMap<>();
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    Random shuffle = new Random(shuffleSeed);
+    for (int w = 0; w < c.queryRates().length; w++) {
+      m.beginWindow(WINDOW_NANOS);
+      List<Long> seqs = new ArrayList<>();
+      for (long seq = 0; seq < SLOTS; seq++) {
+        seqs.add(seq);
+      }
+      Collections.shuffle(seqs, shuffle);
+      int window = w;
+      CountDownLatch start = new CountDownLatch(1);
+      List<Thread> threads = new ArrayList<>();
+      List<List<Long>> halves =
+        Arrays.asList(seqs.subList(0, seqs.size() / 2), seqs.subList(seqs.size() / 2, seqs.size()));
+      for (List<Long> mine : halves) {
+        Thread t = new Thread(() -> {
+          try {
+            start.await();
+            for (long seq : mine) {
+              Mutator.Kind kind = m.choose(seq);
+              long d = m.draw(kind, seq);
+              assertEquals(Mutator.writesNewVector(kind), d >= 0);
+              if (d >= 0) {
+                draws.put(window + ":" + seq, d);
+              }
+            }
+          } catch (Throwable e) {
+            error.compareAndSet(null, e);
+          }
+        });
+        t.start();
+        threads.add(t);
+      }
+      start.countDown();
+      for (Thread t : threads) {
+        t.join();
+      }
+      if (error.get() != null) {
+        throw new AssertionError("a draw failed", error.get());
+      }
+    }
+    return draws;
+  }
+
+  @Test
+  public void testHeldOutRowsDependOnlyOnWindowAndSequenceNumber() throws Exception {
+    HarnessConfig c = published();
+    try (Corpus published = CorpusFactory.open(c)) {
+      assertEquals(BASE - HELD_OUT, published.rows());
+      Map<String, Long> a = draws(c, published, 1L);
+      Map<String, Long> b = draws(c, published, 2L);
+      assertTrue(a.toString(), a.size() > 30);
+      // Paired runs map each operation to the same held-out row, whatever the thread timing.
+      assertEquals(new TreeMap<>(a), new TreeMap<>(b));
+      assertEquals("no two operations share a row", a.size(), new HashSet<>(a.values()).size());
+      long perWindow = c.newVectorsPerWindow();
+      assertEquals(c.plannedNewVectors(), 2 * perWindow);
+      assertTrue(c.plannedNewVectors() <= HELD_OUT);
+      for (Map.Entry<String, Long> e : a.entrySet()) {
+        int w = Integer.parseInt(e.getKey().substring(0, e.getKey().indexOf(':')));
+        assertTrue(e.toString(),
+          e.getValue() >= w * perWindow && e.getValue() < (w + 1) * perWindow);
+      }
+    }
+  }
+
+  @Test
+  public void testAppliedOperationsWriteTheirHeldOutRow() throws Exception {
+    HarnessConfig c = published();
+    try (Corpus published = CorpusFactory.open(c)) {
+      LiveCorpus rows = new LiveCorpus(published, published.rows());
+      Mutator m = new Mutator(c, published, rows, null, new WriteGate(), null);
+      RowWriter w =
+        new RowWriter(connection(), TableNames.of(c), c.layouts(), published.attributeModel());
+      m.beginWindow(WINDOW_NANOS);
+      m.beginWindow(WINDOW_NANOS);
+      int checked = 0;
+      for (long seq = 0; seq < SLOTS && checked < 6; seq++) {
+        Mutator.Kind kind = m.choose(seq);
+        if (!Mutator.writesNewVector(kind)) {
+          continue;
+        }
+        long draw = m.draw(kind, seq);
+        long ordinal = m.apply(w, kind, seq);
+        assertTrue(ordinal >= 0);
+        // The second window takes rows of its own range, after the rows of the first window.
+        assertTrue(draw >= c.newVectorsPerWindow());
+        float[] expected = base.get((int) (published.rows() + draw));
+        assertArrayEquals(expected, rows.get(ordinal).vector(), 0.0f);
+        checked++;
+      }
+      assertEquals(6, checked);
+    }
+  }
+
+  @Test
+  public void testMoreNewVectorsThanPlannedFailsClearly() throws Exception {
+    HarnessConfig c = published();
+    try (Corpus published = CorpusFactory.open(c)) {
+      Mutator m = new Mutator(c, published, new LiveCorpus(published, published.rows()), null,
+        new WriteGate(), null);
+      try {
+        m.draw(Mutator.Kind.INSERT, 0);
+        fail("a draw before the first window must fail");
+      } catch (IllegalStateException expected) {
+        assertTrue(expected.getMessage(), expected.getMessage().contains("no steady window"));
+      }
+      m.beginWindow(WINDOW_NANOS);
+      // A throttle that runs far past its rate makes more operations than the window plans.
+      try {
+        for (long seq = 0; seq < 100_000; seq++) {
+          Mutator.Kind kind = m.choose(seq);
+          if (Mutator.writesNewVector(kind)) {
+            assertTrue(m.draw(kind, seq) < c.newVectorsPerWindow());
+          }
+        }
+        fail("a window past its planned new vectors must fail");
+      } catch (IllegalStateException expected) {
+        assertTrue(expected.getMessage(), expected.getMessage().contains("planned new vectors"));
+      }
     }
   }
 }

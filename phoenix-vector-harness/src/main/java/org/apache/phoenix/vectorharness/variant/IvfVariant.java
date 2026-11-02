@@ -20,6 +20,7 @@ package org.apache.phoenix.vectorharness.variant;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +32,7 @@ import org.apache.phoenix.vectorharness.config.Setting;
 import org.apache.phoenix.vectorharness.config.TableLayout;
 import org.apache.phoenix.vectorharness.observe.PlanClass;
 import org.apache.phoenix.vectorharness.result.EventLog;
+import org.apache.phoenix.vectorharness.truth.QueryCondition;
 import org.apache.phoenix.vectorharness.workload.Schema;
 import org.apache.phoenix.vectorharness.workload.TableNames;
 
@@ -212,5 +214,19 @@ public final class IvfVariant implements IndexVariant {
     // Tenant connections probe centroid ranges under tenant prefix; DOC_ID predicates remain server
     // filters.
     return PlanClass.IVF_PROBE;
+  }
+
+  /**
+   * Only the index of the corpus layout includes columns. A filter on an included column is
+   * covered.
+   */
+  @Override
+  public FilterCoverage coverage(TableLayout layout, QueryCondition.Attribute attribute) {
+    if (attribute == QueryCondition.Attribute.NONE) {
+      return FilterCoverage.NONE;
+    }
+    boolean included = layout == TableLayout.CORPUS
+      && Arrays.asList(COVERED.split(",\\s*")).contains(attribute.name());
+    return included ? FilterCoverage.COVERED : FilterCoverage.UNCOVERED;
   }
 }

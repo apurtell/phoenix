@@ -28,9 +28,12 @@ import java.util.Set;
 public enum QueryShape {
   /** Unfiltered query with no WHERE predicates. */
   UNFILTERED(false),
-  /** Predicate on CATEGORY covered by index columns. */
+  /**
+   * Predicate on CATEGORY. Only the IVF index of the corpus layout includes CATEGORY. The coverage
+   * column of each result tells the real coverage for the layout and variant.
+   */
   COVERED_FILTER(true),
-  /** Predicate on SOURCE not covered by index columns. */
+  /** Predicate on SOURCE, which no vector index includes. */
   UNCOVERED_FILTER(true),
   /** Tenant-scoped query via TENANT_ID equality or tenant connection. */
   TENANT_SCOPED(false),

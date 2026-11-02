@@ -25,6 +25,7 @@ import org.apache.phoenix.vectorharness.config.QueryShape;
 import org.apache.phoenix.vectorharness.config.TableLayout;
 import org.apache.phoenix.vectorharness.observe.PlanClass;
 import org.apache.phoenix.vectorharness.result.EventLog;
+import org.apache.phoenix.vectorharness.truth.QueryCondition;
 import org.apache.phoenix.vectorharness.workload.Schema;
 
 /**
@@ -65,4 +66,11 @@ public interface IndexVariant {
 
   /** Returns expected execution plan class for a given query shape. */
   PlanClass expectedPlan(QueryShape shape, boolean multiTenant);
+
+  /**
+   * Returns how the index for a layout serves a filter on an attribute. The value follows the real
+   * index definition of the layout, so expectations stay correct when the index includes no
+   * columns.
+   */
+  FilterCoverage coverage(TableLayout layout, QueryCondition.Attribute attribute);
 }

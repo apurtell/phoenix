@@ -290,6 +290,59 @@ public final class HarnessConfig {
     return longValue(Setting.CORPUS_ROWS);
   }
 
+  /** The automatic held-out tail is a multiple of this row count. */
+  public static final long HOLDOUT_STEP = 10_000;
+
+  /**
+   * Returns the count of rows at the tail of a published corpus that the run does not load. Inserts
+   * and moves take their new vectors from this tail, so each new vector is a real, unseen row. The
+   * automatic value is zero for a run that writes no new vectors. Otherwise it is the planned
+   * volume, rounded up to a multiple of {@link #HOLDOUT_STEP}. With a prefix, all rows after the
+   * prefix stay unloaded, and they supply the new vectors.
+   */
+  public long holdoutRows() {
+    String v = raw(Setting.CORPUS_HOLDOUT_ROWS).trim();
+    if (!v.equalsIgnoreCase("auto")) {
+      return longValue(Setting.CORPUS_HOLDOUT_ROWS);
+    }
+    long planned = plannedNewVectors();
+    if (planned == 0) {
+      return 0;
+    }
+    return Math.max(HOLDOUT_STEP, (planned + HOLDOUT_STEP - 1) / HOLDOUT_STEP * HOLDOUT_STEP);
+  }
+
+  /**
+   * Returns an upper bound on the new vectors that one repetition draws, from inserts and moves.
+   * Each steady window owns a separate range of draw indexes of {@link #newVectorsPerWindow()}
+   * size, so the bound is that size times the window count.
+   */
+  public long plannedNewVectors() {
+    return newVectorsPerWindow() * queryRates().length;
+  }
+
+  /**
+   * Returns the size of the range of draw indexes for the new vectors of one steady window. Each
+   * window replays the same operation sequence, so all windows use the same size. The size is the
+   * mean count of inserts and moves plus five standard deviations, and at most the slot count. The
+   * slot count uses the whole-nanosecond interval of the mutation throttle, so it is never too low.
+   */
+  public long newVectorsPerWindow() {
+    if (mutationRate() <= 0) {
+      return 0;
+    }
+    double[] mix = mutationMix();
+    double p = mix[0] + mix[1] * (1.0 - attributeFraction()) * moveFraction();
+    if (p <= 0) {
+      return 0;
+    }
+    long interval = Math.max(1L, (long) (1e9 / mutationRate()));
+    double slots = Math.ceil((double) (warmup().toNanos() + duration().toNanos()) / interval) + 1;
+    double mean = slots * Math.min(1.0, p);
+    long window = (long) Math.ceil(mean + 5.0 * Math.sqrt(mean * Math.max(0.0, 1.0 - p)));
+    return Math.min((long) slots, window);
+  }
+
   public int dim() {
     return intValue(Setting.CORPUS_DIM);
   }
@@ -851,6 +904,12 @@ public final class HarnessConfig {
       if (mix[0] < 0 || mix[1] < 0 || mix[2] < 0) {
         problems.add(Setting.MUTATION_MIX.key() + " shares must not be negative");
       }
+      // A published corpus has a finite tail, so the tail must cover every new vector of the run.
+      if (source != CorpusSource.SYNTHETIC && holdoutRows() < plannedNewVectors()) {
+        problems.add(Setting.CORPUS_HOLDOUT_ROWS.key() + "=" + holdoutRows()
+          + " is smaller than the " + plannedNewVectors()
+          + " new vectors that the steady state can draw; raise it or set auto");
+      }
     } catch (IllegalArgumentException e) {
       problems.add(e.getMessage());
     }
@@ -1015,6 +1074,11 @@ public final class HarnessConfig {
       case CORPUS_SEED:
       case CORPUS_ROWS:
         longValue(s);
+        break;
+      case CORPUS_HOLDOUT_ROWS:
+        if (!raw(s).trim().equalsIgnoreCase("auto") && longValue(s) < 0) {
+          throw new IllegalArgumentException("must not be negative");
+        }
         break;
       case CORPUS_VARIANCE_SPREAD:
       case CORPUS_NOISE:

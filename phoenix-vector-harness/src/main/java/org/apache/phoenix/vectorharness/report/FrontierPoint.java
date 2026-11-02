@@ -88,6 +88,11 @@ public final class FrontierPoint {
     return layout;
   }
 
+  /** Returns how the index serves the filter, or an empty string for files without the column. */
+  public String coverage() {
+    return row.getOrDefault("coverage", "");
+  }
+
   public String family() {
     return family;
   }

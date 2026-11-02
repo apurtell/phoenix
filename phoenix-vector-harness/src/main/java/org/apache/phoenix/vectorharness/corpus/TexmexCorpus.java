@@ -64,6 +64,16 @@ public final class TexmexCorpus extends PublishedCorpus {
    */
   public static TexmexCorpus open(Path dir, String name, long rows, RandomStreams streams,
     AttributeModel attributes) throws IOException {
+    return open(dir, name, rows, 0, streams, attributes);
+  }
+
+  /**
+   * Opens a TEXMEX corpus directory. The learn file supplies the new vectors when it exists.
+   * Otherwise the corpus holds out a tail of the base rows and does not load it.
+   * @param holdout the count of base rows at the tail that supply new vectors without a learn file
+   */
+  public static TexmexCorpus open(Path dir, String name, long rows, long holdout,
+    RandomStreams streams, AttributeModel attributes) throws IOException {
     if (!Files.isDirectory(dir)) {
       throw new IOException("TEXMEX corpus path is not a directory: " + dir);
     }
@@ -90,7 +100,7 @@ public final class TexmexCorpus extends PublishedCorpus {
       // vectors.
       Path learnPath = find(dir, prefix + "_learn", false);
       learn = learnPath != null ? new VecsFile(learnPath) : null;
-      long n = rows <= 0 || rows > base.count() ? base.count() : rows;
+      long n = loadedRows(base.count(), rows, learn != null ? 0 : holdout, dir);
       return new TexmexCorpus(streams, attributes, dir, prefix, base, query, gt, learn, n);
     } catch (IOException | RuntimeException e) {
       for (VecsFile f : new VecsFile[] { learn, gt, query, base }) {

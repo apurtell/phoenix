@@ -38,7 +38,9 @@ import org.apache.phoenix.vectorharness.truth.LiveGroundTruth;
  * Applies individual mutations via {@link RowWriter}: inserts, updates, and deletes according to
  * configured workload ratios. Coordinates in-flight tracking with {@link LiveCorpus}, updates
  * {@link LiveGroundTruth}, and synchronizes writes with {@link WriteGate}. Failed commits are
- * marked unresolved to prevent concurrent access until restored.
+ * marked unresolved to prevent concurrent access until restored. When the corpus has a finite
+ * supply of new vectors, each insert and move takes the vector that its window and sequence number
+ * select.
  */
 public final class Mutator {
 
@@ -70,6 +72,7 @@ public final class Mutator {
   private final AtomicLong probeDeletes = new AtomicLong();
   private final AtomicLong probeFailed = new AtomicLong();
   private final Set<Long> unresolved = ConcurrentHashMap.newKeySet();
+  private final NewVectorSchedule schedule;
   private volatile long windowOffsetNanos;
   private volatile long windowLengthNanos;
   private volatile boolean windowed;
@@ -91,6 +94,10 @@ public final class Mutator {
       applied.put(k, new AtomicLong());
       failed.put(k, new AtomicLong());
     }
+    // Only a finite supply of new vectors needs fixed draw indexes.
+    this.schedule = corpus.mutations().finite()
+      ? new NewVectorSchedule(config.newVectorsPerWindow(), config.queryRates().length)
+      : null;
   }
 
   /**
@@ -103,6 +110,22 @@ public final class Mutator {
     }
     windowLengthNanos = lengthNanos;
     windowed = true;
+    if (schedule != null) {
+      schedule.beginWindow(seq -> writesNewVector(choose(seq)));
+    }
+  }
+
+  /** Returns true when an operation of this kind writes a new vector. */
+  static boolean writesNewVector(Kind kind) {
+    return kind == Kind.INSERT || kind == Kind.UPDATE_MOVE;
+  }
+
+  /**
+   * Returns the draw index of the new vector of the operation, or -1 when the supply of new vectors
+   * is not finite. The index depends only on the window and the sequence number.
+   */
+  long draw(Kind kind, long seq) {
+    return schedule != null && writesNewVector(kind) ? schedule.draw(seq) : -1;
   }
 
   /**
@@ -133,6 +156,9 @@ public final class Mutator {
 
   /** Executes mutation operation for sequence number; returns row ordinal, or -1 if skipped. */
   public long apply(RowWriter writer, Kind kind, long seq) throws SQLException {
+    // The draw index comes first. When the window has no free index, the operation stops before it
+    // changes any state.
+    long draw = draw(kind, seq);
     SplitMix64 rnd = streams.at(RandomStreams.MUTATIONS, 0x54415247L, seq);
     long ordinal;
     if (kind == Kind.INSERT) {
@@ -164,7 +190,7 @@ public final class Mutator {
       try {
         switch (kind) {
           case INSERT: {
-            Embedding e = corpus.mutations().insert(ordinal, minutes);
+            Embedding e = corpus.mutations().insert(ordinal, draw, minutes);
             vector = e.vector();
             cluster = e.cluster();
             attrs = corpus.attributes(ordinal);
@@ -187,7 +213,7 @@ public final class Mutator {
             break;
           }
           case UPDATE_MOVE: {
-            Embedding e = corpus.mutations().move(ordinal, current.cluster(), seq, minutes);
+            Embedding e = corpus.mutations().move(ordinal, current.cluster(), seq, draw, minutes);
             vector = e.vector();
             cluster = e.cluster();
             attrs = current.attributes();

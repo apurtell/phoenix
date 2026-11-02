@@ -17,15 +17,13 @@
  */
 package org.apache.phoenix.vectorharness.corpus;
 
-import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.security.MessageDigest;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -217,39 +215,75 @@ public class PublishedCorpusTest {
   }
 
   @Test
-  public void testHeldOutInsertsAndMoves() {
+  public void testDrawIndexSelectsTheHeldOutRow() {
     StubCorpus c = stub(Metric.L2, 7);
     MutationVectors m = c.mutations();
-    for (int j = 0; j < 21; j++) {
-      assertSame(c.heldOut[j % 7], m.insert(50 + j, 0.0).vector());
+    assertTrue(m.finite());
+    // Only the draw index selects the row. The ordinal, the kind and the call order do not.
+    assertSame(c.heldOut[4], m.insert(50, 4, 0.0).vector());
+    assertSame(c.heldOut[0], m.insert(10, 0, 0.0).vector());
+    assertSame(c.heldOut[2], m.move(0, -1, 99, 2, 0.0).vector());
+    assertSame(c.heldOut[4], m.move(3, -1, 7, 4, 0.0).vector());
+    for (int j = 0; j < 7; j++) {
+      assertSame(c.heldOut[j], m.insert(50 + j, j, 0.0).vector());
+      assertSame(c.heldOut[j], m.move(1, -1, 100 + j, j, 0.0).vector());
     }
-    // Ordinals below rows() also map into the held-out set
-    assertSame(c.heldOut[Math.floorMod(10 - 50, 7)], m.insert(10, 0.0).vector());
-    for (long seq = 0; seq < 30; seq++) {
-      float[] v = m.move(0, -1, seq, 0.0).vector();
-      assertTrue(Arrays.asList(c.heldOut).contains(v));
+    assertExhausted(m, 7);
+    assertExhausted(m, Long.MAX_VALUE);
+  }
+
+  @Test
+  public void testNewVectorWithoutDrawIndexFails() {
+    MutationVectors m = stub(Metric.L2, 7).mutations();
+    try {
+      m.insert(50, -1, 0.0);
+      fail("an insert without a draw index must fail");
+    } catch (IllegalArgumentException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("draw index"));
+    }
+    try {
+      m.move(0, -1, 3, -1, 0.0);
+      fail("a move without a draw index must fail");
+    } catch (IllegalArgumentException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("draw index"));
     }
   }
 
   @Test
-  public void testPerturbedCopies() {
+  public void testNoHeldOutRowsFailsInsteadOfPerturbedCopies() {
     for (Metric metric : Metric.values()) {
-      StubCorpus c = stub(metric, 0);
-      MutationVectors m = c.mutations();
-      for (long ordinal = 50; ordinal < 80; ordinal++) {
-        float[] v = m.insert(ordinal, 0.0).vector();
-        assertArrayEquals(v, m.insert(ordinal, 0.0).vector(), 0.0f);
-        boolean equalsBase = false;
-        for (float[] b : c.base) {
-          equalsBase |= Arrays.equals(b, v);
-        }
-        assertFalse(equalsBase);
-        if (metric == Metric.COSINE) {
-          assertEquals(1.0, norm(v), 1e-5);
-        } else {
-          assertTrue(norm(v) > 2.0);
-        }
-      }
+      assertExhausted(stub(metric, 0).mutations(), 0);
+    }
+  }
+
+  @Test
+  public void testLoadedRowsExcludeTheHoldout() {
+    assertEquals(900, PublishedCorpus.loadedRows(1000, 1000, 100, "x"));
+    assertEquals(900, PublishedCorpus.loadedRows(1000, 0, 100, "x"));
+    assertEquals(900, PublishedCorpus.loadedRows(1000, 5000, 100, "x"));
+    assertEquals(500, PublishedCorpus.loadedRows(1000, 500, 100, "x"));
+    assertEquals(1000, PublishedCorpus.loadedRows(1000, 1000, 0, "x"));
+    assertEquals(1000, PublishedCorpus.loadedRows(1000, 0, 0, "x"));
+    try {
+      PublishedCorpus.loadedRows(1000, 1000, 1000, "x");
+      fail("a tail of all rows must fail");
+    } catch (IllegalArgumentException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
+    }
+  }
+
+  private static void assertExhausted(MutationVectors m, long draw) {
+    try {
+      m.insert(80, draw, 0.0);
+      fail("an insert without a free held-out row must fail");
+    } catch (IllegalStateException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
+    }
+    try {
+      m.move(0, -1, 1, draw, 0.0);
+      fail("a move without a free held-out row must fail");
+    } catch (IllegalStateException expected) {
+      assertTrue(expected.getMessage(), expected.getMessage().contains("corpus.holdout.rows"));
     }
   }
 

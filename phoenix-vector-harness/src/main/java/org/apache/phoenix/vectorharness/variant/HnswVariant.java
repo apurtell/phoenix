@@ -41,6 +41,7 @@ import org.apache.phoenix.vectorharness.config.Setting;
 import org.apache.phoenix.vectorharness.config.TableLayout;
 import org.apache.phoenix.vectorharness.observe.PlanClass;
 import org.apache.phoenix.vectorharness.result.EventLog;
+import org.apache.phoenix.vectorharness.truth.QueryCondition;
 import org.apache.phoenix.vectorharness.workload.Schema;
 import org.apache.phoenix.vectorharness.workload.TableNames;
 
@@ -265,5 +266,11 @@ public final class HnswVariant implements IndexVariant {
   public PlanClass expectedPlan(QueryShape shape, boolean multiTenant) {
     PlanClass keyBound = CommonRules.keyBoundPlan(shape, multiTenant);
     return keyBound != null ? keyBound : PlanClass.HNSW_SEARCH;
+  }
+
+  /** The graph lives in the data region, so a filter reads the data rows of the same region. */
+  @Override
+  public FilterCoverage coverage(TableLayout layout, QueryCondition.Attribute attribute) {
+    return attribute == QueryCondition.Attribute.NONE ? FilterCoverage.NONE : FilterCoverage.LOCAL;
   }
 }

@@ -33,6 +33,7 @@ import java.util.TreeMap;
 import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.config.QueryShape;
 import org.apache.phoenix.vectorharness.result.CsvTable;
+import org.apache.phoenix.vectorharness.variant.FilterCoverage;
 
 /**
  * Generates test harness reports: text summaries for single runs, comparative cross-run reports
@@ -173,8 +174,9 @@ public final class ReportGenerator {
       Set<FrontierPoint> pareto =
         new LinkedHashSet<>(Frontiers.pareto(g.getValue(), Frontiers.Cost.P99));
       for (FrontierPoint p : g.getValue()) {
-        t.row(g.getKey(), p.sweep(), p.recall(), ci(p.recallLow(), p.recallHigh()), p.p50(),
-          p.p99(), p.qps(), p.readAmplification(), p.rpcsPerQuery(),
+        t.row(g.getKey() + coverageTag(Collections.singletonList(r), g.getKey()), p.sweep(),
+          p.recall(), ci(p.recallLow(), p.recallHigh()), p.p50(), p.p99(), p.qps(),
+          p.readAmplification(), p.rpcsPerQuery(),
           p.planClass()
             + (p.planDiscrepancy() ? " (expected " + p.column("expected_plan") + ")" : ""),
           pareto.contains(p) ? "*" : "");
@@ -189,13 +191,14 @@ public final class ReportGenerator {
     TextTable t = new TextTable("group", "target", "min p50 ms", "min p99 ms", "max qps",
       "min rows/result", "min rpcs/q", "sweep at min p99");
     for (Map.Entry<String, List<FrontierPoint>> g : Frontiers.byGroup(r.frontier()).entrySet()) {
+      String label = g.getKey() + coverageTag(Collections.singletonList(r), g.getKey());
       for (double target : targets) {
         FrontierPoint p99 = Frontiers.cheapestAtRecall(g.getValue(), target, Frontiers.Cost.P99);
         if (p99 == null) {
-          t.row(g.getKey(), target, null, null, null, null, null, "unreached");
+          t.row(label, target, null, null, null, null, null, "unreached");
           continue;
         }
-        t.row(g.getKey(), target, costValue(g.getValue(), target, Frontiers.Cost.P50), p99.p99(),
+        t.row(label, target, costValue(g.getValue(), target, Frontiers.Cost.P50), p99.p99(),
           costValue(g.getValue(), target, Frontiers.Cost.THROUGHPUT),
           costValue(g.getValue(), target, Frontiers.Cost.READ_AMPLIFICATION),
           costValue(g.getValue(), target, Frontiers.Cost.RPCS), p99.sweep());
@@ -221,7 +224,7 @@ public final class ReportGenerator {
     TextTable t = new TextTable(header.toArray(new String[0]));
     for (String group : groups(runs)) {
       for (double budget : budgets) {
-        List<Object> row = new ArrayList<>(Arrays.asList(group, budget));
+        List<Object> row = new ArrayList<>(Arrays.asList(group + coverageTag(runs, group), budget));
         double best = Double.NEGATIVE_INFINITY;
         String winner = "-";
         for (RunResult r : runs) {
@@ -270,7 +273,8 @@ public final class ReportGenerator {
       for (Map.Entry<Double, String> e : c.getValue().descendingMap().entrySet()) {
         String[] parts = parseGroup(e.getValue());
         List<Object> row = new ArrayList<>(
-          Arrays.asList(parts[0], parts[1].split("@", 2)[0], parts[2].substring(2), e.getKey()));
+          Arrays.asList(parts[0], parts[1].split("@", 2)[0] + coverageTag(runs, e.getValue()),
+            parts[2].substring(2), e.getKey()));
         double best = Double.POSITIVE_INFINITY;
         String winner = "-";
         for (RunResult r : runs) {
@@ -595,7 +599,8 @@ public final class ReportGenerator {
       TextTable t = new TextTable(header.toArray(new String[0]));
       for (String group : groups(runs)) {
         for (double target : targets) {
-          List<Object> row = new ArrayList<>(Arrays.asList(group, target));
+          List<Object> row =
+            new ArrayList<>(Arrays.asList(group + coverageTag(runs, group), target));
           List<double[]> values = new ArrayList<>();
           for (int i = 0; i < runs.size(); i++) {
             FrontierPoint p = Frontiers.cheapestAtRecall(group(runs.get(i), group), target, cost);
@@ -695,7 +700,8 @@ public final class ReportGenerator {
       TextTable t = new TextTable("group", "sweeps", "pairs", "latency ms", "95% CI", "median ms",
         "faster share", "recall", "95% CI", "recall up/down");
       for (PairedComparison.Group g : p.groups) {
-        t.row(g.group(), g.baseSweep() + " vs " + g.otherSweep(), g.pairs(), g.latencyMeanDiff(),
+        t.row(g.group() + coverageTag(Arrays.asList(p.base, p.other), g.group()),
+          g.baseSweep() + " vs " + g.otherSweep(), g.pairs(), g.latencyMeanDiff(),
           ci(g.latencyLow(), g.latencyHigh()), g.latencyMedianDiff(), g.fasterShare(),
           g.recallMeanDiff(), ci(g.recallLow(), g.recallHigh()),
           TextTable.num(g.recallHigherShare()) + "/" + TextTable.num(g.recallLowerShare()));
@@ -788,14 +794,14 @@ public final class ReportGenerator {
   }
 
   private void exportPareto(List<RunResult> runs, Path file) throws IOException {
-    try (CsvTable t = CsvTable.create(file, "run", "variant", "cost", "layout", "family", "k",
-      "sweep", "recall", "value")) {
+    try (CsvTable t = CsvTable.create(file, "run", "variant", "cost", "layout", "family",
+      "coverage", "k", "sweep", "recall", "value")) {
       for (RunResult r : runs) {
         for (List<FrontierPoint> g : Frontiers.byGroup(r.frontier()).values()) {
           for (Frontiers.Cost cost : Frontiers.Cost.values()) {
             for (FrontierPoint p : Frontiers.pareto(g, cost)) {
-              t.row(r.id(), r.variant(), cost.id(), p.layout(), p.family(), p.k(), p.sweep(),
-                p.recall(), cost.value(p));
+              t.row(r.id(), r.variant(), cost.id(), p.layout(), p.family(), p.coverage(), p.k(),
+                p.sweep(), p.recall(), cost.value(p));
             }
           }
         }
@@ -804,17 +810,17 @@ public final class ReportGenerator {
   }
 
   private void exportCost(List<RunResult> runs, Path file) throws IOException {
-    try (CsvTable t = CsvTable.create(file, "run", "variant", "layout", "family", "k", "target",
-      "cost", "value", "sweep", "recall")) {
+    try (CsvTable t = CsvTable.create(file, "run", "variant", "layout", "family", "coverage", "k",
+      "target", "cost", "value", "sweep", "recall")) {
       for (RunResult r : runs) {
         for (List<FrontierPoint> g : Frontiers.byGroup(r.frontier()).values()) {
           FrontierPoint first = g.get(0);
           for (double target : targets) {
             for (Frontiers.Cost cost : Frontiers.Cost.values()) {
               FrontierPoint p = Frontiers.cheapestAtRecall(g, target, cost);
-              t.row(r.id(), r.variant(), first.layout(), first.family(), first.k(), target,
-                cost.id(), p == null ? null : cost.value(p), p == null ? null : p.sweep(),
-                p == null ? null : p.recall());
+              t.row(r.id(), r.variant(), first.layout(), first.family(), first.coverage(),
+                first.k(), target, cost.id(), p == null ? null : cost.value(p),
+                p == null ? null : p.sweep(), p == null ? null : p.recall());
             }
           }
         }
@@ -823,15 +829,15 @@ public final class ReportGenerator {
   }
 
   private void exportBudget(List<RunResult> runs, Path file) throws IOException {
-    try (CsvTable t = CsvTable.create(file, "run", "variant", "layout", "family", "k", "budget_ms",
-      "recall", "sweep", "p99_ms")) {
+    try (CsvTable t = CsvTable.create(file, "run", "variant", "layout", "family", "coverage", "k",
+      "budget_ms", "recall", "sweep", "p99_ms")) {
       for (RunResult r : runs) {
         for (List<FrontierPoint> g : Frontiers.byGroup(r.frontier()).values()) {
           FrontierPoint first = g.get(0);
           for (double budget : budgets) {
             FrontierPoint p = Frontiers.bestWithinBudget(g, budget);
-            t.row(r.id(), r.variant(), first.layout(), first.family(), first.k(), budget,
-              p == null ? null : p.recall(), p == null ? null : p.sweep(),
+            t.row(r.id(), r.variant(), first.layout(), first.family(), first.coverage(), first.k(),
+              budget, p == null ? null : p.recall(), p == null ? null : p.sweep(),
               p == null ? null : p.p99());
           }
         }
@@ -927,6 +933,35 @@ public final class ReportGenerator {
       }
     }
     return out;
+  }
+
+  /**
+   * Returns a display tag for the filter coverage of a group, or an empty string when no run
+   * filters on a non-key column. The tag shows one value when all runs agree and one value for each
+   * run otherwise. The group key itself stays unchanged, so runs still match by key.
+   */
+  static String coverageTag(List<RunResult> runs, String group) {
+    Map<String, String> byRun = new LinkedHashMap<>();
+    Set<String> distinct = new LinkedHashSet<>();
+    for (RunResult r : runs) {
+      List<FrontierPoint> points = group(r, group);
+      String c = points.isEmpty() ? "" : points.get(0).coverage();
+      if (!c.isEmpty() && !c.equals(FilterCoverage.NONE.id())) {
+        byRun.put(label(r, runs), c);
+        distinct.add(c);
+      }
+    }
+    if (distinct.isEmpty()) {
+      return "";
+    }
+    if (distinct.size() == 1 && byRun.size() == runs.size()) {
+      return " [" + distinct.iterator().next() + "]";
+    }
+    List<String> parts = new ArrayList<>();
+    for (Map.Entry<String, String> e : byRun.entrySet()) {
+      parts.add(e.getKey() + ":" + e.getValue());
+    }
+    return " [" + String.join(", ", parts) + "]";
   }
 
   /** Splits a group key into layout, family, and k components. */

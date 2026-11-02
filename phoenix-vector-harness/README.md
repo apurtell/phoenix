@@ -105,15 +105,28 @@ All generated datasets, index states, and run metrics are stored under `run.outp
 | `tables/<suffix>/load.json` | Table load metadata: corpus fingerprint, row counts, ingestion rate, storage footprint, and snapshots |
 | `tables/<suffix>/build.json` | Index build metadata: build duration, index options, plan check, segment/centroid statistics, and storage footprint |
 | `runs/<run-id>/manifest.json` | Run manifest: configuration settings, corpus, cluster topology, validation checks, stage outcomes, and execution flags |
-| `runs/<run-id>/frontier.csv` | Frontier stage results per table layout, predicate condition, k, and sweep parameter |
+| `runs/<run-id>/frontier.csv` | Frontier stage results per table layout, predicate condition, k, and sweep parameter. The `coverage` column gives the real filter coverage (see below) |
 | `runs/<run-id>/per_query.csv` | Scored per-query results from the frontier sweep for paired statistical evaluation |
-| `runs/<run-id>/steady.csv`, `throughput.csv` | Steady-state window measurements and interval throughput metrics |
+| `runs/<run-id>/steady.csv`, `throughput.csv` | Steady-state window measurements (with the same `coverage` column) and interval throughput metrics |
 | `runs/<run-id>/recall.csv` | Time-series recall measurements from streaming and steady-state stages |
 | `runs/<run-id>/metrics.csv`, `cluster.csv` | RegionServer vector index metrics and cluster health telemetry |
 | `runs/<run-id>/lifecycle.csv`, `events.csv` | IVF centroid and HNSW region lifecycle samples, along with cluster event logs |
 | `runs/<run-id>/summary.txt` | Human-readable text summary of the run |
 | `runs/<run-id>/report/` | Standalone single-run report files: `report.txt` and raw CSV data |
 | `reports/<a>_vs_<b>/` | Comparative analysis report: `report.txt`, `runs.csv`, `frontier.csv`, `pareto.csv`, `cost_at_recall.csv`, `recall_at_budget.csv`, `steady.csv`, `recall_timeseries.csv`, `paired.csv` |
+
+### Filter Coverage
+
+The shape names `covered_filter` and `uncovered_filter` give the filter column (`CATEGORY` or `SOURCE`). They do not give the coverage. The `coverage` column of `frontier.csv` and `steady.csv` gives the real coverage for the variant and layout. The reports show it as a tag after the group, for example `profile covered_filter@0.1 k=10 [uncovered]`. The group key itself does not change, so comparisons still match groups across runs.
+
+| Variant | Layout | No filter | `CATEGORY` filter | `SOURCE` filter |
+|---|---|---|---|---|
+| `ivf` | `corpus` | `none` | `covered` | `uncovered` |
+| `ivf` | `profile` | `none` | `uncovered` | `uncovered` |
+| `hnsw` | any | `none` | `local` | `local` |
+| `exact` | any | `none` | `no_index` | `no_index` |
+
+The IVF index is global. The IVF index of the `corpus` layout includes `CATEGORY, ACL_TAG, CREATED_AT`, and the IVF index of the `profile` layout includes no columns. Thus an uncovered IVF filter merges index rows with data rows on the server. The HNSW graph lives in the data region, so a filter reads the data rows of the same region and needs no merge (`local`). The `exact` variant uses no index (`no_index`). Expectations that depend on coverage, such as the `uncovered-path` suite check, use this column.
 
 ### Correctness and Validation Metrics
 
@@ -175,6 +188,7 @@ Default settings reflect baseline recommendations. Settings with inter-dependenc
 | `corpus.path` | — | File path to published corpus directory (TEXMEX) or file (HDF5) |
 | `corpus.name` | — | Prefix for TEXMEX files (e.g. `sift`, `gist`); auto-detected if omitted |
 | `corpus.rows` | `1000000` | Number of rows to generate or slice from published dataset. A prefix of a published dataset has no published ground truth; the harness computes it |
+| `corpus.holdout.rows` | `auto` | Rows at the tail of a published dataset that the run does not load. Each insert and move takes a distinct tail row, so no new vector repeats a loaded row. The steady window and the sequence number of the operation select the row, never thread timing, so paired runs write the same rows in the same operations. Each window owns a range of tail rows of the planned size per window, and the planned volume is that size times the window count. `auto` is 0 for a run that writes no new vectors, and otherwise the planned volume rounded up to a multiple of 10,000. Validation fails when the tail is smaller than the planned volume. With a prefix, the rows after the prefix supply the new vectors. A texmex learn file replaces the tail |
 | `corpus.dim` | `768` | Vector dimension (synthetic datasets only; inferred for published files) |
 | `corpus.clusters` | `200` | Number of mixture components in synthetic generator |
 | `corpus.cluster.weights` | `uniform` | Cluster size distribution: `uniform` or Zipf skew exponent |
@@ -187,7 +201,7 @@ Default settings reflect baseline recommendations. Settings with inter-dependenc
 | `corpus.drift.mode` | `none` | Vector drift mode: `none`, `migrate`, `birth_death`, or `reassign` |
 | `corpus.drift.rate` | `0.0` | Rate of cluster drift per minute during steady state |
 | `corpus.filter.skew` | `uniform` | Attribute vocabulary distribution: `uniform` or Zipf exponent |
-| `corpus.filter.categories` | `1000` | Vocabulary cardinality for `CATEGORY` attribute (covered by IVF index) |
+| `corpus.filter.categories` | `1000` | Vocabulary cardinality for `CATEGORY` attribute (included only by the IVF index of the `corpus` layout) |
 | `corpus.filter.sources` | `1000` | Vocabulary cardinality for `SOURCE` attribute (unindexed) |
 | `corpus.filter.acl_tags` | `16` | Vocabulary cardinality for `ACL_TAG` attribute |
 | `corpus.tenants` | `1` | Number of distinct `TENANT_ID` values |

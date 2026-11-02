@@ -119,6 +119,7 @@ public final class FrontierSweep {
     String family, List<QuerySpec> specs) throws InterruptedException {
     Measurement m = new Measurement(stage, layout.id(), family, k, sweep.label(), sweep.value());
     QuerySpec first = specs.get(0);
+    m.coverage(rc.variant().coverage(layout, first.condition().attribute()).id());
     PlanClass expected =
       rc.variant().expectedPlan(first.condition().shape(), rc.ctx().config().multiTenant());
     try {

@@ -94,7 +94,21 @@ public final class Hdf5Corpus extends PublishedCorpus {
   /** Opens an ANN-Benchmarks formatted HDF5 corpus file. */
   public static Hdf5Corpus open(Path file, long rows, RandomStreams streams,
     AttributeModel attributes) throws IOException {
-    return open(file, rows, streams, attributes, true);
+    return open(file, rows, 0, streams, attributes, true);
+  }
+
+  /**
+   * Opens an ANN-Benchmarks formatted HDF5 corpus file and holds out a tail of the train rows.
+   * @param holdout the count of train rows at the tail that the corpus does not load
+   */
+  public static Hdf5Corpus open(Path file, long rows, long holdout, RandomStreams streams,
+    AttributeModel attributes) throws IOException {
+    return open(file, rows, holdout, streams, attributes, true);
+  }
+
+  static Hdf5Corpus open(Path file, long rows, RandomStreams streams, AttributeModel attributes,
+    boolean mapRows) throws IOException {
+    return open(file, rows, 0, streams, attributes, mapRows);
   }
 
   /**
@@ -102,8 +116,8 @@ public final class Hdf5Corpus extends PublishedCorpus {
    * @param mapRows false to read the train rows in decoded blocks even when a memory map is
    *                possible
    */
-  static Hdf5Corpus open(Path file, long rows, RandomStreams streams, AttributeModel attributes,
-    boolean mapRows) throws IOException {
+  static Hdf5Corpus open(Path file, long rows, long holdout, RandomStreams streams,
+    AttributeModel attributes, boolean mapRows) throws IOException {
     if (!Files.isRegularFile(file)) {
       throw new IOException("HDF5 corpus path is not a file: " + file);
     }
@@ -127,7 +141,7 @@ public final class Hdf5Corpus extends PublishedCorpus {
       float[][] queries = toFloats(test.getData());
       Dataset nb = dataset(hdf, "neighbors", false);
       int[][] neighbors = nb == null ? null : toInts(nb.getData());
-      long n = rows <= 0 || rows > td[0] ? td[0] : rows;
+      long n = loadedRows(td[0], rows, holdout, file);
       MappedRows mapped = mapRows ? MappedRows.map(file, hdf, train) : null;
       if (mapped != null && !mapped.agreesWith(train)) {
         LOG.warn("Memory mapped rows of {} differ from the HDF5 reader; using block reads", file);
@@ -211,8 +225,8 @@ public final class Hdf5Corpus extends PublishedCorpus {
 
   @Override
   public String description() {
-    return String.format(Locale.ROOT, "hdf5:%s rows=%d dim=%d queries=%d distance=%s", baseName(),
-      rows, dim, queries.length, distanceName);
+    return String.format(Locale.ROOT, "hdf5:%s rows=%d held_out=%d dim=%d queries=%d distance=%s",
+      baseName(), rows, heldOutCount(), dim, queries.length, distanceName);
   }
 
   @Override
