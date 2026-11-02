@@ -73,6 +73,33 @@ public class ExampleProfilesTest {
   }
 
   @Test
+  public void testHdf5ProfilesAgreeWithTheDistanceOfTheirFile() throws Exception {
+    int hdf5 = 0;
+    for (Path p : profiles()) {
+      HarnessConfig c = HarnessConfig.load(p, new Properties());
+      if (c.corpusSource() != HarnessConfig.CorpusSource.HDF5) {
+        continue;
+      }
+      hdf5++;
+      // ANN-Benchmarks file names end with the distance, such as sift-128-euclidean.hdf5.
+      String name = c.corpusPath().getFileName().toString();
+      String distance = name.substring(name.lastIndexOf('-') + 1, name.lastIndexOf('.'));
+      Metric expected = distance.equals("euclidean") ? Metric.L2
+        : distance.equals("angular") ? Metric.COSINE
+        : null;
+      assertEquals(p.toString(), expected, c.metric(null));
+    }
+    assertTrue("too few HDF5 profiles: " + hdf5, hdf5 >= 3);
+    for (String profile : new String[] { "sift1m-hnsw-sq8", "sift1m-ivf" }) {
+      HarnessConfig c =
+        HarnessConfig.load(Paths.get("profiles", profile + ".properties"), new Properties());
+      assertEquals(HarnessConfig.CorpusSource.HDF5, c.corpusSource());
+      assertEquals(Paths.get("/data/ann-benchmarks/sift-128-euclidean.hdf5"), c.corpusPath());
+      assertEquals(1000000L, c.rows());
+    }
+  }
+
+  @Test
   public void testComparableSiftProfiles() throws Exception {
     HarnessConfig hnsw =
       HarnessConfig.load(Paths.get("profiles", "sift1m-hnsw-sq8.properties"), new Properties());

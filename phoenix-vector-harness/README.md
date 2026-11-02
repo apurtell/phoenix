@@ -89,7 +89,7 @@ vector-harness report --run-id <hnsw-run-id> --compare <ivf-run-id>
 
 Example profiles in `profiles/`:
 - `smoke.properties`: Small synthetic dataset for quick cluster verification (specify variant with `-Drun.variant`).
-- `sift1m-hnsw-sq8.properties` / `sift1m-ivf.properties`: SIFT1M benchmark profiles for HNSW and IVF comparisons.
+- `sift1m-hnsw-sq8.properties` / `sift1m-ivf.properties`: SIFT1M benchmark profiles for HNSW and IVF comparisons. They read the ann-benchmarks file `sift-128-euclidean.hdf5`.
 - `rag-1m-768.properties`: Multi-tenant document retrieval scenario representing enterprise RAG access patterns.
 - `streaming-hnsw.properties`: High-throughput continuous ingestion, skewed mutation distribution, and region disruption scenarios.
 - `drift-ivf.properties`: Simulates vector distribution drift and tests manual index rebuild cycles.
@@ -174,7 +174,7 @@ Default settings reflect baseline recommendations. Settings with inter-dependenc
 | `corpus.seed` | `42` | Random seed for reproducible data and query generation |
 | `corpus.path` | — | File path to published corpus directory (TEXMEX) or file (HDF5) |
 | `corpus.name` | — | Prefix for TEXMEX files (e.g. `sift`, `gist`); auto-detected if omitted |
-| `corpus.rows` | `1000000` | Number of rows to generate or slice from published dataset |
+| `corpus.rows` | `1000000` | Number of rows to generate or slice from published dataset. A prefix of a published dataset has no published ground truth; the harness computes it |
 | `corpus.dim` | `768` | Vector dimension (synthetic datasets only; inferred for published files) |
 | `corpus.clusters` | `200` | Number of mixture components in synthetic generator |
 | `corpus.cluster.weights` | `uniform` | Cluster size distribution: `uniform` or Zipf skew exponent |

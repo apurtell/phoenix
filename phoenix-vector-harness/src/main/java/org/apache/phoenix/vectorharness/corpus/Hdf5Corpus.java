@@ -21,30 +21,46 @@ import io.jhdf.HdfFile;
 import io.jhdf.api.Attribute;
 import io.jhdf.api.Dataset;
 import io.jhdf.api.Node;
+import io.jhdf.api.dataset.ContiguousDataset;
+import io.jhdf.object.datatype.DataType;
+import io.jhdf.object.datatype.FloatingPoint;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Array;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import org.apache.phoenix.vectorharness.config.Metric;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Published vector corpus backed by ANN-Benchmarks HDF5 format, reading datasets {@code train}
  * (base vectors), {@code test} (queries), {@code neighbors} (ground truth), and the root
- * {@code distance} attribute in buffered blocks.
+ * {@code distance} attribute. The corpus reads a contiguous train dataset without filters through
+ * memory maps, so a random row read costs as little as a sequential read. Other layouts use a cache
+ * of decoded row blocks.
  */
 public final class Hdf5Corpus extends PublishedCorpus {
 
+  private static final Logger LOG = LoggerFactory.getLogger(Hdf5Corpus.class);
+
   static final int BLOCK_ROWS = 4096;
   static final int CACHED_BLOCKS = 64;
+  /** Largest size of one memory mapped region of the train dataset. */
+  static final long MAX_MAP_BYTES = 1L << 30;
 
   private final Path file;
   private final HdfFile hdf;
   private final Dataset train;
+  private final MappedRows mapped;
   private final long trainCount;
   private final int dim;
   private final float[][] queries;
@@ -61,12 +77,13 @@ public final class Hdf5Corpus extends PublishedCorpus {
     };
 
   private Hdf5Corpus(RandomStreams streams, AttributeModel attributes, Path file, HdfFile hdf,
-    Dataset train, long rows, Metric metric, String distanceName, float[][] queries,
-    int[][] neighbors) {
+    Dataset train, MappedRows mapped, long rows, Metric metric, String distanceName,
+    float[][] queries, int[][] neighbors) {
     super(streams, attributes, rows, metric);
     this.file = file;
     this.hdf = hdf;
     this.train = train;
+    this.mapped = mapped;
     this.trainCount = train.getDimensions()[0];
     this.dim = train.getDimensions()[1];
     this.distanceName = distanceName;
@@ -77,6 +94,16 @@ public final class Hdf5Corpus extends PublishedCorpus {
   /** Opens an ANN-Benchmarks formatted HDF5 corpus file. */
   public static Hdf5Corpus open(Path file, long rows, RandomStreams streams,
     AttributeModel attributes) throws IOException {
+    return open(file, rows, streams, attributes, true);
+  }
+
+  /**
+   * Opens an ANN-Benchmarks formatted HDF5 corpus file.
+   * @param mapRows false to read the train rows in decoded blocks even when a memory map is
+   *                possible
+   */
+  static Hdf5Corpus open(Path file, long rows, RandomStreams streams, AttributeModel attributes,
+    boolean mapRows) throws IOException {
     if (!Files.isRegularFile(file)) {
       throw new IOException("HDF5 corpus path is not a file: " + file);
     }
@@ -101,8 +128,15 @@ public final class Hdf5Corpus extends PublishedCorpus {
       Dataset nb = dataset(hdf, "neighbors", false);
       int[][] neighbors = nb == null ? null : toInts(nb.getData());
       long n = rows <= 0 || rows > td[0] ? td[0] : rows;
-      return new Hdf5Corpus(streams, attributes, file, hdf, train, n, metric, distance, queries,
-        neighbors);
+      MappedRows mapped = mapRows ? MappedRows.map(file, hdf, train) : null;
+      if (mapped != null && !mapped.agreesWith(train)) {
+        LOG.warn("Memory mapped rows of {} differ from the HDF5 reader; using block reads", file);
+        mapped = null;
+      }
+      LOG.info("Reading train rows of {} through {}", file,
+        mapped != null ? "a memory map" : "decoded blocks");
+      return new Hdf5Corpus(streams, attributes, file, hdf, train, mapped, n, metric, distance,
+        queries, neighbors);
     } catch (IOException | RuntimeException e) {
       hdf.close();
       throw e;
@@ -205,7 +239,19 @@ public final class Hdf5Corpus extends PublishedCorpus {
     return trainRow(ordinal);
   }
 
+  /** Returns true if train rows come from memory maps and not from decoded blocks. */
+  boolean mapped() {
+    return mapped != null;
+  }
+
   private float[] trainRow(long i) {
+    if (mapped != null) {
+      return mapped.row(i);
+    }
+    return blockRow(i);
+  }
+
+  private float[] blockRow(long i) {
     long block = i / BLOCK_ROWS;
     float[][] rowsOfBlock;
     synchronized (blocks) {
@@ -288,6 +334,105 @@ public final class Hdf5Corpus extends PublishedCorpus {
       hdf.close();
     } catch (RuntimeException e) {
       throw new UncheckedIOException(new IOException("Closing " + file, e));
+    }
+  }
+
+  /**
+   * Reads the train rows of a contiguous dataset without filters directly from memory maps of the
+   * file. Such a dataset is one row-major array, so a row read is a copy at a known offset. Each
+   * region holds whole rows. The reads use absolute offsets, so threads can share the regions.
+   */
+  static final class MappedRows {
+
+    private final ByteBuffer[] regions;
+    private final long rowsPerRegion;
+    private final int rowBytes;
+    private final int dim;
+    private final long count;
+    private final boolean doubles;
+
+    private MappedRows(ByteBuffer[] regions, long rowsPerRegion, int rowBytes, int dim, long count,
+      boolean doubles) {
+      this.regions = regions;
+      this.rowsPerRegion = rowsPerRegion;
+      this.rowBytes = rowBytes;
+      this.dim = dim;
+      this.count = count;
+      this.doubles = doubles;
+    }
+
+    /** Maps the train dataset, or returns null if its layout or type needs the HDF5 reader. */
+    static MappedRows map(Path file, HdfFile hdf, Dataset train) throws IOException {
+      return map(file, hdf, train, MAX_MAP_BYTES);
+    }
+
+    /** Maps the train dataset in regions of at most {@code maxRegionBytes} bytes. */
+    static MappedRows map(Path file, HdfFile hdf, Dataset train, long maxRegionBytes)
+      throws IOException {
+      if (!(train instanceof ContiguousDataset) || !train.getFilters().isEmpty()) {
+        return null;
+      }
+      DataType type = train.getDataType();
+      if (!(type instanceof FloatingPoint) || (type.getSize() != 4 && type.getSize() != 8)) {
+        return null;
+      }
+      int[] d = train.getDimensions();
+      long count = d[0];
+      int dim = d[1];
+      long rowBytes = (long) dim * type.getSize();
+      if (count == 0 || dim == 0 || rowBytes > maxRegionBytes) {
+        return null;
+      }
+      // The HDF5 reader also adds the user block size to the data address.
+      long start = hdf.getUserBlockSize() + ((ContiguousDataset) train).getDataAddress();
+      try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
+        if (start < 0 || start + count * rowBytes > ch.size()) {
+          return null;
+        }
+        long perRegion = maxRegionBytes / rowBytes;
+        int n = Math.toIntExact((count + perRegion - 1) / perRegion);
+        ByteBuffer[] regions = new ByteBuffer[n];
+        for (int r = 0; r < n; r++) {
+          long first = r * perRegion;
+          long bytes = Math.min(perRegion, count - first) * rowBytes;
+          regions[r] = ch.map(FileChannel.MapMode.READ_ONLY, start + first * rowBytes, bytes)
+            .order(((FloatingPoint) type).getByteOrder());
+        }
+        return new MappedRows(regions, perRegion, (int) rowBytes, dim, count, type.getSize() == 8);
+      }
+    }
+
+    /** Returns the number of mapped regions. */
+    int regionCount() {
+      return regions.length;
+    }
+
+    /** Returns the train row at index {@code i}. */
+    float[] row(long i) {
+      ByteBuffer b = regions[(int) (i / rowsPerRegion)];
+      int pos = (int) ((i % rowsPerRegion) * rowBytes);
+      float[] out = new float[dim];
+      if (doubles) {
+        for (int j = 0; j < dim; j++) {
+          out[j] = (float) b.getDouble(pos + 8 * j);
+        }
+      } else {
+        for (int j = 0; j < dim; j++) {
+          out[j] = b.getFloat(pos + 4 * j);
+        }
+      }
+      return out;
+    }
+
+    /** Returns true if the first, middle, and last rows agree with the HDF5 reader. */
+    boolean agreesWith(Dataset train) {
+      for (long i : new long[] { 0, count / 2, count - 1 }) {
+        float[] expected = toFloats(train.getData(new long[] { i, 0 }, new int[] { 1, dim }))[0];
+        if (!Arrays.equals(expected, row(i))) {
+          return false;
+        }
+      }
+      return true;
     }
   }
 }

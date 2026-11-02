@@ -19,6 +19,7 @@ package org.apache.phoenix.vectorharness.corpus;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -27,10 +28,16 @@ import static org.junit.Assert.fail;
 
 import io.jhdf.HdfFile;
 import io.jhdf.WritableHdfFile;
+import io.jhdf.api.Dataset;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.apache.phoenix.vectorharness.config.Metric;
 import org.junit.Rule;
 import org.junit.Test;
@@ -71,7 +78,12 @@ public class Hdf5CorpusTest {
   /** Writes an ANN-Benchmarks file. Null distance omits distance attribute. */
   private Path write(String name, Object trainData, Object testData, Object neighborData,
     String distance) throws IOException {
-    Path p = tmp.getRoot().toPath().resolve(name);
+    return write(tmp.getRoot().toPath(), name, trainData, testData, neighborData, distance);
+  }
+
+  private static Path write(Path dir, String name, Object trainData, Object testData,
+    Object neighborData, String distance) throws IOException {
+    Path p = dir.resolve(name);
     try (WritableHdfFile w = HdfFile.write(p)) {
       if (trainData != null) {
         w.putDataset("train", trainData);
@@ -100,6 +112,11 @@ public class Hdf5CorpusTest {
   private static Hdf5Corpus open(Path p, long rows, long seed) throws IOException {
     RandomStreams streams = new RandomStreams(seed);
     return Hdf5Corpus.open(p, rows, streams, attributes(streams));
+  }
+
+  private static Hdf5Corpus openBlocks(Path p, long rows, long seed) throws IOException {
+    RandomStreams streams = new RandomStreams(seed);
+    return Hdf5Corpus.open(p, rows, streams, attributes(streams), false);
   }
 
   private static double norm(float[] v) {
@@ -245,6 +262,7 @@ public class Hdf5CorpusTest {
     }
     Path p = write("doubles.hdf5", dtrain, test, lnb, "euclidean");
     try (Hdf5Corpus c = open(p, 0, 1L)) {
+      assertTrue(c.mapped());
       for (int i = 0; i < train.length; i++) {
         assertArrayEquals(train[i], c.vector(i), 0.0f);
       }
@@ -313,7 +331,8 @@ public class Hdf5CorpusTest {
       big[i][1] = -i;
     }
     Path p = write("big.hdf5", big, floats(3L, 2, 2), null, null);
-    try (Hdf5Corpus c = open(p, 0, 1L)) {
+    try (Hdf5Corpus c = openBlocks(p, 0, 1L)) {
+      assertFalse(c.mapped());
       assertEquals(rows, c.rows());
       long[] probes = { 0, Hdf5Corpus.BLOCK_ROWS - 1, Hdf5Corpus.BLOCK_ROWS,
         Hdf5Corpus.BLOCK_ROWS + 1, rows - 1, 0 };
@@ -385,13 +404,84 @@ public class Hdf5CorpusTest {
     try (Hdf5Corpus c = open(p, 0, 43L)) {
       assertNotEquals(full, c.fingerprint());
     }
-    // Neighbor list values are included in the digest, altering fingerprint when changed
+    // The digest includes the neighbor lists. The files have the same name, so only the neighbor
+    // lists differ.
     int[][] other = neighbors(9, 4, 120);
     other[0][0] = (other[0][0] + 1) % 120;
-    Path q = write("other.hdf5", train, test, other, "angular");
-    Path same = write("same.hdf5", train, test, nb, "angular");
-    try (Hdf5Corpus c = open(q, 0, 42L); Hdf5Corpus d = open(same, 0, 42L)) {
+    Path q = write(tmp.newFolder("other").toPath(), "x.hdf5", train, test, other, "angular");
+    Path same = write(tmp.newFolder("same").toPath(), "x.hdf5", train, test, nb, "angular");
+    Path again = write(tmp.newFolder("again").toPath(), "x.hdf5", train, test, nb, "angular");
+    try (Hdf5Corpus c = open(q, 0, 42L); Hdf5Corpus d = open(same, 0, 42L);
+      Hdf5Corpus e = open(again, 0, 42L)) {
+      assertEquals(d.fingerprint(), e.fingerprint());
       assertNotEquals(d.fingerprint(), c.fingerprint());
+    }
+  }
+
+  @Test
+  public void testMappedRowsMatchBlockReads() throws IOException {
+    Path p = standard("euclidean");
+    for (long rows : new long[] { 0, 100 }) {
+      try (Hdf5Corpus m = open(p, rows, 42L); Hdf5Corpus b = openBlocks(p, rows, 42L)) {
+        assertTrue(m.mapped());
+        assertFalse(b.mapped());
+        assertEquals(b.description(), m.description());
+        assertEquals(b.parameters(), m.parameters());
+        assertEquals(b.fingerprint(), m.fingerprint());
+        for (long i = 0; i < m.rows(); i++) {
+          assertArrayEquals(train[(int) i], m.vector(i), 0.0f);
+          assertArrayEquals(b.vector(i), m.vector(i), 0.0f);
+        }
+        for (long ordinal = m.rows(); ordinal < m.rows() + 30; ordinal++) {
+          assertArrayEquals(b.mutations().insert(ordinal, 0.0).vector(),
+            m.mutations().insert(ordinal, 0.0).vector(), 0.0f);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testMappedRegionBoundaries() throws IOException {
+    Path p = standard("euclidean");
+    try (HdfFile hdf = new HdfFile(p)) {
+      Dataset ds = (Dataset) hdf.getChildren().get("train");
+      // Regions of seven whole rows; the spare bytes must not split a row.
+      Hdf5Corpus.MappedRows m = Hdf5Corpus.MappedRows.map(p, hdf, ds, 7L * DIM * 4 + 3);
+      assertEquals((train.length + 6) / 7, m.regionCount());
+      for (int i = 0; i < train.length; i++) {
+        assertArrayEquals(train[i], m.row(i), 0.0f);
+      }
+      assertTrue(m.agreesWith(ds));
+      assertNull(Hdf5Corpus.MappedRows.map(p, hdf, ds, DIM * 4 - 1));
+    }
+  }
+
+  @Test
+  public void testConcurrentRandomReads() throws Exception {
+    Path p = standard("euclidean");
+    ExecutorService pool = Executors.newFixedThreadPool(8);
+    try (Hdf5Corpus m = open(p, 0, 42L); Hdf5Corpus b = openBlocks(p, 0, 42L)) {
+      List<Future<Integer>> results = new ArrayList<>();
+      for (int t = 0; t < 8; t++) {
+        long seed = t;
+        results.add(pool.submit(() -> {
+          SplitMix64 rnd = new SplitMix64(seed);
+          int bad = 0;
+          for (int n = 0; n < 2000; n++) {
+            int i = (int) rnd.nextLong(train.length);
+            Hdf5Corpus c = (n & 1) == 0 ? m : b;
+            if (!Arrays.equals(train[i], c.vector(i))) {
+              bad++;
+            }
+          }
+          return bad;
+        }));
+      }
+      for (Future<Integer> f : results) {
+        assertEquals(0, (int) f.get());
+      }
+    } finally {
+      pool.shutdownNow();
     }
   }
 }
