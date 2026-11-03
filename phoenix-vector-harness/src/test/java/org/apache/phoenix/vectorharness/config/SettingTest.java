@@ -79,14 +79,15 @@ public class SettingTest {
     assertEquals("60s", Setting.QUERY_TIMEOUT.defaultText());
     assertEquals("0.3,0.5,0.2", Setting.MUTATION_MIX.defaultText());
     assertEquals("corpus,profile", Setting.TABLE_LAYOUTS.defaultText());
+    assertEquals("table.regions", Setting.IVF_REGIONS.defaultText());
   }
 
   @Test
   public void testSettingsWithoutDefaults() {
-    Setting[] none =
-      { Setting.RUN_ID, Setting.RUN_PROFILE_NAME, Setting.CORPUS_PATH, Setting.CORPUS_NAME,
-        Setting.TABLE_SUFFIX, Setting.HNSW_PQ_SEGMENTS, Setting.QUERY_RATE_VALUES,
-        Setting.REBUILD_EXPLICIT_AT, Setting.OBSERVE_JMX_PORT, Setting.DISRUPTION_SCHEDULE };
+    Setting[] none = { Setting.RUN_ID, Setting.RUN_PROFILE_NAME, Setting.CORPUS_PATH,
+      Setting.CORPUS_NAME, Setting.TABLE_SUFFIX, Setting.IVF_SALT_BUCKETS, Setting.HNSW_PQ_SEGMENTS,
+      Setting.QUERY_RATE_VALUES, Setting.REBUILD_EXPLICIT_AT, Setting.OBSERVE_JMX_PORT,
+      Setting.DISRUPTION_SCHEDULE };
     Set<Setting> expected = new HashSet<>();
     for (Setting s : none) {
       expected.add(s);

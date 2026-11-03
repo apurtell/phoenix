@@ -234,6 +234,13 @@ public final class HarnessConfig {
       }
     }
     out.put(Setting.CORPUS_INTRINSIC_DIM.key(), Integer.toString(intrinsicDim()));
+    // The run records the resolved IVF layout, so runs with the same index layout compare equal.
+    // An unset salt resolves to the salt of the data table. The buckets give the regions of a
+    // salted index.
+    Integer ivfSalt = ivfSaltBuckets();
+    int salt = ivfSalt != null ? ivfSalt : saltBuckets();
+    out.put(Setting.IVF_SALT_BUCKETS.key(), Integer.toString(salt));
+    out.put(Setting.IVF_REGIONS.key(), Integer.toString(salt > 0 ? salt : ivfRegions()));
     out.put(Setting.RUN_PROFILE_NAME.key(), profileName);
     return out;
   }
@@ -500,6 +507,23 @@ public final class HarnessConfig {
 
   public boolean ivfAsync() {
     return boolValue(Setting.IVF_ASYNC);
+  }
+
+  /** Returns the region count of the IVF index, defaulting to the data table region count. */
+  public int ivfRegions() {
+    String v = raw(Setting.IVF_REGIONS);
+    if (v.equalsIgnoreCase("table.regions")) {
+      return regions();
+    }
+    return parseInt(Setting.IVF_REGIONS, v);
+  }
+
+  /**
+   * Returns the SALT_BUCKETS value of the IVF index, or null if unset. An unset value lets the
+   * index inherit the salt of the data table.
+   */
+  public Integer ivfSaltBuckets() {
+    return isSet(Setting.IVF_SALT_BUCKETS) ? intValue(Setting.IVF_SALT_BUCKETS) : null;
   }
 
   public int hnswM() {
@@ -916,6 +940,19 @@ public final class HarnessConfig {
     if (saltBuckets() < 0 || saltBuckets() > 256) {
       problems.add(Setting.TABLE_SALT_BUCKETS.key() + " must be between 0 and 256");
     }
+    if (ivfRegions() < 1) {
+      problems.add(Setting.IVF_REGIONS.key() + " must be at least 1");
+    }
+    Integer ivfSalt = ivfSaltBuckets();
+    if (ivfSalt != null && (ivfSalt < 0 || ivfSalt > 256)) {
+      problems.add(Setting.IVF_SALT_BUCKETS.key() + " must be between 0 and 256");
+    }
+    // The salt buckets set the region layout of a salted index. Explicit split points would
+    // replace the bucket boundaries.
+    if (ivfSalt != null && ivfSalt > 0 && isSet(Setting.IVF_REGIONS) && ivfRegions() > 1) {
+      problems.add(Setting.IVF_REGIONS.key() + "=" + ivfRegions() + " needs an unsalted index;"
+        + " set " + Setting.IVF_SALT_BUCKETS.key() + "=0 or " + Setting.IVF_REGIONS.key() + "=1");
+    }
     String scheme = storageScheme();
     if (!scheme.equals("ONE_CELL_PER_COLUMN") && !scheme.equals("SINGLE_CELL_ARRAY_WITH_OFFSETS")) {
       problems.add(Setting.TABLE_STORAGE_SCHEME.key()
@@ -996,6 +1033,12 @@ public final class HarnessConfig {
         break;
       case CORPUS_INTRINSIC_DIM:
         intrinsicDim();
+        break;
+      case IVF_REGIONS:
+        ivfRegions();
+        break;
+      case IVF_SALT_BUCKETS:
+        ivfSaltBuckets();
         break;
       case QUERY_IVF_PROBE_VALUES:
         ivfProbeValues();

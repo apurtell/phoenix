@@ -131,6 +131,11 @@ final class StageEnd {
     return stopped || slotNanos - windowEndNanos >= 0;
   }
 
+  /** Returns the planned window end. */
+  long windowEndNanos() {
+    return windowEndNanos;
+  }
+
   /** Stops the stage at once, also while a disruption is in flight. */
   void stop() {
     stopped = true;

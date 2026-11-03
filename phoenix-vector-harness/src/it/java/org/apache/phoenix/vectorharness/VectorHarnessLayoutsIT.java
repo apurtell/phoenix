@@ -28,6 +28,8 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import org.apache.phoenix.end2end.ParallelStatsDisabledIT;
 import org.apache.phoenix.end2end.ParallelStatsDisabledTest;
@@ -282,5 +284,76 @@ public class VectorHarnessLayoutsIT extends ParallelStatsDisabledIT {
     assertEquals(2.0, number(r.get("build.indexes.profile.segments.base_segments")), 0.0);
     assertWideBeam(r, "profile");
     assertWideBeam(r, "corpus");
+  }
+
+  @Test
+  public void test12IvfRegions() throws Exception {
+    // The value differs from the table.regions default of the test profile.
+    Properties p = profile("ivf", "LY_IVF_REGIONS", "ly-ivf-regions");
+    p.setProperty("ivf.regions", "3");
+    p.setProperty("ivf.lists", "9");
+    Scenario s = HarnessScenarioSupport.runAll(output, p);
+    assertValid(s);
+    RunResult r = s.result;
+    String ddl = String.valueOf(r.get("build.indexes.corpus.ddl"));
+    assertTrue(ddl, ddl.contains(" SPLIT ON (3, 6)"));
+    Map<String, Object> regions = map(r.get("build.indexes.corpus.regions"));
+    assertEquals(regions.toString(), "SPLIT_ON", path(regions, "layout.mode"));
+    List<?> points = (List<?>) regions.get("split_points");
+    assertTrue(regions.toString(), points.size() >= 2);
+    assertEquals(regions.toString(), "[3, 6]", points.subList(0, 2).toString());
+    if (number(regions.get("lists")) == 9) {
+      // Training returned the requested lists, so the SPLIT ON points give the whole layout.
+      assertFalse(regions.toString(), regions.containsKey("top_up"));
+      assertEquals(regions.toString(), "[3, 6]", points.toString());
+      assertEquals(regions.toString(), 3.0, number(regions.get("populated_regions")), 0.0);
+    } else {
+      assertTrue(regions.toString(), number(regions.get("populated_regions")) >= 3);
+    }
+    assertExhaustive(r, "probes=all", "corpus");
+  }
+
+  @Test
+  public void test13IvfRegionsAcrossAnExplicitRebuild() throws Exception {
+    Properties p = profile("ivf", "LY_IVF_REBUILD", "ly-ivf-rebuild");
+    p.setProperty("ivf.regions", "3");
+    p.setProperty("ivf.lists", "9");
+    p.setProperty("rebuild.explicit.at", "1s");
+    Scenario s = HarnessScenarioSupport.runAll(output, p);
+    assertValid(s);
+    Map<String, Object> window = HarnessScenarioSupport.window(s.result);
+    Object list = window.get("layout_changes");
+    assertTrue(String.valueOf(window), list instanceof List);
+    List<?> changes = (List<?>) list;
+    assertEquals(changes.toString(), 2, changes.size());
+    Map<String, Object> before = map(changes.get(0));
+    Map<String, Object> after = map(changes.get(1));
+    assertEquals(before.toString(), "before-rebuild", before.get("phase"));
+    assertEquals(after.toString(), "after-promotion", after.get("phase"));
+    Map<String, Object> pre = map(before.get("result"));
+    assertFalse(pre.toString(), pre.containsKey("error"));
+    assertEquals(pre.toString(), 3.0, number(pre.get("target_regions")), 0.0);
+    assertTrue(pre.toString(), ((List<?>) path(pre, "split.failed")).isEmpty());
+    assertTrue(pre.toString(), ((List<?>) path(pre, "split.split")).size() >= 3);
+    Map<String, Object> post = map(after.get("result"));
+    assertFalse(post.toString(), post.containsKey("error"));
+    assertTrue(post.toString(), number(post.get("first_id")) > 0);
+    assertTrue(post.toString(),
+      number(post.get("populated_regions")) >= number(post.get("target_regions")));
+    assertEquals(post.toString(), Boolean.TRUE, path(post, "balance.balanced"));
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> map(Object o) {
+    assertTrue(String.valueOf(o), o instanceof Map);
+    return (Map<String, Object>) o;
+  }
+
+  private static Object path(Map<String, Object> m, String dotted) {
+    Object o = m;
+    for (String k : dotted.split("\\.")) {
+      o = o instanceof Map ? ((Map<?, ?>) o).get(k) : null;
+    }
+    return o;
   }
 }

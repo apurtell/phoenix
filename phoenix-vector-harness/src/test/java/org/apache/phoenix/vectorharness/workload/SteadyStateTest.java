@@ -22,12 +22,19 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.config.Metric;
 import org.apache.phoenix.vectorharness.corpus.SplitMix64;
 import org.apache.phoenix.vectorharness.observe.MetricSnapshot;
+import org.apache.phoenix.vectorharness.variant.IvfRegionLayout;
 import org.junit.Test;
 
 public class SteadyStateTest {
@@ -163,5 +170,79 @@ public class SteadyStateTest {
     long notBefore = applied + SteadyState.JMX_CACHE_TTL_MS;
     assertFalse(recovered(pre, sample(applied + 2000, 4, 0, 0, 0), 4, notBefore));
     assertTrue(recovered(pre, sample(notBefore, 4, 0, 0, 0), 4, notBefore));
+  }
+
+  private static IvfRegionLayout.Plan plan(String... kv) {
+    Properties p = new Properties();
+    p.setProperty("ivf.lists", "8");
+    for (int i = 0; i < kv.length; i += 2) {
+      p.setProperty(kv[i], kv[i + 1]);
+    }
+    return IvfRegionLayout.plan(HarnessConfig.of("t", p));
+  }
+
+  @Test
+  public void testRelayoutsOnlyForSplitLayouts() {
+    assertTrue(SteadyState.relayouts(plan("ivf.regions", "2")));
+    assertTrue(SteadyState.relayouts(plan("ivf.regions", "2", "table.multi_tenant", "true")));
+    assertFalse(SteadyState.relayouts(plan("ivf.regions", "1")));
+    assertFalse(SteadyState.relayouts(plan("ivf.salt_buckets", "4", "ivf.regions", "1")));
+    assertFalse(SteadyState.relayouts(plan("table.salt_buckets", "4")));
+  }
+
+  @Test
+  public void testCompleteLayoutNeedsEverySplit() {
+    assertTrue(SteadyState.complete(null));
+    assertTrue(SteadyState.complete(map("index_regions", 4)));
+    assertTrue(SteadyState.complete(map("midkey", map("outcome", "done"))));
+    assertTrue(SteadyState.complete(map("top_up", map("failed", new ArrayList<>()))));
+    assertFalse(SteadyState.complete(map("error", "java.io.IOException")));
+    assertFalse(SteadyState.complete(map("interrupted", true)));
+    assertFalse(SteadyState.complete(map("midkey", map("outcome", "no splittable region"))));
+    assertFalse(SteadyState.complete(map("top_up", map("failed", Arrays.asList(12)))));
+    Map<String, Object> ended = map("midkey", map("outcome", "window ended"));
+    assertFalse(SteadyState.complete(ended));
+    assertTrue(SteadyState.windowEnded(ended));
+    assertFalse(SteadyState.windowEnded(map("midkey", map("outcome", "timed out"))));
+    assertFalse(SteadyState.windowEnded(null));
+  }
+
+  @Test
+  public void testRestartWaitsForTheLayoutLockOnlyUntilTheWindowEnd() throws Exception {
+    ReentrantLock lock = new ReentrantLock();
+    StageEnd end = new StageEnd(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200));
+    CountDownLatch held = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    Thread relayout = new Thread(() -> {
+      lock.lock();
+      try {
+        held.countDown();
+        release.await();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      } finally {
+        lock.unlock();
+      }
+    });
+    relayout.start();
+    held.await();
+    try {
+      // A relayout holds the lock past the window end, so the restart does not start.
+      assertEquals(-1, SteadyState.lockUntilWindowEnd(lock, end));
+      assertFalse(lock.isHeldByCurrentThread());
+    } finally {
+      release.countDown();
+      relayout.join(10_000);
+    }
+    StageEnd open = new StageEnd(System.nanoTime() + TimeUnit.MINUTES.toNanos(10));
+    assertTrue(SteadyState.lockUntilWindowEnd(lock, open) >= 0);
+    assertTrue(lock.isHeldByCurrentThread());
+    lock.unlock();
+  }
+
+  private static Map<String, Object> map(String key, Object value) {
+    Map<String, Object> m = new HashMap<>();
+    m.put(key, value);
+    return m;
   }
 }

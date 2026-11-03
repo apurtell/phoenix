@@ -74,6 +74,13 @@ public class ReportGeneratorTest {
   }
 
   @Test
+  public void testIndexRegionSettingsAreNotExempt() {
+    assertTrue(ReportGenerator.exempt("ivf.lists"));
+    assertFalse(ReportGenerator.exempt("ivf.regions"));
+    assertFalse(ReportGenerator.exempt("ivf.salt_buckets"));
+  }
+
+  @Test
   public void testDeterministicModeIsAnExecutionParameter() throws IOException {
     assertFalse(ReportGenerator.exempt("run.deterministic"));
     for (String key : new String[] { "run.id", "run.variant", "run.output.dir", "run.profile.name",
@@ -156,6 +163,58 @@ public class ReportGeneratorTest {
     assertTrue(report, report.contains("profile covered_filter@0.1 k=10 [uncovered]"));
     assertTrue(report, report.contains("corpus covered_filter@0.1 k=10 [covered]"));
     assertFalse(report, report.contains("corpus unfiltered k=10 ["));
+  }
+
+  private static Map<String, Object> change(String trigger, String phase, Long generation,
+    Map<String, Object> result) {
+    Map<String, Object> c = new LinkedHashMap<>();
+    c.put("layout", "corpus");
+    c.put("trigger", trigger);
+    c.put("phase", phase);
+    c.put("from_generation", 1L);
+    c.put("generation", generation);
+    c.put("start_offset_ms", 61_000L);
+    c.put("end_offset_ms", 125_500L);
+    c.put("result", result);
+    return c;
+  }
+
+  @Test
+  public void testLayoutChangesMarkTheirWindows() {
+    Map<String, Object> balance = new LinkedHashMap<>();
+    balance.put("balanced", false);
+    Map<String, Object> promoted = new LinkedHashMap<>();
+    promoted.put("index_regions", 4);
+    promoted.put("balance", balance);
+    Map<String, Object> midkey = new LinkedHashMap<>();
+    midkey.put("outcome", "timed out");
+    Map<String, Object> auto = new LinkedHashMap<>();
+    auto.put("midkey", midkey);
+    Map<String, Object> error = new LinkedHashMap<>();
+    error.put("error", "java.io.IOException: gone");
+    Map<String, Object> w = new LinkedHashMap<>();
+    w.put("stage", "steady@20");
+    w.put("layout_changes",
+      Arrays.asList(change("explicit", "before-rebuild", null, new LinkedHashMap<>()),
+        change("explicit", "after-promotion", 2L, promoted),
+        change("auto", "auto-promotion", 3L, auto), change("auto", "auto-promotion", 4L, error)));
+    Map<String, Object> quiet = new LinkedHashMap<>();
+    quiet.put("stage", "steady@40");
+    quiet.put("layout_changes", Arrays.asList());
+    List<Map<String, Object>> windows = Arrays.asList(w, quiet);
+    TextTable t = ReportGenerator.layoutChanges(windows);
+    assertFalse(t.isEmpty());
+    String out = t.render("");
+    String[] lines = out.split("\n");
+    assertEquals(out, 5, lines.length);
+    assertTrue(out, lines[1].contains("before-rebuild") && lines[1].contains("done")
+      && lines[1].contains("61.000") && lines[1].contains("125.5"));
+    // A change without a new generation shows the generation before the rebuild.
+    assertTrue(out, lines[1].matches(".*before-rebuild\\s+1\\s.*"));
+    assertTrue(out, lines[2].contains("unbalanced") && lines[2].matches(".*\\s4\\s.*"));
+    assertTrue(out, lines[3].contains("timed out"));
+    assertTrue(out, lines[4].contains("error"));
+    assertTrue(ReportGenerator.layoutChanges(Arrays.asList(quiet)).isEmpty());
   }
 
   @Test

@@ -227,6 +227,8 @@ Default settings reflect baseline recommendations. Settings with inter-dependenc
 | `ivf.lists` | `1024` | Number of centroids (inverted lists) for IVF indexes |
 | `ivf.sample_size` | `50000` | Number of vectors sampled for k-means centroid training |
 | `ivf.async` | `false` | Builds index asynchronously via Phoenix index tooling |
+| `ivf.regions` | `table.regions` | Region count of the IVF index table after the build. `1` leaves the index in one region. See [IVF Index Regions](#ivf-index-regions) |
+| `ivf.salt_buckets` | — | `SALT_BUCKETS` of the IVF index. Unset, the index inherits the salt of the data table. `0` makes an unsalted index, and a positive value salts it. A positive value with an explicit `ivf.regions` above 1 fails validation |
 | `hnsw.m` | `16` | Maximum node degree (outgoing edges per node) in HNSW graph |
 | `hnsw.ef_construction` | `100` | Size of dynamic candidate list during HNSW graph construction |
 | `hnsw.alpha` | `1.2` | Vamana diversity factor |
@@ -301,6 +303,30 @@ Default settings reflect baseline recommendations. Settings with inter-dependenc
 |---|---|---|
 | `report.recall.targets` | `0.90,0.95,0.99` | Target recall thresholds for cost analysis along efficiency frontiers |
 | `report.latency.budgets` | `10ms` | Target p99 latency ceilings for recall analysis along efficiency frontiers |
+
+### IVF Index Regions
+
+A production IVF index starts in one region. It splits as it grows, early in its life, and then keeps a steady region count. The harness gives the index that steady-state layout, so the query plan and the cost per query match a naturally split index. Pre-splitting is a test aid. It does not tune production.
+
+The layout method depends on the row key `[salt][tenant][centroid ID][data key]`:
+
+| Index | Method |
+|---|---|
+| Unsalted, single tenant | `CREATE VECTOR INDEX ... SPLIT ON (...)` at even centroid IDs over the first generation: the step is the ceiling of `ivf.lists` over `ivf.regions`. After the build, the harness reads the real first ID and list count. Training can return more lists than requested, so the harness adds split points where a region holds one and a half even shares of the lists or more. A few extra lists do not add a region |
+| Unsalted, multi-tenant | The tenant ID leads the row key, so SPLIT ON cannot give the layout. After the build, the harness splits the largest region at its midkey, as a size-based split does. Between rounds, the daughters compact away their reference files |
+| Salted | The salt buckets give the regions. The harness does not split the index. A data table with `table.salt_buckets` above 0 salts the index too, unless `ivf.salt_buckets=0` |
+
+SPLIT ON covers only the centroid IDs of the first generation. A rebuilt generation takes the IDs after the IDs of the generation that it replaces. The rows of the old generation stay in the table, so a rebuild must give the new ID range its own regions:
+
+| Rebuild | Method |
+|---|---|
+| Explicit (`rebuild.explicit.at`), keyed by centroid ID | Before `ALTER INDEX ... REBUILD`, the harness splits the empty ID range of the new generation. The first split is at the first new ID. The other splits are at even steps over the expected list count: the larger of the requested count and the list count of the outgoing generation. The target is the larger of `ivf.regions` and the populated region count of the outgoing generation. A split of an empty range moves no data. After the promotion, the harness reads the real list count and adds split points if training returned more lists |
+| Explicit, multi-tenant | After the promotion, the harness splits the largest region at its midkey. Both generations share the regions of each tenant, so this step usually finds the target count already in place |
+| Automatic (`rebuild.auto.enabled=true`) | The harness polls the active generation every 10 seconds. After a promotion, it splits the largest regions that hold the new ID range at their midkeys while the workload runs. The splits stop at the end of the window, and the next window continues them. A failed layout gets three attempts |
+
+After any split, the harness spreads the regions of the new generation across the region servers. A split opens both daughters on the server of the parent, and the balancer evens out only the region count of the whole table. The retired regions of earlier generations count in that total. Thus the harness moves regions of the generation from the busiest server to the idlest server until the counts are even. A spread that times out records a warning event and does not stop the run. Each step records an `index-presplit` event with the phase: `first-build`, `before-rebuild`, `after-promotion`, or `auto-promotion`. A steady window records each rebuild layout change under `layout_changes` with its start and end offsets. The report lists these changes below the window. From the promotion to the end of the split, the index does not have a steady-state layout, so the measurements of that interval do not describe one.
+
+The build record `tables/<suffix>/build.json` holds the layout under `indexes.<layout>.regions`: `index_regions`, `populated_regions`, `split_points`, `lists_per_region` (for an index keyed by centroid ID), `region_bytes`, `size_cv` (the coefficient of variation of the populated region sizes), `regions_per_server` (for an index keyed by centroid ID, only the regions of the populated generation count), `table_regions_per_server`, and the events. The build record also holds the layout time under `regions.seconds`, and `build.layout_seconds` holds the sum. The build time does not include it. Reports show the region count in the `index regions` column. The run records the resolved layout: `ivf.salt_buckets` is the salt of the index, and `ivf.regions` is the target region count, or the bucket count of a salted index. Runs with other resolved values are not comparable.
 
 ## Integration Testing
 

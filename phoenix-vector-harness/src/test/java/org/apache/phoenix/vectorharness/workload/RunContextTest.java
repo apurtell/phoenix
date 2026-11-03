@@ -19,8 +19,10 @@ package org.apache.phoenix.vectorharness.workload;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
 
 import java.util.Collections;
 import java.util.EnumSet;
@@ -71,6 +73,32 @@ public class RunContextTest {
         rc.staticTruth(
           new GroundTruth("fp", "panel", 50, "L2", 10, Collections.singletonList(lists)));
         assertNull(rc.truth(0, planned, 10));
+      }
+    }
+  }
+
+  @Test
+  public void testLaidOutGenerationFollowsTheLastLayout() throws Exception {
+    Properties p = new Properties();
+    p.setProperty("corpus.rows", "100");
+    p.setProperty("corpus.dim", "4");
+    p.setProperty("corpus.clusters", "2");
+    try (HarnessContext ctx = HarnessContext.open(HarnessConfig.of("t", p))) {
+      LiveCorpus live = new LiveCorpus(ctx.corpus(), 100);
+      try (RunContext rc = new RunContext(ctx, null, EnumSet.of(TableLayout.CORPUS), null, null,
+        null, live, Collections.emptyList(), Collections.emptyList(), null, null)) {
+        // Without index metadata, the generation is unknown.
+        assertNull(rc.laidOutGeneration(TableLayout.CORPUS));
+        rc.laidOutGeneration(TableLayout.CORPUS, 7L);
+        assertEquals(Long.valueOf(7), rc.laidOutGeneration(TableLayout.CORPUS));
+        assertNull(rc.laidOutGeneration(TableLayout.PROFILE));
+        // Failed attempts add up until a complete layout resets them.
+        assertEquals(1, rc.layoutAttempt(TableLayout.CORPUS));
+        assertEquals(2, rc.layoutAttempt(TableLayout.CORPUS));
+        rc.laidOutGeneration(TableLayout.CORPUS, 8L);
+        assertEquals(1, rc.layoutAttempt(TableLayout.CORPUS));
+        assertTrue(rc.explicitRebuilds().isEmpty());
+        assertFalse(rc.relayoutLock().isLocked());
       }
     }
   }

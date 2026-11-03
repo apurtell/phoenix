@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import org.HdrHistogram.Histogram;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Admin;
@@ -46,6 +47,9 @@ import org.apache.phoenix.vectorharness.observe.StorageFootprint;
 import org.apache.phoenix.vectorharness.result.CsvTable;
 import org.apache.phoenix.vectorharness.result.LatencyRecorder;
 import org.apache.phoenix.vectorharness.truth.QueryCondition;
+import org.apache.phoenix.vectorharness.variant.IndexInfo;
+import org.apache.phoenix.vectorharness.variant.IvfRegionLayout;
+import org.apache.phoenix.vectorharness.variant.IvfVariant;
 import org.apache.phoenix.vectorharness.variant.SweepPoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,10 +72,16 @@ public final class SteadyState {
    */
   static final long MAX_EXTENSION_NANOS =
     TimeUnit.MILLISECONDS.toNanos(6 * GracefulRestart.STEP_TIMEOUT_MS + RECOVERY_TIMEOUT_MS);
+  /** Shortest wait for the layout lock that the disruption record gives. */
+  static final long LOCK_WAIT_RECORD_NANOS = TimeUnit.SECONDS.toNanos(1);
   /** JMX cache TTL margin in milliseconds for HTTP metrics reader. */
   static final long JMX_CACHE_TTL_MS = 11_000;
   /** Scale factor applied to INNER_PRODUCT freshness probe vectors. */
   static final double INNER_PRODUCT_PROBE_SCALE = 1000.0;
+  /** Interval of the check for a generation that an automatic rebuild promotes. */
+  static final long GENERATION_POLL_MS = 10_000;
+  /** Attempts at the layout of one generation before the harness gives up on it. */
+  static final int MAX_LAYOUT_ATTEMPTS = 3;
 
   private final RunContext rc;
   private final Mutator mutator;
@@ -100,6 +110,7 @@ public final class SteadyState {
   private final LatencyRecorder freshnessLatency = new LatencyRecorder();
   private final Map<String, Measurement> measurements = new ConcurrentHashMap<>();
   private final List<Map<String, Object>> disruptions = new ArrayList<>();
+  private final List<Map<String, Object>> layoutChanges = new ArrayList<>();
   private volatile long warmupEndNanos;
   private long gateClosedAtStart;
   private long recomputesAtStart;
@@ -165,6 +176,10 @@ public final class SteadyState {
       }
       if (c.rebuildExplicitAt() != null) {
         threads.add(thread("vh-rebuild", () -> rebuildAt(c.rebuildExplicitAt().toNanos())));
+      }
+      IvfRegionLayout.Plan plan = c.variant() == VariantKind.IVF ? IvfRegionLayout.plan(c) : null;
+      if (plan != null && c.rebuildAutoEnabled() && relayouts(plan)) {
+        threads.add(thread("vh-generations", () -> generationLoop(plan, endNanos)));
       }
       threads.add(thread("vh-ticker", () -> tickerLoop(end, stage)));
       for (Thread t : threads) {
@@ -610,21 +625,43 @@ public final class SteadyState {
         if (!running.get()) {
           return;
         }
-        if (!end.begin(d.toString(), System.nanoTime())) {
+        // A restart holds the layout lock, because a layout move can put regions on the drained
+        // server. During the restart, the midkey layout skips its polls, and the other layouts
+        // wait.
+        ReentrantLock lock = d.kind() == Disruption.Kind.RESTART ? rc.relayoutLock() : null;
+        long lockWait = lock == null ? 0 : lockUntilWindowEnd(lock, end);
+        boolean started = lockWait >= 0 && end.begin(d.toString(), System.nanoTime());
+        if (!started) {
+          String reason = "the steady window ended";
+          if (lockWait < 0) {
+            end.skip(d.toString());
+            reason = "the layout lock stayed busy until the window end";
+          } else if (lock != null) {
+            lock.unlock();
+          }
           for (Disruption later : schedule.subList(i + 1, schedule.size())) {
             end.skip(later.toString());
           }
-          rc.events().event("disruption-skipped",
-            String.join(" ", end.skipped()) + ": the steady window ended");
+          rc.events().event("disruption-skipped", String.join(" ", end.skipped()) + ": " + reason);
           return;
         }
         Map<String, Object> record = new LinkedHashMap<>();
         record.put("disruption", d.toString());
         // Every failure after the start ends the disruption, so the stage cannot stay open.
         try {
-          MetricSnapshot pre = rc.metrics() == null ? null : rc.metrics().sample(null);
-          record.put("offset_ms", rc.events().offset());
-          record.put("action", ChaosInjector.apply(d, n++, conn, table, rc.events(), record));
+          MetricSnapshot pre;
+          try {
+            pre = rc.metrics() == null ? null : rc.metrics().sample(null);
+            record.put("offset_ms", rc.events().offset());
+            if (lockWait >= LOCK_WAIT_RECORD_NANOS) {
+              record.put("lock_wait_seconds", lockWait / 1e9);
+            }
+            record.put("action", ChaosInjector.apply(d, n++, conn, table, rc.events(), record));
+          } finally {
+            if (lock != null) {
+              lock.unlock();
+            }
+          }
           record.put("mttr_seconds",
             awaitRecovery(pre, conn, table, System.currentTimeMillis(), record));
         } catch (InterruptedException e) {
@@ -653,6 +690,19 @@ public final class SteadyState {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
+  }
+
+  /**
+   * Takes the layout lock for a restart. The wait ends at the window end, because no disruption
+   * starts after it.
+   * @return the wait in nanoseconds, or -1 if the lock stays busy until the window end
+   */
+  static long lockUntilWindowEnd(ReentrantLock lock, StageEnd end) throws InterruptedException {
+    long start = System.nanoTime();
+    if (!lock.tryLock(Math.max(0L, end.windowEndNanos() - start), TimeUnit.NANOSECONDS)) {
+      return -1;
+    }
+    return System.nanoTime() - start;
   }
 
   /**
@@ -765,22 +815,248 @@ public final class SteadyState {
         rc.events().event("explicit-rebuild-skipped", "rebuild.explicit.at applies to IVF indexes");
         return;
       }
+      IvfRegionLayout.Plan plan = IvfRegionLayout.plan(rc.ctx().config());
       for (TableLayout layout : rc.layouts()) {
-        String sql = "ALTER INDEX " + rc.ctx().tables().index(layout) + " ON "
-          + rc.ctx().tables().fullTable(layout) + " REBUILD";
-        rc.events().event("explicit-rebuild-start", sql);
-        long t0 = System.nanoTime();
-        try (Connection conn = rc.ctx().connection()) {
-          conn.createStatement().execute(sql);
-          rc.events().event("explicit-rebuild-end",
-            String.format("%s in %.1f s", layout.id(), (System.nanoTime() - t0) / 1e9));
-        } catch (SQLException e) {
-          rc.events().event("explicit-rebuild-failed", e.getMessage());
+        rc.explicitRebuilds().add(layout);
+        try {
+          rebuild(layout, plan);
+        } finally {
+          rc.explicitRebuilds().remove(layout);
         }
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
+  }
+
+  /**
+   * Rebuilds the index of one layout. Before the rebuild, the empty ID range of the new generation
+   * gets its splits. After the promotion, the populated range gets its final layout.
+   */
+  private void rebuild(TableLayout layout, IvfRegionLayout.Plan plan) throws InterruptedException {
+    String index = rc.ctx().tables().fullIndex(layout);
+    String sql = "ALTER INDEX " + rc.ctx().tables().index(layout) + " ON "
+      + rc.ctx().tables().fullTable(layout) + " REBUILD";
+    try (Connection conn = rc.ctx().connection()) {
+      Long before = activeGeneration(conn, index);
+      int target = plan.regions();
+      if (before != null && plan.mode() == IvfRegionLayout.Mode.SPLIT_ON) {
+        long t0 = System.currentTimeMillis();
+        Map<String, Object> pre;
+        try {
+          pre = IvfVariant.layoutBeforeRebuild(conn, index, plan, before, rc.events());
+        } catch (InterruptedException e) {
+          throw e;
+        } catch (Exception e) {
+          pre = failure(index, IvfRegionLayout.PHASE_BEFORE_REBUILD, e);
+        }
+        Object t = pre == null ? null : pre.get("target_regions");
+        if (t instanceof Number) {
+          target = ((Number) t).intValue();
+        }
+        recordLayoutChange(layout, "explicit", IvfRegionLayout.PHASE_BEFORE_REBUILD, before, null,
+          t0, pre);
+      }
+      rc.events().event("explicit-rebuild-start", sql);
+      long t0 = System.nanoTime();
+      try {
+        conn.createStatement().execute(sql);
+        rc.events().event("explicit-rebuild-end",
+          String.format("%s in %.1f s", layout.id(), (System.nanoTime() - t0) / 1e9));
+      } catch (SQLException e) {
+        rc.events().event("explicit-rebuild-failed", e.getMessage());
+        return;
+      } catch (RuntimeException e) {
+        // An unchecked exception shows a defect, not a refused rebuild. Mark the run as degraded.
+        LOG.error("The explicit rebuild of {} failed", index, e);
+        rc.events().event("explicit-rebuild-failed", e.toString());
+        rc.manifest().degrade("the explicit rebuild of " + index + " failed: " + e);
+        return;
+      }
+      Long after = activeGeneration(conn, index);
+      if (relayouts(plan) && IvfRegionLayout.promoted(before, after)) {
+        relayoutAfterPromotion(conn, layout, plan, before, after, target, false, "explicit",
+          IvfRegionLayout.PHASE_AFTER_PROMOTION, Long.MAX_VALUE);
+      }
+    } catch (SQLException e) {
+      rc.events().event("explicit-rebuild-failed", e.getMessage());
+    }
+  }
+
+  /**
+   * Checks at intervals for a generation that an automatic rebuild promotes. The new generation
+   * fills the regions that hold its ID range. Natural growth splits these regions by size under
+   * load, so the harness splits them at their midkeys. A promotion between windows shows at the
+   * first check of the next window.
+   */
+  private void generationLoop(IvfRegionLayout.Plan plan, long endNanos) {
+    try (Connection conn = rc.ctx().connection()) {
+      while (running.get() && System.nanoTime() - endNanos < 0) {
+        for (TableLayout layout : rc.layouts()) {
+          if (!running.get()) {
+            return;
+          }
+          if (rc.explicitRebuilds().contains(layout)) {
+            continue;
+          }
+          String index = rc.ctx().tables().fullIndex(layout);
+          Long active;
+          try {
+            active = activeGeneration(conn, index);
+          } catch (SQLException e) {
+            LOG.debug("Reading the generation of {} failed", index, e);
+            continue;
+          }
+          Long known = rc.laidOutGeneration(layout);
+          if (known == null && active != null) {
+            rc.laidOutGeneration(layout, active);
+          } else if (IvfRegionLayout.promoted(known, active)) {
+            long stopMillis =
+              System.currentTimeMillis() + Math.max(0, (endNanos - System.nanoTime()) / 1_000_000);
+            relayoutAfterPromotion(conn, layout, plan, known, active, plan.regions(), true, "auto",
+              IvfRegionLayout.PHASE_AUTO_PROMOTION, stopMillis);
+          }
+        }
+        long left = (endNanos - System.nanoTime()) / 1_000_000;
+        if (left > 0) {
+          Thread.sleep(Math.min(GENERATION_POLL_MS, left));
+        }
+      }
+    } catch (SQLException e) {
+      LOG.warn("The generation check failed", e);
+      rc.manifest().flag("generation check failed: " + e.getMessage());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  /** Returns true if the layout of the plan changes when a generation changes. */
+  static boolean relayouts(IvfRegionLayout.Plan plan) {
+    return plan.mode() == IvfRegionLayout.Mode.SPLIT_ON
+      || plan.mode() == IvfRegionLayout.Mode.MIDKEY;
+  }
+
+  private static Long activeGeneration(Connection conn, String index) throws SQLException {
+    return IndexInfo.read(conn, index).activeGeneration();
+  }
+
+  /**
+   * Gives a promoted generation its region layout. Only one thread changes the layout at a time,
+   * also across windows. The explicit rebuild waits for the lock. The generation check skips a poll
+   * while another thread holds it. Each generation gets its layout once. A failed or partial layout
+   * leaves the generation open, so a later poll tries again. After {@link #MAX_LAYOUT_ATTEMPTS}
+   * failures the harness gives up on the generation. A layout that stops at the end of its window
+   * does not count as a failure. An interrupt records the partial change before it ends the layout.
+   * @param stopMillis the wall time at which the layout stops
+   */
+  private void relayoutAfterPromotion(Connection conn, TableLayout layout,
+    IvfRegionLayout.Plan plan, Long from, long generation, int target, boolean byMidkey,
+    String trigger, String phase, long stopMillis) throws InterruptedException {
+    ReentrantLock lock = rc.relayoutLock();
+    if (byMidkey) {
+      if (!lock.tryLock()) {
+        return;
+      }
+    } else {
+      lock.lockInterruptibly();
+    }
+    try {
+      Long known = rc.laidOutGeneration(layout);
+      if (known != null && known == generation) {
+        return;
+      }
+      String index = rc.ctx().tables().fullIndex(layout);
+      long start = System.currentTimeMillis();
+      Map<String, Object> result = null;
+      try {
+        Long promoted = IvfVariant.promotionMillis(conn, index, generation);
+        if (promoted != null && promoted > rc.events().startMillis() && promoted < start) {
+          start = promoted;
+        }
+        result = IvfVariant.layoutAfterPromotion(conn, index, plan, generation, target, byMidkey,
+          phase, stopMillis, rc.events());
+      } catch (InterruptedException e) {
+        result = new LinkedHashMap<>();
+        result.put("interrupted", true);
+        recordLayoutChange(layout, trigger, phase, from, generation, start, result);
+        throw e;
+      } catch (Exception e) {
+        result = failure(index, phase, e);
+      }
+      recordLayoutChange(layout, trigger, phase, from, generation, start, result);
+      if (complete(result)) {
+        rc.laidOutGeneration(layout, generation);
+      } else if (!windowEnded(result) && rc.layoutAttempt(layout) >= MAX_LAYOUT_ATTEMPTS) {
+        rc.laidOutGeneration(layout, generation);
+        rc.manifest().flag("the " + phase + " layout of " + index + " generation " + generation
+          + " is incomplete after " + MAX_LAYOUT_ATTEMPTS + " attempts");
+      }
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /** Returns true if a layout result has no error, no stalled midkey split, and no failed split. */
+  static boolean complete(Map<String, Object> result) {
+    if (result == null) {
+      return true;
+    }
+    if (result.containsKey("error") || result.containsKey("interrupted")) {
+      return false;
+    }
+    Object midkey = result.get("midkey");
+    if (midkey instanceof Map && !"done".equals(((Map<?, ?>) midkey).get("outcome"))) {
+      return false;
+    }
+    Object topUp = result.get("top_up");
+    if (topUp instanceof Map) {
+      Object failed = ((Map<?, ?>) topUp).get("failed");
+      return !(failed instanceof List) || ((List<?>) failed).isEmpty();
+    }
+    return true;
+  }
+
+  /** Returns true if the midkey splits of a layout result stopped at the end of the window. */
+  static boolean windowEnded(Map<String, Object> result) {
+    Object midkey = result == null ? null : result.get("midkey");
+    return midkey instanceof Map && "window ended".equals(((Map<?, ?>) midkey).get("outcome"));
+  }
+
+  private Map<String, Object> failure(String index, String phase, Exception e) {
+    LOG.warn("The {} layout of {} failed", phase, index, e);
+    rc.events().event(IvfRegionLayout.EVENT, phase + " failed " + index + ": " + e);
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("error", e.toString());
+    return m;
+  }
+
+  /**
+   * Records a change of the index layout. The interval from the start to the end is not a
+   * steady-state layout, and the report marks it.
+   */
+  private void recordLayoutChange(TableLayout layout, String trigger, String phase, Long from,
+    Long generation, long startMillis, Map<String, Object> result) {
+    long end = System.currentTimeMillis();
+    long origin = rc.events().startMillis();
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("layout", layout.id());
+    m.put("index", rc.ctx().tables().fullIndex(layout));
+    m.put("trigger", trigger);
+    m.put("phase", phase);
+    m.put("from_generation", from);
+    m.put("generation", generation);
+    m.put("start_offset_ms", startMillis - origin);
+    m.put("end_offset_ms", end - origin);
+    m.put("seconds", (end - startMillis) / 1000.0);
+    m.put("result", result);
+    synchronized (layoutChanges) {
+      layoutChanges.add(m);
+    }
+    Object regions = result == null ? null : result.get("index_regions");
+    rc.events().event(IvfRegionLayout.EVENT,
+      String.format(java.util.Locale.ROOT, "%s done %s: %s rebuild, generation %s, %.1f s%s", phase,
+        m.get("index"), trigger, generation == null ? from : generation, m.get("seconds"),
+        regions == null ? "" : ", " + regions + " regions"));
   }
 
   private void tickerLoop(StageEnd end, String stage) {
@@ -868,6 +1144,9 @@ public final class SteadyState {
     }
     synchronized (disruptions) {
       m.put("disruptions", new ArrayList<>(disruptions));
+    }
+    synchronized (layoutChanges) {
+      m.put("layout_changes", new ArrayList<>(layoutChanges));
     }
     List<Map<String, Object>> groups = new ArrayList<>();
     for (Measurement meas : measurements.values()) {

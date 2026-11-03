@@ -46,7 +46,7 @@ usage: $PROG [-t THRESHOLDS] RUN_DIR CHECK...
   Run status   wrapper simd no-simd errors
   Recall       recall-exact recall-ivf-all recall-hnsw-ef256 recall:<sweep-regex>:<min>
   Index        fsck uncovered restriction probe-rise offheap rebuild-queue overflow
-  Resources    gc saturation client-bound tail warnings
+  Resources    gc saturation client-bound tail warnings read-skew
   Disruption   mttr recall-stable errors-after-recovery recall-samples
   Lifecycle    drift-recovery[:<family-regex>] families uncovered-path no-rebuild-on-open
   Comparison   qps-vs-exact:<exact-run-id> simd-ab:<simd-run-id> published build-rate
@@ -509,6 +509,60 @@ chk_tail() {
     fail "$bad (max $max)"
   else
     pass "steady p99/p50 at or below $max in every window without a disruption"
+  fi
+}
+
+# Checks the read requests of each region server in the steady windows. The skew is the
+# largest share over the mean share. An even spread gives 1. One server that serves all reads
+# gives the server count. The counter of a server is the sum of the counters of its online
+# regions. A region move, split, or merge lowers the sum, and a restart resets it. Thus only
+# increases count, each window starts its own baseline, and the result reports the drops. A drop
+# loses the reads of the interval, so the skew can be a little low. The counter covers all tables.
+# Data table reads usually spread evenly and dilute the skew, but system tables sit on one server
+# and raise it.
+chk_read_skew() {
+  local wmax fmax out skew servers top drops counts note
+  wmax="$(th read.skew.warn)"
+  fmax="$(th read.skew.fail)"
+  out="$(qcsv "$RUN_DIR/cluster.csv" '
+    $col["stage"] ~ /^steady@/ && $col["attribute"] == "readRequestCount" {
+      s = $col["server"]; k = $col["stage"] SUBSEP s; x = $col["value"] + 0
+      if (!(s in inc)) inc[s] = 0
+      if (k in last) {
+        if (x >= last[k]) inc[s] += x - last[k]
+        else drops++
+      }
+      last[k] = x
+    }
+    END {
+      for (s in inc) { n++; t += inc[s]; if (inc[s] >= m) { m = inc[s]; ms = s } }
+      if (!n) exit
+      printf "%.3f\t%d\t%s\t%d\t", (t > 0 ? m / (t / n) : 0), n, (t > 0 ? ms : "-"), drops
+      for (s in inc) printf "%s=%.0f ", s, inc[s]
+      printf "\n"
+    }')"
+  if [ -z "$out" ]; then
+    warn "cluster.csv has no readRequestCount samples in the steady windows"
+    return
+  fi
+  IFS="$(printf '\t')" read -r skew servers top drops counts <<EOF
+$out
+EOF
+  counts="${counts% }"
+  note=""
+  if [ "$drops" -gt 0 ]; then
+    note="; $drops counter drops from region moves, splits, or restarts not counted"
+  fi
+  if [ "$servers" -lt 2 ]; then
+    pass "one region server; no read skew"
+  elif [ "$top" = - ]; then
+    warn "no read requests in the steady windows"
+  elif cmp "$skew" '>=' "$fmax"; then
+    fail "the busiest server $top serves $skew times the mean share of the reads (max $fmax): $counts$note"
+  elif cmp "$skew" '>=' "$wmax"; then
+    warn "the busiest server $top serves $skew times the mean share of the reads (warn at $wmax): $counts$note"
+  else
+    pass "the busiest server $top serves $skew times the mean share of the reads: $counts$note"
   fi
 }
 

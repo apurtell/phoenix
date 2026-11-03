@@ -25,6 +25,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import org.apache.phoenix.index.vector.CentroidManager;
+import org.apache.phoenix.index.vector.GenerationSummary;
 import org.apache.phoenix.vectorharness.HarnessContext;
 import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.config.QueryShape;
@@ -80,6 +82,7 @@ public final class IvfVariant implements IndexVariant {
       out.add("IVF trains on " + prebuildRows + " prebuild rows, fewer than sample_size "
         + ctx.config().ivfSampleSize());
     }
+    out.addAll(IvfRegionLayout.plan(ctx.config()).notes());
     return out;
   }
 
@@ -92,6 +95,10 @@ public final class IvfVariant implements IndexVariant {
     CommonRules.option(options, "metric", ctx.metric().indexOption());
     CommonRules.option(options, "lists", c.ivfLists());
     CommonRules.option(options, "sample_size", c.ivfSampleSize());
+    Integer salt = c.ivfSaltBuckets();
+    if (salt != null) {
+      CommonRules.option(options, "SALT_BUCKETS", salt);
+    }
     StringBuilder sb = new StringBuilder("CREATE VECTOR INDEX IF NOT EXISTS ");
     sb.append(n.index(layout)).append(" ON ").append(n.fullTable(layout)).append(" (")
       .append(schema.vectorExpression(layout)).append(')');
@@ -101,6 +108,14 @@ public final class IvfVariant implements IndexVariant {
     sb.append(CommonRules.withClause(options));
     if (c.ivfAsync()) {
       sb.append(" ASYNC");
+    }
+    IvfRegionLayout.Plan plan = IvfRegionLayout.plan(c);
+    if (plan.mode() == IvfRegionLayout.Mode.SPLIT_ON && !plan.splitIds().isEmpty()) {
+      sb.append(" SPLIT ON (");
+      for (int i = 0; i < plan.splitIds().size(); i++) {
+        sb.append(i == 0 ? "" : ", ").append(plan.splitIds().get(i));
+      }
+      sb.append(')');
     }
     return sb.toString();
   }
@@ -156,7 +171,173 @@ public final class IvfVariant implements IndexVariant {
       events.event("index-active",
         full + " lists=" + info.ivfLists() + " generation=" + info.activeGeneration());
     }
+    m.put("regions", layoutAfterBuild(conn, full, IvfRegionLayout.plan(c), c.ivfLists(),
+      info.activeGeneration(), events));
     return m;
+  }
+
+  /**
+   * Completes the region layout of the first generation and measures it. The SPLIT ON points assume
+   * the requested list count from the first ID. Training can return more lists, so the populated
+   * range can need more points. A multi-tenant index splits at region midkeys. After any split, the
+   * regions must spread across the region servers before the measured stages. The record holds the
+   * time of this work, because the build time of the index does not include it.
+   */
+  static Map<String, Object> layoutAfterBuild(Connection conn, String index,
+    IvfRegionLayout.Plan plan, int requestedLists, long generation, EventLog events)
+    throws Exception {
+    long start = System.nanoTime();
+    CentroidManager.Model model = CentroidManager.loadModel(conn, index, generation);
+    int firstId = model != null ? model.getFirstId() : IvfRegionLayout.FIRST_GENERATION_FIRST_ID;
+    int lists = model != null ? model.getCentroids().size() : requestedLists;
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("layout", plan.toMap());
+    m.put("first_id", firstId);
+    m.put("lists", lists);
+    try (IvfRegionLayout layout =
+      IvfRegionLayout.open(conn, index, IvfRegionLayout.PHASE_FIRST_BUILD, events)) {
+      if (plan.mode() == IvfRegionLayout.Mode.SPLIT_ON) {
+        List<Integer> missing =
+          IvfRegionLayout.missingSplitIds(layout.boundaryIds(), firstId, lists, plan.regions());
+        if (!missing.isEmpty()) {
+          m.put("top_up", layout.splitAt(missing));
+        }
+      } else if (plan.mode() == IvfRegionLayout.Mode.MIDKEY) {
+        m.put("midkey", layout.splitLargest(plan.regions()));
+      }
+      if (layout.regions().size() > 1) {
+        m.put("balance",
+          plan.centroidKeys()
+            ? layout.awaitBalanced(firstId, lists)
+            : layout.awaitBalanced(null, null));
+      }
+      m.putAll(layout.stats(plan.centroidKeys(), firstId, lists));
+      m.put("events", layout.events());
+    }
+    m.put("seconds", (System.nanoTime() - start) / 1e9);
+    return m;
+  }
+
+  /**
+   * Splits the empty ID range of the next generation before an explicit rebuild. The range starts
+   * after the IDs of the active generation, as in the product. The first split separates the range
+   * from the active generation. The later splits divide empty regions, so they move no data. Thus
+   * the rebuild writes into regions that already spread across the servers. The range gets at least
+   * as many regions as the active generation fills. The splits assume the list count of the active
+   * generation if training returned more lists than requested.
+   * @return the record of the splits, or null if the layout does not split at centroid IDs
+   */
+  public static Map<String, Object> layoutBeforeRebuild(Connection conn, String index,
+    IvfRegionLayout.Plan plan, long active, EventLog events) throws Exception {
+    if (plan.mode() != IvfRegionLayout.Mode.SPLIT_ON) {
+      return null;
+    }
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("generation", active);
+    CentroidManager.Model model = CentroidManager.loadModel(conn, index, active);
+    try (IvfRegionLayout layout =
+      IvfRegionLayout.open(conn, index, IvfRegionLayout.PHASE_BEFORE_REBUILD, events)) {
+      if (model == null || model.getCentroids().isEmpty()) {
+        layout.event("skipped", "generation " + active + " has no centroids");
+        m.put("skipped", "no centroids");
+        return m;
+      }
+      int outgoingFirst = model.getFirstId();
+      int outgoingLists = model.getCentroids().size();
+      int outgoingRegions = layout.populatedRegions(outgoingFirst, outgoingLists);
+      int target = IvfRegionLayout.rebuildTarget(plan.regions(), outgoingRegions);
+      int requested = rebuildLists(conn, index, active, outgoingLists);
+      int lists = IvfRegionLayout.expectedLists(requested, outgoingLists);
+      Integer firstId = IvfRegionLayout.nextFirstId(outgoingFirst, outgoingLists);
+      m.put("outgoing_first_id", outgoingFirst);
+      m.put("outgoing_lists", outgoingLists);
+      m.put("outgoing_regions", outgoingRegions);
+      m.put("first_id", firstId);
+      m.put("requested_lists", requested);
+      m.put("expected_lists", lists);
+      m.put("target_regions", target);
+      if (firstId == null) {
+        layout.event("skipped", "the next ID range is out of the INTEGER range");
+        m.put("skipped", "ID overflow");
+        return m;
+      }
+      m.put("split", layout.splitAt(IvfRegionLayout.futureRangeSplitIds(firstId, lists, target)));
+      m.put("balance", layout.awaitBalanced(firstId, lists));
+      m.put("events", layout.events());
+    }
+    return m;
+  }
+
+  /**
+   * Completes the region layout of a promoted generation and measures it. For an index keyed by
+   * centroid ID, the populated range of the generation gets the target count of regions. After an
+   * explicit rebuild, the empty range already has split points. Training can return more lists, so
+   * the harness adds points as after the first build. After an automatic rebuild, the harness
+   * splits the regions of the range at their midkeys under load, as natural growth does. A
+   * multi-tenant index always splits at midkeys.
+   * @param byMidkey   true to split at midkeys, false to split at centroid IDs
+   * @param stopMillis the wall time at which the layout stops, so that the next window continues it
+   */
+  public static Map<String, Object> layoutAfterPromotion(Connection conn, String index,
+    IvfRegionLayout.Plan plan, long generation, int targetRegions, boolean byMidkey, String phase,
+    long stopMillis, EventLog events) throws Exception {
+    CentroidManager.Model model = CentroidManager.loadModel(conn, index, generation);
+    Integer firstId = model != null ? Integer.valueOf(model.getFirstId()) : null;
+    Integer lists = model != null ? Integer.valueOf(model.getCentroids().size()) : null;
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("generation", generation);
+    m.put("first_id", firstId);
+    m.put("lists", lists);
+    m.put("target_regions", targetRegions);
+    try (IvfRegionLayout layout =
+      IvfRegionLayout.open(conn, index, phase, events).stopAt(stopMillis)) {
+      if (plan.mode() == IvfRegionLayout.Mode.SPLIT_ON) {
+        if (firstId == null) {
+          layout.event("skipped", "generation " + generation + " has no centroids");
+        } else if (byMidkey) {
+          m.put("midkey", layout.splitLargest(targetRegions, firstId, lists));
+        } else {
+          List<Integer> ids = IvfRegionLayout.topUpSplitIds(layout.boundaryIds(), firstId, lists,
+            targetRegions, firstId > IvfRegionLayout.FIRST_GENERATION_FIRST_ID);
+          if (!ids.isEmpty()) {
+            m.put("top_up", layout.splitAt(ids));
+          }
+        }
+      } else if (plan.mode() == IvfRegionLayout.Mode.MIDKEY) {
+        // The tenant ID leads the row key, so both generations share the regions of each tenant.
+        m.put("midkey", layout.splitLargest(targetRegions));
+      }
+      if (layout.regions().size() > 1) {
+        m.put("balance",
+          plan.centroidKeys() && firstId != null
+            ? layout.awaitBalanced(firstId, lists)
+            : layout.awaitBalanced(null, null));
+      }
+      m.putAll(layout.stats(plan.centroidKeys(), firstId, lists));
+      m.put("events", layout.events());
+    }
+    return m;
+  }
+
+  /**
+   * Returns the list count that a rebuild trains. The product takes the requested count of the
+   * active generation, or else the count of its lists.
+   */
+  static int rebuildLists(Connection conn, String index, long active, int activeLists)
+    throws SQLException {
+    GenerationSummary s = CentroidManager.loadGenerationSummary(conn, index, active);
+    Integer requested = s != null ? s.getRequestedLists() : null;
+    return requested != null && requested > 0 ? requested : activeLists;
+  }
+
+  /**
+   * Returns the wall time of the promotion of a generation, or null if the catalog does not record
+   * it.
+   */
+  public static Long promotionMillis(Connection conn, String index, long generation)
+    throws SQLException {
+    GenerationSummary s = CentroidManager.loadGenerationSummary(conn, index, generation);
+    return s != null ? s.getLastRebuildTime() : null;
   }
 
   @Override

@@ -138,6 +138,8 @@ public class HarnessConfigTest {
     assertEquals(1024, c.ivfLists());
     assertEquals(50000, c.ivfSampleSize());
     assertFalse(c.ivfAsync());
+    assertEquals(16, c.ivfRegions());
+    assertNull(c.ivfSaltBuckets());
     assertEquals(16, c.hnswM());
     assertEquals(100, c.hnswEfConstruction());
     assertEquals(1.2, c.hnswAlpha(), EPS);
@@ -295,6 +297,8 @@ public class HarnessConfigTest {
     m.put("ivfLists", c.ivfLists());
     m.put("ivfSampleSize", c.ivfSampleSize());
     m.put("ivfAsync", c.ivfAsync());
+    m.put("ivfRegions", c.ivfRegions());
+    m.put("ivfSaltBuckets", c.ivfSaltBuckets());
     m.put("hnswM", c.hnswM());
     m.put("hnswEfConstruction", c.hnswEfConstruction());
     m.put("hnswAlpha", c.hnswAlpha());
@@ -646,6 +650,9 @@ public class HarnessConfigTest {
     }
     assertEquals("32", eff.get("corpus.dim"));
     assertEquals("32", eff.get("corpus.intrinsic_dim"));
+    assertEquals("16", eff.get("ivf.regions"));
+    // The unset IVF salt resolves to the salt of the unsalted data table.
+    assertEquals("0", eff.get("ivf.salt_buckets"));
     assertEquals("test", eff.get("run.profile.name"));
     assertEquals("ivf", eff.get("run.variant"));
     assertEquals("", eff.get("run.id"));
@@ -757,7 +764,10 @@ public class HarnessConfigTest {
     { "table.snapshot", "x", "table.snapshot" }, { "index.metric", "hamming", "index.metric" },
     { "index.build.timeout", "forever", "index.build.timeout" },
     { "ivf.lists", "many", "ivf.lists" }, { "ivf.sample_size", "x", "ivf.sample_size" },
-    { "ivf.async", "x", "ivf.async" }, { "hnsw.m", "x", "hnsw.m" },
+    { "ivf.async", "x", "ivf.async" }, { "ivf.regions", "0", "ivf.regions" },
+    { "ivf.regions", "many", "ivf.regions" }, { "ivf.salt_buckets", "-1", "ivf.salt_buckets" },
+    { "ivf.salt_buckets", "257", "ivf.salt_buckets" },
+    { "ivf.salt_buckets", "x", "ivf.salt_buckets" }, { "hnsw.m", "x", "hnsw.m" },
     { "hnsw.ef_construction", "x", "hnsw.ef_construction" }, { "hnsw.alpha", "x", "hnsw.alpha" },
     { "hnsw.pq_segments", "x", "hnsw.pq_segments" },
     { "ingest.prebuild.fraction", "0", "ingest.prebuild.fraction" },
@@ -900,6 +910,50 @@ public class HarnessConfigTest {
       }
       assertTrue(key + " in " + p, found);
     }
+  }
+
+  @Test
+  public void testIvfRegionsFollowTheDataTable() {
+    assertEquals(4, config("table.regions", "4").ivfRegions());
+    assertEquals(2, config("table.regions", "4", "ivf.regions", "2").ivfRegions());
+    assertEquals(1, config("ivf.regions", "1").ivfRegions());
+    assertEquals(Integer.valueOf(0), config("ivf.salt_buckets", "0").ivfSaltBuckets());
+    assertEquals(Integer.valueOf(8), config("ivf.salt_buckets", "8").ivfSaltBuckets());
+  }
+
+  @Test
+  public void testEffectiveSettingsRecordTheResolvedIvfLayout() {
+    // An unset salt and an explicit zero give the same unsalted index.
+    Map<String, String> unset = config("table.regions", "4").effectiveSettings();
+    Map<String, String> zero =
+      config("table.regions", "4", "ivf.salt_buckets", "0").effectiveSettings();
+    assertEquals("0", unset.get("ivf.salt_buckets"));
+    assertEquals(unset.get("ivf.salt_buckets"), zero.get("ivf.salt_buckets"));
+    assertEquals("4", unset.get("ivf.regions"));
+    assertEquals(unset.get("ivf.regions"), zero.get("ivf.regions"));
+    // The salt buckets give the regions of a salted index, so ivf.regions has no effect.
+    Map<String, String> salted = config("table.salt_buckets", "8").effectiveSettings();
+    Map<String, String> asked =
+      config("table.salt_buckets", "8", "ivf.regions", "2").effectiveSettings();
+    assertEquals("8", salted.get("ivf.salt_buckets"));
+    assertEquals("8", salted.get("ivf.regions"));
+    assertEquals(salted.get("ivf.regions"), asked.get("ivf.regions"));
+    // An explicit zero salt on a salted data table gives other regions.
+    assertEquals("0", config("table.salt_buckets", "8", "ivf.salt_buckets", "0").effectiveSettings()
+      .get("ivf.salt_buckets"));
+  }
+
+  @Test
+  public void testValidateRejectsSplitsOfASaltedIndex() {
+    List<String> p = config("ivf.regions", "4", "ivf.salt_buckets", "8").validate();
+    assertEquals(p.toString(), 1, p.size());
+    assertTrue(p.get(0), p.get(0).startsWith("ivf.regions=4 needs an unsalted index"));
+    // The salt buckets give the layout when ivf.regions takes its default or asks for one region.
+    assertTrue(config("ivf.salt_buckets", "8").validate().isEmpty());
+    assertTrue(config("ivf.regions", "1", "ivf.salt_buckets", "8").validate().isEmpty());
+    assertTrue(config("ivf.regions", "4", "ivf.salt_buckets", "0").validate().isEmpty());
+    // An inherited salt is not a problem; the build records a note instead.
+    assertTrue(config("ivf.regions", "4", "table.salt_buckets", "8").validate().isEmpty());
   }
 
   @Test

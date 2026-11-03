@@ -35,7 +35,7 @@ p1-ivf-load          harness load sift1m-ivf --overrides p1-common
 p1-ivf-build         harness build-index sift1m-ivf --overrides p1-common
 p1-ivf-truth         harness truth sift1m-ivf --overrides p1-common
 p1-ivf-run           harness run sift1m-ivf --overrides p1-common --run-id @p1-ivf
-p1-ivf-check         check @p1-ivf wrapper simd errors probe-rise gc saturation client-bound tail published warnings build-rate
+p1-ivf-check         check @p1-ivf wrapper simd errors probe-rise gc saturation client-bound tail published warnings build-rate read-skew
 p1-hnsw-load         harness load sift1m-hnsw-sq8 --overrides p1-common
 p1-hnsw-build        harness build-index sift1m-hnsw-sq8 --overrides p1-common
 p1-hnsw-truth        harness truth sift1m-hnsw-sq8 --overrides p1-common

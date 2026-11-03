@@ -25,6 +25,8 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import org.apache.phoenix.vectorharness.HarnessContext;
 import org.apache.phoenix.vectorharness.config.TableLayout;
 import org.apache.phoenix.vectorharness.corpus.PanelQuery;
@@ -52,6 +54,10 @@ public final class RunContext implements Closeable {
   private final HarnessContext ctx;
   private final IndexVariant variant;
   private final Map<TableLayout, IndexInfo> indexes = new EnumMap<>(TableLayout.class);
+  private final Map<TableLayout, Long> laidOut = new ConcurrentHashMap<>();
+  private final Map<TableLayout, Integer> layoutAttempts = new ConcurrentHashMap<>();
+  private final Set<TableLayout> explicitRebuilds = ConcurrentHashMap.newKeySet();
+  private final ReentrantLock relayoutLock = new ReentrantLock();
   private final Set<TableLayout> layouts;
   private final EventLog events;
   private final Manifest manifest;
@@ -100,6 +106,50 @@ public final class RunContext implements Closeable {
 
   public Map<TableLayout, IndexInfo> indexes() {
     return indexes;
+  }
+
+  /**
+   * Returns the IVF generation with a complete region layout. Before any change, this is the active
+   * generation at the start of the run.
+   */
+  public Long laidOutGeneration(TableLayout layout) {
+    Long g = laidOut.get(layout);
+    if (g != null) {
+      return g;
+    }
+    IndexInfo info = indexes.get(layout);
+    return info == null ? null : info.activeGeneration();
+  }
+
+  /** Records that the generation of the layout has a complete region layout. */
+  public void laidOutGeneration(TableLayout layout, long generation) {
+    laidOut.put(layout, generation);
+    layoutAttempts.remove(layout);
+  }
+
+  /**
+   * Counts a failed or partial layout of the next generation and returns the count so far. A
+   * complete layout resets the count.
+   */
+  public int layoutAttempt(TableLayout layout) {
+    return layoutAttempts.merge(layout, 1, Integer::sum);
+  }
+
+  /**
+   * Returns the lock of the index layout changes. The lock spans the steady windows, so a layout
+   * that outlives its window still excludes the layout threads of the next window. A restart
+   * disruption also holds the lock, so that no layout move puts regions on a drained server.
+   */
+  public ReentrantLock relayoutLock() {
+    return relayoutLock;
+  }
+
+  /**
+   * Returns the layouts with an explicit rebuild in progress. The rebuild thread lays out its own
+   * generation, so the generation check skips these layouts.
+   */
+  public Set<TableLayout> explicitRebuilds() {
+    return explicitRebuilds;
   }
 
   public Set<TableLayout> layouts() {

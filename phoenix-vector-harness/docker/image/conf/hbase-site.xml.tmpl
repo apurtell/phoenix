@@ -158,6 +158,15 @@
     <value>0.35</value>
   </property>
 
+  <!--
+    The IVF first-build layout splits regions in rounds. Each round waits until the server
+    archives the compacted files. A short discharger interval makes each round fast.
+  -->
+  <property>
+    <name>hbase.hfile.compaction.discharger.interval</name>
+    <value>10000</value>
+  </property>
+
   <!-- Timeouts. The scanner lease is a server setting. Long timeouts cover slow first index opens. -->
   <property>
     <name>hbase.rpc.timeout</name>

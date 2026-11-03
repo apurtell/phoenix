@@ -121,6 +121,10 @@ public final class BuildIndexPhase {
         MetricSnapshot before = metrics.snapshot("build-start");
         Map<String, Object> builds = new LinkedHashMap<>();
         long start = System.nanoTime();
+        // The region layout is harness work that a naturally split index does not do at build
+        // time. Thus the build time excludes it, and the layout time has its own field.
+        double layoutSeconds = 0;
+        boolean laidOut = false;
         for (TableLayout layout : c.layouts()) {
           Map<String, Object> b = variant.build(ctx, conn, schema, layout, null);
           builds.put(layout.id(), b);
@@ -128,6 +132,18 @@ public final class BuildIndexPhase {
           out.printf(Locale.ROOT, "%s %s on %s ACTIVE in %.1f s%n", variant.id(),
             ctx.tables().fullIndex(layout), ctx.tables().fullTable(layout),
             secs instanceof Number ? ((Number) secs).doubleValue() : 0.0);
+          Object regions = b.get("regions");
+          if (regions instanceof Map) {
+            Map<?, ?> r = (Map<?, ?>) regions;
+            Object ls = r.get("seconds");
+            double layoutSecs = ls instanceof Number ? ((Number) ls).doubleValue() : 0.0;
+            layoutSeconds += layoutSecs;
+            laidOut = true;
+            out.printf(Locale.ROOT,
+              "%s index regions %s, populated %s, size cv %s, per server %s, layout in %.1f s%n",
+              ctx.tables().fullIndex(layout), r.get("index_regions"), r.get("populated_regions"),
+              r.get("size_cv"), r.get("regions_per_server"), layoutSecs);
+          }
         }
         if (
           c.variant() == VariantKind.HNSW
@@ -137,7 +153,10 @@ public final class BuildIndexPhase {
           out.println(
             "warning: the metrics still show uncovered HNSW regions after " + c.buildTimeout());
         }
-        state.put("build", "seconds", (System.nanoTime() - start) / 1e9);
+        state.put("build", "seconds", (System.nanoTime() - start) / 1e9 - layoutSeconds);
+        if (laidOut) {
+          state.put("build", "layout_seconds", layoutSeconds);
+        }
         state.putSection("indexes", builds);
         MetricSnapshot after = metrics.snapshot("build-end");
         state.put("build", "metrics_mode", reader.mode());

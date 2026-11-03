@@ -33,6 +33,7 @@ import java.util.TreeMap;
 import org.apache.phoenix.vectorharness.config.HarnessConfig;
 import org.apache.phoenix.vectorharness.config.QueryShape;
 import org.apache.phoenix.vectorharness.result.CsvTable;
+import org.apache.phoenix.vectorharness.result.Json;
 import org.apache.phoenix.vectorharness.variant.FilterCoverage;
 
 /**
@@ -53,6 +54,13 @@ public final class ReportGenerator {
       "table.snapshot", "table.update_statistics", "table.layouts", "index.build.timeout", "ivf.",
       "hnsw.", "query.ivf.", "query.hnsw.", "query.timeout", "ingest.threads", "ingest.batch.size",
       "observe.", "report.", "rebuild.", "recall.bootstrap.resamples", "phoenix.", "hbase."));
+
+  /**
+   * Settings under an exempt prefix that comparable runs must share. The region layout of the IVF
+   * index changes the cost per query, so runs with other layouts are not comparable.
+   */
+  static final List<String> NOT_EXEMPT =
+    Collections.unmodifiableList(Arrays.asList("ivf.regions", "ivf.salt_buckets"));
 
   private final double[] targets;
   private final double[] budgets;
@@ -123,16 +131,46 @@ public final class ReportGenerator {
   private void setup(StringBuilder sb, List<RunResult> runs) {
     sb.append("\nLoad, build, and storage\n");
     TextTable t = new TextTable("run", "rows", "load rows/s", "stream rows/s", "build s",
-      "load bytes", "built bytes", "index bytes", "end bytes", "plan check");
+      "load bytes", "built bytes", "index bytes", "end bytes", "index regions", "plan check");
     for (RunResult r : runs) {
       double load = r.footprintBytes("load_footprint");
       double built = r.footprintBytes("build.footprint");
       t.row(label(r, runs), r.get("load.rows_loaded"), number(r.get("ingest.rows_per_second")),
         number(r.get("stream.rows_per_second")), number(r.get("build.build.seconds")),
         TextTable.bytes(load), TextTable.bytes(built), TextTable.bytes(built - load),
-        TextTable.bytes(r.footprintBytes("footprint")), planCheck(r));
+        TextTable.bytes(r.footprintBytes("footprint")), indexRegions(r), planCheck(r));
     }
     sb.append(t.render("  "));
+  }
+
+  /**
+   * Returns the region count of the index of each layout after the build, joined by a slash. The
+   * IVF build records the count of the index table. The HNSW graph lives in the data regions, so
+   * the HNSW build records the data region count. A salted IVF index gets a tag.
+   */
+  @SuppressWarnings("unchecked")
+  static String indexRegions(RunResult r) {
+    Object indexes = r.get("build.indexes");
+    if (!(indexes instanceof Map)) {
+      return "-";
+    }
+    List<String> counts = new ArrayList<>();
+    boolean salted = false;
+    for (Object v : ((Map<String, Object>) indexes).values()) {
+      if (!(v instanceof Map)) {
+        continue;
+      }
+      Map<String, Object> b = (Map<String, Object>) v;
+      Object n = Json.path(b, "regions.index_regions");
+      if (n == null) {
+        n = Json.path(b, "segments.regions");
+      }
+      if (n instanceof Number) {
+        counts.add(Long.toString(((Number) n).longValue()));
+      }
+      salted |= "SALTED".equals(Json.path(b, "regions.layout.mode"));
+    }
+    return counts.isEmpty() ? "-" : String.join("/", counts) + (salted ? " salted" : "");
   }
 
   @SuppressWarnings("unchecked")
@@ -366,6 +404,11 @@ public final class ReportGenerator {
     }
     sb.append(t.render("  "));
     sb.append(extensions(windows));
+    TextTable changes = layoutChanges(windows);
+    if (!changes.isEmpty()) {
+      sb.append("  index layout changes (no steady-state layout from the start to the end):\n");
+      sb.append(changes.render("    "));
+    }
     Map<String, Double> deltas = new TreeMap<>();
     for (Map<String, Object> w : windows) {
       Object d = w.get("metric_deltas");
@@ -386,6 +429,64 @@ public final class ReportGenerator {
       }
       sb.append(m.render("    "));
     }
+  }
+
+  /**
+   * Returns the index layout changes of the windows. A rebuild changes the regions of the index
+   * while the window runs. From the start to the end of a change, the measurements do not describe
+   * a steady-state layout.
+   */
+  @SuppressWarnings("unchecked")
+  static TextTable layoutChanges(List<Map<String, Object>> windows) {
+    TextTable t = new TextTable("stage", "layout", "trigger", "phase", "generation", "start s",
+      "end s", "regions", "outcome");
+    for (Map<String, Object> w : windows) {
+      Object list = w.get("layout_changes");
+      if (!(list instanceof List)) {
+        continue;
+      }
+      for (Object o : (List<Object>) list) {
+        if (!(o instanceof Map)) {
+          continue;
+        }
+        Map<String, Object> c = (Map<String, Object>) o;
+        Object generation =
+          c.get("generation") != null ? c.get("generation") : c.get("from_generation");
+        t.row(w.get("stage"), c.get("layout"), c.get("trigger"), c.get("phase"), generation,
+          number(c.get("start_offset_ms")) / 1000.0, number(c.get("end_offset_ms")) / 1000.0,
+          c.get("result") == null ? null : path(c, "result.index_regions"), layoutOutcome(c));
+      }
+    }
+    return t;
+  }
+
+  /**
+   * Returns the outcome of a layout change: an error, an interrupt, a stalled split, or a balance
+   * timeout.
+   */
+  static String layoutOutcome(Map<String, Object> change) {
+    Object error = path(change, "result.error");
+    if (error != null) {
+      return "error";
+    }
+    if (Boolean.TRUE.equals(path(change, "result.interrupted"))) {
+      return "interrupted";
+    }
+    Object midkey = path(change, "result.midkey.outcome");
+    if (midkey != null && !"done".equals(midkey)) {
+      return String.valueOf(midkey);
+    }
+    Object failed = path(change, "result.split.failed");
+    if (failed == null) {
+      failed = path(change, "result.top_up.failed");
+    }
+    if (failed instanceof List && !((List<?>) failed).isEmpty()) {
+      return "split failed";
+    }
+    if (Boolean.FALSE.equals(path(change, "result.balance.balanced"))) {
+      return "unbalanced";
+    }
+    return "done";
   }
 
   /** Returns the mean and minimum recall for samples in the specified stage. */
@@ -531,6 +632,9 @@ public final class ReportGenerator {
 
   /** Returns true if the setting prefix is exempt from cross-run equality checks. */
   public static boolean exempt(String key) {
+    if (NOT_EXEMPT.contains(key)) {
+      return false;
+    }
     for (String p : EXEMPT_PREFIXES) {
       if (key.startsWith(p)) {
         return true;
@@ -753,15 +857,15 @@ public final class ReportGenerator {
   private void exportRuns(List<RunResult> runs, Path file) throws IOException {
     try (CsvTable t = CsvTable.create(file, "run", "variant", "profile", "fingerprint",
       "panel_digest", "rows_loaded", "load_rows_per_second", "stream_rows_per_second",
-      "build_seconds", "load_bytes", "built_bytes", "index_bytes", "end_bytes", "exact_recall",
-      "freshness", "flags")) {
+      "build_seconds", "load_bytes", "built_bytes", "index_bytes", "end_bytes", "index_regions",
+      "exact_recall", "freshness", "flags")) {
       for (RunResult r : runs) {
         double load = r.footprintBytes("load_footprint");
         double built = r.footprintBytes("build.footprint");
         t.row(r.id(), r.variant(), r.profile(), r.fingerprint(), r.panelDigest(),
           r.get("load.rows_loaded"), r.get("ingest.rows_per_second"),
           r.get("stream.rows_per_second"), r.get("build.build.seconds"), load, built, built - load,
-          r.footprintBytes("footprint"), r.get("validity.exact_recall"),
+          r.footprintBytes("footprint"), indexRegions(r), r.get("validity.exact_recall"),
           r.get("validity.freshness"), String.join("; ", r.flags()));
       }
     }
