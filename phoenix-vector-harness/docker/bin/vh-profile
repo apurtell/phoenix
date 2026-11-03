@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script attaches async-profiler to the JVM of one container.
+# The profiler runs inside the container as the user that owns the JVM, so it needs no
+# extra privileges. The default event is itimer, because the Docker VM blocks perf events.
+# Output goes to the profile directory of the instance on the log bind mount,
+# so the host sees each file at once.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+ASPROF=/opt/async-profiler/bin/asprof
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG <target> [record] [options] [-- ASPROF_ARGS...]
+       $VH_PROG <target> start  [options] [-- ASPROF_ARGS...]
+       $VH_PROG <target> stop
+       $VH_PROG <target> status | list
+
+  target           A service (rs1, master, nn, ...), harness, or a container name or id
+  record           Profile for a fixed time, then write the output (default)
+  start / stop     Profile from start until stop
+  status / list    The profiler state, or the events that this JVM supports
+
+  -e EVENT         itimer (default: VH_ASPROF_EVENT=$VH_ASPROF_EVENT), wall, alloc, lock, cpu
+  -d SECONDS       Duration of record (default 60)
+  -f FORMAT        html (default), jfr or collapsed
+  -o PATH          Output path in the container (default: the prof directory of the instance)
+
+The cpu event needs perf events, which the Docker VM does not allow by default.
+EOF
+}
+
+# Prints the asprof output format and the file extension of a format name.
+format_of() {
+  case "$1" in
+    html) echo "flamegraph html" ;;
+    jfr) echo "jfr jfr" ;;
+    collapsed) echo "collapsed collapsed" ;;
+    *) vh_die "unknown format '$1'; use html, jfr or collapsed" ;;
+  esac
+}
+
+check_event() {
+  case "$1" in
+    itimer | wall | alloc | lock) ;;
+    cpu) vh_warn "the cpu event needs perf events; use itimer if asprof fails" ;;
+    *) vh_die "unknown event '$1'; use itimer, wall, alloc, lock or cpu" ;;
+  esac
+}
+
+asprof() {
+  vh_docker exec -u "$VH_EXEC_USER" "$VH_T_CID" "$ASPROF" "$@"
+}
+
+main() {
+  [ $# -gt 0 ] || {
+    usage >&2
+    exit 2
+  }
+  case "$1" in
+    -h | --help | help)
+      usage
+      return 0
+      ;;
+  esac
+  local target="$1" action=record
+  shift
+  case "${1:-}" in
+    record | start | stop | status | list)
+      action="$1"
+      shift
+      ;;
+  esac
+  local event="$VH_ASPROF_EVENT" secs=60 format=html out=""
+  local -a extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -e) event="${2:?-e needs an event}"; shift 2 ;;
+      -d) secs="${2:?-d needs seconds}"; shift 2 ;;
+      -f) format="${2:?-f needs a format}"; shift 2 ;;
+      -o) out="${2:?-o needs a path}"; shift 2 ;;
+      --)
+        shift
+        extra=("$@")
+        break
+        ;;
+      *) vh_die "unknown option $1" ;;
+    esac
+  done
+  check_event "$event"
+  local fe ofmt ext
+  fe="$(format_of "$format")"
+  ofmt="${fe% *}"
+  ext="${fe#* }"
+
+  vh_resolve_jvm "$target" || vh_die "cannot find the JVM of '$target'"
+  local dir state
+  dir="$(vh_role_value "$VH_T_ROLE" "$VH_T_INDEX" VH_PROF_DIR)"
+  state="$dir/.asprof-$VH_T_PID"
+  if [ -z "$out" ]; then
+    out="$dir/$VH_T_INST-$event-$(vh_ts).$ext"
+  fi
+  vh_docker exec -u "$VH_EXEC_USER" "$VH_T_CID" mkdir -p "$dir" "$(dirname "$out")"
+
+  local -a opts=(-e "$event" -o "$ofmt" -f "$out")
+  if [ ${#extra[@]} -gt 0 ]; then
+    opts+=("${extra[@]}")
+  fi
+  case "$action" in
+    record)
+      vh_log "profiling $VH_T_INST pid $VH_T_PID: $event for ${secs}s"
+      asprof -d "$secs" "${opts[@]}" "$VH_T_PID"
+      vh_host_path "$out"
+      ;;
+    start)
+      # JFR output takes its file at start. Every other format takes its file at stop.
+      if [ "$ofmt" = jfr ]; then
+        asprof start "${opts[@]}" "$VH_T_PID"
+      elif [ ${#extra[@]} -gt 0 ]; then
+        asprof start -e "$event" "${extra[@]}" "$VH_T_PID"
+      else
+        asprof start -e "$event" "$VH_T_PID"
+      fi
+      # The stop command needs the output settings of the start command.
+      printf '%s %s\n' "$ofmt" "$out" |
+        vh_docker exec -i -u "$VH_EXEC_USER" "$VH_T_CID" tee "$state" >/dev/null
+      vh_log "profiling $VH_T_INST pid $VH_T_PID: $event; stop with: $VH_PROG $target stop"
+      vh_host_path "$out"
+      ;;
+    stop)
+      local saved
+      saved="$(vh_docker exec -u "$VH_EXEC_USER" "$VH_T_CID" cat "$state" 2>/dev/null || true)"
+      if [ -n "$saved" ]; then
+        ofmt="${saved%% *}"
+        out="${saved#* }"
+      else
+        vh_warn "no saved start settings for pid $VH_T_PID; writing $ofmt output to $out"
+      fi
+      if [ "$ofmt" = jfr ]; then
+        asprof stop "$VH_T_PID"
+      else
+        asprof stop -o "$ofmt" -f "$out" "$VH_T_PID"
+      fi
+      vh_docker exec -u "$VH_EXEC_USER" "$VH_T_CID" rm -f "$state"
+      vh_host_path "$out"
+      ;;
+    status) asprof status "$VH_T_PID" ;;
+    list) asprof list "$VH_T_PID" ;;
+  esac
+}
+
+main "$@"

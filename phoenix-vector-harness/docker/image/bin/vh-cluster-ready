@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script waits until the cluster is ready for the harness. It is the one-shot cluster-ready role.
+# The harness depends on its successful exit.
+# The container health checks test each daemon alone. This script tests the services together.
+# A master can report itself active before it finishes initialization.
+# The script therefore uses five gates, from cheap to strong:
+#   1. HDFS is out of safe mode, and the name node sees all data nodes.
+#   2. The resource manager sees all node managers, and none of them is unhealthy.
+#   3. The master JMX shows all region servers and no regions in transition.
+#   4. The HBase shell lists the tables and reports all region servers as live.
+#   5. A Phoenix JDBC connection runs a query on the system catalog.
+#      This query proves that the master initialization is complete.
+#      The first connection also creates the Phoenix system tables.
+# Then vh-verify checks the configuration of the running cluster.
+
+set -euo pipefail
+
+if [ -z "${VH_INST:-}" ]; then
+  : "${VH_ROLE:=cluster-ready}"
+  # shellcheck source=SCRIPTDIR/../lib/ports.sh
+  . /opt/vh/lib/ports.sh
+  # shellcheck source=SCRIPTDIR/../lib/roles.sh
+  . /opt/vh/lib/roles.sh
+fi
+
+timeout="${VH_READY_TIMEOUT:-900}"
+deadline=$((SECONDS + timeout))
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+out="$work/out"
+
+log() { echo "vh-cluster-ready: $*" >&2; }
+
+# Runs a check until it passes or the deadline is reached.
+# On timeout, the last output of the check goes to the log.
+wait_for() {
+  local what="$1" pause="$2"
+  shift 2
+  log "waiting for $what"
+  until "$@" >"$out" 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      log "timed out after ${timeout}s waiting for $what; last output:"
+      tail -n 40 "$out" >&2
+      exit 1
+    fi
+    sleep "$pause"
+  done
+  log "ready: $what ($SECONDS s)"
+}
+
+# Prints one value of a name node JMX bean.
+nn_jmx() {
+  curl -fsS --max-time 5 "http://localhost:$VH_NN_HTTP/jmx?qry=Hadoop:service=NameNode,name=$1" \
+    | jq -r ".beans[0].$2"
+}
+
+# The hdfs-init role waited for the same state before. This gate checks it again,
+# because a data node can stop after that time.
+hdfs_view() {
+  local safemode live
+  safemode="$(nn_jmx NameNodeInfo Safemode)"
+  live="$(nn_jmx FSNamesystemState NumLiveDataNodes)"
+  echo "safe mode: '${safemode}', live data nodes: $live"
+  [ -z "$safemode" ] && [ "$live" = "$VH_GROUP_SIZE" ]
+}
+
+yarn_view() {
+  local metrics active unhealthy
+  metrics="$(curl -fsS --max-time 5 "http://localhost:$VH_RM_WEB/ws/v1/cluster/metrics")"
+  active="$(jq -r '.clusterMetrics.activeNodes' <<<"$metrics")"
+  unhealthy="$(jq -r '.clusterMetrics.unhealthyNodes' <<<"$metrics")"
+  echo "active node managers: $active, unhealthy node managers: $unhealthy"
+  [ "$active" = "$VH_GROUP_SIZE" ] && [ "$unhealthy" = 0 ]
+}
+
+# Prints one value of a master JMX bean.
+master_jmx() {
+  curl -fsS --max-time 5 "http://localhost:$VH_MASTER_INFO/jmx?qry=Hadoop:service=HBase,name=Master,sub=$1" \
+    | jq -r ".beans[0].$2"
+}
+
+master_view() {
+  local servers rit
+  servers="$(master_jmx Server numRegionServers)"
+  rit="$(master_jmx AssignmentManager ritCount)"
+  echo "region servers: $servers, regions in transition: $rit"
+  [ "$servers" = "$VH_GROUP_SIZE" ] && [ "$rit" = 0 ]
+}
+
+shell_view() {
+  printf "list\nstatus 'simple'\n" | hbase shell -n >"$work/shell" 2>&1 || {
+    cat "$work/shell"
+    return 1
+  }
+  cat "$work/shell"
+  grep -E "^$VH_GROUP_SIZE live servers" "$work/shell" >/dev/null
+}
+
+phoenix_view() {
+  echo 'SELECT COUNT(*) FROM SYSTEM.CATALOG;' >"$work/probe.sql"
+  hbase org.apache.phoenix.util.PhoenixRuntime "$VH_JDBC_URL" "$work/probe.sql"
+}
+
+wait_for "HDFS view of $VH_GROUP_SIZE live data nodes" 3 hdfs_view
+wait_for "YARN view of $VH_GROUP_SIZE active node managers" 3 yarn_view
+wait_for "master view of $VH_GROUP_SIZE region servers" 3 master_view
+wait_for "HBase shell view of $VH_GROUP_SIZE live servers" 5 shell_view
+wait_for "Phoenix connection to $VH_JDBC_URL" 10 phoenix_view
+
+log "running vh-verify"
+vh-verify
+log "cluster is ready"

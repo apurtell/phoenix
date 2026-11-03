@@ -1,0 +1,41 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# The drift IVF profile at a size that fits the functional suite.
+# A high drift rate makes the filtered recall fall before the explicit rebuild. The rebuild comes
+# late enough for the drop to pass the drift check at the achieved mutation rate of about 150/s.
+-Dcorpus.rows=200000
+-Divf.lists=256
+-Divf.sample_size=20000
+-Dmutation.rate.per_sec=200
+-Drebuild.explicit.at=8m
+-Dcorpus.drift.rate=0.8
+
+# Load sizing. Without mutations the pre-split index is CPU bound at about 72 q/s. With 200
+# mutations/s, 43 q/s did not repeat, so the offered rate and the sampler use about 45 % of 43 q/s.
+# The quiesced sampler stops the writes while it scores, so small samples let the mutations reach
+# their rate. More workers give the queries and the mutations a margin during the rebuild.
+-Dquery.rate.per_sec=12
+-Dquery.threads=16
+-Dmutation.threads=16
+-Drecall.sample.queries=20
+-Drecall.sample.interval=30s
+
+# The rebuild first splits the id range of the new generation, which adds about two minutes before
+# the cutover. A longer steady state keeps at least three samples after the cutover.
+-Dsteady_state.duration=14m

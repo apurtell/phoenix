@@ -1,0 +1,130 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# bin/vh-suite runs this file. Each line is one step: an id, an action and its arguments.
+# Whitespace separates the words, and the runner does not interpret quotes.
+# "@name" is the run id SESSION-name, so a resumed session finds the runs of earlier steps.
+# The steps of one table pass the same overrides, so every phase sees the same settings.
+
+# The functional suite tests correctness under disruption, crash, drift, multi-tenant queries,
+# MapReduce paths and index damage. It uses the schema VH_FUNC and takes about six hours.
+# The groups are independent, except that the f5 checker steps read the f1 and f4 tables.
+
+setup-reset          cluster reset --yes
+setup-up             cluster up
+setup-verify         cluster verify
+
+# Disruptions: one split, move, merge, compaction and region server restart in the steady state.
+f1-ivf-load          harness load smoke --variant ivf --overrides f1-disruptions
+f1-ivf-build         harness build-index smoke --variant ivf --overrides f1-disruptions
+f1-ivf-truth         harness truth smoke --variant ivf --overrides f1-disruptions
+f1-ivf-run           harness run smoke --variant ivf --overrides f1-disruptions --run-id @f1-ivf
+f1-ivf-check         check @f1-ivf wrapper mttr recall-stable errors-after-recovery recall-samples
+f1-hnsw-load         harness load smoke --variant hnsw --overrides f1-disruptions
+f1-hnsw-build        harness build-index smoke --variant hnsw --overrides f1-disruptions
+f1-hnsw-truth        harness truth smoke --variant hnsw --overrides f1-disruptions
+f1-hnsw-run          harness run smoke --variant hnsw --overrides f1-disruptions --run-id @f1-hnsw
+f1-hnsw-check        check @f1-hnsw wrapper mttr recall-stable errors-after-recovery recall-samples fsck
+
+# Crash: SIGKILL of one region server JVM in the steady state, on the f1 HNSW tables.
+f7-hnsw-run          needs=f1-hnsw-build,f1-hnsw-truth harness run smoke --variant hnsw --overrides f7-crash --run-id @f7-crash --at 6m kill rs2
+f7-hnsw-check        check @f7-crash wrapper recall-stable errors-after-recovery
+
+# Streaming ingest with disruptions, at a reduced size.
+f2-stream-load       harness load streaming-hnsw --overrides f2-streaming-small --heap 6g
+f2-stream-build      harness build-index streaming-hnsw --overrides f2-streaming-small --heap 6g
+f2-stream-truth      harness truth streaming-hnsw --overrides f2-streaming-small --heap 6g
+f2-stream-run        harness run streaming-hnsw --overrides f2-streaming-small --heap 6g --run-id @f2-stream
+f2-stream-check      check @f2-stream wrapper mttr fsck rebuild-queue overflow recall-samples
+
+# Drift: the corpus moves away from the trained centroids, and an explicit rebuild restores the
+# recall. The check uses a selective filter on an uncovered column. Stale centroids send its list
+# expansion to the wrong lists. Unfiltered recall stays at its maximum, because writes and probes
+# use the same nearest centroid rule.
+f3-drift-load        harness load drift-ivf --overrides f3-drift-small --heap 6g
+f3-drift-build       harness build-index drift-ivf --overrides f3-drift-small --heap 6g
+f3-drift-truth       harness truth drift-ivf --overrides f3-drift-small --heap 6g
+f3-drift-run         harness run drift-ivf --overrides f3-drift-small --heap 6g --run-id @f3-drift
+f3-drift-check       check @f3-drift wrapper drift-recovery:^uncovered_filter@0.001
+
+# Multi-tenant RAG: every query family on each variant, at a reduced size. Only IVF has an
+# uncovered index filter, so only the IVF check selects the uncovered path.
+# The capacity of the three variants differs by up to four times. So the exact and HNSW steps add
+# a file with their own rates, and each top stage uses about one half of the measured capacity.
+f4-exact-load        harness load rag-1m-768 --variant exact --overrides f4-rag-small --overrides f4-rag-exact --heap 6g
+f4-exact-build       harness build-index rag-1m-768 --variant exact --overrides f4-rag-small --overrides f4-rag-exact --heap 6g
+f4-exact-truth       harness truth rag-1m-768 --variant exact --overrides f4-rag-small --overrides f4-rag-exact --heap 6g
+f4-exact-run         harness run rag-1m-768 --variant exact --overrides f4-rag-small --overrides f4-rag-exact --heap 6g --run-id @f4-exact
+f4-exact-check       check @f4-exact wrapper families errors
+f4-ivf-load          harness load rag-1m-768 --variant ivf --overrides f4-rag-small --heap 6g
+f4-ivf-build         harness build-index rag-1m-768 --variant ivf --overrides f4-rag-small --heap 6g
+f4-ivf-truth         harness truth rag-1m-768 --variant ivf --overrides f4-rag-small --heap 6g
+f4-ivf-run           harness run rag-1m-768 --variant ivf --overrides f4-rag-small --heap 6g --run-id @f4-ivf
+f4-ivf-check         check @f4-ivf wrapper families uncovered-path errors
+f4-hnsw-load         harness load rag-1m-768 --variant hnsw --overrides f4-rag-small --overrides f4-rag-hnsw --heap 6g
+f4-hnsw-build        harness build-index rag-1m-768 --variant hnsw --overrides f4-rag-small --overrides f4-rag-hnsw --heap 6g
+f4-hnsw-truth        harness truth rag-1m-768 --variant hnsw --overrides f4-rag-small --overrides f4-rag-hnsw --heap 6g
+f4-hnsw-run          harness run rag-1m-768 --variant hnsw --overrides f4-rag-small --overrides f4-rag-hnsw --heap 6g --run-id @f4-hnsw
+f4-hnsw-check        check @f4-hnsw wrapper families errors fsck
+
+# Reopen: after a restart of HBase, the regions open the persisted HNSW segments and do not
+# rebuild them.
+# The step uses the overrides of the f4 HNSW tables, so it runs at the HNSW rates.
+f8-restart           cluster restart --full hbase
+f8-run               needs=f8-restart,f4-hnsw-build,f4-hnsw-truth harness run rag-1m-768 --variant hnsw --overrides f4-rag-small --overrides f4-rag-hnsw --heap 6g --run-id @f8-reopen
+f8-check             check @f8-reopen wrapper errors no-rebuild-on-open
+
+# Index checker: the tables of f1 and f4 must be clean after their disruptions.
+f5-ivf-smoke-fsck        needs=f1-ivf-build fsck 0 fsck -s VH_FUNC -dt DOC_CORPUS_IVF_SMOKE -it DOC_CORPUS_IVF_SMOKE_VIDX
+f5-ivf-smoke-gens        needs=f1-ivf-build fsck 0 inspect generations -s VH_FUNC -dt DOC_CORPUS_IVF_SMOKE -it DOC_CORPUS_IVF_SMOKE_VIDX
+f5-ivf-smoke-scorecard   needs=f1-ivf-build fsck 0 inspect scorecard -s VH_FUNC -dt DOC_CORPUS_IVF_SMOKE -it DOC_CORPUS_IVF_SMOKE_VIDX
+f5-ivf-rag-fsck          needs=f4-ivf-build fsck 0 fsck -s VH_FUNC -dt DOC_CORPUS_IVF_RAG_1M_768 -it DOC_CORPUS_IVF_RAG_1M_768_VIDX
+f5-hnsw-smoke-fsck       needs=f1-hnsw-build fsck 0 fsck -s VH_FUNC -dt DOC_CORPUS_HNSW_SMOKE -it DOC_CORPUS_HNSW_SMOKE_VIDX
+f5-hnsw-smoke-coverage   needs=f1-hnsw-build fsck 0 inspect coverage -s VH_FUNC -dt DOC_CORPUS_HNSW_SMOKE -it DOC_CORPUS_HNSW_SMOKE_VIDX
+f5-hnsw-rag-fsck         needs=f4-hnsw-build fsck 0 fsck -s VH_FUNC -dt DOC_CORPUS_HNSW_RAG_1M_768 -it DOC_CORPUS_HNSW_RAG_1M_768_VIDX
+f5-hnsw-rag-list         needs=f4-hnsw-build fsck 0 inspect list -s VH_FUNC -dt DOC_CORPUS_HNSW_RAG_1M_768 -it DOC_CORPUS_HNSW_RAG_1M_768_VIDX
+
+# MapReduce: an asynchronous IVF build and a bulk load, both as YARN jobs.
+f6-async-load        harness load smoke --variant ivf --overrides f6-ivf-async
+f6-async-build       harness build-index smoke --variant ivf --overrides f6-ivf-async
+f6-async-truth       harness truth smoke --variant ivf --overrides f6-ivf-async
+f6-async-run         harness run smoke --variant ivf --overrides f6-ivf-async --run-id @f6-async
+f6-async-check       check @f6-async wrapper errors recall-ivf-all
+f6-bulk-load         harness load smoke --variant ivf --overrides f6-bulkload
+f6-bulk-build        harness build-index smoke --variant ivf --overrides f6-bulkload
+f6-yarn              needs=f6-async-build,f6-bulk-load tool-grep SUCCEEDED yarn application -list -appStates FINISHED
+
+# Index damage: a clean table, then one orphan from a raw delete, then detection and repair.
+# The damage is a removed data row or embedding. The checker reports a missing index row only
+# as information while max lookback is off, so an orphan is the damage that it must find.
+f9-ivf-load          harness load smoke --variant ivf --overrides f9-fsck-ivf
+f9-ivf-build         harness build-index smoke --variant ivf --overrides f9-fsck-ivf
+f9-ivf-clean         fsck 0 verify -s VH_FUNC -dt DOC_CORPUS_FSCK_IVF -it DOC_CORPUS_FSCK_IVF_VIDX
+f9-ivf-corrupt       corrupt ivf VH_FUNC DOC_CORPUS_FSCK_IVF
+f9-ivf-detect        fsck 1 verify -s VH_FUNC -dt DOC_CORPUS_FSCK_IVF -it DOC_CORPUS_FSCK_IVF_VIDX
+f9-ivf-repair        fsck 0,1 repair -confirm -s VH_FUNC -dt DOC_CORPUS_FSCK_IVF -it DOC_CORPUS_FSCK_IVF_VIDX
+f9-ivf-verify        fsck 0 verify -s VH_FUNC -dt DOC_CORPUS_FSCK_IVF -it DOC_CORPUS_FSCK_IVF_VIDX
+f9-ivf-fsck          fsck 0 fsck -s VH_FUNC -dt DOC_CORPUS_FSCK_IVF -it DOC_CORPUS_FSCK_IVF_VIDX
+f9-hnsw-load         harness load smoke --variant hnsw --overrides f9-fsck-hnsw
+f9-hnsw-build        harness build-index smoke --variant hnsw --overrides f9-fsck-hnsw
+f9-hnsw-clean        fsck 0 verify -s VH_FUNC -dt DOC_CORPUS_FSCK_HNSW -it DOC_CORPUS_FSCK_HNSW_VIDX
+f9-hnsw-corrupt      corrupt hnsw VH_FUNC DOC_CORPUS_FSCK_HNSW
+f9-hnsw-detect       fsck 1 verify -s VH_FUNC -dt DOC_CORPUS_FSCK_HNSW -it DOC_CORPUS_FSCK_HNSW_VIDX
+f9-hnsw-repair       fsck 0,1 repair -confirm -s VH_FUNC -dt DOC_CORPUS_FSCK_HNSW -it DOC_CORPUS_FSCK_HNSW_VIDX
+f9-hnsw-verify       fsck 0 verify -s VH_FUNC -dt DOC_CORPUS_FSCK_HNSW -it DOC_CORPUS_FSCK_HNSW_VIDX
+f9-hnsw-fsck         fsck 0 fsck -s VH_FUNC -dt DOC_CORPUS_FSCK_HNSW -it DOC_CORPUS_FSCK_HNSW_VIDX

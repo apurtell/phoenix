@@ -1,0 +1,358 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This file defines the all-localhost cluster for the vector harness.
+# Use bin/vh-cluster, bin/vh-tool and the other bin/ scripts. They load env/defaults.env
+# and env/local.env and export the values that this file reads.
+#
+# Every container shares the network of the Docker VM, so each daemon instance has its own ports.
+# The image entrypoint selects the ports, the JVM and the configuration from VH_ROLE and VH_INDEX.
+# Start order: zk, nn, dn1-3, hdfs-init, then snn, rm, nm1-3, jhs and master, then rs1-3,
+# then cluster-ready. The harness and tools services are in the "client" profile.
+# The scripts start them with "compose run --no-deps", so a run never restarts the cluster.
+
+name: ${VH_PROJECT:?run through bin/vh-cluster}
+
+# Settings that pass from the host environment into every container.
+# A setting without a value on the host stays unset, and the role defaults in the image apply.
+# The daemons get only cluster settings. Thus a change of a client setting does not recreate them.
+x-vh-env: &vh-env
+  VH_READY_TIMEOUT:
+  VH_DFS_REPLICATION:
+  VH_BALANCER_PERIOD:
+  VH_HNSW_OFFHEAP_MAX_BYTES:
+  VH_NM_MEMORY_MB:
+  VH_NM_VCORES:
+  VH_YARN_MIN_ALLOC_MB:
+  VH_YARN_MAX_ALLOC_MB:
+  VH_ZK_MAX_CLIENT_CNXNS:
+  VH_RPC_TIMEOUT_MS:
+  VH_SCANNER_TIMEOUT_MS:
+  VH_TASK_INTERVAL_MS:
+  VH_CLUSTER_ID:
+  VH_HEAP_ZK:
+  VH_HEAP_NN:
+  VH_HEAP_SNN:
+  VH_HEAP_DN:
+  VH_HEAP_RM:
+  VH_HEAP_NM:
+  VH_HEAP_JHS:
+  VH_HEAP_MASTER:
+  VH_HEAP_RS:
+  VH_DIRECT_RS:
+  VH_HEAP_CLI:
+  VH_JVECTOR_FORCE_PANAMA:
+  VH_JFR:
+  VH_DEBUG:
+
+# Settings of the harness and tools clients only.
+# VH_RS_SIMD also goes to the region servers and to cluster-ready, so an A/B change recreates
+# only those containers.
+x-vh-client-env: &vh-client-env
+  <<: *vh-env
+  VH_RS_SIMD:
+  VH_HEAP_TOOLS:
+  VH_DIRECT_TOOLS:
+  VH_HARNESS_HEAP:
+  VH_HARNESS_DIRECT:
+  VH_HARNESS_SIMD:
+  VH_HARNESS_EXTRA_OPTS:
+
+# Settings that every container shares.
+# The init process reaps the child processes of the NodeManagers and forwards SIGTERM.
+# The tmpfs gives each start an empty pid directory, so no stale pid file survives a restart.
+x-vh-base: &vh-base
+  image: ${VH_IMAGE:?run through bin/vh-cluster}:${VH_IMAGE_TAG:?run through bin/vh-cluster}
+  pull_policy: never
+  platform: linux/arm64
+  network_mode: host
+  init: true
+  restart: "no"
+  stop_grace_period: 30s
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+    nproc:
+      soft: 65535
+      hard: 65535
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: "10"
+  tmpfs:
+    - /run/vh:mode=1777,size=16m
+
+# The image health check knows each role. Daemons on a small heap start in about a minute.
+x-vh-health: &vh-health
+  test: ["CMD", "/opt/vh/healthcheck.sh"]
+  interval: 5s
+  timeout: 5s
+  retries: 60
+  start_period: 180s
+  start_interval: 2s
+
+x-vh-no-health: &vh-no-health
+  disable: true
+
+# Bind mounts. Each daemon writes GC logs, JFR files, profiles and heap dumps below its own
+# instance directory in the shared log tree. The corpora are read-only.
+x-vol-logs: &vol-logs ${VH_WORK:?run through bin/vh-cluster}/logs:/var/log/vh
+x-vol-out: &vol-out ${VH_WORK:?run through bin/vh-cluster}/out:/work/out
+x-vol-prof: &vol-prof ${VH_WORK:?run through bin/vh-cluster}/prof:/work/prof
+x-vol-profiles: &vol-profiles ${VH_WORK:?run through bin/vh-cluster}/profiles:/work/profiles:ro
+x-vol-data: &vol-data ${VH_DATA:?run through bin/vh-cluster}:/data:ro
+
+x-healthy: &healthy
+  condition: service_healthy
+x-completed: &completed
+  condition: service_completed_successfully
+
+x-vh-dn: &vh-dn
+  <<: *vh-base
+  mem_limit: ${VH_MEM_DN:?run through bin/vh-cluster}
+  healthcheck: *vh-health
+  depends_on:
+    nn: *healthy
+
+x-vh-nm: &vh-nm
+  <<: *vh-base
+  mem_limit: ${VH_MEM_NM:?run through bin/vh-cluster}
+  healthcheck: *vh-health
+  depends_on:
+    rm: *healthy
+
+# A region server restarts after every exit, so a graceful stop or a crash leads to a rejoin.
+# The long grace period lets a stopped server close its regions and its WAL.
+x-vh-rs: &vh-rs
+  <<: *vh-base
+  restart: always
+  stop_grace_period: 120s
+  mem_limit: ${VH_MEM_RS:?run through bin/vh-cluster}
+  healthcheck: *vh-health
+  volumes:
+    - *vol-logs
+  depends_on:
+    master: *healthy
+
+x-vh-client: &vh-client
+  <<: *vh-base
+  healthcheck: *vh-no-health
+  working_dir: /work
+  volumes:
+    - *vol-logs
+    - *vol-out
+    - *vol-prof
+    - *vol-profiles
+    - *vol-data
+  depends_on:
+    cluster-ready: *completed
+
+services:
+  zk:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_ZK:?run through bin/vh-cluster}
+    healthcheck: *vh-health
+    labels: {org.apache.phoenix.vh.role: zk, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: zk}
+    volumes:
+      - *vol-logs
+      - vh-zk:/vh/data/zk
+  nn:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_NN:?run through bin/vh-cluster}
+    healthcheck: *vh-health
+    labels: {org.apache.phoenix.vh.role: nn, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: nn}
+    volumes:
+      - *vol-logs
+      - vh-nn:/vh/data/nn
+    depends_on:
+      zk: *healthy
+  dn1:
+    <<: *vh-dn
+    labels: {org.apache.phoenix.vh.role: dn, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: dn, VH_INDEX: "1"}
+    volumes:
+      - *vol-logs
+      - vh-dn1:/vh/data/dn
+  dn2:
+    <<: *vh-dn
+    labels: {org.apache.phoenix.vh.role: dn, org.apache.phoenix.vh.index: "2"}
+    environment: {<<: *vh-env, VH_ROLE: dn, VH_INDEX: "2"}
+    volumes:
+      - *vol-logs
+      - vh-dn2:/vh/data/dn
+  dn3:
+    <<: *vh-dn
+    labels: {org.apache.phoenix.vh.role: dn, org.apache.phoenix.vh.index: "3"}
+    environment: {<<: *vh-env, VH_ROLE: dn, VH_INDEX: "3"}
+    volumes:
+      - *vol-logs
+      - vh-dn3:/vh/data/dn
+
+  # One-shot HDFS setup. It waits for safe mode to end and for all DataNodes,
+  # then creates the shared directories. It is safe to run again.
+  hdfs-init:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_CLI:?run through bin/vh-cluster}
+    healthcheck: *vh-no-health
+    labels: {org.apache.phoenix.vh.role: hdfs-init, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: hdfs-init}
+    volumes:
+      - *vol-logs
+    depends_on:
+      nn: *healthy
+      dn1: *healthy
+      dn2: *healthy
+      dn3: *healthy
+
+  snn:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_SNN:?run through bin/vh-cluster}
+    healthcheck: *vh-health
+    labels: {org.apache.phoenix.vh.role: snn, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: snn}
+    volumes:
+      - *vol-logs
+      - vh-snn:/vh/data/snn
+    depends_on:
+      nn: *healthy
+      hdfs-init: *completed
+  rm:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_RM:?run through bin/vh-cluster}
+    healthcheck: *vh-health
+    labels: {org.apache.phoenix.vh.role: rm, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: rm}
+    volumes:
+      - *vol-logs
+    depends_on:
+      hdfs-init: *completed
+  nm1:
+    <<: *vh-nm
+    labels: {org.apache.phoenix.vh.role: nm, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: nm, VH_INDEX: "1"}
+    volumes:
+      - *vol-logs
+      - vh-nm1:/vh/data/nm
+  nm2:
+    <<: *vh-nm
+    labels: {org.apache.phoenix.vh.role: nm, org.apache.phoenix.vh.index: "2"}
+    environment: {<<: *vh-env, VH_ROLE: nm, VH_INDEX: "2"}
+    volumes:
+      - *vol-logs
+      - vh-nm2:/vh/data/nm
+  nm3:
+    <<: *vh-nm
+    labels: {org.apache.phoenix.vh.role: nm, org.apache.phoenix.vh.index: "3"}
+    environment: {<<: *vh-env, VH_ROLE: nm, VH_INDEX: "3"}
+    volumes:
+      - *vol-logs
+      - vh-nm3:/vh/data/nm
+  jhs:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_JHS:?run through bin/vh-cluster}
+    healthcheck: *vh-health
+    labels: {org.apache.phoenix.vh.role: jhs, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: jhs}
+    volumes:
+      - *vol-logs
+    depends_on:
+      hdfs-init: *completed
+      rm: *healthy
+
+  master:
+    <<: *vh-base
+    stop_grace_period: 60s
+    mem_limit: ${VH_MEM_MASTER:?run through bin/vh-cluster}
+    healthcheck: *vh-health
+    labels: {org.apache.phoenix.vh.role: master, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: master}
+    volumes:
+      - *vol-logs
+    depends_on:
+      zk: *healthy
+      hdfs-init: *completed
+  rs1:
+    <<: *vh-rs
+    labels: {org.apache.phoenix.vh.role: rs, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "1", VH_RS_SIMD: null}
+  rs2:
+    <<: *vh-rs
+    labels: {org.apache.phoenix.vh.role: rs, org.apache.phoenix.vh.index: "2"}
+    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "2", VH_RS_SIMD: null}
+  rs3:
+    <<: *vh-rs
+    labels: {org.apache.phoenix.vh.role: rs, org.apache.phoenix.vh.index: "3"}
+    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "3", VH_RS_SIMD: null}
+
+  # One-shot readiness gate. It exits 0 only when HBase and Phoenix serve requests,
+  # so its completion means that the whole topology is ready.
+  cluster-ready:
+    <<: *vh-base
+    mem_limit: ${VH_MEM_CLI:?run through bin/vh-cluster}
+    healthcheck: *vh-no-health
+    labels: {org.apache.phoenix.vh.role: cluster-ready, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-env, VH_ROLE: cluster-ready, VH_RS_SIMD: null}
+    volumes:
+      - *vol-logs
+    depends_on:
+      hdfs-init: *completed
+      snn: *healthy
+      nm1: *healthy
+      nm2: *healthy
+      nm3: *healthy
+      jhs: *healthy
+      master: *healthy
+      rs1: *healthy
+      rs2: *healthy
+      rs3: *healthy
+
+  # The harness client. bin/vh-harness runs one phase per container.
+  # The CPU cap also bounds the truth threads, because the JVM counts the processors of its cgroup.
+  harness:
+    <<: *vh-client
+    profiles: [client]
+    mem_limit: ${VH_HARNESS_MEM:?run through bin/vh-cluster}
+    cpus: ${VH_HARNESS_CPUS:?run through bin/vh-cluster}
+    labels: {org.apache.phoenix.vh.role: harness, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-client-env, VH_ROLE: harness, VH_RUN_DIR: null, HARNESS_LOG4J: null}
+
+  # The tools client for indexfsck, IndexTool, the HBase shell and the Hadoop CLIs.
+  # It uses the server configuration and the shaded Phoenix server jar on the HBase classpath.
+  tools:
+    <<: *vh-client
+    profiles: [client]
+    mem_limit: ${VH_MEM_TOOLS:?run through bin/vh-cluster}
+    labels: {org.apache.phoenix.vh.role: tools, org.apache.phoenix.vh.index: "1"}
+    environment: {<<: *vh-client-env, VH_ROLE: tools}
+
+# Named volumes keep daemon data on the VM disk and away from the slower host file sharing.
+# The region servers have no data volume, because all HBase data lives on HDFS.
+volumes:
+  vh-zk:
+  vh-nn:
+  vh-snn:
+  vh-dn1:
+  vh-dn2:
+  vh-dn3:
+  vh-nm1:
+  vh-nm2:
+  vh-nm3:

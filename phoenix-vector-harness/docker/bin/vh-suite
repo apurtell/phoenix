@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script runs the steps of a suite file in order.
+# A suite file is a plain list of steps, so an operator can read it, change it and resume it.
+# The script only calls the other host scripts. It holds no cluster or harness logic.
+# A session id ties the run ids of one pass together. A resumed pass with the same session
+# id finds the runs of the earlier steps.
+# A step does not run when a step that makes its input failed. The summary then shows only the
+# root causes as failures.
+# The script runs on macOS bash 3.2.
+
+set -euo pipefail
+
+# shellcheck source-path=SCRIPTDIR source-path=SCRIPTDIR/.. source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+# shellcheck source=suites/lib/common.sh
+. "$VH_ROOT/suites/lib/common.sh"
+
+BIN="$VH_ROOT/bin"
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG <suite> [options]
+
+  suite             smoke | functional | perf, or the path of a .suite file
+
+  --session ID      Session id. "@name" in the suite becomes ID-name. Default: a UTC timestamp.
+  --from STEP       Start at the first step that STEP selects
+  --to STEP         Stop after the last step that STEP selects
+  --only S[,S]      Run only the steps that these selectors select
+  --keep-going      Run the remaining steps after a step fails
+  --list            Print the steps and exit
+  --dry-run         Print the commands and exit
+
+A selector selects the step with the same id, and each step whose id starts with the
+selector and a dash. For example, "smoke-ivf" selects "smoke-ivf-load" and "smoke-ivf-run".
+
+A step line is: ID [needs=STEP[,STEP]...] ACTION ARGS. A step needs the earlier steps of its
+chain, and each step that its needs= list names. The chain of a step is its id without the
+last dash and phase. In a chain, build and truth need load, run needs load, build and truth,
+and corrupt needs load and build. Each other phase needs all of these phases. When a needed
+step failed or is NOT_RUN in this session, the runner marks the step NOT_RUN and goes on.
+A failed run step still writes its outputs, so it stops only the steps of the load, build,
+truth, run and corrupt phases. A check or other step that reads the outputs still runs.
+
+Step actions:
+  cluster [K=V]... ARGS                vh-cluster ARGS, with the given environment
+  harness [K=V]... PHASE PROFILE ARGS  vh-harness PHASE PROFILE --suite SUITE ARGS
+  check RUN CHECK...                   suites/check-run.sh on out/SUITE/runs/RUN
+  fsck EXPECT ARGS                     vh-tool indexfsck ARGS. EXPECT is an exit code, a
+                                       comma list of exit codes, or "any".
+  corrupt ivf|hnsw SCHEMA TABLE        Delete one data row (ivf) or one embedding (hnsw)
+                                       with a raw HBase delete, so that the index has an orphan
+  tool ARGS                            vh-tool ARGS
+  tool-grep REGEX ARGS                 vh-tool ARGS; the output must match REGEX
+  sleep DURATION                       Wait, for example 30s or 2m
+  note TEXT                            Write TEXT to the log
+
+Records: out/SUITE/suite-SESSION.log, and the step output in out/SUITE/checks and out/SUITE/tools.
+Exit codes: 0 when all steps pass, 1 when a step fails or is NOT_RUN, 2 for a usage error.
+EOF
+}
+
+die_usage() {
+  printf '%s: ERROR: %s\n' "$VH_PROG" "$*" >&2
+  exit 2
+}
+
+# Writes a line to the terminal and to the log.
+say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# A selector selects the step with the same id, and each step whose id starts with the
+# selector and a dash.
+selects() {
+  local id="$1" sel="$2"
+  [ "$id" = "$sel" ] && return 0
+  case "$id" in
+    "$sel"-*) return 0 ;;
+  esac
+  return 1
+}
+
+# Replaces a session reference. "@name" and "check:@name" refer to the run SESSION-name.
+subst() {
+  local t="$1"
+  case "$t" in
+    @?*) t="$SESSION-${t#@}" ;;
+    *:@?*) t="${t%%:@*}:$SESSION-${t#*:@}" ;;
+  esac
+  printf '%s' "$t"
+}
+
+# Runs one command. The output goes to the terminal, to the log and to the capture file.
+# The command reads its input from STDIN_FILE, so no step waits on the terminal.
+execute() {
+  say "+ $(printf '%q ' "$@")"
+  [ "$DRY" = 0 ] || return 0
+  local rc
+  set +e
+  if [ -n "$CAPTURE" ]; then
+    "$@" <"$STDIN_FILE" 2>&1 | tee -a "$LOG" "$CAPTURE"
+    rc=${PIPESTATUS[0]}
+  else
+    "$@" <"$STDIN_FILE" 2>&1 | tee -a "$LOG"
+    rc=${PIPESTATUS[0]}
+  fi
+  set -e
+  return "$rc"
+}
+
+# Splits the leading NAME=VALUE words from the arguments.
+# ENV_WORDS gets the assignments. ENV_SKIP gets their count.
+split_env() {
+  ENV_WORDS=()
+  ENV_SKIP=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      [A-Z_]*=*) ENV_WORDS+=("$1") ;;
+      *) break ;;
+    esac
+    ENV_SKIP=$((ENV_SKIP + 1))
+    shift
+  done
+}
+
+# Prints the run directory of a run id. A run with repetitions keeps its first run in ID-r1.
+run_dir() {
+  local d="$OUT/runs/$1"
+  if [ ! -f "$d/manifest.json" ] && [ -f "$d-r1/manifest.json" ]; then
+    d="$d-r1"
+  fi
+  printf '%s' "$d"
+}
+
+# A run step that runs again moves the files of the earlier attempt aside.
+# Thus the checks see only the files of the new attempt.
+retire_run() {
+  local id="$1" d stamp
+  stamp="$(date -u +%Y%m%dt%H%M%S)"
+  for d in "$OUT/runs/$id" "$OUT/docker/$id"; do
+    [ -e "$d" ] || continue
+    mkdir -p "$OUT/replaced"
+    say "moving the earlier attempt $d to $OUT/replaced"
+    mv "$d" "$OUT/replaced/$(basename "$(dirname "$d")")-$id-$stamp"
+  done
+}
+
+act_cluster() {
+  split_env "$@"
+  shift "$ENV_SKIP"
+  [ $# -gt 0 ] || {
+    say "cluster: name a vh-cluster command"
+    return 2
+  }
+  execute env ${ENV_WORDS[@]+"${ENV_WORDS[@]}"} "$BIN/vh-cluster" "$@"
+}
+
+act_harness() {
+  split_env "$@"
+  shift "$ENV_SKIP"
+  [ $# -ge 2 ] || {
+    say "harness: name a phase and a profile"
+    return 2
+  }
+  local phase="$1" profile="$2" a prev=""
+  shift 2
+  if [ "$phase" = run ] && [ "$DRY" = 0 ]; then
+    for a in "$@"; do
+      [ "$prev" != --run-id ] || retire_run "$a"
+      [ "$a" != -- ] || break
+      prev="$a"
+    done
+  fi
+  execute env ${ENV_WORDS[@]+"${ENV_WORDS[@]}"} "$BIN/vh-harness" "$phase" "$profile" \
+    --suite "$SUITE" "$@"
+}
+
+act_check() {
+  [ $# -ge 2 ] || {
+    say "check: name a run and at least one check"
+    return 2
+  }
+  local dir
+  dir="$(run_dir "$1")"
+  shift
+  CAPTURE="$OUT/checks/$SESSION-$STEP.txt"
+  [ "$DRY" = 1 ] || : >"$CAPTURE"
+  execute "$VH_ROOT/suites/check-run.sh" "$dir" "$@"
+}
+
+# Compares an exit code with the expected exit codes.
+expect_rc() {
+  local expect="$1" rc="$2" e
+  [ "$expect" != any ] || return 0
+  for e in $(printf '%s' "$expect" | tr ',' ' '); do
+    [ "$e" != "$rc" ] || return 0
+  done
+  say "exit code $rc, expected $expect"
+  return 1
+}
+
+act_fsck() {
+  [ $# -ge 2 ] || {
+    say "fsck: name the expected exit code and the IndexFsckTool arguments"
+    return 2
+  }
+  local expect="$1" rc=0
+  shift
+  case "$expect" in
+    any | [0-9]*) ;;
+    *)
+      say "fsck: bad expected exit code '$expect'"
+      return 2
+      ;;
+  esac
+  CAPTURE="$OUT/tools/$SESSION-$STEP.txt"
+  [ "$DRY" = 1 ] || : >"$CAPTURE"
+  execute "$BIN/vh-tool" indexfsck "$@" || rc=$?
+  [ "$DRY" = 0 ] || return 0
+  expect_rc "$expect" "$rc"
+}
+
+# Prints a JRuby script for the HBase shell that removes data under the index.
+# The script uses raw HBase deletes, so Phoenix does not maintain the index for them.
+# Each delete marker has the timestamp of the cell that it removes.
+# A newer marker looks like a write that the index has not applied yet.
+# The checker reports such a write as a backlog, not as an error.
+#   ivf   removes a whole data row. The index row of that row becomes an orphan.
+#   hnsw  removes the embedding of one row. The segment entry of that row becomes an orphan.
+corrupt_script() {
+  local mode="$1" url="$2" name="$3"
+  cat <<EOF
+mode = '$mode'
+url = '$url'
+name = '$name'
+EOF
+  cat <<'EOF'
+java_import org.apache.hadoop.hbase.HBaseConfiguration
+java_import org.apache.hadoop.hbase.TableName
+java_import org.apache.hadoop.hbase.client.ConnectionFactory
+java_import org.apache.hadoop.hbase.client.Delete
+java_import org.apache.hadoop.hbase.client.Get
+java_import org.apache.hadoop.hbase.client.Scan
+java_import org.apache.hadoop.hbase.util.Bytes
+java_import org.apache.phoenix.jdbc.PhoenixDriver
+java_import org.apache.phoenix.util.PhoenixRuntime
+
+exit_code = 1
+begin
+  pconn = PhoenixDriver::INSTANCE.connect(url, java.util.Properties.new)
+  begin
+    ptable = PhoenixRuntime.getTableNoCache(pconn, name)
+    column = ptable.getColumnForColumnName('EMBEDDING')
+    physical = ptable.getPhysicalName.getString
+    family = column.getFamilyName.getBytes
+    qualifier = column.getColumnQualifierBytes
+  ensure
+    pconn.close
+  end
+  hconn = ConnectionFactory.createConnection(HBaseConfiguration.create)
+  begin
+    htable = hconn.getTable(TableName.valueOf(physical))
+    sc = Scan.new
+    sc.addColumn(family, qualifier)
+    sc.setLimit(1)
+    scanner = htable.getScanner(sc)
+    result = scanner.next
+    scanner.close
+    raise 'the table has no row with an embedding' if result.nil?
+    row = result.getRow
+    if mode == 'hnsw'
+      ts = result.getColumnLatestCell(family, qualifier).getTimestamp
+      del = Delete.new(row)
+      del.addColumn(family, qualifier, ts)
+    else
+      ts = htable.get(Get.new(row)).rawCells.to_a.map { |c| c.getTimestamp }.max
+      del = Delete.new(row, ts)
+    end
+    htable.delete(del)
+    htable.close
+    puts "vh-corrupt: #{mode}: deleted row #{Bytes.toStringBinary(row)} of #{physical} at timestamp #{ts}"
+    exit_code = 0
+  ensure
+    hconn.close
+  end
+rescue Exception => e
+  puts "vh-corrupt: ERROR: #{e}"
+end
+exit exit_code
+EOF
+}
+
+act_corrupt() {
+  [ $# -eq 3 ] || {
+    say "corrupt: name ivf or hnsw, the schema and the table"
+    return 2
+  }
+  local mode="$1" schema="$2" table="$3" f url
+  # shellcheck disable=SC2031 # The shared library sets the value once at load time. No subshell changes it here.
+  url="$VH_JDBC_URL"
+  case "$mode" in
+    ivf | hnsw) ;;
+    *)
+      say "corrupt: the mode is ivf or hnsw, not '$mode'"
+      return 2
+      ;;
+  esac
+  # The values go into the generated script, so they must be plain identifiers.
+  case "$schema$table" in
+    *[!A-Z0-9_]*)
+      say "corrupt: the schema and the table must be upper-case Phoenix identifiers"
+      return 2
+      ;;
+  esac
+  case "$url" in
+    *[!A-Za-z0-9:/._,=\;-]*)
+      say "corrupt: VH_JDBC_URL has characters that the generated script cannot hold"
+      return 2
+      ;;
+  esac
+  f="$OUT/tools/$SESSION-$STEP.rb"
+  if [ "$DRY" = 1 ]; then
+    f=/dev/null
+  else
+    corrupt_script "$mode" "$url" "$schema.$table" >"$f"
+  fi
+  CAPTURE="$OUT/tools/$SESSION-$STEP.txt"
+  [ "$DRY" = 1 ] || : >"$CAPTURE"
+  STDIN_FILE="$f"
+  # shellcheck disable=SC2016 # The inner script runs in the tools container, so this shell must not expand it.
+  execute "$BIN/vh-tool" exec bash -c \
+    'f=/tmp/vh-corrupt.$$.rb; cat >"$f"; hbase shell -n "$f"; rc=$?; rm -f "$f"; exit "$rc"'
+}
+
+act_tool() {
+  [ $# -ge 1 ] || {
+    say "tool: name a vh-tool command"
+    return 2
+  }
+  CAPTURE="$OUT/tools/$SESSION-$STEP.txt"
+  [ "$DRY" = 1 ] || : >"$CAPTURE"
+  execute "$BIN/vh-tool" "$@"
+}
+
+act_tool_grep() {
+  [ $# -ge 2 ] || {
+    say "tool-grep: name a regex and a vh-tool command"
+    return 2
+  }
+  local re="$1"
+  shift
+  act_tool "$@" || return
+  [ "$DRY" = 0 ] || return 0
+  if ! grep -Eq -- "$re" "$CAPTURE"; then
+    say "the output does not match /$re/"
+    return 1
+  fi
+}
+
+act_sleep() {
+  local s
+  s="$(vhs_duration_s "${1:-}")" || {
+    say "sleep: bad duration '${1:-}'"
+    return 2
+  }
+  execute sleep "$s"
+}
+
+# Runs the step at an index. The return value is the result of the step.
+run_step() {
+  local i="$1" action
+  local -a words
+  STEP="${STEP_IDS[$i]}"
+  CAPTURE=""
+  STDIN_FILE=/dev/null
+  read -r -a words <<<"${STEP_BODIES[$i]}"
+  action="${words[0]}"
+  local -a args=()
+  local w
+  for w in ${words[@]+"${words[@]:1}"}; do
+    args+=("$(subst "$w")")
+  done
+  case "$action" in
+    cluster) act_cluster ${args[@]+"${args[@]}"} ;;
+    harness) act_harness ${args[@]+"${args[@]}"} ;;
+    check) act_check ${args[@]+"${args[@]}"} ;;
+    fsck) act_fsck ${args[@]+"${args[@]}"} ;;
+    corrupt) act_corrupt ${args[@]+"${args[@]}"} ;;
+    tool) act_tool ${args[@]+"${args[@]}"} ;;
+    tool-grep) act_tool_grep ${args[@]+"${args[@]}"} ;;
+    sleep) act_sleep ${args[@]+"${args[@]}"} ;;
+    note) say "note: ${args[*]+"${args[*]}"}" ;;
+  esac
+}
+
+# Prints the phases in the chain of a step that make the input of a step of this phase.
+# The truth phase reads only the table, so it does not need the index build.
+input_phases() {
+  case "$1" in
+    load) ;;
+    build | truth) printf 'load' ;;
+    corrupt) printf 'load build' ;;
+    run) printf 'load build truth' ;;
+    *) printf 'load build truth run corrupt' ;;
+  esac
+}
+
+# Prints the earlier steps that make the input of a new step: the steps of its chain that the
+# phase of the step needs, and then the steps of its needs= list.
+step_needs() {
+  local id="$1" chain phase inputs j other
+  shift
+  if [ "${id%-*}" != "$id" ]; then
+    chain="${id%-*}"
+    phase="${id##*-}"
+    inputs=" $(input_phases "$phase") "
+    j=0
+    while [ "$j" -lt ${#STEP_IDS[@]} ]; do
+      other="${STEP_IDS[$j]}"
+      if [ "${other%-*}" = "$chain" ]; then
+        case "$inputs" in
+          *" ${other##*-} "*) printf '%s ' "$other" ;;
+        esac
+      fi
+      j=$((j + 1))
+    done
+  fi
+  [ $# -eq 0 ] || printf '%s ' "$@"
+}
+
+# Reads the suite file into STEP_IDS, STEP_BODIES and STEP_NEEDS. The parse checks every step
+# before the first step runs, so a typing error does not stop a long suite halfway.
+load_suite() {
+  local file="$1" line n=0 id action body j k p
+  local -a words names needs
+  STEP_IDS=()
+  STEP_BODIES=()
+  STEP_NEEDS=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    read -r -a words <<<"$line"
+    [ ${#words[@]} -gt 0 ] || continue
+    case "${words[0]}" in
+      '#'*) continue ;;
+    esac
+    id="${words[0]}"
+    case "$id" in
+      *[!a-z0-9._-]* | [!a-z0-9]*) die_usage "$file:$n: bad step id '$id'" ;;
+    esac
+    # A needed step must come earlier in the file, because the runner runs the steps in order.
+    needs=()
+    k=1
+    while [ "$k" -lt ${#words[@]} ]; do
+      case "${words[$k]}" in
+        needs=*) ;;
+        *) break ;;
+      esac
+      read -r -a names <<<"$(printf '%s' "${words[$k]#needs=}" | tr ',' ' ')"
+      [ ${#names[@]} -gt 0 ] || die_usage "$file:$n: step $id has an empty needs= list"
+      for p in "${names[@]}"; do
+        j=0
+        while [ "$j" -lt ${#STEP_IDS[@]} ] && [ "${STEP_IDS[$j]}" != "$p" ]; do
+          j=$((j + 1))
+        done
+        [ "$j" -lt ${#STEP_IDS[@]} ] ||
+          die_usage "$file:$n: step $id needs '$p', which is not an earlier step"
+        needs+=("$p")
+      done
+      k=$((k + 1))
+    done
+    [ "$k" -lt ${#words[@]} ] || die_usage "$file:$n: step $id has no action"
+    action="${words[$k]}"
+    case "$action" in
+      cluster | harness | check | fsck | corrupt | tool | tool-grep | sleep | note) ;;
+      *) die_usage "$file:$n: unknown action '$action'" ;;
+    esac
+    j=0
+    while [ "$j" -lt ${#STEP_IDS[@]} ]; do
+      [ "${STEP_IDS[$j]}" != "$id" ] || die_usage "$file:$n: step id '$id' is not unique"
+      j=$((j + 1))
+    done
+    body="${words[*]:$k}"
+    STEP_NEEDS+=("$(step_needs "$id" ${needs[@]+"${needs[@]}"})")
+    STEP_IDS+=("$id")
+    STEP_BODIES+=("$body")
+  done <"$file"
+  [ ${#STEP_IDS[@]} -gt 0 ] || die_usage "$file has no steps"
+}
+
+# Prints the latest result of a step in this session: PASS, FAIL, NOT_RUN or nothing.
+# A result of this invocation comes first. Otherwise the session log gives the result of an
+# earlier invocation. A step without a result does not stop the steps that need it.
+step_status() {
+  local id="$1" k=${#RES_IDS[@]}
+  while [ "$k" -gt 0 ]; do
+    k=$((k - 1))
+    if [ "${RES_IDS[$k]}" = "$id" ]; then
+      printf '%s' "${RES_STATUS[$k]}"
+      return 0
+    fi
+  done
+  [ -f "$SESSION_LOG" ] || return 0
+  awk -v id="$id:" '$1 == "--" && $3 == "step" && $4 == id { s = $5 } END { printf "%s", s }' \
+    "$SESSION_LOG"
+}
+
+# Prints each needed step of the step at an index that failed or is NOT_RUN, with its result.
+# The return value is success when there is such a step.
+# A failed run still writes its outputs, and the checks of these outputs explain the failure.
+# Thus a failed run stops only the steps that make data or run a workload. The readers still run.
+blocked_by() {
+  local p s out="" id="${STEP_IDS[$1]}" reader=1
+  case "${id##*-}" in
+    load | build | truth | run | corrupt) reader=0 ;;
+  esac
+  # shellcheck disable=SC2086 # The list holds checked step ids, so the split is safe.
+  for p in ${STEP_NEEDS[$1]}; do
+    s="$(step_status "$p")"
+    if [ "$s" = FAIL ] && [ "$reader" = 1 ] && [ "${p##*-}" = run ]; then
+      continue
+    fi
+    case "$s" in
+      FAIL | NOT_RUN) out="$out${out:+, }$p $s" ;;
+    esac
+  done
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# Marks the selected steps in STEP_SEL.
+select_steps() {
+  local n=${#STEP_IDS[@]} i first=-1 last=-1 sel ok
+  STEP_SEL=()
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ -n "$FROM" ] && [ "$first" -lt 0 ] && selects "${STEP_IDS[$i]}" "$FROM"; then
+      first=$i
+    fi
+    if [ -n "$TO" ] && selects "${STEP_IDS[$i]}" "$TO"; then
+      last=$i
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$FROM" ] || [ "$first" -ge 0 ] || die_usage "--from $FROM selects no step"
+  [ -z "$TO" ] || [ "$last" -ge 0 ] || die_usage "--to $TO selects no step"
+  [ "$first" -ge 0 ] || first=0
+  [ "$last" -ge 0 ] || last=$((n - 1))
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    ok=0
+    if [ "$i" -ge "$first" ] && [ "$i" -le "$last" ]; then
+      ok=1
+      if [ -n "$ONLY" ]; then
+        ok=0
+        for sel in $(printf '%s' "$ONLY" | tr ',' ' '); do
+          if selects "${STEP_IDS[$i]}" "$sel"; then
+            ok=1
+          fi
+        done
+      fi
+    fi
+    STEP_SEL+=("$ok")
+    i=$((i + 1))
+  done
+}
+
+resume_hint() {
+  say "resume: $BIN/vh-suite $SUITE_ARG --session $SESSION --from $1"
+}
+
+on_signal() {
+  trap - INT TERM
+  say "$(ts) interrupted in step ${STEP:-none}"
+  [ -z "${STEP:-}" ] || resume_hint "$STEP"
+  exit 130
+}
+
+main() {
+  SUITE_ARG=""
+  SESSION=""
+  FROM=""
+  TO=""
+  ONLY=""
+  DRY=0
+  local list=0 keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) SESSION="${2:?--session needs an id}"; shift 2 ;;
+      --from) FROM="${2:?--from needs a step}"; shift 2 ;;
+      --to) TO="${2:?--to needs a step}"; shift 2 ;;
+      --only) ONLY="${2:?--only needs a step list}"; shift 2 ;;
+      --keep-going) keep=1; shift ;;
+      --list) list=1; shift ;;
+      --dry-run) DRY=1; shift ;;
+      -h | --help | help)
+        usage
+        return 0
+        ;;
+      -*) die_usage "unknown option '$1'" ;;
+      *)
+        [ -z "$SUITE_ARG" ] || die_usage "name one suite only"
+        SUITE_ARG="$1"
+        shift
+        ;;
+    esac
+  done
+  [ -n "$SUITE_ARG" ] || {
+    usage >&2
+    return 2
+  }
+  local file
+  case "$SUITE_ARG" in
+    */* | *.suite) file="$SUITE_ARG" ;;
+    *) file="$VH_ROOT/suites/$SUITE_ARG.suite" ;;
+  esac
+  [ -f "$file" ] || die_usage "no such suite: $file"
+  SUITE="$(basename "$file" .suite)"
+  [ "$(vhs_run_id "$SUITE")" = "$SUITE" ] || die_usage "bad suite name '$SUITE'"
+  if [ -z "$SESSION" ]; then
+    SESSION="$(date -u +%Y%m%dt%H%M%S)"
+  fi
+  [ "$(vhs_run_id "$SESSION")" = "$SESSION" ] ||
+    die_usage "a session id has only lower-case letters, digits, dot, dash and underscore"
+
+  load_suite "$file"
+  select_steps
+  OUT="$VH_WORK/out/$SUITE"
+  local n=${#STEP_IDS[@]} i
+  if [ "$list" = 1 ]; then
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if [ "${STEP_SEL[$i]}" = 1 ]; then
+        printf '%-28s %s\n' "${STEP_IDS[$i]}" "${STEP_BODIES[$i]}"
+        [ -z "${STEP_NEEDS[$i]}" ] || printf '%-28s needs %s\n' "" "${STEP_NEEDS[$i]% }"
+      fi
+      i=$((i + 1))
+    done
+    return 0
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    LOG=/dev/null
+  else
+    mkdir -p "$OUT/checks" "$OUT/tools"
+    LOG="$OUT/suite-$SESSION.log"
+  fi
+  SESSION_LOG="$OUT/suite-$SESSION.log"
+  STEP=""
+  trap on_signal INT TERM
+  say "$(ts) suite $SUITE session $SESSION file $file"
+  say "log: $LOG"
+
+  RES_IDS=()
+  RES_STATUS=()
+  RES_SECS=()
+  local passed=0 failed=0 notrun=0 rc t0 secs status blockers
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${STEP_SEL[$i]}" != 1 ]; then
+      i=$((i + 1))
+      continue
+    fi
+    say ""
+    say "== $(ts) step ${STEP_IDS[$i]}: ${STEP_BODIES[$i]}"
+    # A step without its input can only fail. It does not run, and it is not a new failure,
+    # so the pass goes on without --keep-going.
+    rc=0
+    if blockers="$(blocked_by "$i")"; then
+      status=NOT_RUN
+      secs=0
+      notrun=$((notrun + 1))
+      say "-- $(ts) step ${STEP_IDS[$i]}: $status (needs $blockers)"
+    else
+      t0="$(vhs_now_s)"
+      run_step "$i" || rc=$?
+      secs=$(($(vhs_now_s) - t0))
+      if [ "$rc" = 0 ]; then
+        status=PASS
+        passed=$((passed + 1))
+      else
+        status=FAIL
+      fi
+      say "-- $(ts) step ${STEP_IDS[$i]}: $status (exit $rc, ${secs}s)"
+    fi
+    RES_IDS+=("${STEP_IDS[$i]}")
+    RES_STATUS+=("$status")
+    RES_SECS+=("$secs")
+    if [ "$rc" != 0 ]; then
+      failed=$((failed + 1))
+      if [ "$keep" = 0 ]; then
+        resume_hint "${STEP_IDS[$i]}"
+        break
+      fi
+    fi
+    i=$((i + 1))
+  done
+  STEP=""
+
+  say ""
+  say "summary of suite $SUITE session $SESSION"
+  i=0
+  while [ "$i" -lt ${#RES_IDS[@]} ]; do
+    say "$(printf '  %-7s %6ss  %s' "${RES_STATUS[$i]}" "${RES_SECS[$i]}" "${RES_IDS[$i]}")"
+    i=$((i + 1))
+  done
+  say "$passed passed, $failed failed, $notrun not run of ${#RES_IDS[@]} steps"
+  [ "$failed" = 0 ] && [ "$notrun" = 0 ]
+}
+
+main "$@"

@@ -1,0 +1,54 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# bin/vh-suite runs this file. Each line is one step: an id, an action and its arguments.
+# Whitespace separates the words, and the runner does not interpret quotes.
+# "@name" is the run id SESSION-name, so a resumed session finds the runs of earlier steps.
+# The steps of one table pass the same overrides, so every phase sees the same settings.
+
+# The smoke suite proves the path from the cluster to the report in about one hour.
+# It runs each variant on the small synthetic profile in the schema VH_SMOKE.
+# The recall sampler stops the writes while it scores. A small sample size lets the mutations
+# reach their rate.
+
+setup-reset          cluster reset --yes
+setup-up             cluster up
+setup-verify         cluster verify
+
+smoke-exact-load     harness load smoke --variant exact --overrides smoke-sampler
+smoke-exact-build    harness build-index smoke --variant exact --overrides smoke-sampler
+smoke-exact-truth    harness truth smoke --variant exact --overrides smoke-sampler
+smoke-exact-run      harness run smoke --variant exact --overrides smoke-sampler --run-id @smoke-exact
+smoke-exact-report   harness report - --run-id @smoke-exact
+smoke-exact-check    check @smoke-exact wrapper simd errors recall-exact
+
+smoke-ivf-load       harness load smoke --variant ivf --overrides smoke-sampler
+smoke-ivf-build      harness build-index smoke --variant ivf --overrides smoke-sampler
+smoke-ivf-truth      harness truth smoke --variant ivf --overrides smoke-sampler
+smoke-ivf-run        harness run smoke --variant ivf --overrides smoke-sampler --run-id @smoke-ivf
+smoke-ivf-report     harness report - --run-id @smoke-ivf
+smoke-ivf-check      check @smoke-ivf wrapper simd errors recall-ivf-all probe-rise fsck
+
+smoke-hnsw-load      harness load smoke --variant hnsw --overrides smoke-sampler
+smoke-hnsw-build     harness build-index smoke --variant hnsw --overrides smoke-sampler
+smoke-hnsw-truth     harness truth smoke --variant hnsw --overrides smoke-sampler
+smoke-hnsw-run       harness run smoke --variant hnsw --overrides smoke-sampler --run-id @smoke-hnsw
+smoke-hnsw-report    harness report - --run-id @smoke-hnsw
+smoke-hnsw-check     check @smoke-hnsw wrapper simd errors recall-hnsw-ef256 fsck uncovered restriction
+
+smoke-compare        needs=smoke-exact-run,smoke-ivf-run,smoke-hnsw-run harness report - --run-id @smoke-exact --compare @smoke-ivf --compare @smoke-hnsw

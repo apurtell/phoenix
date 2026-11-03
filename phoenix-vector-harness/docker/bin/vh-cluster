@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script controls the lifecycle of the all-localhost cluster.
+# Compose starts the daemons in dependency order. The one-shot cluster-ready service is the
+# readiness gate, so "up" returns only when HBase and Phoenix serve requests.
+# A crash test kills the region server JVM inside its container. The container then exits
+# with code 137, and its restart policy brings it back.
+# A restart of the master and the region servers is a rolling restart, as in production.
+# Each region server moves its regions to the other servers before a clean stop.
+# After the start, the regions move back.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG <command> [options]
+
+  up [--skip-preflight]       Start the cluster and wait for cluster-ready (timeout VH_READY_TIMEOUT=${VH_READY_TIMEOUT}s)
+  down                        Stop and remove all containers. Volumes and $VH_WORK stay.
+  reset [--yes]               Remove all containers and data volumes. Move out/*/tables aside.
+  status                      One line per container, then the web UI addresses. Exit 1 if not ready.
+  ps [ARGS]                   docker compose ps -a
+  logs [ARGS]                 docker compose logs, for example: logs -f --tail 100 rs1
+  config [ARGS]               The resolved compose configuration
+  verify [--crash-check [RS]] Host checks, then vh-verify in a tools container.
+                              --crash-check also kills one region server (default rs3) and waits for its rejoin.
+  kill <svc> [--no-wait]      SIGKILL the daemon JVM of a service. For rs1-3, wait for the restart.
+  restart [--full] <svc|group>
+                              Stop and start in dependency order, then wait for health.
+                              Groups: hdfs yarn hbase dn nm rs all
+                              For master and rs1-3 only, a rolling restart: the master first, then each
+                              region server with a drain and a load (timeout VH_RS_MOVE_TIMEOUT=${VH_RS_MOVE_TIMEOUT}s).
+                              --full stops all members first, also for master and rs1-3.
+
+Services: $VH_DAEMON_SERVICES
+EOF
+}
+
+# Prints all containers of the project in service order, one line each.
+status_lines() {
+  local svc cid st
+  for svc in $VH_ALL_SERVICES; do
+    for cid in $(vh_svc_cids -a "$svc"); do
+      st="$(vh_cid_state "$cid")"
+      # shellcheck disable=SC2086 # The state is five words, one for each column.
+      printf '%-14s %-36s %-9s %-10s %-8s %-6s %s\n' "$svc" "$(vh_cid_name "$cid")" $st
+    done
+  done
+}
+
+# Prints the names of daemons that are not running and healthy. Prints nothing when all are ready.
+not_ready_daemons() {
+  local svc cid st out=""
+  for svc in $VH_DAEMON_SERVICES; do
+    cid="$(vh_svc_cids "$svc" | head -n 1)"
+    if [ -z "$cid" ]; then
+      out="$out $svc"
+      continue
+    fi
+    st="$(vh_cid_state "$cid")"
+    case "$st" in
+      "running healthy "*) ;;
+      *) out="$out $svc" ;;
+    esac
+  done
+  echo "${out# }"
+}
+
+# Prints the state of the last cluster-ready run: "exited 0", "running" and so on.
+ready_state() {
+  local cid
+  cid="$(vh_svc_cids -a cluster-ready | head -n 1)"
+  if [ -z "$cid" ]; then
+    echo missing
+    return 0
+  fi
+  vh_docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$cid"
+}
+
+run_preflight() {
+  local pf="$VH_ROOT/scripts/preflight.sh"
+  if [ -x "$pf" ]; then
+    "$pf" || vh_die "preflight failed; fix the Docker VM settings or pass --skip-preflight"
+  else
+    vh_warn "no executable $pf; skipping the preflight checks"
+  fi
+}
+
+# Prints the services that stopped and do not come back by themselves.
+# A region server has a restart policy, and hdfs-init may exit with code 0.
+stopped_services() {
+  local svc cid st out=""
+  for svc in $VH_DAEMON_SERVICES hdfs-init; do
+    case "$svc" in
+      rs[1-9]) continue ;;
+    esac
+    cid="$(vh_svc_cids -a "$svc" | head -n 1)"
+    [ -n "$cid" ] || continue
+    st="$(vh_docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$cid")"
+    case "$st" in
+      "exited 0") [ "$svc" = hdfs-init ] || out="$out $svc" ;;
+      exited* | dead*) out="$out $svc" ;;
+    esac
+  done
+  echo "${out# }"
+}
+
+# Waits for the one-shot readiness gate. Fails early when a daemon without restart policy stops.
+wait_ready() {
+  local timeout="$1" st dead
+  local deadline=$((SECONDS + timeout))
+  while :; do
+    st="$(ready_state)"
+    case "$st" in
+      "exited 0")
+        vh_log "cluster ready after ${SECONDS}s"
+        return 0
+        ;;
+      exited*)
+        vh_warn "cluster-ready failed ($st); its last log lines follow"
+        vh_compose logs --no-color --tail 60 cluster-ready >&2 || true
+        return 1
+        ;;
+    esac
+    dead="$(stopped_services)"
+    if [ -n "$dead" ]; then
+      vh_warn "stopped before cluster-ready finished: $dead"
+      return 1
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      vh_warn "cluster-ready did not finish within ${timeout}s; not ready: $(not_ready_daemons)"
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+cmd_up() {
+  local preflight=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --skip-preflight) preflight=0 ;;
+      *) vh_die "up: unknown option $1" ;;
+    esac
+    shift
+  done
+  [ "$preflight" = 0 ] || run_preflight
+  vh_require_image
+  vh_prepare_dirs
+  SECONDS=0
+  # Compose blocks on each health condition while it starts the dependency chain.
+  if ! vh_compose up -d; then
+    status_lines >&2 || true
+    vh_die "docker compose up failed; see '$VH_PROG logs <svc>'"
+  fi
+  if ! wait_ready "$VH_READY_TIMEOUT"; then
+    status_lines >&2 || true
+    vh_die "the cluster is not ready; see '$VH_PROG logs <svc>' and '$VH_ROOT/bin/vh-collect'"
+  fi
+}
+
+cmd_down() {
+  vh_compose --profile client down --remove-orphans "$@"
+}
+
+cmd_reset() {
+  local yes=0 ts d
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y | --yes) yes=1 ;;
+      *) vh_die "reset: unknown option $1" ;;
+    esac
+    shift
+  done
+  if [ "$yes" = 0 ]; then
+    if [ -t 0 ]; then
+      printf 'Delete all cluster data volumes of project %s? [y/N] ' "$VH_PROJECT" >&2
+      read -r answer
+      case "$answer" in
+        y | Y | yes) ;;
+        *) vh_die "reset cancelled" ;;
+      esac
+    else
+      vh_die "reset deletes all cluster data; pass --yes"
+    fi
+  fi
+  vh_compose --profile client down -v --remove-orphans
+  # The load and build state of the harness describes tables in the old cluster.
+  # Runs and the truth cache stay, because they do not depend on the cluster.
+  ts="$(vh_ts)"
+  for d in "$VH_WORK"/out/tables "$VH_WORK"/out/*/tables; do
+    [ -d "$d" ] || continue
+    mv "$d" "$d.stale-$ts"
+    vh_log "moved $d to $d.stale-$ts"
+  done
+}
+
+cmd_status() {
+  local rc=0 nr
+  printf '%-14s %-36s %-9s %-10s %-8s %-6s %s\n' SERVICE CONTAINER STATE HEALTH RESTARTS OOM EXIT
+  status_lines
+  echo
+  vh_ports_urls
+  nr="$(not_ready_daemons)"
+  if [ -n "$nr" ]; then
+    echo
+    echo "not ready: $nr"
+    rc=1
+  fi
+  if [ "$(ready_state)" != "exited 0" ]; then
+    echo "cluster-ready: $(ready_state)"
+    rc=1
+  fi
+  return "$rc"
+}
+
+# Kills the daemon JVM of a service with SIGKILL from inside its container.
+# The process name comes from the role table of the image.
+kill_service() {
+  local svc="$1" wait="$2" role idx pattern cid before policy st
+  vh_is_daemon "$svc" || vh_die "kill: '$svc' is not a daemon service"
+  role="$(vh_svc_role "$svc")"
+  idx="$(vh_svc_index "$svc")"
+  pattern="$(vh_role_value "$role" "$idx" VH_PROC_PATTERN)"
+  [ -n "$pattern" ] || vh_die "kill: no process name for role $role"
+  cid="$(vh_cid "$svc")" || vh_die "kill: $svc is not running"
+  before="$(vh_docker inspect -f '{{.RestartCount}}' "$cid")"
+  policy="$(vh_docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid")"
+  vh_log "kill -9 $pattern in $svc"
+  SECONDS=0
+  # pkill runs directly as the exec process, so no shell with the pattern in its arguments exists.
+  if ! vh_docker exec -u "$VH_EXEC_USER" "$cid" pkill -9 -f "$pattern"; then
+    vh_warn "pkill reported no match or lost its container; checking the container state"
+  fi
+  if [ "$policy" != always ]; then
+    vh_warn "$svc has no restart policy; it stays down until '$VH_PROG restart $svc'"
+    return 0
+  fi
+  [ "$wait" = 1 ] || return 0
+  local deadline=$((SECONDS + VH_READY_TIMEOUT))
+  while [ "$(vh_docker inspect -f '{{.RestartCount}}' "$cid")" -le "$before" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || vh_die "$svc did not restart within ${VH_READY_TIMEOUT}s"
+    sleep 1
+  done
+  vh_log "$svc restarted after ${SECONDS}s (restart count $before -> $((before + 1)))"
+  vh_wait_healthy "$VH_READY_TIMEOUT" "$svc" || vh_die "$svc did not become healthy"
+  vh_log "$svc healthy after ${SECONDS}s"
+  if [ "$role" = rs ]; then
+    vh_wait_live_rs "$VH_READY_TIMEOUT" || vh_die "the master does not see $VH_RS_COUNT region servers"
+    vh_log "the master reports $VH_RS_COUNT live region servers after ${SECONDS}s"
+  fi
+  st="$(vh_cid_state "$cid")"
+  vh_log "$svc state: $st"
+}
+
+cmd_kill() {
+  local svc="" wait=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-wait) wait=0 ;;
+      -*) vh_die "kill: unknown option $1" ;;
+      *) svc="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$svc" ] || vh_die "kill: name a service"
+  kill_service "$svc" "$wait"
+}
+
+cmd_restart() {
+  local target="" full=0 members svc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --full) full=1 ;;
+      -*) vh_die "restart: unknown option $1" ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || vh_die "restart: name a service or a group"
+  members="$(vh_group_members "$target")" || vh_die "restart: unknown service or group '$target'"
+  if [ "$full" = 1 ]; then
+    full_restart "$target" "$members"
+    return
+  fi
+  for svc in $members; do
+    case "$(vh_svc_role "$svc")" in
+      master | rs) ;;
+      *)
+        full_restart "$target" "$members"
+        return
+        ;;
+    esac
+  done
+  rolling_restart "$target" "$members"
+}
+
+# Stops all members and then starts them in dependency order. Groups with HDFS, YARN or
+# ZooKeeper services always use this restart.
+full_restart() {
+  local target="$1" members="$2" svc cid tier stop_list="" r
+  # Stop in reverse start order, so a region server never outlives its master.
+  for svc in $members; do
+    stop_list="$svc $stop_list"
+  done
+  for svc in $stop_list; do
+    for cid in $(vh_svc_cids "$svc"); do
+      vh_log "stopping $svc"
+      vh_docker stop "$cid" >/dev/null
+    done
+  done
+  # Start one role at a time in start order, and wait for health before the next role.
+  for r in zk nn snn dn rm nm jhs master rs; do
+    tier=""
+    for svc in $members; do
+      [ "$(vh_svc_role "$svc")" = "$r" ] && tier="$tier $svc"
+    done
+    [ -n "$tier" ] || continue
+    for svc in $tier; do
+      cid="$(vh_svc_cids -a "$svc" | head -n 1)"
+      [ -n "$cid" ] || vh_die "restart: $svc has no container; run '$VH_PROG up'"
+      vh_docker start "$cid" >/dev/null
+    done
+    vh_log "waiting for$tier"
+    # shellcheck disable=SC2086 # The tier is a list of service names.
+    vh_wait_healthy "$VH_READY_TIMEOUT" $tier || vh_die "restart: not healthy:$tier"
+  done
+  case " $members " in
+    *" master "* | *" rs"[1-9]" "*)
+      vh_wait_live_rs "$VH_READY_TIMEOUT" || vh_die "restart: the master does not see all region servers"
+      ;;
+  esac
+  vh_log "restart of $target done"
+}
+
+# The state of the rolling restart, for the exit handler.
+RR_BALANCER_RESTORE=""
+RR_BALANCER_PREV=""
+RR_TOOL=""
+
+# Restores the balancer and stops a running tool container when the rolling restart exits,
+# also after a failure or an interrupt.
+rolling_restart_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [ -n "$RR_TOOL" ]; then
+    vh_docker stop -t 10 "$RR_TOOL" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$RR_BALANCER_RESTORE" ]; then
+    RR_BALANCER_RESTORE=""
+    if balancer_switch true; then
+      vh_log "the balancer is on again"
+    else
+      vh_warn "the balancer stays off; run \"balance_switch true\" in the HBase shell"
+      [ "$rc" != 0 ] || rc=1
+    fi
+  fi
+  exit "$rc"
+}
+
+# Runs one command in a named tools container and writes its output to a log file.
+# At the timeout, the function stops the container and returns 124.
+run_tool_bounded() {
+  local timeout="$1" log="$2" pid
+  shift 2
+  local deadline=$((SECONDS + timeout))
+  RR_TOOL="$VH_PROJECT-restart-$$-$RANDOM"
+  vh_compose run --rm --no-deps -T --name "$RR_TOOL" tools "$@" </dev/null >"$log" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      vh_warn "the tool did not finish within ${timeout}s; stopping it (log: $log)"
+      vh_docker stop -t 10 "$RR_TOOL" >/dev/null 2>&1 || true
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      RR_TOOL=""
+      return 124
+    fi
+    sleep 1
+  done
+  local rc=0
+  wait "$pid" || rc=$?
+  RR_TOOL=""
+  return "$rc"
+}
+
+# Sets the balancer switch through the HBase shell and keeps the earlier state in RR_BALANCER_PREV.
+# The function runs in the main shell, so the exit handler can stop its tool container.
+balancer_switch() {
+  local want="$1" log prev
+  log="$RR_LOG_DIR/balancer-$want.log"
+  # shellcheck disable=SC2016 # The command expands its own variables in the container.
+  if ! run_tool_bounded "$VH_RS_MOVE_TIMEOUT" "$log" \
+    bash -c 'printf "balance_switch %s\n" "$1" | hbase shell -n' balancer "$want"; then
+    vh_warn "balance_switch $want failed (log: $log)"
+    return 1
+  fi
+  prev="$(sed -En 's/.*Previous balancer state *: *(true|false).*/\1/p' "$log" | tail -n 1)"
+  if [ -z "$prev" ]; then
+    vh_warn "balance_switch $want gave no earlier state (log: $log)"
+    return 1
+  fi
+  RR_BALANCER_PREV="$prev"
+}
+
+# Prints the number of regions that a region server reports, or -1.
+rs_region_count() {
+  local svc="$1" cid info out
+  cid="$(vh_svc_cids "$svc" | head -n 1)"
+  info="$(vh_role_value rs "$(vh_svc_index "$svc")" VH_RS_INFO)"
+  out="$(vh_docker exec "$cid" curl -fsS --max-time 10 \
+    "http://localhost:$info/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub=Server" \
+    2>/dev/null || true)"
+  out="$(printf '%s\n' "$out" | sed -n 's/.*"regionCount"[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  echo "${out:--1}"
+}
+
+# Succeeds when the master has a load report from the live instance of a region server.
+# Until the first report, the master does not select the server as a destination.
+# A move to the server in that period opens the region on another server.
+rs_reported() {
+  local svc="$1" cid port filter
+  cid="$(vh_svc_cids master | head -n 1)"
+  [ -n "$cid" ] || return 1
+  port="$(vh_role_value rs "$(vh_svc_index "$svc")" VH_RS_RPC)"
+  # shellcheck disable=SC2016 # jq expands its own variables.
+  filter='any(.data[]; (.server_name.server_name | split(",")[1]) == $port
+    and (.last_report_timestamp // 0) > 0)'
+  # shellcheck disable=SC2016 # The command expands its own variables in the container.
+  vh_docker exec "$cid" bash -c 'curl -fsS --max-time 10 "$1" | jq -e --arg port "$2" "$3"' \
+    rs-reported "http://localhost:$VH_MASTER_INFO/api/v1/admin/cluster_metrics/live_servers" \
+    "$port" "$filter" >/dev/null 2>&1
+}
+
+# Runs the region mover of HBase for one region server. The region list file stays in the
+# output directory, so the load step reads the list that the unload step wrote.
+region_mover() {
+  local op="$1" svc="$2" port rc=0
+  port="$(vh_role_value rs "$(vh_svc_index "$svc")" VH_RS_RPC)"
+  run_tool_bounded "$((VH_RS_MOVE_TIMEOUT + 60))" "$RR_LOG_DIR/$svc-$op.log" \
+    hbase org.apache.hadoop.hbase.util.RegionMover -r "localhost:$port" -o "$op" \
+    -m "$VH_RS_MOVE_THREADS" -t "$VH_RS_MOVE_TIMEOUT" -f "/work/out/region-mover/$svc.regions" ||
+    rc=$?
+  if [ "$rc" = 124 ]; then
+    vh_die "restart: the $op of $svc did not finish within ${VH_RS_MOVE_TIMEOUT}s; see $RR_LOG_DIR/$svc-$op.log"
+  elif [ "$rc" != 0 ]; then
+    vh_die "restart: the $op of $svc failed with exit code $rc; see $RR_LOG_DIR/$svc-$op.log"
+  fi
+}
+
+# Stops a container cleanly and returns 1 if the stop grace period ran out.
+stop_clean() {
+  local svc="$1" cid="$2" code
+  vh_log "stopping $svc"
+  vh_docker stop "$cid" >/dev/null
+  code="$(vh_docker inspect -f '{{.State.ExitCode}}' "$cid")"
+  case "$code" in
+    0 | 143) return 0 ;;
+    *)
+      vh_warn "$svc did not stop cleanly (exit code $code)"
+      return 1
+      ;;
+  esac
+}
+
+# Restarts the master and the region servers as a production rolling restart does.
+# The master stops and starts first. Then each region server in turn moves its regions to the
+# other servers, stops cleanly, starts, and gets its regions back. The balancer is off during
+# the region server steps, so it does not undo the moves.
+# The container restart policy does not act on a stop through Docker, so the restart count of
+# each container stays the same.
+rolling_restart() {
+  local target="$1" members="$2" svc cid unclean="" servers="" running="" n deadline v
+  for v in VH_RS_MOVE_TIMEOUT VH_RS_MOVE_THREADS; do
+    case "${!v}" in
+      '' | *[!0-9]* | 0) vh_die "restart: $v must be a positive integer, not '${!v}'" ;;
+    esac
+  done
+  RR_LOG_DIR="$VH_WORK/logs/region-mover"
+  mkdir -p "$RR_LOG_DIR" "$VH_WORK/out/region-mover"
+  trap rolling_restart_exit EXIT
+  trap 'exit 130' INT TERM
+  for svc in $members; do
+    if [ "$svc" = master ]; then
+      cid="$(vh_svc_cids master | head -n 1)"
+      if [ -n "$cid" ]; then
+        stop_clean master "$cid" || unclean="$unclean master"
+      fi
+      start_and_wait master
+    else
+      servers="$servers $svc"
+    fi
+  done
+  # A stopped region server has no regions to move, so it only starts.
+  for svc in $servers; do
+    if [ -n "$(vh_svc_cids "$svc")" ]; then
+      running="$running $svc"
+    else
+      vh_warn "$svc is not running; it starts without a drain"
+      start_and_wait "$svc"
+    fi
+  done
+  if [ -z "$running" ]; then
+    [ -z "$unclean" ] || vh_die "restart: these services did not stop cleanly:$unclean"
+    vh_log "restart of $target done"
+    return 0
+  fi
+  vh_wait_live_rs "$VH_READY_TIMEOUT" "$(running_rs_count)" ||
+    vh_die "restart: the master does not see all running region servers"
+  balancer_switch false || vh_die "restart: cannot switch the balancer off"
+  [ "$RR_BALANCER_PREV" = true ] && RR_BALANCER_RESTORE=1
+  vh_log "the balancer is off (it was $RR_BALANCER_PREV)"
+  for svc in $running; do
+    SECONDS=0
+    cid="$(vh_svc_cids "$svc" | head -n 1)"
+    [ -n "$cid" ] || vh_die "restart: $svc stopped during the rolling restart"
+    vh_log "moving the regions of $svc to the other region servers"
+    region_mover unload "$svc"
+    # The region count metric updates every few seconds, so the check waits for some updates.
+    deadline=$((SECONDS + 30))
+    while n="$(rs_region_count "$svc")" && [ "$n" != 0 ]; do
+      [ "$SECONDS" -lt "$deadline" ] ||
+        vh_die "restart: $svc reports $n regions after the drain (-1: no answer); see $RR_LOG_DIR/$svc-unload.log"
+      sleep 2
+    done
+    vh_log "$svc has no regions after ${SECONDS}s"
+    stop_clean "$svc" "$cid" || unclean="$unclean $svc"
+    vh_wait_live_rs "$VH_READY_TIMEOUT" "$(running_rs_count)" ||
+      vh_die "restart: the master still lists $svc as live"
+    start_and_wait "$svc"
+    deadline=$((SECONDS + VH_READY_TIMEOUT))
+    until rs_reported "$svc"; do
+      [ "$SECONDS" -lt "$deadline" ] ||
+        vh_die "restart: the master has no load report from $svc after ${VH_READY_TIMEOUT}s"
+      sleep 1
+    done
+    vh_log "moving the regions back to $svc"
+    region_mover load "$svc"
+    vh_log "$svc restarted with its regions in ${SECONDS}s"
+  done
+  if [ -n "$RR_BALANCER_RESTORE" ]; then
+    RR_BALANCER_RESTORE=""
+    balancer_switch true || vh_die "restart: cannot switch the balancer on again"
+    vh_log "the balancer is on again"
+  fi
+  [ -z "$unclean" ] || vh_die "restart: these services did not stop cleanly:$unclean"
+  vh_log "restart of $target done"
+}
+
+# Prints the number of region server containers that run.
+running_rs_count() {
+  local svc n=0
+  for svc in $(vh_group_members rs); do
+    [ -z "$(vh_svc_cids "$svc")" ] || n=$((n + 1))
+  done
+  echo "$n"
+}
+
+# Starts a stopped service and waits until it is healthy and the master sees each running
+# region server. A region server that is stopped does not make the wait fail.
+start_and_wait() {
+  local svc="$1" want cid
+  cid="$(vh_svc_cids -a "$svc" | head -n 1)"
+  [ -n "$cid" ] || vh_die "restart: $svc has no container; run '$VH_PROG up'"
+  vh_docker start "$cid" >/dev/null
+  want="$(running_rs_count)"
+  vh_log "waiting for $svc"
+  vh_wait_healthy "$VH_READY_TIMEOUT" "$svc" || vh_die "restart: $svc is not healthy"
+  vh_wait_live_rs "$VH_READY_TIMEOUT" "$want" ||
+    vh_die "restart: the master does not see $want region servers"
+}
+
+# Checks that the host side of the cluster is as the design needs it.
+host_checks() {
+  local rc=0 svc cid st policy mem
+  for svc in $VH_DAEMON_SERVICES; do
+    cid="$(vh_svc_cids "$svc" | head -n 1)"
+    if [ -z "$cid" ]; then
+      echo "FAIL $svc: no running container"
+      rc=1
+      continue
+    fi
+    st="$(vh_cid_state "$cid")"
+    policy="$(vh_docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid")"
+    mem="$(vh_docker inspect -f '{{.HostConfig.Memory}}' "$cid")"
+    case "$st" in
+      "running healthy "*" false "*) echo "ok   $svc: $st policy=$policy mem=$mem" ;;
+      *)
+        echo "FAIL $svc: $st"
+        rc=1
+        ;;
+    esac
+    case "$svc" in
+      rs[1-9]) [ "$policy" = always ] || {
+        echo "FAIL $svc: restart policy is '$policy', expected 'always'"
+        rc=1
+      } ;;
+    esac
+    if [ "$mem" = 0 ]; then
+      echo "FAIL $svc: no memory limit"
+      rc=1
+    fi
+  done
+  st="$(ready_state)"
+  if [ "$st" = "exited 0" ]; then
+    echo "ok   cluster-ready: $st"
+  else
+    echo "FAIL cluster-ready: $st"
+    rc=1
+  fi
+  st="$(vh_live_rs)"
+  if [ "$st" = "$VH_RS_COUNT" ]; then
+    echo "ok   master: $st live region servers"
+  else
+    echo "FAIL master: $st live region servers"
+    rc=1
+  fi
+  return "$rc"
+}
+
+cmd_verify() {
+  local crash="" rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --crash-check)
+        crash=rs3
+        case "${2:-}" in
+          rs[1-9])
+            crash="$2"
+            shift
+            ;;
+        esac
+        ;;
+      *) vh_die "verify: unknown option $1" ;;
+    esac
+    shift
+  done
+  echo "== host checks"
+  host_checks || rc=1
+  echo "== in-cluster checks (vh-verify in a tools container)"
+  vh_run_tools vh-verify || rc=1
+  if [ -n "$crash" ]; then
+    echo "== crash check on $crash"
+    if [ "$rc" != 0 ]; then
+      echo "FAIL crash check skipped, because an earlier check failed"
+    elif (kill_service "$crash" 1); then
+      echo "ok   $crash rejoined after SIGKILL"
+    else
+      echo "FAIL $crash did not rejoin after SIGKILL"
+      rc=1
+    fi
+  fi
+  if [ "$rc" = 0 ]; then
+    echo "verify: PASS"
+  else
+    echo "verify: FAIL"
+  fi
+  return "$rc"
+}
+
+main() {
+  local cmd="${1:-}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
+    reset) cmd_reset "$@" ;;
+    status) cmd_status ;;
+    ps) vh_compose --profile client ps -a "$@" ;;
+    logs) vh_compose --profile client logs "$@" ;;
+    config) vh_compose --profile client config "$@" ;;
+    verify) cmd_verify "$@" ;;
+    kill) cmd_kill "$@" ;;
+    restart) cmd_restart "$@" ;;
+    -h | --help | help | "") usage ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script prints the extra classpath that the harness needs to submit MapReduce jobs to YARN.
+# The harness lib directory has only part of the Hadoop client.
+# The script adds a Hadoop jar only if the harness lib directory has no jar of that artifact.
+# It never adds the whole Hadoop classpath, because that brings a second logging binding.
+# All jars come from the Hadoop installation of the image, which matches the cluster version.
+#
+# Usage: vh-mr-classpath [--list]
+#   With no option, the output is one line of jars with colons between them.
+#   With --list, the output has one jar on each line.
+# VH_MR_EXTRA_ARTIFACTS adds more artifact names, with spaces between them.
+
+set -euo pipefail
+
+hadoop_home="${VH_HADOOP_HOME:-/opt/hadoop}"
+harness_lib="${VH_HARNESS_HOME:-/opt/vector-harness}/target/lib"
+artifacts="hadoop-mapreduce-client-common hadoop-mapreduce-client-jobclient
+  hadoop-mapreduce-client-app hadoop-mapreduce-client-shuffle hadoop-mapreduce-client-core
+  hadoop-yarn-client hadoop-yarn-common hadoop-yarn-api ${VH_MR_EXTRA_ARTIFACTS:-}"
+
+die() { echo "vh-mr-classpath: $*" >&2; exit 1; }
+
+# Returns success if the harness lib directory has a jar of the artifact.
+in_harness() {
+  compgen -G "$harness_lib/$1-[0-9]*.jar" >/dev/null
+}
+
+# Prints the main jar of an artifact in the Hadoop installation.
+# Test, source and macOS metadata files do not count.
+hadoop_jar() {
+  local aid="$1" d f
+  for d in mapreduce yarn common hdfs; do
+    for f in "$hadoop_home/share/hadoop/$d/$aid"-[0-9]*.jar; do
+      [ -f "$f" ] || continue
+      case "$f" in
+        */._*|*-tests.jar|*-test-sources.jar|*-sources.jar) continue ;;
+      esac
+      echo "$f"
+      return 0
+    done
+  done
+  return 1
+}
+
+main() {
+  local mode="join" aid jar jars=()
+  case "${1:-}" in
+    "") ;;
+    --list) mode="list" ;;
+    -h|--help) sed -n '/^# Usage:/,/^# VH_MR_EXTRA/s/^# \{0,1\}//p' "$0"; return 0 ;;
+    *) die "unknown argument '$1'" ;;
+  esac
+  [ -d "$harness_lib" ] || die "$harness_lib is missing"
+
+  for aid in $artifacts; do
+    if in_harness "$aid"; then
+      continue
+    fi
+    jar="$(hadoop_jar "$aid")" || die "no jar for $aid in $hadoop_home/share/hadoop"
+    jars+=("$jar")
+  done
+
+  if [ "$mode" = "list" ]; then
+    if [ "${#jars[@]}" -gt 0 ]; then
+      printf '%s\n' "${jars[@]}"
+    fi
+  else
+    local IFS=:
+    echo "${jars[*]:-}"
+  fi
+}
+
+main "$@"

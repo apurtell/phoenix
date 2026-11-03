@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script runs one cluster tool in a new tools container and removes the container after.
+# The tools container has the server configuration and the shaded Phoenix server jar on the
+# HBase classpath. Index verify and repair jobs therefore ship all classes that their tasks need.
+# The exit code of the tool is the exit code of this script.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG [-e NAME=VALUE]... <command> [args...]
+
+  indexfsck ARGS    Phoenix IndexFsckTool: fsck, verify, repair, inspect
+                    example: $VH_PROG indexfsck -s VH_FUNC -dt T -it T_IDX verify
+  indextool ARGS    Phoenix IndexTool, for example: -s VH_FUNC -dt T -it T_IDX -runfg
+  shell [ARGS]      HBase shell. Pipe commands with: echo "status 'simple'" | $VH_PROG shell -n
+  hbase ARGS        bin/hbase
+  hdfs ARGS         bin/hdfs, for example: hdfs dfsadmin -report
+  yarn ARGS         bin/yarn, for example: yarn application -list -appStates ALL
+  mapred ARGS       bin/mapred
+  bash              An interactive shell in a tools container
+  exec CMD ARGS     Any command
+
+  -e NAME=VALUE     Set a variable in the tools container, for example -e VH_HEAP_TOOLS=4g
+
+Exit codes of indexfsck: 0 clean, 1 errors found, 255 bad usage.
+The cluster must be up: $VH_ROOT/bin/vh-cluster up
+EOF
+}
+
+main() {
+  local -a envs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -e)
+        [ $# -ge 2 ] || vh_die "-e needs NAME=VALUE"
+        envs+=(-e "$2")
+        shift 2
+        ;;
+      -h | --help | help)
+        usage
+        return 0
+        ;;
+      -*) vh_die "unknown option $1" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || {
+    usage >&2
+    return 2
+  }
+  local cmd="$1"
+  shift
+  local -a argv
+  case "$cmd" in
+    indexfsck) argv=(hbase org.apache.phoenix.mapreduce.index.fsck.IndexFsckTool "$@") ;;
+    indextool) argv=(hbase org.apache.phoenix.mapreduce.index.IndexTool "$@") ;;
+    shell) argv=(hbase shell "$@") ;;
+    hbase | hdfs | yarn | mapred) argv=("$cmd" "$@") ;;
+    bash) argv=(bash) ;;
+    exec)
+      [ $# -gt 0 ] || vh_die "exec: name a command"
+      argv=("$@")
+      ;;
+    *)
+      usage >&2
+      return 2
+      ;;
+  esac
+
+  local -a run=(run --rm --no-deps)
+  local tty
+  tty="$(vh_tty_flag)"
+  [ -z "$tty" ] || run+=("$tty")
+  if [ ${#envs[@]} -gt 0 ]; then
+    run+=("${envs[@]}")
+  fi
+  vh_compose "${run[@]}" tools "${argv[@]}"
+}
+
+main "$@"

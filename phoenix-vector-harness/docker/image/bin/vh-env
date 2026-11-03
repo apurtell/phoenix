@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script runs a command with the environment of the container role.
+# "docker exec" does not run the entrypoint, so its commands do not get the role settings.
+# Examples of these settings are the heap sizes, the JVM module flags, and the conf directories.
+# The container environment must hold VH_ROLE, and VH_INDEX for an indexed role.
+#
+# Usage: vh-env [COMMAND [ARG...]]
+#   With no command, the script prints the VH_* variables of the role.
+
+set -euo pipefail
+
+# shellcheck source=SCRIPTDIR/../lib/ports.sh
+. /opt/vh/lib/ports.sh
+# shellcheck source=SCRIPTDIR/../lib/roles.sh
+. /opt/vh/lib/roles.sh
+
+if [ "$#" -eq 0 ]; then
+  env | grep -E '^VH_[A-Z0-9_]+=' | sort
+  exit 0
+fi
+exec "$@"

@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# This script writes a diagnostic bundle of the cluster into one host directory.
+# The bundle holds the container state, the console logs, the daemon HTTP endpoints,
+# thread dumps, GC logs and the HDFS, YARN and HBase reports.
+# Each step is best effort. A failed step writes a warning and the next step continues,
+# because a bundle is most useful when the cluster is in a bad state.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+usage() {
+  cat <<EOF
+usage: $VH_PROG [-o DIR] [--jstack N[,SECONDS]] [--since TIME] [--tail LINES] [--no-cluster] [SERVICE...]
+
+  -o DIR            Bundle directory on the host (default: $VH_WORK/collect/<timestamp>)
+  --jstack N,S      Take N thread dumps S seconds apart (default 1,5; 0 turns them off)
+  --since TIME      Console logs since TIME, for example 30m or 2026-11-01T10:00:00
+  --tail LINES      Only the last LINES lines of each console log
+  --no-cluster      Skip the HDFS, YARN and HBase reports, which start a tools container
+  SERVICE...        Limit the per-service steps to these services or groups (default all)
+EOF
+}
+
+OUT=""
+JSTACK_N=1
+JSTACK_S=5
+SINCE=""
+TAIL=""
+CLUSTER=1
+SERVICES=""
+
+parse_args() {
+  local m
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) OUT="${2:?-o needs a directory}"; shift 2 ;;
+      --jstack)
+        m="${2:?--jstack needs N[,SECONDS]}"
+        JSTACK_N="${m%%,*}"
+        case "$m" in
+          *,*) JSTACK_S="${m#*,}" ;;
+        esac
+        shift 2
+        ;;
+      --since) SINCE="${2:?--since needs a time}"; shift 2 ;;
+      --tail) TAIL="${2:?--tail needs a line count}"; shift 2 ;;
+      --no-cluster) CLUSTER=0; shift ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -*) vh_die "unknown option $1" ;;
+      *)
+        if vh_in_list "$1" "$VH_ALL_SERVICES"; then
+          SERVICES="$SERVICES $1"
+        elif m="$(vh_group_members "$1")"; then
+          SERVICES="$SERVICES $m"
+        else
+          vh_die "unknown service or group '$1'"
+        fi
+        shift
+        ;;
+    esac
+  done
+  case "$JSTACK_N$JSTACK_S" in
+    *[!0-9]*) vh_die "--jstack needs N[,SECONDS] with whole numbers" ;;
+  esac
+  [ -n "$SERVICES" ] || SERVICES="$VH_ALL_SERVICES"
+  [ -n "$OUT" ] || OUT="$VH_WORK/collect/$(vh_ts)"
+}
+
+# Runs one step and records a failure without stopping the bundle.
+step() {
+  local what="$1"
+  shift
+  if ! "$@"; then
+    vh_warn "step failed: $what"
+    echo "$what" >>"$OUT/failed-steps.txt"
+  fi
+}
+
+collect_docker() {
+  vh_docker version >"$OUT/docker-version.txt" 2>&1 || true
+  vh_docker info >"$OUT/docker-info.txt" 2>&1 || true
+  vh_compose --profile client ps -a >"$OUT/ps.txt" 2>&1 || true
+  vh_compose --profile client config >"$OUT/compose-resolved.yaml" 2>&1 || true
+  vh_docker stats --no-stream --no-trunc \
+    --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}' \
+    >"$OUT/docker-stats.tsv" 2>&1 || true
+}
+
+# Writes the state table, the inspect output and the console log of every container.
+collect_containers() {
+  local svc cid name
+  mkdir -p "$OUT/inspect" "$OUT/console"
+  printf 'service\tcontainer\tstatus\thealth\trestarts\toomkilled\texitcode\n' >"$OUT/state.tsv"
+  local -a logargs=(logs --timestamps)
+  [ -z "$SINCE" ] || logargs+=(--since "$SINCE")
+  [ -z "$TAIL" ] || logargs+=(--tail "$TAIL")
+  for svc in $SERVICES; do
+    for cid in $(vh_svc_cids -a "$svc"); do
+      name="$(vh_cid_name "$cid")"
+      printf '%s\t%s\t%s\n' "$svc" "$name" "$(vh_cid_state "$cid" | tr ' ' '\t')" >>"$OUT/state.tsv"
+      vh_docker inspect "$cid" >"$OUT/inspect/$name.json" 2>&1 || true
+      vh_docker "${logargs[@]}" "$cid" >"$OUT/console/$name.log" 2>&1 || true
+    done
+  done
+}
+
+# Prints the port of the web endpoint of a daemon service, or nothing.
+http_port() {
+  local idx
+  idx="$(vh_svc_index "$1")"
+  case "$(vh_svc_role "$1")" in
+    nn) vh_port NN_HTTP ;;
+    snn) vh_port SNN_HTTP ;;
+    dn) vh_port DN_HTTP "$idx" ;;
+    rm) vh_port RM_WEB ;;
+    nm) vh_port NM_WEB "$idx" ;;
+    jhs) vh_port JHS_WEB ;;
+    master) vh_port MASTER_INFO ;;
+    rs) vh_port RS_INFO "$idx" ;;
+  esac
+}
+
+# Saves /jmx and /conf of each running daemon. ZooKeeper answers the four-letter words instead.
+collect_http() {
+  local svc cid port
+  mkdir -p "$OUT/http"
+  for svc in $SERVICES; do
+    vh_is_daemon "$svc" || continue
+    cid="$(vh_svc_cids "$svc" | head -n 1)"
+    [ -n "$cid" ] || continue
+    if [ "$svc" = zk ]; then
+      vh_docker exec "$cid" bash -c "echo mntr | nc -q1 localhost $VH_ZK_CLIENT" \
+        >"$OUT/http/zk-mntr.txt" 2>&1 || true
+      vh_docker exec "$cid" bash -c "echo srvr | nc -q1 localhost $VH_ZK_CLIENT" \
+        >"$OUT/http/zk-srvr.txt" 2>&1 || true
+      continue
+    fi
+    port="$(http_port "$svc")"
+    [ -n "$port" ] || continue
+    vh_docker exec "$cid" curl -fsS --max-time 30 "http://localhost:$port/jmx" \
+      >"$OUT/http/$svc-jmx.json" 2>&1 || true
+    vh_docker exec "$cid" curl -fsS --max-time 30 "http://localhost:$port/conf" \
+      >"$OUT/http/$svc-conf.xml" 2>&1 || true
+  done
+}
+
+# Takes repeated thread dumps of every running daemon JVM in the selection.
+collect_jstack() {
+  local round=1 svc role idx pattern jhome cid pid
+  [ "$JSTACK_N" -gt 0 ] || return 0
+  mkdir -p "$OUT/jstack"
+  while [ "$round" -le "$JSTACK_N" ]; do
+    for svc in $SERVICES; do
+      vh_is_daemon "$svc" || [ "$svc" = harness ] || continue
+      role="$(vh_svc_role "$svc")"
+      idx="$(vh_svc_index "$svc")"
+      pattern="$(vh_role_value "$role" "$idx" VH_PROC_PATTERN)"
+      jhome="$(vh_role_value "$role" "$idx" JAVA_HOME)"
+      [ -n "$pattern" ] || continue
+      for cid in $(vh_svc_cids "$svc"); do
+        pid="$(vh_jvm_pid "$cid" "$pattern" 2>/dev/null)" || continue
+        vh_docker exec -u "$VH_EXEC_USER" "$cid" "$jhome/bin/jcmd" "$pid" Thread.print -l \
+          >"$OUT/jstack/$(vh_cid_name "$cid")-$round.txt" 2>&1 || true
+      done
+    done
+    if [ "$round" -lt "$JSTACK_N" ]; then
+      sleep "$JSTACK_S"
+    fi
+    round=$((round + 1))
+  done
+}
+
+# Copies GC logs and JVM crash logs from the log bind mount. Heap dumps stay in place.
+collect_gc() {
+  local svc inst f
+  for svc in $SERVICES; do
+    inst="$svc"
+    [ -d "$VH_WORK/logs/$inst" ] || continue
+    for f in "$VH_WORK/logs/$inst"/gc-*.log* "$VH_WORK/logs/$inst"/*gc.log* \
+      "$VH_WORK/logs/$inst"/hs_err_pid*.log; do
+      [ -f "$f" ] || continue
+      mkdir -p "$OUT/gc/$inst"
+      cp -p "$f" "$OUT/gc/$inst/"
+    done
+  done
+  ls -lR "$VH_WORK/logs" >"$OUT/logs-tree.txt" 2>&1 || true
+}
+
+# One tools container runs every report, so the bundle starts only one extra container.
+# The script runs in the container, so its variables expand there.
+collect_cluster() {
+  [ "$CLUSTER" = 1 ] || return 0
+  # shellcheck disable=SC2016 # The script expands its own variables in the container.
+  vh_compose run --rm --no-deps -T tools bash -c '
+    run() { echo "===== $*"; "$@" 2>&1; echo "===== exit $?"; echo; }
+    run hdfs dfsadmin -report
+    run hdfs dfs -du -h /hbase/data
+    run hdfs dfs -du -s -h "/hbase/data/*/*"
+    run hdfs fsck /hbase
+    run yarn node -list -all
+    run yarn application -list -appStates ALL
+    echo "===== hbase shell status detailed"
+    echo "status '"'"'detailed'"'"'" | hbase shell -n 2>&1
+    echo "===== exit $?"
+  ' >"$OUT/cluster-reports.txt" 2>&1
+}
+
+main() {
+  parse_args "$@"
+  mkdir -p "$OUT"
+  : >"$OUT/failed-steps.txt"
+  vh_log "writing the bundle to $OUT"
+  step docker collect_docker
+  step containers collect_containers
+  step http collect_http
+  step jstack collect_jstack
+  step gc collect_gc
+  step cluster collect_cluster
+  if [ -s "$OUT/failed-steps.txt" ]; then
+    vh_warn "some steps failed: $(tr '\n' ' ' <"$OUT/failed-steps.txt")"
+  else
+    rm -f "$OUT/failed-steps.txt"
+  fi
+  echo "$OUT"
+}
+
+main "$@"
