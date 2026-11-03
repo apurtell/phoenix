@@ -672,7 +672,7 @@ public class VectorIndexFunctionsIT extends ParallelStatsDisabledIT {
   private static Map<String, Object> activeGeneration(Map<String, Object> sample) {
     List<Map<String, Object>> gens = (List<Map<String, Object>>) sample.get("generations");
     assertEquals(sample.toString(), 1, gens.size());
-    assertEquals(sample.toString(), "active", gens.get(0).get("role"));
+    assertEquals(sample.toString(), "ACTIVE", gens.get(0).get("role"));
     return gens.get(0);
   }
 

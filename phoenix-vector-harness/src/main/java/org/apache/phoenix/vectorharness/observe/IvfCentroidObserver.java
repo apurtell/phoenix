@@ -132,10 +132,10 @@ public final class IvfCentroidObserver implements AutoCloseable {
     trackTransitions(index, active, inProgress, building);
     List<Map<String, Object>> gens = new ArrayList<>();
     if (active != null) {
-      gens.add(assessGeneration(conn, table, index, active, "active", exact));
+      gens.add(assessGeneration(conn, table, index, active, "ACTIVE", exact));
     }
     if (inProgress && building != null) {
-      gens.add(assessGeneration(conn, table, index, building, "building", exact));
+      gens.add(assessGeneration(conn, table, index, building, "BUILDING", exact));
     }
     m.put("generations", gens);
     return m;
