@@ -110,6 +110,7 @@ VH_RUN_DIR="${VH_RUN_DIR:-}"
 VH_RS_SIMD="${VH_RS_SIMD:-1}"
 VH_JVECTOR_FORCE_PANAMA="${VH_JVECTOR_FORCE_PANAMA:-0}"
 VH_JFR="${VH_JFR:-0}"
+VH_HICCUP="${VH_HICCUP:-0}"
 VH_DEBUG="${VH_DEBUG:-0}"
 
 # Shared homes and tool settings for every role.
@@ -151,6 +152,14 @@ if [ "$VH_DEBUG" = "1" ] && [ -n "${VH_DEBUG_PORT:-}" ]; then
   vh_opt_debug="-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=localhost:$VH_DEBUG_PORT"
 fi
 vh_opt_daemon="$vh_opt_gc $vh_opt_dump $vh_opt_jfr $vh_opt_debug"
+# jHiccup records the stalls that a JVM sees, one histogram for each second.
+# Only the JVMs on the query path get the agent. The process id in the log name keeps the
+# log of a restarted daemon apart from the log of the earlier process.
+vh_hiccup_agent="-javaagent:/opt/jhiccup/jhiccup-agent.jar=-d,0,-i,1000"
+vh_opt_hiccup=""
+if [ "$VH_HICCUP" = "1" ]; then
+  vh_opt_hiccup="$vh_hiccup_agent,-l,$VH_LOG_DIR/hiccup/%date-%pid.hlog"
+fi
 vh_opt_vector="--add-modules jdk.incubator.vector"
 if [ "$VH_ROLE" = "rs" ] && [ "$VH_RS_SIMD" = "0" ]; then
   vh_opt_vector=""
@@ -169,6 +178,10 @@ VH_ROLE_HEAP=""
 VH_ROLE_DIRECT=""
 VH_PROC_PATTERN=""
 VH_ROLE_DIRS="$VH_LOG_DIR $VH_PROF_DIR $VH_JFR_DIR $VH_PID_DIR"
+# The agent does not create a directory. Without its log directory it records nothing.
+if [ "$VH_HICCUP" = "1" ]; then
+  VH_ROLE_DIRS="$VH_ROLE_DIRS $VH_LOG_DIR/hiccup"
+fi
 
 case "$VH_ROLE" in
   zk)
@@ -226,7 +239,7 @@ case "$VH_ROLE" in
     VH_PROC_PATTERN=proc_master
     HBASE_HEAPSIZE="$VH_HEAP_MASTER"
     HBASE_OPTS="$vh_opt_hbase21"
-    HBASE_MASTER_OPTS="-Xms$VH_HEAP_MASTER -XX:ActiveProcessorCount=4 $vh_opt_daemon"
+    HBASE_MASTER_OPTS="-Xms$VH_HEAP_MASTER -XX:ActiveProcessorCount=4 $vh_opt_daemon $vh_opt_hiccup"
     ;;
   rs)
     JAVA_HOME="$VH_JAVA21_HOME"
@@ -236,7 +249,7 @@ case "$VH_ROLE" in
     HBASE_HEAPSIZE="$VH_HEAP_RS"
     HBASE_OFFHEAPSIZE="$VH_DIRECT_RS"
     HBASE_OPTS="$vh_opt_hbase21"
-    HBASE_REGIONSERVER_OPTS="-Xms$VH_HEAP_RS -XX:ParallelGCThreads=4 -XX:ConcGCThreads=2 $vh_opt_daemon"
+    HBASE_REGIONSERVER_OPTS="-Xms$VH_HEAP_RS -XX:ParallelGCThreads=4 -XX:ConcGCThreads=2 $vh_opt_daemon $vh_opt_hiccup"
     ;;
   hdfs-init)
     VH_ROLE_KIND=oneshot
@@ -272,7 +285,12 @@ case "$VH_ROLE" in
     # The run directory holds the GC log, so the log stays with the run artifacts.
     VH_HARNESS_GC_DIR="${VH_RUN_DIR:-$VH_LOG_DIR}"
     VH_ROLE_DIRS="$VH_ROLE_DIRS $VH_HARNESS_GC_DIR /work/prof"
-    HARNESS_OPTS="-Xms$VH_HARNESS_HEAP -Xmx$VH_HARNESS_HEAP -XX:MaxDirectMemorySize=$VH_HARNESS_DIRECT -XX:+UseG1GC -Djava.net.preferIPv4Stack=true $vh_opt_diag -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/work/prof -Xlog:gc*:file=$VH_HARNESS_GC_DIR/harness-gc.log:time,uptime,level,tags $vh_opt_jfr $vh_opt_debug $VH_HARNESS_EXTRA_OPTS"
+    # The harness log stays with the run artifacts. The control JVM of the harness agent
+    # does no work, so its stalls come from the platform and not from a JVM under load.
+    if [ "$VH_HICCUP" = "1" ]; then
+      vh_opt_hiccup="$vh_hiccup_agent,-l,$VH_HARNESS_GC_DIR/harness-hiccup.hlog,-c,-x,-Xmx64m"
+    fi
+    HARNESS_OPTS="-Xms$VH_HARNESS_HEAP -Xmx$VH_HARNESS_HEAP -XX:MaxDirectMemorySize=$VH_HARNESS_DIRECT -XX:+UseG1GC -Djava.net.preferIPv4Stack=true $vh_opt_diag -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/work/prof -Xlog:gc*:file=$VH_HARNESS_GC_DIR/harness-gc.log:time,uptime,level,tags $vh_opt_jfr $vh_opt_debug $vh_opt_hiccup $VH_HARNESS_EXTRA_OPTS"
     ;;
   *)
     echo "roles.sh: unknown VH_ROLE '$VH_ROLE'" >&2
@@ -283,6 +301,6 @@ esac
 PATH="$JAVA_HOME/bin:$VH_HOME/bin:$VH_HADOOP_HOME/bin:$VH_HBASE_HOME/bin:$VH_ASPROF_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 unset vh_opt_diag vh_opt_gc vh_opt_dump vh_opt_jfr vh_opt_debug vh_opt_daemon vh_opt_vector \
-  vh_opt_panama vh_opt_hbase21 vh_opt_small
+  vh_opt_panama vh_opt_hbase21 vh_opt_small vh_hiccup_agent vh_opt_hiccup
 [ "$vh_roles_had_a" = 1 ] || set +a
 unset vh_roles_had_a

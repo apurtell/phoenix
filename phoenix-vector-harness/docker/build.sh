@@ -18,14 +18,16 @@
 #
 
 # This script builds the cluster image on the host.
-# The steps are: preflight, Phoenix build, artifact staging, tarball fetch, context assembly,
-# and the image build. Each step is a separate script, and each script can also run alone.
+# The steps are: preflight, Phoenix build, artifact staging, tarball fetch, jHiccup build,
+# context assembly, and the image build. Each step is a separate script, and each script
+# can also run alone.
 # The image build context is a separate directory that holds only the image inputs.
 # The repository tree therefore never goes into the context.
 #
 # Context layout:
 #   <context>/image/                        a copy of image/ with the Dockerfile
 #   <context>/<tarball>                     the Hadoop, HBase and async-profiler tarballs
+#   <context>/<jHiccup jar>                 the agent jar from build-jhiccup.sh
 #   <context>/<server jar>, vector-harness/ the Phoenix artifacts from stage-artifacts.sh
 #   <context>/build-args.env                the build arguments of the last build
 #
@@ -98,10 +100,10 @@ tar_top_dir() {
   echo "$first"
 }
 
-# Links a cached tarball into the context. A hard link costs no space and no copy time.
-link_tarball() {
-  local src="$VH_DIST_CACHE/$1" dest="$VH_CONTEXT/$1"
-  [ -f "$src" ] || die "$src is missing; run scripts/fetch-dist.sh"
+# Links a cached file into the context. A hard link costs no space and no copy time.
+link_cached() {
+  local src="$1/$2" dest="$VH_CONTEXT/$2"
+  [ -f "$src" ] || die "$src is missing; run $3"
   rm -f "$dest"
   ln "$src" "$dest" 2>/dev/null || cp -p "$src" "$dest"
 }
@@ -130,10 +132,11 @@ assemble_context() {
   fi
   rm -rf "$ctx/image"
   cp -pR "$VH_ROOT/image" "$ctx/image"
-  find "$ctx" -maxdepth 1 -name '*.tar.gz' -exec rm -f {} +
-  link_tarball "$VH_HADOOP_TARBALL"
-  link_tarball "$VH_HBASE_TARBALL"
-  link_tarball "$VH_ASPROF_TARBALL"
+  find "$ctx" -maxdepth 1 \( -name '*.tar.gz' -o -name 'jhiccup-agent-*.jar' \) -exec rm -f {} +
+  link_cached "$VH_DIST_CACHE" "$VH_HADOOP_TARBALL" scripts/fetch-dist.sh
+  link_cached "$VH_DIST_CACHE" "$VH_HBASE_TARBALL" scripts/fetch-dist.sh
+  link_cached "$VH_DIST_CACHE" "$VH_ASPROF_TARBALL" scripts/fetch-dist.sh
+  link_cached "$VH_BUILD_CACHE" "$VH_JHICCUP_JAR" scripts/build-jhiccup.sh
 
   {
     license_header
@@ -152,6 +155,7 @@ assemble_context() {
     echo "VH_ASPROF_SHA256=$VH_ASPROF_SHA256"
     echo "VH_PHOENIX_SERVER_JAR=$VH_PHOENIX_SERVER_JAR"
     echo "VH_HARNESS_JAR=$VH_HARNESS_JAR"
+    echo "VH_JHICCUP_JAR=$VH_JHICCUP_JAR"
     echo "VH_UID=$VH_UID"
     echo "VH_GID=$VH_GID"
     echo "VH_USER=$VH_USER"
@@ -249,6 +253,13 @@ main() {
   fi
   # The fetch can record a new pin in versions.local.env, so the settings load again.
   vh_load_env
+
+  step "jHiccup build"
+  if [ "$skip_fetch" = 1 ]; then
+    "$VH_ROOT/scripts/build-jhiccup.sh" --offline
+  else
+    "$VH_ROOT/scripts/build-jhiccup.sh"
+  fi
 
   step "context assembly"
   assemble_context "$dry"

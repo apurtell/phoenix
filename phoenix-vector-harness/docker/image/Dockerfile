@@ -85,6 +85,7 @@ ARG VH_GID=1001
 ARG VH_USER=vh
 ARG VH_PHOENIX_SERVER_JAR=phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar
 ARG VH_HARNESS_JAR=phoenix-vector-harness-5.4.0-SNAPSHOT.jar
+ARG VH_JHICCUP_JAR=jhiccup-agent-2.0.10.jar
 ARG VH_GIT_REVISION=unknown
 
 # Runtime packages. The scripts use curl, jq, nc and envsubst. HBase and Hadoop load the
@@ -113,6 +114,8 @@ COPY --from=unpack /opt/hadoop /opt/hadoop
 COPY --from=unpack /opt/hbase /opt/hbase
 COPY --from=unpack /opt/async-profiler /opt/async-profiler
 COPY ${VH_PHOENIX_SERVER_JAR} /opt/hbase/lib/
+# A fixed path lets the role settings name the agent without a version.
+COPY ${VH_JHICCUP_JAR} /opt/jhiccup/jhiccup-agent.jar
 COPY --chown=${VH_UID}:${VH_GID} vector-harness/ /opt/vector-harness/
 COPY image/entrypoint.sh image/healthcheck.sh /opt/vh/
 COPY image/lib/ /opt/vh/lib/
@@ -173,6 +176,9 @@ check "harness launcher" test -x /opt/vector-harness/bin/vector-harness
 check "harness lib" test -d /opt/vector-harness/target/lib
 check "async-profiler launcher" test -x /opt/async-profiler/bin/asprof
 check "async-profiler library" test -f /opt/async-profiler/lib/libasyncProfiler.so
+# The usage call also writes an empty default log, so the check runs in /tmp and removes it.
+check "jHiccup agent" has 'reportingIntervalMs' sh -c 'cd /tmp \
+  && /opt/jdk21/bin/java -cp /opt/jhiccup/jhiccup-agent.jar org.jhiccup.HiccupMeter -h; rm -f /tmp/hiccup.*'
 check "no macOS metadata files" sh -c '[ -z "$(find /opt/hadoop /opt/hbase -name "._*" -print -quit)" ]'
 rm -f "$out" "$out.cmd"
 SH

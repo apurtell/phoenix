@@ -61,11 +61,12 @@ x-vh-env: &vh-env
   VH_DEBUG:
 
 # Settings of the harness and tools clients only.
-# VH_RS_SIMD also goes to the region servers and to cluster-ready, so an A/B change recreates
-# only those containers.
+# VH_RS_SIMD also goes to the region servers and to cluster-ready, and VH_HICCUP also goes to
+# the master and the region servers. A change of either switch recreates only those containers.
 x-vh-client-env: &vh-client-env
   <<: *vh-env
   VH_RS_SIMD:
+  VH_HICCUP:
   VH_HEAP_TOOLS:
   VH_DIRECT_TOOLS:
   VH_HARNESS_HEAP:
@@ -284,7 +285,7 @@ services:
     mem_limit: ${VH_MEM_MASTER:?run through bin/vh-cluster}
     healthcheck: *vh-health
     labels: {org.apache.phoenix.vh.role: master, org.apache.phoenix.vh.index: "1"}
-    environment: {<<: *vh-env, VH_ROLE: master}
+    environment: {<<: *vh-env, VH_ROLE: master, VH_HICCUP: null}
     volumes:
       - *vol-logs
     depends_on:
@@ -293,15 +294,15 @@ services:
   rs1:
     <<: *vh-rs
     labels: {org.apache.phoenix.vh.role: rs, org.apache.phoenix.vh.index: "1"}
-    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "1", VH_RS_SIMD: null}
+    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "1", VH_RS_SIMD: null, VH_HICCUP: null}
   rs2:
     <<: *vh-rs
     labels: {org.apache.phoenix.vh.role: rs, org.apache.phoenix.vh.index: "2"}
-    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "2", VH_RS_SIMD: null}
+    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "2", VH_RS_SIMD: null, VH_HICCUP: null}
   rs3:
     <<: *vh-rs
     labels: {org.apache.phoenix.vh.role: rs, org.apache.phoenix.vh.index: "3"}
-    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "3", VH_RS_SIMD: null}
+    environment: {<<: *vh-env, VH_ROLE: rs, VH_INDEX: "3", VH_RS_SIMD: null, VH_HICCUP: null}
 
   # One-shot readiness gate. It exits 0 only when HBase and Phoenix serve requests,
   # so its completion means that the whole topology is ready.
