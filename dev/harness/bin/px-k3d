@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Manages the local Kubernetes cluster used to verify the Kubernetes backend by provisioning a
+# small, version-pinned k3s environment that retains metrics collection and never runs the bundled
+# ingress controller.
+#
+# As elsewhere in the harness, the run class determines the default cluster topology. The
+# measurement class provisions a single node without a service load balancer so that the node
+# retains every byte of memory required for the measurement. The validation class provisions a
+# configurable number of agent nodes and includes the service load balancer, binding any
+# load-balancer ports exclusively to the loopback interface.
+#
+# Round K2 implements the underlying cluster operations together with the Kubernetes preflight
+# checks, target environment files, and container image push. This round defines the command name,
+# the full option interface, and the argument validation rules so that the run class and its
+# implied cluster shape are established upfront. Every execution path that creates or removes a
+# cluster returns the unsupported exit code and identifies round K2.
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/common.sh
+. "$SELF/../lib/common.sh"
+
+set -euo pipefail
+px_trap_enable
+
+K3D_OWNER="K2"
+K3D_CLASSES="validation measurement"
+K3D_AGENTS_MAX=9
+
+K3D_ACTION=""
+K3D_CLASS=""
+K3D_AGENTS=""
+K3D_NAME=""
+K3D_CONFIG_FILES=()
+
+## @description  Prints the command-line usage summary and supported options.
+## @return       Writes the help text to standard output and exits with status 0.
+usage() {
+  cat <<'EOF'
+Usage: px-k3d <create|delete|status> [option...]
+
+Subcommands:
+  create     make the local cluster of the named class [K2]
+  delete     remove the local cluster [K2]
+  status     report the local cluster [K2]
+
+Options:
+  --class NAME    validation or measurement, default PX_RUN_CLASS. The class
+                  selects the cluster shape
+  --agents N      agent nodes, 1 to 9. The validation class only
+  --name NAME     the cluster name, default PX_CLUSTER_ID
+  --config FILE   an extra configuration file, repeatable
+  -v, --verbose   report detail
+  -h, --help      show this text
+
+Exit codes: 0 ok, 1 failure, 2 usage, 4 timeout, 5 a behaviour round K2 owns,
+6 no such cluster.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -v | --verbose)
+    PX_VERBOSE=1
+    export PX_VERBOSE
+    ;;
+  --class) px_cli_need_value "$@" && K3D_CLASS="$2" && shift ;;
+  --agents) px_cli_need_value "$@" && K3D_AGENTS="$2" && shift ;;
+  --name) px_cli_need_value "$@" && K3D_NAME="$2" && shift ;;
+  --config) px_cli_need_value "$@" && K3D_CONFIG_FILES+=("$2") && shift ;;
+  -*) px_usage_error "unknown option: $1" ;;
+  *)
+    if [ -n "$K3D_ACTION" ]; then
+      px_usage_error "unexpected argument: $1"
+    fi
+    K3D_ACTION="$1"
+    ;;
+  esac
+  shift
+done
+
+if [ -z "$K3D_ACTION" ]; then
+  px_usage_error "name a subcommand: create, delete or status"
+fi
+case "$K3D_ACTION" in
+create | delete | status) ;;
+*) px_usage_error "unknown subcommand: $K3D_ACTION" ;;
+esac
+
+if [ "${#K3D_CONFIG_FILES[@]}" -gt 0 ]; then
+  px_config_load "${K3D_CONFIG_FILES[@]}"
+else
+  px_config_load
+fi
+
+if [ -z "$K3D_CLASS" ]; then
+  K3D_CLASS="${PX_RUN_CLASS:-}"
+fi
+if [ -z "$K3D_NAME" ]; then
+  K3D_NAME="${PX_CLUSTER_ID:-}"
+fi
+
+# The create subcommand requires a run class because the class determines the cluster topology,
+# whereas delete and status operate on a cluster by name and do not require a class.
+if [ "$K3D_ACTION" = create ]; then
+  if [ -z "$K3D_CLASS" ]; then
+    px_usage_error "name the class with --class, or set PX_RUN_CLASS"
+  fi
+  case " $K3D_CLASSES " in
+  *" $K3D_CLASS "*) ;;
+  *) px_usage_error "--class accepts $K3D_CLASSES, got '$K3D_CLASS'" ;;
+  esac
+  # Specifying an agent count for the measurement topology contradicts its single-node design, so
+  # argument validation rejects that combination immediately rather than deferring to round K2.
+  if [ -n "$K3D_AGENTS" ]; then
+    if [ "$K3D_CLASS" != validation ]; then
+      px_usage_error "--agents belongs to the validation class"
+    fi
+    if ! [[ $K3D_AGENTS =~ $PX_RE_INT ]] ||
+      [ "$K3D_AGENTS" -lt 1 ] || [ "$K3D_AGENTS" -gt "$K3D_AGENTS_MAX" ]; then
+      px_usage_error "--agents accepts 1 to $K3D_AGENTS_MAX, got '$K3D_AGENTS'"
+    fi
+  fi
+elif [ -n "$K3D_AGENTS" ]; then
+  px_usage_error "--agents belongs to create"
+fi
+if [ -z "$K3D_NAME" ]; then
+  px_usage_error "name the cluster with --name, or set PX_CLUSTER_ID"
+fi
+
+px_die "$PX_EXIT_UNSUPPORTED" \
+  "px-k3d $K3D_ACTION arrives with round $K3D_OWNER, which brings the second backend"

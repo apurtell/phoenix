@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This command performs the verdict merge by reading the verdict records from every driver and
+# every cluster component of a single run to produce one consolidated result.
+#
+# The merge policy is fixed by the system design and is documented here so that driver authors and
+# check authors can write conforming verdict records immediately:
+#   PASS < SKIP < ADVISORY < FAIL < ERROR
+# The merge selects the highest severity encountered, and only FAIL and ERROR cause a run to fail.
+# ERROR is reserved for a harness or infrastructure fault, which separates a cluster anomaly from
+# a workload failure. SKIP and ADVISORY never block a run, a run that produces only SKIP verdicts
+# is treated as inconclusive rather than a pass, and any record carrying a severity outside this
+# defined set is rejected.
+#
+# Round A5 implements the core behavior, encompassing the merge logic, the severity check, and the
+# report packaged into the result bundle. The current round establishes the command name, the
+# complete option surface, and the argument validation checks, while every execution path that
+# requires the merge returns the unsupported exit code and identifies round A5.
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/common.sh
+. "$SELF/../lib/common.sh"
+
+set -euo pipefail
+px_trap_enable
+
+REPORT_OWNER="A5"
+REPORT_FORMATS="tsv json"
+
+REPORT_RUN=""
+REPORT_BUNDLES=()
+REPORT_FORMAT="tsv"
+REPORT_VERDICTS=()
+
+## @description  Prints the command usage and option reference to standard output.
+## @return       Writes the usage message to stdout and exits with status 0.
+usage() {
+  cat <<'EOF'
+Usage: px-report [option...]
+
+Options:
+  --run DIR         the run whose verdict records to merge, default PX_RUN_DIR
+  --verdict FILE    one verdict record, repeatable. It adds to the records
+                    the run directory already holds
+  --format NAME     tsv or json, default tsv
+  --out FILE        write the report to this file instead of stdout
+  --config FILE     an extra configuration file, repeatable
+  -v, --verbose     report detail
+  -h, --help        show this text
+
+Severity order, lowest first: PASS SKIP ADVISORY FAIL ERROR. The merge takes
+the highest. Only FAIL and ERROR fail a run.
+
+Exit codes: 0 every verdict passed, 1 a FAIL verdict, 2 usage, 3 an ERROR
+verdict, 5 a behaviour round A5 owns, 6 no such run or record.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -v | --verbose)
+    PX_VERBOSE=1
+    export PX_VERBOSE
+    ;;
+  --run) px_cli_need_value "$@" && REPORT_RUN="$2" && shift ;;
+  --format) px_cli_need_value "$@" && REPORT_FORMAT="$2" && shift ;;
+  --out) px_cli_need_value "$@" && REPORT_OUT="$2" && shift ;;
+  --verdict) px_cli_need_value "$@" && REPORT_VERDICTS+=("$2") && shift ;;
+  --config) px_cli_need_value "$@" && REPORT_CONFIG_FILES+=("$2") && shift ;;
+  -*) px_usage_error "unknown option: $1" ;;
+  *) px_usage_error "unexpected argument: $1" ;;
+  esac
+  shift
+done
+
+if [ "${#REPORT_CONFIG_FILES[@]}" -gt 0 ]; then
+  px_config_load "${REPORT_CONFIG_FILES[@]}"
+else
+  px_config_load
+fi
+
+case " $REPORT_FORMATS " in
+*" $REPORT_FORMAT "*) ;;
+*) px_usage_error "--format accepts $REPORT_FORMATS, got '$REPORT_FORMAT'" ;;
+esac
+
+# Argument validation is implemented in this round because it does not depend on the merge logic.
+# Because generating a report requires at least one source of verdict records, an invocation that
+# specifies no input source is rejected as a usage error rather than treated as an empty pass.
+if [ -z "$REPORT_RUN" ]; then
+  REPORT_RUN="${PX_RUN_DIR:-}"
+fi
+if [ -z "$REPORT_RUN" ] && [ "${#REPORT_VERDICTS[@]}" = 0 ]; then
+  px_usage_error "name a run with --run, a record with --verdict, or export PX_RUN_DIR"
+fi
+if [ -n "$REPORT_RUN" ] && [ ! -d "$REPORT_RUN" ]; then
+  px_die "$PX_EXIT_NO_OBJECT" "no such run directory: $REPORT_RUN"
+fi
+if [ "${#REPORT_VERDICTS[@]}" -gt 0 ]; then
+  for REPORT_FILE in "${REPORT_VERDICTS[@]}"; do
+    if [ ! -f "$REPORT_FILE" ]; then
+      px_die "$PX_EXIT_NO_OBJECT" "no such verdict record: $REPORT_FILE"
+    fi
+  done
+fi
+# Output path resolution executes at the top level rather than inside a command argument so that a
+# policy refusal terminates the main process instead of only exiting a subshell.
+if [ -n "$REPORT_OUT" ]; then
+  REPORT_DEST="$(px_out_resolve "$REPORT_OUT")" || exit $?
+  px_debug "the report would go to $REPORT_DEST"
+fi
+
+px_die "$PX_EXIT_UNSUPPORTED" \
+  "the verdict merge arrives with round $REPORT_OWNER, which fixes the verdict record"

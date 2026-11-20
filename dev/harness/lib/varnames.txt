@@ -1,0 +1,114 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The declared registry of PX_* names. px_config_load --strict refuses any
+# PX_* name that is not declared here, so a misspelled name fails closed
+# instead of becoming a silent default.
+#
+# One name per line. A comment and a blank line are ignored. A name that ends
+# with an asterisk declares a family, and every name with that prefix counts
+# as declared. The word private after a name keeps that name in the process
+# that loads it: the loader never exports it to a child process.
+#
+# This file holds the harness-generic names only. A later round appends its
+# own group: role, sizing and version names arrive with the topology
+# generator, and the Kubernetes names arrive with the second backend.
+
+# --- Layout -----------------------------------------------------------------
+PX_HOME                  # the dev/harness directory, resolved from lib/common.sh
+PX_OUT                   # output root, default $HOME/phoenix-harness, never in the tree
+PX_STATE_DIR             # backend state under PX_OUT: scope and cluster records, caches
+PX_ENV_DIR               # directory that holds the environment files
+PX_VARNAMES_FILE         # this registry, default lib/varnames.txt
+
+# --- Configuration stages ---------------------------------------------------
+# The loader consults these in order and the first stage that sets a name
+# wins. Each name below overrides where one stage reads from.
+PX_LOCAL_ENV             # stage 3, the local environment overrides
+PX_CLASS_ENV             # stage 4, the run class defaults
+PX_DEFAULTS_ENV          # stage 5, the baseline defaults, the mandatory stage
+PX_VERSIONS_ENV          # stage 6, the version definitions
+PX_VERSIONS_LOCAL_ENV    # stage 7, the local version pins recorded on first use
+PX_PORT_MAP_ENV          # stage 8, the port map, default in the deployment directory
+PX_STRICT_CONFIG         # 1 refuses an undeclared PX_* name, read from the environment only
+
+# --- Switches ---------------------------------------------------------------
+PX_VERBOSE               # 1 turns px_debug output on
+PX_DRY_RUN               # 1 means report the plan and change nothing
+PX_KEEP                  # 1 keeps what a command would otherwise remove (--keep); never recorded
+PX_FORCE                 # 1 proceeds past a refusal an operator accepts
+PX_LOG_FILE              # a file under PX_OUT that receives a copy of every message line
+
+# --- Backend binding --------------------------------------------------------
+PX_BACKEND               # the substrate backend to bind, for example compose
+PX_DOCKER_BIN   private  # the engine binary of the Compose backend, set in env/local.env
+PX_COMPOSE_FLAVOUR       # plugin or standalone, how the backend reaches compose
+PX_LABEL_PREFIX          # label namespace that scopes every object, default px.harness
+PX_PROJECT_PREFIX        # name prefix of a scope, default px
+PX_REGION_MOVER_CMD      # the drain command template of the Compose backend
+
+# --- Scope ------------------------------------------------------------------
+PX_CLUSTER_ID            # the cluster name an operator chooses
+PX_SCOPE_ID              # the opaque scope id that sb_scope_create returned
+PX_DEPLOYMENT_DIR        # the rendered deployment directory under PX_OUT
+PX_PORT_*                # the port map that the generator writes, read by the backend
+
+# --- Run identity -----------------------------------------------------------
+PX_RUN_CLASS             # validation or measurement, it selects defaults only
+PX_RUN_ID                # the sortable identifier of the current run
+PX_RUN_DIR               # the directory of the current run under PX_OUT
+PX_SESSION_ID            # isolates one suite session from another
+
+# --- Timeouts ---------------------------------------------------------------
+# Every wait in the harness is finite. docker/env/defaults.env holds the one
+# default of each name. A new timeout adds its own line here.
+PX_TIMEOUT_DEFAULT       # the timeout an operation uses when it has no own value
+PX_TIMEOUT_RUN           # the bound that prepare and run of px-run share
+PX_TIMEOUT_PROVISION     # instance creation
+PX_TIMEOUT_READY         # the readiness barrier
+PX_TIMEOUT_EXEC          # one command inside an instance
+PX_TIMEOUT_TEARDOWN      # instance removal
+PX_TIMEOUT_DRAIN         # region drain before a graceful restart
+PX_TIMEOUT_SCALE         # a change of instance count
+PX_TIMEOUT_GROUP         # a role group stop or start
+PX_TIMEOUT_STOP          # a stop that keeps state
+PX_POLL_INTERVAL_S       # the interval a readiness poll waits between probes
+
+# --- Suites, runs and drivers -----------------------------------------------
+PX_SUITE_DIR             # directory of the .suite files, default suites
+PX_SUITE_CONTINUE        # 1 selects fault-tolerant mode, a step failure does not stop
+PX_SUITE_FILTER          # selects exact test ids
+PX_SUITE_FROM            # the first step to run, the lower execution boundary
+PX_SUITE_TO              # the last step to run, the upper execution boundary
+PX_DRIVERS_DIR           # directory of the built-in drivers, default drivers
+PX_DISRUPT_SPEC          # the schedule of disruptions a run injects
+
+# --- Measurement toolkit ----------------------------------------------------
+PX_TOOLKIT_DIR           # staging directory of the profiling tools under PX_OUT
+PX_COLLECT_INTERVAL_S    # sampling interval of the resource collector
+PX_COLLECT_DURATION_S    # how long the collector samples, 0 means until stopped
+PX_COLLECT_TARGETS       # the roles the collector samples
+PX_PROFILE_DURATION_S    # length of one profiling session
+PX_PROFILE_TARGETS       # the roles the profiler attaches to
+PX_JFR_DURATION_S        # length of one flight recording
+PX_JFR_TARGETS           # the roles that record a flight recording
+PX_TRACE_DURATION_S      # length of one invocation-count trace
+PX_TRACE_TARGETS         # the roles the tracer attaches to
+
+# --- Test fixtures ----------------------------------------------------------
+# The self-test sets these. No shipped component reads them.
+PX_FAKE_*                # the family of fixture controls used by test/run-tests.sh
+PX_FAKE_DOCKER_LOG       # the file the fake runtime shim appends its argv to
+PX_FAKE_STATE_DIR        # the fixture state the fake runtime shim answers from

@@ -1,0 +1,1059 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# px-run executes a single test run. It owns a single dedicated run directory under PX_OUT and
+# writes its own files exclusively within that directory, while backend state and the
+# planned-action record are stored in the shared state directory under PX_OUT.
+#
+# Execution proceeds through five ordered steps:
+#   1. Resolve the configuration, mint the unique run identifier, and create the run directory.
+#   2. Capture the pre-run snapshot of the cluster through the substrate contract.
+#   3. Start the workload driver and inject the disruptions defined by the schedule.
+#   4. Capture the post-run snapshot and compare each instance against its pre-run state and
+#      restart count.
+#   5. Report a single exit code from the shared exit-code vocabulary.
+#
+# Because the driver owns the verdict for its workload, its exit status passes through unchanged
+# unless overridden by a cluster anomaly: an unplanned instance change replaces an exit code of 0
+# or 1 with the cluster-anomaly exit code 3. An instance is considered changed if its restart count
+# rose, if a running instance exited or transitioned to unknown, or if the instance vanished. A
+# change is unplanned when no planned action recorded during the run covers that instance, showing
+# that the failure originated in the cluster rather than the workload so that callers can tell the
+# two apart.
+#
+# Because every cluster query and fault injection goes through the substrate contract, this script
+# references no specific container runtime and executes unchanged across every supported backend.
+#
+# Run record format: A real run writes a single flat tab-separated record file at
+# $PX_RUN_DIR/run-record.tsv whose first column identifies the row type. Because a subsequent
+# development round defines the final bundle layout, this file is intentionally structured as a
+# single flat stream that a bundle writer can ingest without walking a directory tree:
+#   run       run_id run_class backend scope driver
+#   stage     name ts_ms
+#   version   phase component version
+#   instance  phase <the instance schema of the contract>
+#   restart   phase role index count
+#   sample    phase <the sample schema of the contract>
+#   disrupt   ordinal when_kind when_value action role index argument state
+#   action    ts_ms action role index argument state exit_code
+#   phase     role index <the phase schema of the contract>
+#   diff      role index before after verdict pre_state post_state
+#   term      role index <the term schema of the contract>
+#   oom       role index <the oom schema of the contract>
+#   driver    elapsed_ms exit_code log
+#   skip      phase subject reason
+#   result    exit_code name anomaly
+# Each diff row carries a verdict of unchanged, planned, unplanned, vanished, or unknown. Every
+# unplanned or vanished instance is also accompanied by a term row and an oom row containing
+# evidence of the underlying cause. A record file that ends without a result row indicates an
+# interrupted run.
+#
+# A dry run neither creates a run directory nor invokes the backend; instead, it writes the same
+# row stream to stdout and emits "plan step detail" rows describing what a real run would execute.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Sourcing the backend contract automatically loads lib/common.sh as well.
+# shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
+. "$SELF/../lib/backend/contract.sh"
+
+px_trap_enable
+
+## @description  Prints the command-line usage, disruption specification grammar, and exit codes.
+## @return       Writes the usage text to stdout. Exit 0.
+usage() {
+  cat <<'EOF'
+Usage: px-run [option...] [-- driver argument...]
+
+Runs one test. px-run owns one run directory, runs one driver, snapshots the
+cluster before and after the driver, injects the declared disruptions, and
+reports one exit code.
+
+Options:
+  -d, --driver NAME|PATH  the driver program: a path, or a name that resolves
+                          to <drivers>/NAME/driver.sh. A real run needs one.
+  -s, --scope ID          the scope id of a provisioned cluster, default
+                          PX_SCOPE_ID, else the scope px-cluster recorded for
+                          PX_CLUSTER_ID. Without one px-run takes no snapshot
+                          and refuses a disruption.
+  -b, --backend NAME      the substrate backend to bind
+  -c, --class NAME        the run class, which selects the configuration
+  -D, --disrupt SPEC      one disruption, repeatable. Several specifications
+                          in one value are separated by a semicolon.
+  -t, --timeout SECONDS   the bound on the driver, default PX_TIMEOUT_DEFAULT
+  -e, --set NAME=VALUE    one configuration value, repeatable
+  -f, --config FILE       one configuration file, repeatable
+  -n, --dry-run           print the plan, call no backend, make no run
+                          directory
+  -k, --keep              keep temporary files, and give the switch to the
+                          driver
+  -v, --verbose           report progress in detail
+  -h, --help              print this text
+
+A disruption specification is WHEN,ACTION,ROLE,INDEX[,ARGUMENT].
+  WHEN      +SECONDS after the driver starts, or phase:NAME
+  ACTION    kill, signal or restart
+  ARGUMENT  the kill mode (hard or delete, default hard), the signal name, or
+            empty for restart
+A phase name is a point that px-run announces: setup, snapshot_pre,
+driver_start, driver_exit and snapshot_post. A specification that never fires
+is recorded as skipped. signal and restart are optional substrate functions,
+so a backend that lacks one records a skip instead of a failure.
+
+Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
+5 unsupported, 6 no such object. A status of 0 to 6 from the driver passes
+through unchanged. An unplanned restart, an unplanned exit of a running
+instance, or an instance that vanished replaces 0 or 1 with 3. A planned
+action of this run, or of px-cluster during this run, explains a change.
+
+Output: a real run writes the run directory to stdout and its record to
+run-record.tsv in that directory. A dry run writes the plan to stdout.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Global runtime state
+# ---------------------------------------------------------------------------
+# Leaving RECORD_FILE empty directs all record output to stdout, allowing dry-run mode to print the
+# execution plan without creating any files on disk.
+
+RECORD_FILE=""
+RUN_ID=""
+RUN_DIR=""
+SCOPE=""
+DRIVER_SPEC=""
+DRIVER_PATH=""
+DRIVER_LOG=""
+DRIVER_PID=""
+DRIVER_STATUS=0
+DRIVER_START_S=0
+DRIVER_START_MS=0
+DRIVER_DEADLINE=0
+DRIVER_TIMEOUT=0
+DRIVER_TIMED_OUT=0
+SNAPSHOT_FAILED=0
+ANOMALY=0
+PRE_RESTARTS=""
+POST_RESTARTS=""
+PLANNED_SINCE_MS=0
+DISRUPT_COUNT=0
+DISRUPT_KIND=()
+DISRUPT_WHEN=()
+DISRUPT_ACTION=()
+DISRUPT_ROLE=()
+DISRUPT_INDEX=()
+DISRUPT_ARG=()
+DISRUPT_STATE=()
+DRIVER_ARGS=()
+DRIVER_CMD=()
+CONFIG_FILES=()
+SET_PAIRS=()
+
+# ---------------------------------------------------------------------------
+# Run record emission
+# ---------------------------------------------------------------------------
+
+# Writes the formatted row to the active record file, or to stdout during a dry run. Fails if any
+# field contains an embedded tab or newline character.
+## @description  Formats and writes a single tab-separated record row from individual field values.
+## @param        field...
+## @return       Writes to the record file or stdout. Exit 0, or 1 if a field holds a tab/newline.
+record_row() {
+  if [ -n "$RECORD_FILE" ]; then
+    px_tsv_row "$@" >>"$RECORD_FILE"
+  else
+    px_tsv_row "$@"
+  fi
+}
+
+# Rows returned by substrate contract calls already contain tab-delimited fields in their canonical
+# schema order, so callers prepend the record prefix columns and pass the resulting line here.
+## @description  Writes a pre-formatted tab-separated record line to the active output stream.
+## @param        text
+## @return       Writes the line to the record file, or to stdout during a dry run. Exit 0.
+record_line() {
+  if [ -n "$RECORD_FILE" ]; then
+    printf '%s\n' "$1" >>"$RECORD_FILE"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# Logs a stage transition in the run record and triggers any pending phase-based disruptions
+# scheduled for that point. Future implementation rounds will announce driver verb phases through
+# this same entry point so that phase triggers require no additional dispatch mechanism.
+## @description  Records arrival at a named execution phase and fires matching disruptions.
+## @param        name
+## @return       Exit 0.
+phase_reached() {
+  local name=$1 index=0
+  record_row stage "$name" "$(px_epoch_ms)"
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    if [ "${DISRUPT_STATE[$index]}" = pending ] &&
+      [ "${DISRUPT_KIND[$index]}" = phase ] &&
+      [ "${DISRUPT_WHEN[$index]}" = "$name" ]; then
+      disrupt_fire "$index"
+    fi
+    index=$((index + 1))
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Workload driver lifecycle
+# ---------------------------------------------------------------------------
+
+# Values containing a slash are treated as explicit filesystem paths, whereas bare names are
+# resolved beneath the configured drivers directory according to the fixed harness directory layout.
+## @description  Resolves a driver name or path specification to an absolute executable path.
+## @param        name_or_path
+## @return       Writes the absolute path to stdout. Exit 0, or 2 if absent or not executable.
+driver_resolve() {
+  local spec=$1 dir path
+  case "$spec" in
+  */*) path=$spec ;;
+  *)
+    dir=${PX_DRIVERS_DIR:-drivers}
+    case "$dir" in
+    /*) ;;
+    *) dir="$PX_HOME/$dir" ;;
+    esac
+    path="$dir/$spec/driver.sh"
+    ;;
+  esac
+  if [ ! -f "$path" ]; then
+    px_die "$PX_EXIT_USAGE" "no driver program at $path"
+  fi
+  if [ ! -x "$path" ]; then
+    px_die "$PX_EXIT_USAGE" "the driver program is not executable: $path"
+  fi
+  px_realpath "$path" || px_die "$PX_EXIT_FAIL" "cannot resolve $path"
+}
+
+# Centralizes construction of the driver invocation command line so that when a subsequent round
+# introduces the six-verb driver protocol, the verb argument can be prepended ahead of the operator
+# arguments in this single location without requiring changes to any caller.
+## @description  Assembles the command-line array for a single driver invocation in DRIVER_CMD.
+## @return       Sets DRIVER_CMD. Exit 0.
+driver_command() {
+  # Under set -u, Bash 3.2 treats an empty array expansion as an unbound variable error, so the
+  # operator arguments are expanded conditionally.
+  DRIVER_CMD=("$DRIVER_PATH" ${DRIVER_ARGS[@]+"${DRIVER_ARGS[@]}"})
+}
+
+# The driver executes asynchronously in the background so that px-run remains free to inject timed
+# disruptions while the workload is active. All driver output is redirected to a log file because
+# the standard output of px-run serves as a structured data channel.
+## @description  Launches the workload driver in the background and computes its timeout deadline.
+## @return       Sets DRIVER_PID, DRIVER_START_S, DRIVER_START_MS, and DRIVER_DEADLINE. Exit 0.
+driver_start() {
+  driver_command
+  # Using exec replaces the background subshell with the driver binary itself, ensuring that the
+  # recorded PID refers directly to the driver rather than an intermediate shell and that signals
+  # reach the workload directly. Any child processes spawned by the driver are owned by the driver,
+  # which is required by the driver contract to handle termination signals cleanly.
+  ( exec "${DRIVER_CMD[@]}" ) >"$DRIVER_LOG" 2>&1 &
+  DRIVER_PID=$!
+  DRIVER_START_S="$(px_epoch_s)"
+  DRIVER_START_MS="$(px_epoch_ms)"
+  DRIVER_DEADLINE=$((DRIVER_START_S + DRIVER_TIMEOUT))
+  px_info "driver $DRIVER_PATH started as process $DRIVER_PID"
+}
+
+# Requests graceful termination via SIGTERM first and escalates to SIGKILL after 10 seconds, giving
+# the driver time to flush its output while ensuring unresponsive processes are still terminated.
+# Registered as an exit hook so that an interrupted px-run invocation never leaves an orphaned
+# workload process running behind.
+## @description  Terminates the active background driver process gracefully, then forcefully.
+## @return       Exit 0.
+driver_terminate() {
+  local waited=0
+  [ -n "$DRIVER_PID" ] || return 0
+  kill -0 "$DRIVER_PID" 2>/dev/null || return 0
+  px_warn "stopping driver process $DRIVER_PID"
+  # Suppress the shell's default job-termination notification on stderr, which would expose the
+  # raw internal command line after the harness has already logged a structured warning message.
+  {
+    kill -s TERM "$DRIVER_PID" || return 0
+    while [ "$waited" -lt 10 ] && kill -0 "$DRIVER_PID"; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$DRIVER_PID"; then
+      kill -s KILL "$DRIVER_PID" || true
+    fi
+  } 2>/dev/null
+}
+
+# Periodic polling allows a single process to monitor the child driver and dispatch offset-based
+# disruptions on schedule without spawning a separate scheduler process.
+## @description  Monitors the running driver until completion or timeout and fires due disruptions.
+## @return       Sets DRIVER_TIMED_OUT if the timeout bound expires. Exit 0.
+driver_watch() {
+  local interval now
+  interval=${PX_POLL_INTERVAL_S:-1}
+  while kill -0 "$DRIVER_PID" 2>/dev/null; do
+    now="$(px_epoch_s)"
+    if [ "$now" -ge "$DRIVER_DEADLINE" ]; then
+      DRIVER_TIMED_OUT=1
+      px_error "the driver passed its bound of ${DRIVER_TIMEOUT}s"
+      driver_terminate
+      return 0
+    fi
+    disrupt_due "$now"
+    sleep "$interval"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Planned fault accounting
+# ---------------------------------------------------------------------------
+# Instance state changes or restarts caused by a fault injected by px-run or an administrative
+# action performed by px-cluster during the run are considered expected. The post-run comparison
+# relies on this distinction because only unexplained changes constitute a cluster anomaly. Both
+# tools append to the substrate contract's shared planned-action record, and the comparison logic
+# consults only entries recorded during the current run.
+
+# The inspection window opens immediately before the pre-run snapshot so that actions from earlier
+# runs cannot excuse changes in the current run. If the planned-action record cannot be read, no
+# instance is treated as covered, preventing a read error from masking a genuine cluster fault.
+## @description  Checks whether a planned action recorded during this run covers the instance.
+## @param        role, index
+## @return       Exit 0 if a planned action covers the instance, or 1 otherwise.
+planned_covers() {
+  local status=0
+  sb_planned_contains "$SCOPE" "$1" "$2" "$PLANNED_SINCE_MS" || status=$?
+  case "$status" in
+  0) return 0 ;;
+  1) return 1 ;;
+  esac
+  px_warn "cannot read the planned-action record, exit $status:" \
+    "a change of $1/$2 counts as unplanned"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Cluster snapshots and anomaly detection
+# ---------------------------------------------------------------------------
+
+## @description  Looks up the recorded state and restart count of an instance in a snapshot list.
+## @param        list (the lines of one snapshot), role, index
+## @return       Writes the state, a tab, and the count to stdout. Exit 0, or 6 if not found.
+snapshot_lookup() {
+  local list=$1 role=$2 index=$3 line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+    "$role$PX_TAB$index$PX_TAB"*)
+      printf '%s\n' "${line#"$role$PX_TAB$index$PX_TAB"}"
+      return 0
+      ;;
+    esac
+  done <<EOF
+$list
+EOF
+  return "$PX_EXIT_NO_OBJECT"
+}
+
+# Captures substrate tooling versions for inclusion in the diagnostic bundle manifest so that test
+# results remain attributable to the exact software versions that produced them.
+## @description  Queries and records the versions of the underlying substrate tooling.
+## @param        phase
+## @return       Exit 0.
+snapshot_versions() {
+  local phase=$1 rows row status=0
+  rows="$(sb_call sb_version_info)" || status=$?
+  if [ "$status" != 0 ]; then
+    record_row skip "$phase" version_info "exit $status"
+    return 0
+  fi
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    record_line "version$PX_TAB$phase$PX_TAB$row"
+  done <<EOF
+$rows
+EOF
+}
+
+# Resource sampling is an optional substrate capability; if the active backend does not declare a
+# metrics source, a skip entry is recorded instead of failing the snapshot.
+## @description  Captures and records a single resource-utilization sample for every instance.
+## @param        phase
+## @return       Exit 0.
+snapshot_samples() {
+  local phase=$1 rows row status=0
+  if ! sb_capability resource_sampling >/dev/null; then
+    record_row skip "$phase" resource_sampling "the backend declares no metrics source"
+    return 0
+  fi
+  rows="$(sb_call sb_sample_resources "$SCOPE")" || status=$?
+  if [ "$status" != 0 ]; then
+    record_row skip "$phase" sample_resources "exit $status"
+    return 0
+  fi
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    record_line "sample$PX_TAB$phase$PX_TAB$row"
+  done <<EOF
+$rows
+EOF
+}
+
+# Collects the instance inventory, per-instance state and restart counts, substrate tool versions,
+# and a resource sample. Because instance states and restart counts provide the baseline evidence
+# required for cluster anomaly detection, an unreadable inventory is treated as a hard failure
+# rather than a skippable operation.
+## @description  Captures a full cluster snapshot for the specified execution phase.
+## @param        phase (pre or post)
+## @return       Exit 0, or 1 if the cluster inventory cannot be read.
+snapshot_take() {
+  local phase=$1 rows row role index state count list="" status=0
+  local role_col index_col state_col
+  role_col="$(sb_schema_index instance role)"
+  index_col="$(sb_schema_index instance index)"
+  state_col="$(sb_schema_index instance state)"
+  rows="$(sb_call sb_list "$SCOPE")" || status=$?
+  if [ "$status" != 0 ]; then
+    px_error "the $phase snapshot cannot read the inventory of scope $SCOPE"
+    record_row skip "$phase" inventory "exit $status"
+    return "$PX_EXIT_FAIL"
+  fi
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    record_line "instance$PX_TAB$phase$PX_TAB$row"
+    role="$(px_tsv_field "$role_col" "$row")" || continue
+    index="$(px_tsv_field "$index_col" "$row")" || continue
+    state="$(px_tsv_field "$state_col" "$row")" || state=unknown
+    status=0
+    count="$(sb_call sb_restart_count "$SCOPE" "$role" "$index")" || status=$?
+    if [ "$status" != 0 ]; then
+      px_warn "no restart count for $role/$index, exit $status"
+      count=""
+    fi
+    record_row restart "$phase" "$role" "$index" "$count"
+    list="$list$role$PX_TAB$index$PX_TAB$state$PX_TAB$count$PX_NL"
+  done <<EOF
+$rows
+EOF
+  if [ "$phase" = pre ]; then
+    PRE_RESTARTS=$list
+  else
+    POST_RESTARTS=$list
+  fi
+  snapshot_versions "$phase"
+  snapshot_samples "$phase"
+  return 0
+}
+
+# Queries the backend for the instance's termination reason and out-of-memory kill status. Because a
+# vanished instance can provide neither, any query that the backend refuses is logged as a skip row
+# in the run record.
+## @description  Records termination and out-of-memory evidence for an anomalous cluster instance.
+## @param        role, index
+## @return       Exit 0.
+evidence_record() {
+  local role=$1 index=$2 term="" oom="" reason="" kill="" status=0 column
+  term="$(sb_call sb_termination_reason "$SCOPE" "$role" "$index" current)" ||
+    status=$?
+  if [ "$status" = 0 ] && [ -n "$term" ]; then
+    record_line "term$PX_TAB$role$PX_TAB$index$PX_TAB$term"
+    column="$(sb_schema_index term reason)" || column=1
+    reason="$(px_tsv_field "$column" "$term")" || reason=""
+  else
+    record_row skip post "termination reason of $role/$index" "exit $status"
+  fi
+  status=0
+  oom="$(sb_call sb_oom_killed "$SCOPE" "$role" "$index")" || status=$?
+  if [ "$status" = 0 ] && [ -n "$oom" ]; then
+    record_line "oom$PX_TAB$role$PX_TAB$index$PX_TAB$oom"
+    column="$(sb_schema_index oom oom)" || column=1
+    kill="$(px_tsv_field "$column" "$oom")" || kill=""
+  else
+    record_row skip post "out-of-memory evidence of $role/$index" "exit $status"
+  fi
+  px_error "instance $role/$index: termination reason ${reason:-not known}," \
+    "out-of-memory kill ${kill:-not known}"
+}
+
+# Compares every instance between the pre-run and post-run snapshots. An instance is considered
+# changed if its restart count increased, if it was running before and is now exited, dead, or
+# unknown, or if it vanished from the inventory. Any change not covered by a planned action of the
+# current run constitutes a cluster anomaly (failing the run with exit code 3) and triggers evidence
+# collection into the run record.
+## @description  Diffs pre-run and post-run instance states and restart counts to detect anomalies.
+## @return       Sets ANOMALY=1 on any unexplained instance change. Exit 0.
+restart_diff() {
+  local line rest role index before after pre_state post_state verdict status
+  local changed comparable
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    role=${line%%"$PX_TAB"*}
+    rest=${line#*"$PX_TAB"}
+    index=${rest%%"$PX_TAB"*}
+    rest=${rest#*"$PX_TAB"}
+    pre_state=${rest%%"$PX_TAB"*}
+    before=${rest#*"$PX_TAB"}
+    status=0
+    rest="$(snapshot_lookup "$POST_RESTARTS" "$role" "$index")" || status=$?
+    if [ "$status" != 0 ]; then
+      if planned_covers "$role" "$index"; then
+        record_row diff "$role" "$index" "$before" "" planned "$pre_state" ""
+      else
+        ANOMALY=1
+        px_error "instance $role/$index vanished with no planned action"
+        record_row diff "$role" "$index" "$before" "" vanished "$pre_state" ""
+        evidence_record "$role" "$index"
+      fi
+      continue
+    fi
+    post_state=${rest%%"$PX_TAB"*}
+    after=${rest#*"$PX_TAB"}
+    # Restart counts that are empty or non-decimal cannot be compared numerically; the raw values
+    # are preserved in the diff record so that the reporting fault remains visible.
+    comparable=1
+    case "$before" in '' | *[!0-9]*) comparable=0 ;; esac
+    case "$after" in '' | *[!0-9]*) comparable=0 ;; esac
+    changed=""
+    if [ "$comparable" = 1 ] && [ "$after" -gt "$before" ]; then
+      changed="restarted $before to $after"
+    fi
+    if [ "$pre_state" = running ]; then
+      case "$post_state" in
+      exited | dead | unknown)
+        changed="${changed:+$changed and }went from running to $post_state"
+        ;;
+      esac
+    fi
+    if [ -n "$changed" ]; then
+      if planned_covers "$role" "$index"; then
+        verdict=planned
+      else
+        verdict=unplanned
+        ANOMALY=1
+        px_error "instance $role/$index $changed with no planned action"
+      fi
+    elif [ "$comparable" = 0 ]; then
+      verdict=unknown
+    else
+      verdict=unchanged
+    fi
+    record_row diff "$role" "$index" "$before" "$after" "$verdict" "$pre_state" \
+      "$post_state"
+    if [ "$verdict" = unplanned ]; then
+      evidence_record "$role" "$index"
+    fi
+  done <<EOF
+$PRE_RESTARTS
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Disruption scheduling and injection
+# ---------------------------------------------------------------------------
+# Because Bash 3.2 lacks associative arrays, the disruption schedule is stored across seven
+# parallel indexed arrays where each index represents a single scheduled disruption entry.
+
+# Validates the specification up front so that px-run fails closed before performing any cluster
+# operations; a malformed disruption specification must halt execution immediately rather than
+# silently resulting in an uninjected fault.
+## @description  Parses, validates, and appends a single disruption specification to the schedule.
+## @param        specification
+## @return       Exit 0, or 2 if the specification is invalid.
+disrupt_add() {
+  local spec=$1 when action role index argument extra kind value
+  IFS=, read -r when action role index argument extra <<EOF
+$spec
+EOF
+  # Strip leading and trailing whitespace from each parsed field before validation so that
+  # specifications formatted with spaces after commas are accepted cleanly.
+  px_trim_var when
+  px_trim_var action
+  px_trim_var role
+  px_trim_var index
+  px_trim_var argument
+  if [ -n "${extra:-}" ]; then
+    px_usage_error "disruption '$spec' holds more than five fields"
+  fi
+  case "${when:-}" in
+  +*)
+    kind=offset
+    value=${when#+}
+    [[ $value =~ $PX_RE_INT ]] ||
+      px_usage_error "disruption '$spec' needs whole seconds after the plus sign"
+    ;;
+  phase:*)
+    kind=phase
+    value=${when#phase:}
+    [[ $value =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
+      px_usage_error "disruption '$spec' names an invalid phase '$value'"
+    ;;
+  *)
+    px_usage_error "disruption '$spec' needs +SECONDS or phase:NAME"
+    ;;
+  esac
+  case "${action:-}" in
+  kill | signal | restart) ;;
+  *) px_usage_error "disruption '$spec' needs the action kill, signal or restart" ;;
+  esac
+  [[ ${role:-} =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] ||
+    px_usage_error "disruption '$spec' names an invalid role '${role:-}'"
+  [[ ${index:-} =~ $PX_RE_INT ]] ||
+    px_usage_error "disruption '$spec' needs a whole instance index"
+  argument=${argument:-}
+  case "$action" in
+  kill)
+    [ -n "$argument" ] || argument=hard
+    sb_valid_value kill_mode "$argument" ||
+      px_usage_error "disruption '$spec' names an unknown kill mode '$argument'"
+    ;;
+  signal)
+    [[ $argument =~ ^(SIG)?[A-Z][A-Z0-9]+$ ]] ||
+      px_usage_error "disruption '$spec' needs a signal name, for example QUIT"
+    ;;
+  restart)
+    [ -z "$argument" ] ||
+      px_usage_error "disruption '$spec' takes no argument after the index"
+    ;;
+  esac
+  DISRUPT_KIND[DISRUPT_COUNT]=$kind
+  DISRUPT_WHEN[DISRUPT_COUNT]=$value
+  DISRUPT_ACTION[DISRUPT_COUNT]=$action
+  DISRUPT_ROLE[DISRUPT_COUNT]=$role
+  DISRUPT_INDEX[DISRUPT_COUNT]=$index
+  DISRUPT_ARG[DISRUPT_COUNT]=$argument
+  DISRUPT_STATE[DISRUPT_COUNT]=pending
+  DISRUPT_COUNT=$((DISRUPT_COUNT + 1))
+}
+
+# Individual specifications are separated by semicolons so that a complete disruption schedule can
+# be passed within a single environment variable or option value.
+## @description  Splits and parses a semicolon-delimited disruption schedule string.
+## @param        text
+## @return       Exit 0, or 2 if any specification in the schedule is invalid.
+disrupt_parse() {
+  local rest=${1:-} spec
+  while [ -n "$rest" ]; do
+    case "$rest" in
+    *';'*)
+      spec=${rest%%;*}
+      rest=${rest#*;}
+      ;;
+    *)
+      spec=$rest
+      rest=""
+      ;;
+    esac
+    px_trim_var spec
+    [ -n "$spec" ] || continue
+    disrupt_add "$spec"
+  done
+}
+
+# In a dry-run plan all entries appear in the pending state, whereas at the end of an active run
+# each row reflects the final outcome of that disruption.
+## @description  Emits a disrupt record row for every scheduled entry and its current state.
+## @return       Exit 0.
+disrupt_rows() {
+  local index=0
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    record_row disrupt "$((index + 1))" "${DISRUPT_KIND[$index]}" \
+      "${DISRUPT_WHEN[$index]}" "${DISRUPT_ACTION[$index]}" \
+      "${DISRUPT_ROLE[$index]}" "${DISRUPT_INDEX[$index]}" \
+      "${DISRUPT_ARG[$index]}" "${DISRUPT_STATE[$index]}"
+    index=$((index + 1))
+  done
+}
+
+# Because signal and restart are optional substrate operations, backend capabilities are checked
+# first and unsupported operations are recorded as skipped. The planned action is written to the
+# substrate contract record before injecting the fault so that the post-run anomaly check can
+# account for it; if recording the planned action fails, the fault is aborted to avoid triggering a
+# false cluster anomaly. Conversely, once recorded, an attempted fault remains marked as planned
+# even if the backend call reports an error, because the target instance may still have been
+# affected and a false anomaly report is worse than a soft one.
+## @description  Executes a scheduled disruption through the substrate contract and logs the result.
+## @param        index (into the disruption schedule)
+## @return       Exit 0.
+disrupt_fire() {
+  local index=$1 action role instance argument out="" status=0 state line
+  action=${DISRUPT_ACTION[$index]}
+  role=${DISRUPT_ROLE[$index]}
+  instance=${DISRUPT_INDEX[$index]}
+  argument=${DISRUPT_ARG[$index]}
+  # Mark the entry as no longer pending immediately so that a failed attempt cannot be re-fired.
+  DISRUPT_STATE[index]=fail
+  px_info "disruption $((index + 1)): $action $role/$instance ${argument:-(no argument)}"
+  case "$action" in
+  signal)
+    sb_capability signal_delivery >/dev/null || status=$PX_EXIT_UNSUPPORTED
+    ;;
+  restart)
+    sb_capability drain_restart >/dev/null || status=$PX_EXIT_UNSUPPORTED
+    ;;
+  esac
+  if [ "$status" = 0 ]; then
+    sb_planned_record "$SCOPE" "$action" "$role" "$instance" \
+      "run $RUN_ID${argument:+ $argument}" || status=$?
+    if [ "$status" != 0 ]; then
+      px_error "disruption $((index + 1)) not injected: its planned action" \
+        "cannot be recorded, exit $status"
+    else
+      case "$action" in
+      kill)
+        out="$(sb_call sb_kill "$SCOPE" "$role" "$instance" "$argument")" ||
+          status=$?
+        ;;
+      signal)
+        out="$(sb_call sb_signal "$SCOPE" "$role" "$instance" "$argument")" ||
+          status=$?
+        ;;
+      restart)
+        out="$(sb_call sb_restart_drain "$SCOPE" "$role" "$instance" \
+          "${PX_TIMEOUT_DRAIN:-300}" "${PX_TIMEOUT_READY:-300}")" || status=$?
+        ;;
+      esac
+    fi
+  fi
+  case "$status" in
+  0) state=ok ;;
+  "$PX_EXIT_UNSUPPORTED") state=skip ;;
+  *) state=fail ;;
+  esac
+  if [ "$state" = skip ]; then
+    px_warn "disruption $((index + 1)) skipped: the backend cannot $action"
+  fi
+  DISRUPT_STATE[index]=$state
+  record_row action "$(px_epoch_ms)" "$action" "$role" "$instance" "$argument" \
+    "$state" "$status"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    record_line "phase$PX_TAB$role$PX_TAB$instance$PX_TAB$line"
+  done <<EOF
+$out
+EOF
+}
+
+## @description  Fires all pending offset-based disruptions whose scheduled time has arrived.
+## @param        now (current epoch time in seconds)
+## @return       Exit 0.
+disrupt_due() {
+  local now=$1 index=0
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    if [ "${DISRUPT_STATE[$index]}" = pending ] &&
+      [ "${DISRUPT_KIND[$index]}" = offset ] &&
+      [ "$now" -ge $((DRIVER_START_S + DISRUPT_WHEN[index])) ]; then
+      disrupt_fire "$index"
+    fi
+    index=$((index + 1))
+  done
+}
+
+# Any disruption that remains pending at the end of the run is explicitly marked as skipped along
+# with the reason it did not fire, ensuring that an uninjected fault never makes the post-run
+# restart comparison appear clean under false pretenses.
+## @description  Finalizes the disruption schedule by recording any unfired entries as skipped.
+## @return       Exit 0.
+disrupt_sweep() {
+  local index=0 reason
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    if [ "${DISRUPT_STATE[$index]}" = pending ]; then
+      if [ "${DISRUPT_KIND[$index]}" = offset ]; then
+        reason="the driver ended before offset ${DISRUPT_WHEN[$index]}s"
+      else
+        reason="phase ${DISRUPT_WHEN[$index]} was not reached"
+      fi
+      px_warn "disruption $((index + 1)) did not fire: $reason"
+      record_row skip run "disruption $((index + 1))" "$reason"
+      DISRUPT_STATE[index]=skip
+    fi
+    index=$((index + 1))
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Dry-run execution plan
+# ---------------------------------------------------------------------------
+
+# Resolves and validates the output root directory so that the dry-run output guarantees a legal
+# destination path, without creating the run directory itself or invoking any backend operations.
+## @description  Emits the dry-run execution plan describing what a real run would perform.
+## @return       Writes plan rows to stdout. Exit 0.
+plan_print() {
+  local root
+  # Because px_out_root terminates inside a command substitution when the output root is invalid,
+  # propagate its non-zero exit status directly to terminate px-run.
+  root="$(px_out_root)" || exit "$?"
+  record_row plan run_id "$RUN_ID"
+  record_row plan run_dir "$root/runs/$RUN_ID"
+  record_row plan run_class "${PX_RUN_CLASS:-}"
+  record_row plan backend "${PX_BACKEND:-the default of the contract}"
+  record_row plan scope "${SCOPE:-none, snapshots skipped}"
+  record_row plan driver "${DRIVER_PATH:-none, a real run needs one}"
+  record_row plan driver_arguments "${#DRIVER_ARGS[@]}"
+  record_row plan driver_timeout_s "$DRIVER_TIMEOUT"
+  record_row plan snapshot_pre "sb_list sb_restart_count sb_version_info sb_sample_resources"
+  record_row plan disruptions "$DISRUPT_COUNT"
+  disrupt_rows
+  record_row plan snapshot_post "sb_list sb_restart_count sb_version_info sb_sample_resources"
+  record_row plan diff "an unplanned restart, exit or loss gives exit $PX_EXIT_ANOMALY"
+}
+
+# ---------------------------------------------------------------------------
+# Command-line argument parsing and configuration
+# ---------------------------------------------------------------------------
+
+# Because command-line arguments have the highest configuration precedence, --set pairs are
+# registered with the cli origin before loading configuration files.
+## @description  Applies all NAME=VALUE pairs passed via --set as command-line configuration values.
+## @return       Exit 0, or 2 if a variable name is invalid.
+apply_set_pairs() {
+  local index=0 pair
+  while [ "$index" -lt "${#SET_PAIRS[@]}" ]; do
+    pair=${SET_PAIRS[$index]}
+    px_config_set "${pair%%=*}" "${pair#*=}" cli
+    index=$((index + 1))
+  done
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    usage
+    exit "$PX_EXIT_OK"
+    ;;
+  -d | --driver)
+    px_cli_need_value "$@"
+    DRIVER_SPEC=$2
+    shift 2
+    ;;
+  -s | --scope)
+    px_cli_need_value "$@"
+    px_config_set PX_SCOPE_ID "$2" cli
+    shift 2
+    ;;
+  -b | --backend)
+    px_cli_need_value "$@"
+    px_config_set PX_BACKEND "$2" cli
+    shift 2
+    ;;
+  -c | --class)
+    px_cli_need_value "$@"
+    px_config_set PX_RUN_CLASS "$2" cli
+    shift 2
+    ;;
+  -D | --disrupt)
+    px_cli_need_value "$@"
+    if [ -n "$DISRUPT_INPUT" ]; then
+      DISRUPT_INPUT="$DISRUPT_INPUT;$2"
+    else
+      DISRUPT_INPUT=$2
+    fi
+    shift 2
+    ;;
+  -t | --timeout)
+    px_cli_need_value "$@"
+    [[ $2 =~ $PX_RE_INT ]] || px_usage_error "$1 needs a whole number of seconds"
+    px_config_set PX_TIMEOUT_DEFAULT "$2" cli
+    shift 2
+    ;;
+  -e | --set)
+    px_cli_need_value "$@"
+    case "$2" in
+    *=*) SET_PAIRS[${#SET_PAIRS[@]}]=$2 ;;
+    *) px_usage_error "$1 needs NAME=VALUE, got '$2'" ;;
+    esac
+    shift 2
+    ;;
+  -f | --config)
+    px_cli_need_value "$@"
+    CONFIG_FILES[${#CONFIG_FILES[@]}]=$2
+    shift 2
+    ;;
+  -n | --dry-run)
+    px_config_set PX_DRY_RUN 1 cli
+    shift
+    ;;
+  -k | --keep)
+    px_config_set PX_KEEP 1 cli
+    shift
+    ;;
+  -v | --verbose)
+    px_config_set PX_VERBOSE 1 cli
+    shift
+    ;;
+  --)
+    shift
+    DRIVER_ARGS=("$@")
+    break
+    ;;
+  -*) px_usage_error "unknown option $1" ;;
+  *) px_usage_error "px-run takes no positional argument, got '$1'" ;;
+  esac
+done
+
+# The configuration loader preserves the first value assigned to each variable; register all
+# command-line overrides first so that the highest-precedence origin wins.
+if [ -n "$DRIVER_SPEC" ]; then
+  px_config_set PX_DRIVER "$DRIVER_SPEC" cli
+fi
+if [ -n "$DISRUPT_INPUT" ]; then
+  px_config_set PX_DISRUPT_SPEC "$DISRUPT_INPUT" cli
+fi
+apply_set_pairs
+px_config_load ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}
+
+# Resolve the target scope from PX_SCOPE_ID or from the scope recorded by px-cluster for the active
+# cluster. Running without a provisioned cluster is a supported mode that skips cluster snapshots;
+# catching the exit status inside the command substitution prevents the error trap from firing when
+# no cluster object exists.
+SCOPE_STATUS=0
+SCOPE="$(sb_scope_resolve || exit "$?")" || SCOPE_STATUS=$?
+case "$SCOPE_STATUS" in
+0) ;;
+"$PX_EXIT_NO_OBJECT") SCOPE="" ;;
+*) px_die "$SCOPE_STATUS" "cannot resolve the scope of cluster ${PX_CLUSTER_ID:-default}" ;;
+esac
+DRIVER_SPEC=${PX_DRIVER:-}
+DRIVER_TIMEOUT=${PX_TIMEOUT_DEFAULT:-3600}
+[[ $DRIVER_TIMEOUT =~ $PX_RE_INT ]] ||
+  px_usage_error "PX_TIMEOUT_DEFAULT needs whole seconds, got '$DRIVER_TIMEOUT'"
+if [ -n "$DRIVER_SPEC" ]; then
+  DRIVER_PATH="$(driver_resolve "$DRIVER_SPEC")" || exit "$?"
+fi
+disrupt_parse "${PX_DISRUPT_SPEC:-}"
+if [ "$DISRUPT_COUNT" -gt 0 ] && [ -z "$SCOPE" ]; then
+  px_usage_error "a disruption needs a cluster: run px-cluster up, or name one" \
+    "with --scope"
+fi
+
+# ---------------------------------------------------------------------------
+# Dry-run termination: print the execution plan and exit without invoking the
+# backend or writing anything beyond the validated output root and state directory.
+# ---------------------------------------------------------------------------
+
+if px_is_dry_run; then
+  RUN_ID="$(px_run_id)"
+  plan_print
+  exit "$PX_EXIT_OK"
+fi
+
+if [ -z "$DRIVER_PATH" ]; then
+  px_usage_error "a run needs a driver: name one with --driver or PX_DRIVER"
+fi
+
+# ---------------------------------------------------------------------------
+# Test run execution
+# ---------------------------------------------------------------------------
+
+RUN_DIR="$(px_run_dir)" || exit "$?"
+RUN_ID=${RUN_DIR##*/}
+RECORD_FILE="$RUN_DIR/run-record.tsv"
+DRIVER_LOG="$RUN_DIR/driver.log"
+# Because px-run mints PX_RUN_ID and PX_RUN_DIR for each execution, it exports them directly rather
+# than passing them through the configuration loader, whose first-writer-wins rule is designed for
+# operator-supplied inputs rather than per-run generated outputs.
+PX_RUN_ID=$RUN_ID
+PX_RUN_DIR=$RUN_DIR
+export PX_RUN_ID PX_RUN_DIR
+printf '%s\n' "$RUN_DIR"
+px_info "run $RUN_ID in $RUN_DIR"
+
+sb_load
+px_on_exit driver_terminate
+
+record_row run "$RUN_ID" "${PX_RUN_CLASS:-}" "$(sb_bound_backend)" "$SCOPE" "$DRIVER_PATH"
+# Open the planned-action timestamp window before reaching the first phase that can trigger a
+# disruption so that every fault injected during this run falls within the window.
+PLANNED_SINCE_MS="$(px_epoch_ms)"
+phase_reached setup
+
+if [ -n "$SCOPE" ]; then
+  SCOPE_STATUS=0
+  sb_call sb_scope_exists "$SCOPE" || SCOPE_STATUS=$?
+  if [ "$SCOPE_STATUS" != 0 ]; then
+    px_die "$SCOPE_STATUS" "the scope $SCOPE is not usable"
+  fi
+  snapshot_take pre || px_die "$PX_EXIT_FAIL" "the run needs a pre-run snapshot"
+else
+  px_warn "no scope id and no recorded cluster: px-run takes no snapshot and" \
+    "checks no instance"
+  record_row skip pre scope "no scope id"
+fi
+phase_reached snapshot_pre
+
+driver_start
+phase_reached driver_start
+driver_watch
+DRIVER_STATUS=0
+{ wait "$DRIVER_PID"; } 2>/dev/null || DRIVER_STATUS=$?
+DRIVER_PID=""
+record_row driver "$(($(px_epoch_ms) - DRIVER_START_MS))" "$DRIVER_STATUS" \
+  "$DRIVER_LOG"
+px_info "driver ended with status $DRIVER_STATUS, output in $DRIVER_LOG"
+phase_reached driver_exit
+
+if [ -n "$SCOPE" ]; then
+  # An inability to read the post-run inventory does not prove that instances vanished, so run the
+  # state and restart comparison only when the post-run snapshot succeeds.
+  if snapshot_take post; then
+    restart_diff
+  else
+    SNAPSHOT_FAILED=1
+    record_row skip post diff "the post-run inventory cannot be read"
+  fi
+else
+  record_row skip post scope "no scope id"
+fi
+phase_reached snapshot_post
+disrupt_sweep
+disrupt_rows
+
+# ---------------------------------------------------------------------------
+# Final run verdict
+# ---------------------------------------------------------------------------
+# The workload verdict belongs to the driver, so its exit code passes through directly whenever it
+# falls within the shared exit-code vocabulary. Any driver exit status outside that vocabulary
+# (such as 143 from a termination signal) is normalized to a general failure (exit code 1), while
+# the run record preserves the raw numeric status emitted by the driver.
+
+EXIT_CODE=$DRIVER_STATUS
+if [ "$DRIVER_TIMED_OUT" = 1 ]; then
+  EXIT_CODE=$PX_EXIT_TIMEOUT
+else
+  case "$EXIT_CODE" in
+  0 | 1 | 2 | 3 | 4 | 5 | 6) ;;
+  "$SB_EXEC_TIMEOUT") EXIT_CODE=$PX_EXIT_TIMEOUT ;;
+  *)
+    px_warn "the driver returned $DRIVER_STATUS, which is outside the vocabulary"
+    EXIT_CODE=$PX_EXIT_FAIL
+    ;;
+  esac
+fi
+if [ "$ANOMALY" = 1 ] && { [ "$EXIT_CODE" = 0 ] || [ "$EXIT_CODE" = 1 ]; }; then
+  EXIT_CODE=$PX_EXIT_ANOMALY
+fi
+if [ "$EXIT_CODE" = 0 ] && [ "$SNAPSHOT_FAILED" = 1 ]; then
+  px_error "the post-run snapshot failed, so the run cannot be reported clean"
+  EXIT_CODE=$PX_EXIT_FAIL
+fi
+
+if [ "$ANOMALY" = 1 ]; then
+  record_row result "$EXIT_CODE" "$(px_exit_name "$EXIT_CODE")" yes
+else
+  record_row result "$EXIT_CODE" "$(px_exit_name "$EXIT_CODE")" no
+fi
+px_info "run $RUN_ID ends with exit $EXIT_CODE, $(px_exit_name "$EXIT_CODE")"
+exit "$EXIT_CODE"
