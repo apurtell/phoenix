@@ -864,7 +864,13 @@ stop)
   ;;
 start)
   fake_find "${1:-}" || exit 1
-  fake_rewrite id "$1" running 'Up 1 second (healthy)'
+  if [ -e "$fake_state/start-exits" ]; then
+    fake_rewrite id "$1" exited 'Exited (1) 1 second ago'
+  elif [ -e "$fake_state/start-unready" ]; then
+    fake_rewrite id "$1" running 'Up 1 second (health: starting)'
+  else
+    fake_rewrite id "$1" running 'Up 1 second (healthy)'
+  fi
   ;;
 logs)
   fake_id=${!#}
@@ -1410,8 +1416,9 @@ A2_EOF
   cat >"$T_A2_BIN/mvn" <<'A2_EOF'
 #!/usr/bin/env bash
 # A fixture that stands in for Maven. It records the JDK and the argument
-# list, and it writes one jar for each module of -pl, so a build record names
-# files that exist. Without -pl it writes the product that the case names.
+# list, and it writes the jar of each module of -pl under its real name, so a
+# build record names files that exist. With PX_FAKE_MVN_NO_SHADED set, it
+# writes no module jar. Without -pl it writes the product that the case names.
 [ -z "${PX_FAKE_MVN_LOG:-}" ] || printf 'JAVA_HOME=%s %s\n' "${JAVA_HOME:-}" "$*" \
   >>"$PX_FAKE_MVN_LOG"
 printf '[INFO] fake build\n'
@@ -1428,12 +1435,13 @@ done
 tree=${pom%/pom.xml}
 for module in ${list//,/ }; do
   case "$module" in
-  phoenix-server) jar="phoenix-server-hbase-$profile.jar" ;;
-  */phoenix-client-embedded) jar="phoenix-client-embedded-hbase-$profile.jar" ;;
+  phoenix-server) jar="phoenix-server-hbase-$profile-5.4.0-SNAPSHOT.jar" ;;
+  */phoenix-client-embedded) jar="phoenix-client-embedded-hbase-$profile-5.4.0-SNAPSHOT.jar" ;;
   *) jar="${module##*/}-5.4.0-SNAPSHOT.jar" ;;
   esac
   mkdir -p "$tree/$module/target"
-  printf 'fake jar %s\n' "$module" >"$tree/$module/target/$jar"
+  [ -n "${PX_FAKE_MVN_NO_SHADED:-}" ] ||
+    printf 'fake jar %s\n' "$module" >"$tree/$module/target/$jar"
 done
 if [ -z "$list" ] && [ -n "${PX_FAKE_MVN_PRODUCT:-}" ]; then
   mkdir -p "$tree/${PX_FAKE_MVN_PRODUCT%/*}"
@@ -3596,10 +3604,41 @@ t_group_sweep_scale() {
 2 sb_scale px-sweep regionserver 10 10
 2 sb_scale px-sweep nosuch 2 10
 2 sb_scale px-sweep regionserver 2 0"
+  # Because an exited instance runs no active process, restarting it skips the drain, stop, and
+  # rebalance phases even when an earlier restart previously drained that instance. In this fixture
+  # port map, only regionserver 0 defines an rpc port.
+  t_sb sb_kill px-sweep regionserver 0 hard
+  t_shim_log_reset
+  t_sb sb_restart_drain px-sweep regionserver 0 10 5
+  t_outcome_columns sweep_restart_drain_starts_a_killed_instance 0 2 \
+    "$(t_rows 2 drain skip stop skip start ok ready ok rebalance skip)"
+  t_absent sweep_killed_instance_has_no_unload 'mover unload' "$T_STDERR"
+  t_absent sweep_killed_instance_loads_no_regions 'mover load' "$T_STDERR"
+  t_absent sweep_killed_instance_has_no_stop 'stop --time' "$(cat "$T_SHIM_LOG")"
+  # The readiness wait inspects only the restarted instance, so an exited sibling instance is not
+  # treated as a fault; however, the wait fails if the restarted instance exits and expires if the
+  # instance remains unready.
   t_shim_log_reset
   t_sb sb_kill px-sweep regionserver 2 hard
   t_outcome sweep_sb_kill_hard 0 ""
   t_called sweep_kill_hard_sends_kill 'kill -s KILL rs03'
+  t_sb sb_kill px-sweep regionserver 0 hard
+  t_sb sb_restart_drain px-sweep regionserver 0 10 5
+  t_outcome_columns sweep_restart_drain_ignores_an_exited_sibling 0 2 \
+    "$(t_rows 2 drain skip stop skip start ok ready ok rebalance skip)"
+  t_sb sb_kill px-sweep regionserver 0 hard
+  : >"$T_SWEEP_STATE/start-exits"
+  t_sb sb_restart_drain px-sweep regionserver 0 10 5
+  t_outcome_columns sweep_restart_drain_fails_when_the_instance_exits 1 2 \
+    "$(t_rows 2 drain skip stop skip start ok ready fail rebalance skip)"
+  rm -f "$T_SWEEP_STATE/start-exits"
+  : >"$T_SWEEP_STATE/start-unready"
+  t_sb sb_restart_drain px-sweep regionserver 0 10 1
+  t_outcome_columns sweep_restart_drain_expires_when_the_instance_stays_unready 4 2 \
+    "$(t_rows 2 drain skip stop skip start ok ready fail rebalance skip)"
+  rm -f "$T_SWEEP_STATE/start-unready"
+  t_sb sb_kill px-sweep regionserver 0 hard
+  t_sb sb_restart_drain px-sweep regionserver 0 10 5
   t_sb sb_termination_reason px-sweep regionserver 2
   t_outcome sweep_termination_reason_of_a_kill 0 \
     "$(t_rows 4 killed 137 9 2026-01-01T00:00:00Z)"
@@ -3994,6 +4033,33 @@ t_group_a2_generator() {
   t_empty generator_calls_no_runtime "$(cat "$T_SHIM_LOG")"
   t_contains setup_mounts_the_namenode_volume '- namenode-0-data:/data' \
     "$(sed -n '/^  setup-0:/,/^[a-z]/p' "$dir/compose.yaml")"
+  # The bootstrap probe reads the health monitor heartbeat through a read-only bind mount of the
+  # state directory and accepts a maximum heartbeat age of three monitor intervals.
+  text="$(sed -n '/^  setup-0:/,/^[a-z]/p' "$dir/compose.yaml")"
+  t_equals setup_reads_the_monitor_heartbeat "yes yes yes" \
+    "$(t_flag 'PX_MONITOR_HEARTBEATS: "/var/lib/px/state/monitor-px-m.heartbeat"' "$text") $(
+      t_flag "PX_MONITOR_STALE_S: \"$((3 * PX_MONITOR_INTERVAL_S))\"" "$text") $(
+      t_flag "\"$(px_realpath "$T_A2_OUT")/state:/var/lib/px/state:ro\"" "$text")"
+  t_absent only_setup_reads_the_monitor_heartbeat /var/lib/px/state \
+    "$(sed '/^  setup-0:/,/^[a-z]/d' "$dir/compose.yaml")"
+  t_gen --class validation --cluster hb -e PX_MONITOR_INTERVAL_S=20
+  t_equals heartbeat_age_is_three_monitor_intervals "0 yes" "$T_STATUS $(
+    t_flag 'PX_MONITOR_STALE_S: "60"' "$(cat "$T_A2_OUT/deploy/hb/compose.yaml")")"
+  rm -rf "$T_A2_OUT/deploy/hb"
+  # Because a ':' character in the state directory path would prematurely terminate the host-path
+  # field of the setup volume mount, deployment rendering rejects colons in both PX_STATE_DIR and
+  # PX_OUT.
+  t_gen --class validation --cluster colon -e PX_STATE_DIR=st:ate
+  t_equals state_dir_with_a_colon_is_refused "2 yes no" "$T_STATUS $(t_flag \
+    'because the setup role mounts it' "$T_STDERR") $(t_exists "$T_A2_OUT/deploy/colon")"
+  mkdir -p "$T_A2/o:ut"
+  t_a2 "PX_OUT=$T_A2/o:ut" "$T_BASH" "$T_GEN" --class validation --cluster colon
+  t_equals output_root_with_a_colon_is_refused "2 yes" "$T_STATUS $(t_flag \
+    'because the setup role mounts it' "$T_STDERR")"
+  t_empty output_root_with_a_colon_gets_no_file "$(find "$T_A2/o:ut" ! -type d)"
+  t_gen --class validation --cluster int0 -e PX_MONITOR_INTERVAL_S=0
+  t_equals monitor_interval_of_zero_is_refused "2 no" \
+    "$T_STATUS $(t_exists "$T_A2_OUT/deploy/int0")"
   t_equals volumes_are_declared_once_by_their_owner 6 \
     "$(sed -n '/^volumes:/,$p' "$dir/compose.yaml" | grep -c '^  [a-z0-9-]*-data:$')"
   rows="$(awk '/^  [a-z-]+-[0-9]:$/ { s = $1 } /px.harness.(group|start|drain):/ \
@@ -4261,6 +4327,11 @@ t_group_a2_image() {
     t_contains "render_nodemanager_1_${line%%:*}" \
       "<name>${line%%:*}</name><value>${line#*:}</value>" "$text"
   done
+  t_render "$dir" resourcemanager-0
+  line=org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo.FifoScheduler
+  t_contains render_resourcemanager_needs_no_queue_file \
+    "<name>yarn.resourcemanager.scheduler.class</name><value>$line</value>" \
+    "$(tr -d ' \n' <"$out/yarn-site.xml" 2>/dev/null)"
   t_render "$dir" zookeeper-0
   t_contains render_zookeeper_binds_every_interface 'clientPortAddress=0.0.0.0' \
     "$(cat "$out/zoo.cfg" 2>/dev/null)"
@@ -4937,6 +5008,8 @@ t_group_a2_dist() {
     "${T_STDOUT//\\/}"
   t_contains build_phoenix_dry_run_selects_the_default_profile '-Dhbase.profile=2.6 -DskipTests' \
     "$T_STDOUT"
+  t_contains build_phoenix_cleans_before_it_packages '-Dskip.code-coverage clean package' \
+    "$T_STDOUT"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHOENIX_HBASE_PROFILE=2.5 "$T_BASH" "$bp" --tree "$tree" -n
   t_contains build_phoenix_profile_reaches_maven '-Dhbase.profile=2.5 -DskipTests' "$T_STDOUT"
   t_empty build_phoenix_dry_run_runs_no_maven "$(cat "$T_A2_MVN_LOG")"
@@ -4945,12 +5018,24 @@ t_group_a2_dist() {
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHOENIX_HBASE_PROFILE=2.6.3 "$T_BASH" "$bp" --tree "$tree" -n
   t_equals build_phoenix_refuses_a_pom_with_another_module "1 yes" \
     "$T_STATUS $(t_flag 'Bring the table up to date' "$T_STDERR")"
+  # Run this negative check before the first build of the fixture source tree so that no JAR left
+  # behind by an earlier build can stand in for the missing artifact.
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_NO_SHADED=1 "$T_BASH" "$bp" --tree "$tree"
+  t_equals build_phoenix_refuses_a_missing_jar "1 yes no" "$T_STATUS $(t_flag \
+    "made no $tree/phoenix-server/target/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar" \
+    "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/build.tsv")"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
   t_equals build_phoenix_builds_and_records 0 "$T_STATUS"
   t_contains build_phoenix_runs_maven_with_the_jdk "JAVA_HOME=$jdk " "$(cat "$T_A2_MVN_LOG")"
   t_equals build_phoenix_records_the_profile "5.4.0-SNAPSHOT 2.6 2.6.4 2.6.5-hadoop3 3.4.2 17" \
     "$(t_build_record phoenix_version hbase_profile compat_module hbase_version hadoop_version \
       jdk)"
+  t_equals build_phoenix_selects_the_shaded_jars \
+    "$tree/phoenix-server/target/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar \
+$tree/phoenix-client-parent/phoenix-client-embedded/target/\
+phoenix-client-embedded-hbase-2.6-5.4.0-SNAPSHOT.jar \
+$tree/phoenix-pherf/target/phoenix-pherf-5.4.0-SNAPSHOT.jar" \
+    "$(t_build_record server_jar client_jar pherf_jar)"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_BUILD_JDK=8
   t_equals build_phoenix_refuses_jdk_8 2 "$T_STATUS"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_BUILD_JDK=11
@@ -5002,8 +5087,10 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
   for line in Dockerfile entrypoint.sh healthcheck.sh render.sh lib/image.sh \
     bin/px-bootstrap-probe conf/hbase-site.xml.tmpl .dockerignore \
     dist/hbase-2.6.7-hadoop3-bin.tar.gz dist/hadoop-3.4.3-aarch64.tar.gz \
-    dist/async-profiler-4.1-linux-arm64.tar.gz phoenix/phoenix-server-hbase-2.6.jar \
-    phoenix/phoenix-client-embedded-hbase-2.6.jar phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar; do
+    dist/async-profiler-4.1-linux-arm64.tar.gz \
+    phoenix/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar \
+    phoenix/phoenix-client-embedded-hbase-2.6-5.4.0-SNAPSHOT.jar \
+    phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar; do
     [ -f "$ctx/$line" ] || bad="$bad $line"
   done
   t_empty stage_artifacts_context_holds_every_part "$bad"
@@ -5628,7 +5715,7 @@ t_a3_preflight_cases() {
 ##               clusters (R-044).
 ## @return       Records test assertions. Exit 0.
 t_a3_inhibit_cases() {
-  local pid manual run dir os prog logs="" sig code name run_name owner before tries=0
+  local pid manual run dir os prog logs="" sig code name run_name owner before tries=0 start
   printf '# sleep inhibition\n'
   t_shim_state_reset
   # Start an independent operator-owned sleep inhibitor process that harness teardown must never
@@ -5736,8 +5823,27 @@ t_a3_inhibit_cases() {
   t_a3 "$T_BASH" "$T_BIN/px-cluster" --cluster sweep down
   t_equals inhibit_released_when_the_cluster_is_down "0 no no" \
     "$T_STATUS $(t_alive "$pid") $(t_exists "$dir/inhibit-cluster-px-sweep")"
-  t_equals monitor_stops_when_the_cluster_is_down "no no" \
-    "$(t_alive "$T_A3_MONITOR") $(t_exists "$dir/monitor-px-sweep")"
+  t_equals monitor_stops_when_the_cluster_is_down "no no no" "$(t_alive "$T_A3_MONITOR")\
+ $(t_exists "$dir/monitor-px-sweep") $(t_exists "$dir/monitor-px-sweep.heartbeat")"
+  # Because the setup role depends on the health monitor heartbeat, a monitor that fails to start
+  # (simulated here by creating a regular file at its run directory path) aborts cluster bring-up
+  # before provisioning begins.
+  rm -rf "${T_A3_STATE:?}"/*
+  cp "$T_SWEEP_STATE/provision.txt" "$T_A3_STATE/"
+  printf 'sweep\n' >"$T_A3_STATE/cluster"
+  run="$T_A3/no-monitor"
+  mkdir -p "$run"
+  : >"$run/monitor"
+  t_shim_log_reset
+  start="$(px_epoch_ms)"
+  t_a3 "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "PX_OUT=$run" "$T_BASH" "$T_BIN/px-cluster" \
+    --cluster sweep up --timeout 5 "$T_DEPLOY"
+  t_equals monitor_that_cannot_start_fails_the_up_at_once "1 yes yes" "$T_STATUS $(t_flag \
+    'no run directory for the health monitor' "$T_STDERR") $(t_within 5000 "$start")"
+  t_equals monitor_that_cannot_start_provisions_nothing 0 \
+    "$(grep -c '^compose .* up ' "$T_SHIM_LOG")"
+  t_equals monitor_that_cannot_start_leaves_no_guard "no no" \
+    "$(t_exists "$run/state/inhibit-cluster-px-sweep") $(t_exists "$run/state/monitor-px-sweep")"
 }
 
 ## @description  Verifies default cluster teardown behavior after individual runs and full suite

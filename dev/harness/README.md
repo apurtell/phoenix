@@ -510,11 +510,12 @@ entire workstation, whereas an instance reaching its own memory limit remains co
 container where `px-run` reports its out-of-memory kill. Upon detecting a breach, the monitor writes
 the triggering sample to `breach.tsv` in its run directory at `$PX_OUT/monitor/<run-id>`, tears the
 cluster down with `px-cluster down`, and exits with code 3. Any active `px-run` copies that
-`breach.tsv` file into its own run directory and references it in its abort row. Concurrent
+`breach.tsv` file into its own run directory and references it in its abort row. Two concurrent
 `px-cluster down` invocations against the same scope execute sequentially, and the second call
-succeeds as already down. Each sampling cycle also refreshes the heartbeat file
+succeeds as already down. Each sampling pass also refreshes the heartbeat file
 `$PX_OUT/state/monitor-<scope>.heartbeat`, whose age is verified by the monitors subject of the
-bootstrap probe whenever `PX_MONITOR_HEARTBEATS` names it.
+bootstrap probe. The setup instance reads this heartbeat through a read-only mount of
+`$PX_OUT/state`, and the probe accepts a heartbeat age of up to three monitor intervals.
 
 **The quiet-host check.** Timing measurements are meaningful only on a quiet host. Before starting
 the test driver, `px-run` invokes `px-tool quiet-host`, which compares the host's one-minute load

@@ -912,18 +912,21 @@ between backends.
 
 * **stdout** Emits `phase` rows in fixed sequence for `drain`, `stop`, `start`, `ready`, and
   `rebalance`. If any phase fails, its row reports `fail` and all subsequent phases report `skip`.
-* **exit** Returns exit code 0 when every phase succeeds; 1 if any phase fails or the runtime fails
-  to respond; 4 if the drain phase, readiness wait, or rebalance phase times out; 2 if the target
-  role lacks drain semantics or the region-mover command requires an `rpc` port that is absent from
-  the port map; and 6 if the target instance does not exist. The default timeouts are
+  Because an already exited instance runs no process, its `drain`, `stop`, and `rebalance` phases
+  are recorded as `skip`. The `ready` wait inspects only the restarted instance.
+* **exit** Returns exit code 0 when no phase fails; 1 if any phase fails or the runtime fails to
+  respond; 4 if the drain phase, readiness wait, or rebalance phase times out; 2 if the target role
+  lacks drain semantics or the region-mover command requires an `rpc` port that is absent from the
+  port map; and 6 if the target instance does not exist. The default timeouts are
   `PX_TIMEOUT_DRAIN` and `PX_TIMEOUT_READY`.
 * **Compose** Permits draining only for roles carrying the `regionmover` drain label. The backend
   executes the region-mover unload command via `sb_exec` under the drain timeout, stops the
-  container with a grace period of `PX_TIMEOUT_STOP`, starts the container, invokes `sb_wait_ready`
-  for the role, and re-runs the region mover to reload regions. The mover command is expanded from
-  a template—using `PX_REGION_MOVER_CMD` when configured—supporting the placeholders `{operation}`
-  (`unload` or `load`), `{host}` (the container hostname), `{port}` (the instance's `rpc` port from
-  the port map), `{timeout}`, and `{file}`.
+  container with a grace period of `PX_TIMEOUT_STOP`, starts the container, polls that instance
+  until it reports ready, and re-runs the region mover to reload regions. The readiness poll fails
+  immediately if the instance exits and times out after the readiness timeout. The mover command
+  line is expanded from a template—using `PX_REGION_MOVER_CMD` when configured—supporting the
+  placeholders `{operation}` (`unload` or `load`), `{host}` (the container hostname), `{port}` (the
+  instance's `rpc` port from the port map), `{timeout}`, and `{file}`.
 
 ### Evidence
 

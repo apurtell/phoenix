@@ -88,6 +88,9 @@ PXG_BIND_HOST=0.0.0.0
 PXG_PUBLISH_HOST=127.0.0.1
 PXG_HEALTHCHECK=/opt/px/healthcheck.sh
 PXG_DATA_DIR=/data
+# Read-only container mount point where the setup role mounts the host state directory so the
+# bootstrap probe can inspect the health monitor heartbeat.
+PXG_STATE_MOUNT=/var/lib/px/state
 
 # Header marker written as the first line of topology.env. A target directory whose topology.env
 # begins with this marker is recognized as a rendered deployment that the generator may safely
@@ -102,6 +105,7 @@ PXG_MIB_RE='^[1-9][0-9]*$'
 PXG_FRACTION_RE='^0\.[0-9][0-9]?$'
 PXG_VERSION_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 PXG_LABEL_RE='^[a-z0-9][a-z0-9.-]*$'
+PXG_PATH_RE='^/[A-Za-z0-9 ._/+@-]*$'
 
 # Memory totals recorded in topology.env, aggregated from the limits of the rendered services:
 # PX_TOPOLOGY_MEM_MIB covers all services, PX_TOPOLOGY_MEM_EAGER_MIB covers the services started by
@@ -117,6 +121,8 @@ PXG_PUBLISHED=""
 PXG_TSV=""
 PXG_RENDERED=""
 PXG_YARN_ROLES=""
+PXG_STATE_HOST=""
+PXG_HEARTBEAT=""
 PXG_SERVICES=0
 PXG_MEM_TOTAL=0
 PXG_MEM_EAGER=0
@@ -335,9 +341,9 @@ pxg_hundredths() {
   printf '%s\n' "$((10#$digits))"
 }
 
-## @description  Validates all configuration inputs required for rendering and resolves the cluster
-##               name, the active role list (PXG_RENDERED), and HDFS replication (PXG_REPLICATION).
-## @return       Exits 0 when configuration is valid, or exits 2 on any rejected value.
+## @description  Validates all inputs read during rendering and populates the derived PXG_* values.
+## @return       Exits 0 when valid, 2 on any rejected value, or 1 when the state directory cannot
+##               be resolved.
 pxg_configure() {
   local role key cache store name
   local required=()
@@ -444,6 +450,19 @@ pxg_configure() {
     px_die "$PX_EXIT_USAGE" "PX_LABEL_PREFIX='$PX_LABEL_PREFIX' must hold lower case" \
       "letters, digits, dots and hyphens"
   fi
+
+  # The bootstrap probe verifies the health monitor heartbeat. Because the monitor refreshes its
+  # heartbeat after every sampling pass, a live heartbeat is at most one interval plus the duration
+  # of one sample old, and the probe accepts a maximum heartbeat age of three intervals.
+  pxg_require PX_MONITOR_INTERVAL_S PX_PROJECT_PREFIX
+  pxg_check_mib PX_MONITOR_INTERVAL_S
+  PXG_STATE_HOST="$(px_out_resolve "${PX_STATE_DIR:-state}")" || exit $?
+  if ! [[ $PXG_STATE_HOST =~ $PXG_PATH_RE ]]; then
+    px_die "$PX_EXIT_USAGE" "the state directory '$PXG_STATE_HOST' must hold letters," \
+      "digits, spaces and . _ / + @ - only, because the setup role mounts it"
+  fi
+  name="$(px_guard_name monitor "$PX_PROJECT_PREFIX-$PX_CLUSTER_ID")"
+  PXG_HEARTBEAT="$PXG_STATE_MOUNT/$name.heartbeat"
 }
 
 ## @description  Appends a single line to the accumulated Compose YAML buffer.
@@ -531,6 +550,10 @@ pxg_render_service() {
   pxg_y "      PX_INSTANCE_INDEX: \"$index\""
   pxg_y "      PX_JDK: \"$jdk\""
   pxg_y "      PX_MEM_MIB: \"$mem\""
+  if [ "$role" = setup ]; then
+    pxg_y "      PX_MONITOR_HEARTBEATS: \"$PXG_HEARTBEAT\""
+    pxg_y "      PX_MONITOR_STALE_S: \"$((3 * PX_MONITOR_INTERVAL_S))\""
+  fi
   pxg_y "      PX_ROLE: \"$role\""
   # The one-shot setup service also defines a healthcheck so that it remains unready until the
   # bootstrap probe succeeds, ensuring the cluster readiness barrier waits for completion while any
@@ -553,6 +576,9 @@ pxg_render_service() {
   if [ -n "$volume" ]; then
     pxg_y "    volumes:"
     pxg_y "      - $volume:$PXG_DATA_DIR"
+    if [ "$role" = setup ]; then
+      pxg_y "      - \"$PXG_STATE_HOST:$PXG_STATE_MOUNT:ro\""
+    fi
   fi
   # Each persistent volume is declared once in the top-level volumes section by its owning instance.
   if [ "$volume" = "$service-data" ]; then

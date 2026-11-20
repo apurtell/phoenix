@@ -290,7 +290,8 @@ EOF
   restart) cat <<'EOF'
 Usage: px-cluster restart ROLE INDEX [--drain-timeout S] [--ready-timeout S]
   Drains the hosted regions, restarts the instance, waits for readiness and
-  rebalances. The action is recorded as planned.
+  rebalances. An exited instance starts with no drain, no stop and no
+  rebalance. The action is recorded as planned.
   --drain-timeout S  drain timeout, default PX_TIMEOUT_DRAIN
   --ready-timeout S  readiness timeout, default PX_TIMEOUT_READY
 EOF
@@ -778,31 +779,45 @@ pc_teardown_locked() {
   fi
 }
 
-## @description  Starts the sleep inhibitor and the health monitor for a newly provisioned cluster
-##               (scope); both remain active until stopped by pc_guards_stop.
-## @return       Exits with 0, emitting a warning if the health monitor fails to start.
+# Holds the host awake and launches the health monitor for a cluster (scope) coming up; both
+# remain active until stopped by pc_guards_stop.
+## @description  Starts the sleep inhibitor and health monitor for a cluster (scope) coming up.
+## @return       Exits with 0, or 1 if there is no state directory, no run directory, or no
+##               monitor record within 10 s.
 pc_guards_start() {
-  local scope=$1 dir record status=0
+  local scope=$1 dir record pid status=0
   px_inhibit_start "cluster-$scope"
-  record="$(px_guard_path monitor "$scope")" || return 0
+  record="$(px_guard_path monitor "$scope")" || return "$PX_EXIT_FAIL"
   px_guard_stop "$record"
   dir="$(px_run_dir monitor)" || status=$?
   if [ "$status" != 0 ]; then
-    px_warn "no run directory for the health monitor of scope $scope"
-    return 0
+    px_error "no run directory for the health monitor of scope $scope"
+    return "$PX_EXIT_FAIL"
   fi
   # Because the monitor daemon outlives this process, redirect its standard streams to its run
   # directory so it does not hold open any file descriptors inherited from the caller.
   (PX_RUN_DIR=$dir px_with_private "$PX_HOME/bin/px-tool" monitor -e "PX_SCOPE_ID=$scope") \
     </dev/null >"$dir/monitor.out" 2>"$dir/monitor.log" &
-  px_wait_until 10 0.1 test -f "$record" ||
-    px_warn "the health monitor of scope $scope did not start, see $dir/monitor.log"
+  pid=$!
+  if ! px_wait_until 10 0.1 test -f "$record"; then
+    # Terminate a slow-starting monitor process so it cannot begin watching the scope after cluster
+    # bring-up has already aborted.
+    px_kill_tree "$pid" || true
+    px_error "the health monitor of scope $scope did not start, see $dir/monitor.log"
+    return "$PX_EXIT_FAIL"
+  fi
 }
 
-## @description  Stops the health monitor and releases the sleep inhibitor for a cluster (scope).
+## @description  Stops the health monitor for a cluster (scope), removes its heartbeat file, and
+##               releases the sleep inhibitor.
 ## @return       Exits with 0.
 pc_guards_stop() {
+  local record
   px_guard_release monitor "$1"
+  # Because the monitor may continue refreshing its heartbeat until it terminates, remove the
+  # heartbeat file only after stopping the monitor so a stale heartbeat without an active monitor
+  # cannot satisfy a subsequent probe.
+  record="$(px_guard_path monitor "$1" 2>/dev/null)" && rm -f "$record.heartbeat"
   px_guard_release inhibit "cluster-$1"
 }
 
@@ -846,10 +861,10 @@ pc_up_plan() {
 }
 
 ## @description  Provisions a cluster from a rendered deployment directory and waits for readiness.
-## @return       Exits 0, 1 if provisioning fails, 2 on usage or a missing deployment directory, 3
-##               if an instance terminates, or 4 on a timeout.
+## @return       Exits 0, 1 if the monitor or provisioning fails, 2 on usage or a recorded cluster,
+##               3 on a concurrent cluster, preflight refusal, or exit, 4 on timeout, 6 on no image.
 pc_up() {
-  local dir timeout ready scope rows file status=0
+  local dir timeout ready scope rows status=0
   dir=${1:-${PX_DEPLOYMENT_DIR:-}}
   if [ -z "$dir" ] && [ -z "${PX_RUN_CLASS:-}" ]; then
     px_die "$PX_EXIT_USAGE" "name a rendered deployment directory, set PX_DEPLOYMENT_DIR, or" \
@@ -904,7 +919,13 @@ pc_up() {
   pc_scope_save "$scope"
   pc_deployment_save "$dir"
   pc_record_save "$dir"
-  pc_guards_start "$scope"
+  # Because the setup bootstrap probe verifies the monitor heartbeat, it cannot pass without a
+  # running monitor; if the monitor fails to start, abort bring-up immediately before provisioning
+  # any instances.
+  if ! pc_guards_start "$scope"; then
+    pc_up_failed "$scope"
+    exit "$PX_EXIT_FAIL"
+  fi
   px_info "provisioning cluster $PX_CLUSTER_ID in scope $scope from $dir"
   rows="$(sb_call sb_provision "$scope" "$dir" "$timeout")" || status=$?
   pc_table instance <<EOF
@@ -1423,12 +1444,11 @@ pc_signal() {
   fi
 }
 
-# Drains hosted regions, restarts the instance, waits for readiness, and rebalances. Exits 0 when
-# every phase succeeds, 1 if a phase fails, 2 on usage or when the role has no drain semantics, 4 if
-# a phase times out, 5 if the backend has no drain-aware restart, or 6 if no such instance exists.
+# Drains hosted regions, restarts the instance, waits for readiness, and rebalances; exits 5 when
+# the backend has no drain-aware restart, or 6 when no such instance exists.
 ## @description  Drains, restarts, waits for readiness on, and rebalances a single instance.
-## @return       Exits 0 if all phases succeed, 1 on phase failure, 2 on usage or no drain
-##               semantics, 4 on timeout, 5 if drain-aware restart is unsupported, or 6 if missing.
+## @return       Exits 0 if no phase fails, 1 if a phase fails, 2 on usage or no drain semantics,
+##               4 if a phase times out, 5 if drain-aware restart is unsupported, or 6 if absent.
 pc_restart() {
   local drain="" ready="" role index scope rows detail status=0
   pc_opts restart "--drain-timeout=drain --ready-timeout=ready" "$@"

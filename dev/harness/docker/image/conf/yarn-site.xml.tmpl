@@ -57,6 +57,14 @@ limitations under the License.
     <value>${PX_BIND_HOST}</value>
   </property>
   <property>
+    <!-- The capacity scheduler stops the ResourceManager when its queue file,
+         capacity-scheduler.xml, is not there, and the render writes no such
+         file. The FIFO scheduler needs no queue file and is enough for one
+         queue. -->
+    <name>yarn.resourcemanager.scheduler.class</name>
+    <value>org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo.FifoScheduler</value>
+  </property>
+  <property>
     <!-- A NodeManager reports its own hostname and binds every interface. -->
     <name>yarn.nodemanager.hostname</name>
     <value>${PX_HOSTNAME}</value>

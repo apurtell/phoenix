@@ -38,7 +38,12 @@
 # that the project does not support. Instead, PX_BUILD_JAVA_HOME specifies an explicit JDK path, or
 # the platform JDK registry resolves an installation matching the requested major version.
 #
-# All Maven console output is captured in maven.log next to the generated build record.
+# Each build execution begins with the Maven clean phase. Without an initial clean, stale JARs left
+# in target/ directories from an earlier build are swept into the shaded artifacts and cause the
+# shading step to fail; cleaning also guarantees that building the same source tree always produces
+# identical JARs.
+#
+# All Maven console output is captured in maven.log alongside the generated build record.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
@@ -68,11 +73,12 @@ usage() {
   cat <<'EOF'
 Usage: build-phoenix.sh [option...]
 
-Builds phoenix-server, phoenix-client-embedded and phoenix-pherf with their
-dependencies from the local tree, with the HBase profile
+Cleans and builds phoenix-server, phoenix-client-embedded and phoenix-pherf
+with their dependencies from the local tree, with the HBase profile
 PX_PHOENIX_HBASE_PROFILE and no tests, and records the jars, the profile, its
 compatibility module and the HBase and Hadoop that Phoenix compiles against
-in $PX_OUT/build/phoenix/build.tsv.
+in $PX_OUT/build/phoenix/build.tsv. The clean empties target/ of every module
+that the build selects, the dependencies included.
 
 Options:
   --jdk N             the JDK major version of the build: 11, 17 or 21,
@@ -209,7 +215,7 @@ fi
 px_build_jdk || exit $?
 
 BP_ARGS=(-B -f "$BP_TREE/pom.xml" -pl "$BP_LIST" -am "-Dhbase.profile=$BP_PROFILE"
-  -DskipTests -Dskip.code-coverage package)
+  -DskipTests -Dskip.code-coverage clean package)
 
 px_info "profile $BP_PROFILE (compatibility module $BP_POM_MODULE) compiles against HBase" \
   "$BP_POM_HBASE and Hadoop $BP_POM_HADOOP"
@@ -232,12 +238,13 @@ px_info "building Phoenix $BP_POM_VERSION with JDK $PX_BUILD_JDK_SEL ($PX_BUILD_
   "$BP_LOG"
 px_maven_run "$BP_LOG" "${BP_ARGS[@]}"
 
-# Construct the expected artifact paths according to the naming conventions defined in each module
-# POM. The shaded server and client JARs embed the HBase profile identifier without a project
-# version, whereas the Pherf JAR embeds the project version.
-BP_SERVER_JAR="$BP_TREE/phoenix-server/target/phoenix-server-hbase-$BP_PROFILE.jar"
+# Construct the expected artifact paths from the naming rules defined in each module POM. Both the
+# server and client JARs embed the HBase profile identifier and the project version, while the
+# Pherf JAR embeds the project version; running the clean phase ensures no JAR from an earlier
+# build remains beside them.
+BP_SERVER_JAR="$BP_TREE/phoenix-server/target/phoenix-server-hbase-$BP_PROFILE-$BP_POM_VERSION.jar"
 BP_CLIENT_JAR="$BP_TREE/phoenix-client-parent/phoenix-client-embedded/target/"
-BP_CLIENT_JAR="${BP_CLIENT_JAR}phoenix-client-embedded-hbase-$BP_PROFILE.jar"
+BP_CLIENT_JAR="${BP_CLIENT_JAR}phoenix-client-embedded-hbase-$BP_PROFILE-$BP_POM_VERSION.jar"
 BP_PHERF_JAR="$BP_TREE/phoenix-pherf/target/phoenix-pherf-$BP_POM_VERSION.jar"
 BP_JARS=("$BP_SERVER_JAR" "$BP_CLIENT_JAR" "$BP_PHERF_JAR")
 BP_DIST_JAR=""

@@ -191,7 +191,8 @@ PX_JVM_DEBUG             # 1 adds the debug agent and publishes the debug port, 
 PX_JVM_OPTS_EXTRA        # JVM options that come last
 PX_BOOTSTRAP_SETUP_DIR   # the workload setup hooks of the bootstrap probe
 PX_MONITOR_HEARTBEATS    # the heartbeat files that the bootstrap probe checks
-PX_MONITOR_STALE_S       # the largest heartbeat age, default 90 seconds
+PX_MONITOR_STALE_S       # the largest heartbeat age; the render sets 3 x PX_MONITOR_INTERVAL_S,
+                         # else the probe takes 90
 PX_RENDER_*              # values the image derives before it renders a template
 
 # --- Versions and the image (docker/versions.env, scripts/) ------------------

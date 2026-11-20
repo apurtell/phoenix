@@ -2044,19 +2044,22 @@ px_compose_phase_fail() {
   done
 }
 
-## @description  Perform a graceful drain-aware restart for a role labeled with drain=regionmover.
+# Perform a drain-aware restart of a single regionmover instance; an already exited instance skips
+# the drain, stop, and rebalance phases, and a missing instance exits with status 6.
+## @description  Restart one regionmover instance, skipping drain, stop, and rebalance if exited.
 ## @param        scope_id: the scope ID returned by sb_scope_create
 ## @param        role: target role name carrying the drain=regionmover label
 ## @param        index: the zero-based instance index
-## @param        drain_timeout_s: whole seconds > 0 for drain, stop, and rebalance; empty uses
-##               PX_TIMEOUT_DRAIN (default 600)
-## @param        ready_timeout_s: whole seconds > 0 for start and readiness wait; empty uses
-##               PX_TIMEOUT_READY (default 600)
-## @return       Write one TSV row per phase and exit 0 when all pass, 1 on phase/runtime failure,
-##               2 on usage, no drain label, or no rpc port, 4 on phase timeout, or 6 if absent.
+## @param        drain_timeout_s: whole seconds above zero for the drain, stop, and rebalance
+##               phases; empty uses PX_TIMEOUT_DRAIN (default 600)
+## @param        ready_timeout_s: whole seconds above zero for the start and readiness wait; empty
+##               uses PX_TIMEOUT_READY (default 600)
+## @return       Emit phase TSV rows and exit 0 if no phase fails, 1 on phase failure or no runtime
+##               answer, 2 on usage, no drain label, or no rpc port, 4 on phase expiry, 6 if absent.
 sb_restart_drain() {
   local scope=${1:-} role=${2:-} index=${3:-} drain=${4:-} ready=${5:-}
-  local host port file cmd container grace start status=0 outcome=0
+  local host port file cmd container grace start status=0 outcome=0 exited=0
+  local deadline interval
   drain="$(px_compose_timeout_arg "$drain" PX_TIMEOUT_DRAIN 600)" || return $?
   ready="$(px_compose_timeout_arg "$ready" PX_TIMEOUT_READY 600)" || return $?
   px_compose_instance "$scope" "$role" "$index" || return $?
@@ -2084,30 +2087,39 @@ sb_restart_drain() {
   fi
   grace="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
 
-  # Redirect RegionMover's standard output to stderr so its progress messages do not corrupt the
-  # structured phase TSV rows emitted on this function's stdout.
+  # An exited instance has no running process, regardless of whether it terminated due to a kill,
+  # an OOM condition, or a crash. Because it cannot drain regions, has no running process to stop,
+  # and produces no region list during this restart to reload later, those three phases are marked
+  # as skip.
   start="$(px_epoch_ms)"
-  sb_exec "$scope" "$role" "$index" "$drain" -- sh -c "$cmd" >&2 || status=$?
-  if [ "$status" != 0 ]; then
-    px_compose_phase_fail drain "$start"
-    if [ "$status" = "$SB_EXEC_TIMEOUT" ]; then
-      px_error "the region drain of $role/$index expired after ${drain}s"
-      return "$SB_EXIT_TIMEOUT"
+  if [ "$PX_PS_STATE" = exited ]; then
+    exited=1
+    px_compose_phase drain skip "$start"
+    px_compose_phase stop skip "$start"
+  else
+    # Because the region mover writes its progress output to stdout while this function's stdout is
+    # reserved for the phase TSV rows, redirect the mover's stdout stream to stderr.
+    sb_exec "$scope" "$role" "$index" "$drain" -- sh -c "$cmd" >&2 || status=$?
+    if [ "$status" != 0 ]; then
+      px_compose_phase_fail drain "$start"
+      if [ "$status" = "$SB_EXEC_TIMEOUT" ]; then
+        px_error "the region drain of $role/$index expired after ${drain}s"
+        return "$SB_EXIT_TIMEOUT"
+      fi
+      px_error "the region drain of $role/$index failed with status $status"
+      return "$SB_EXIT_FAIL"
     fi
-    px_error "the region drain of $role/$index failed with status $status"
-    return "$SB_EXIT_FAIL"
-  fi
-  px_compose_phase drain ok "$start"
+    px_compose_phase drain ok "$start"
 
-  start="$(px_epoch_ms)"
-  status=0
-  px_compose_engine "$drain" stop --time "$grace" "$container" >/dev/null || status=$?
-  if [ "$status" != 0 ]; then
-    px_compose_phase_fail stop "$start"
-    px_error "the stop of $role/$index failed"
-    return "$SB_EXIT_FAIL"
+    start="$(px_epoch_ms)"
+    px_compose_engine "$drain" stop --time "$grace" "$container" >/dev/null || status=$?
+    if [ "$status" != 0 ]; then
+      px_compose_phase_fail stop "$start"
+      px_error "the stop of $role/$index failed"
+      return "$SB_EXIT_FAIL"
+    fi
+    px_compose_phase stop ok "$start"
   fi
-  px_compose_phase stop ok "$start"
 
   start="$(px_epoch_ms)"
   status=0
@@ -2119,20 +2131,38 @@ sb_restart_drain() {
   fi
   px_compose_phase start ok "$start"
 
+  # Scope the readiness wait strictly to the instance being restarted; another instance of the same
+  # role may be exited, which is not a failure of this restart operation.
   start="$(px_epoch_ms)"
-  status=0
-  sb_wait_ready "$scope" "$ready" "$role" >/dev/null || status=$?
-  if [ "$status" != 0 ]; then
-    px_compose_phase_fail ready "$start"
-    px_error "$role/$index did not become ready in ${ready}s"
-    if [ "$status" = "$SB_EXIT_TIMEOUT" ]; then
+  deadline=$(($(px_epoch_s) + ready))
+  interval=${PX_POLL_INTERVAL_S:-2}
+  [[ $interval =~ $PX_RE_SECONDS ]] || interval=2
+  while :; do
+    status=0
+    px_compose_instance "$scope" "$role" "$index" || status=$?
+    if [ "$status" != 0 ] || [ "$PX_PS_STATE" = exited ]; then
+      px_compose_phase_fail ready "$start"
+      px_error "$role/$index stopped while the restart waited for it to become ready"
+      return "$SB_EXIT_FAIL"
+    fi
+    [ "$PX_PS_READY" != ready ] || break
+    if [ "$(px_epoch_s)" -ge "$deadline" ]; then
+      px_compose_phase_fail ready "$start"
+      px_error "$role/$index did not become ready in ${ready}s"
       return "$SB_EXIT_TIMEOUT"
     fi
-    return "$SB_EXIT_FAIL"
-  fi
+    sleep "$interval"
+  done
   px_compose_phase ready ok "$start"
 
   start="$(px_epoch_ms)"
+  if [ "$exited" = 1 ]; then
+    # Because this restart wrote no region list, any list left behind by an earlier drain of the
+    # same instance must not be reloaded to move regions back, ensuring that the outcome of an
+    # instance rejoin never depends on previous restarts.
+    px_compose_phase rebalance skip "$start"
+    return 0
+  fi
   status=0
   cmd="$(px_compose_mover_cmd load "$host" "$port" "$drain" "$file")"
   sb_exec "$scope" "$role" "$index" "$drain" -- sh -c "$cmd" >&2 || status=$?

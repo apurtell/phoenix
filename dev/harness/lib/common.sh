@@ -2445,13 +2445,20 @@ px_unlock() {
   return 0
 }
 
-## @description  Computes the state-directory record file path for a host guard (KIND and KEY).
+## @description  Computes the sanitized record file name for a host guard given KIND and KEY.
+## @return       Writes the guard file name to stdout and exits 0.
+px_guard_name() {
+  local key=${2:-}
+  printf '%s-%s\n' "${1:-guard}" "${key//[!A-Za-z0-9._-]/_}"
+}
+
+## @description  Resolves the state-directory record file path for a host guard (KIND and KEY).
 ## @return       Writes the path to stdout and exits 0, or propagates exit code 2 or 1 from
 ##               px_state_dir.
 px_guard_path() {
-  local dir key=${2:-}
+  local dir
   dir="$(px_state_dir)" || return $?
-  printf '%s/%s-%s\n' "$dir" "${1:-guard}" "${key//[!A-Za-z0-9._-]/_}"
+  printf '%s/%s\n' "$dir" "$(px_guard_name "$@")"
 }
 
 ## @description  Lists all descendant process IDs beneath a root process ID in breadth-first
