@@ -97,6 +97,19 @@ PX_SUITE_TO              # the last step to run, the upper execution boundary
 PX_DRIVERS_DIR           # directory of the built-in drivers, default drivers
 PX_DISRUPT_SPEC          # the schedule of disruptions a run injects
 
+# --- Host safety ------------------------------------------------------------
+# docker/env/defaults.env holds the default of each name, and a run class
+# file holds the value of its class.
+PX_PREFLIGHT_MIN_DISK_MIB # the free disk under PX_OUT on the host that the preflight requires
+PX_PREFLIGHT_MIN_CPUS    # the processors the deployment requires, checked on the host and engine
+PX_MONITOR_INTERVAL_S    # the interval of the health monitor, default 30 seconds
+PX_MONITOR_HOST_FREE_MIB # the free host memory that the health monitor keeps
+PX_QUIET_HOST_WAIT_S     # the longest pause for a quiet host; 0 takes one sample, or none
+                         # when no quiet host is required
+PX_REQUIRE_QUIET_HOST    # 1 fails a run when the host is still busy after the wait
+PX_QUIET_HOST_LOAD_PCT   # the load, a percent of the processors, of a quiet host
+PX_CONTAMINATION         # the causes that make the time results of a run ADVISORY
+
 # --- Measurement toolkit ----------------------------------------------------
 PX_TOOLKIT_DIR           # staging directory of the profiling tools under PX_OUT
 PX_COLLECT_INTERVAL_S    # sampling interval of the resource collector

@@ -444,15 +444,20 @@ px_compose_selector() {
   printf '%s.cluster=%s\n' "$prefix" "$PX_COMPOSE_CLUSTER"
 }
 
-## @description  Report all distinct cluster IDs carrying a harness cluster label on this host.
-## @return       Write one cluster ID per line to stdout and exit 0, or exit 1 when the container
-##               runtime cannot be reached.
+## @description  Report every harness cluster on this host as "project PROJECT (cluster ID)".
+## @return       Write one cluster entry per line to stdout and exit 0, or exit 1 when the
+##               container runtime cannot be reached.
 px_compose_host_clusters() {
   local prefix out
   prefix="$(px_compose_label_prefix)"
   out="$(px_compose_engine 30 ps -a --filter "label=$prefix.cluster" \
-    --format "{{.Label \"$prefix.cluster\"}}")" || return "$SB_EXIT_FAIL"
-  printf '%s\n' "$out" | sed '/^$/d' | LC_ALL=C sort -u
+    --format "{{.Label \"$prefix.cluster\"}}|{{.Label \"com.docker.compose.project\"}}")" ||
+    return "$SB_EXIT_FAIL"
+  # Include the Compose project name in the refusal summary because operators reference the project
+  # name to tear down a leftover cluster; containers not created by Compose carry no project label.
+  printf '%s\n' "$out" | awk -F '|' '$1 != "" {
+    printf "project %s (cluster %s)\n", ($2 == "" ? "unknown" : $2), $1 }' |
+    LC_ALL=C sort -u
 }
 
 ## @description  List all scope IDs that currently have a state record in the backend directory.
@@ -468,46 +473,9 @@ px_compose_recorded_scopes() {
   done
 }
 
-# Acquire the host lock directory LOCK for the scope creation gate, automatically removing any stale
-# lock whose recorded owner process is no longer running.
-## @description  Acquire the host lock directory LOCK for the scope gate, removing any stale lock.
-## @return       Exit 0 when this process holds the lock, or exit 1 when another process holds it
-##               for 30 seconds.
-px_compose_lock() {
-  local lock=${1:-} owner waited=0
-  while ! mkdir "$lock" 2>/dev/null; do
-    owner="$(cat "$lock/pid" 2>/dev/null)" || owner=""
-    case "$owner" in
-    '' | *[!0-9]*) owner="" ;;
-    esac
-    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-      px_warn "removing the stale host lock of process $owner"
-      rm -f "$lock/pid"
-      rmdir "$lock" 2>/dev/null || true
-      continue
-    fi
-    if [ "$waited" -ge 30 ]; then
-      px_error "another process holds the host lock $lock"
-      return "$SB_EXIT_FAIL"
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  printf '%s\n' "$$" >"$lock/pid" || true
-  return 0
-}
-
-## @description  Release the host lock directory LOCK guarding the scope creation gate.
-## @return       Exit 0 always.
-px_compose_unlock() {
-  rm -f "${1:-}/pid"
-  rmdir "${1:-}" 2>/dev/null || true
-  return 0
-}
-
-## @description  Enforce the single-cluster host gate against existing containers or scope records,
-##               then initialize the persistent state record for SCOPE.
-## @return       Exit 0 when the record is written, or exit 1 when the gate refuses or a step fails.
+## @description  Enforce the host gate against any harness container or scope record, then record
+##               SCOPE.
+## @return       Exit 0 when the record is written, or 1 when the gate refuses or a step fails.
 px_compose_scope_gate() {
   local scope=${1:-} present others="" name path now status=0
   present="$(px_compose_host_clusters)" || status=$?
@@ -573,9 +541,9 @@ sb_scope_create() {
     return 0
   fi
   dir="$(px_compose_state_dir)" || return "$SB_EXIT_FAIL"
-  px_compose_lock "$dir/host.lock" || return "$SB_EXIT_FAIL"
+  px_lock "$dir/host.lock" 30 || return "$SB_EXIT_FAIL"
   px_compose_scope_gate "$scope" || status=$?
-  px_compose_unlock "$dir/host.lock"
+  px_unlock "$dir/host.lock"
   if [ "$status" != 0 ]; then
     return "$status"
   fi
@@ -1098,12 +1066,15 @@ px_compose_port_free() {
   return 0
 }
 
-## @description  Run the engine half of host preflight: runtime, versions, memory, and free ports.
-## @param        scope_id: the scope ID whose generated port map is inspected for port availability
+# Evaluates the container engine portion of host preflight validation, checking runtime presence,
+# daemon responsiveness, client authorization, engine and Compose version floors, total engine
+# memory, engine processor count, and loopback port availability.
+## @description  Run the engine preflight checks: engine, versions, memory, processors, and ports.
+## @param        scope_id: the scope ID whose generated port map is checked for port availability
 ## @return       Write check TSV rows to stdout and exit 0 when no check fails, exit 3 when any
 ##               check fails, or exit 2 on invalid usage or a port-map line rejected by the loader.
 sb_preflight() {
-  local scope=${1:-} failed=0 server compose memory busy="" names name port floor
+  local scope=${1:-} failed=0 server compose memory cpus busy="" names name port floor status=0
   px_compose_ports_load "$scope" || return $?
   if px_compose_resolve_engine; then
     px_tsv_row engine_binary ok "$_PXC_ENGINE"
@@ -1112,20 +1083,34 @@ sb_preflight() {
     px_tsv_row engine_responsive fail "no runtime to ask"
     return "$SB_EXIT_ANOMALY"
   fi
-  server="$(px_compose_engine 30 version --format '{{.Server.Version}}')" || server=""
+  # Terminate evaluation at the first engine fault because no subsequent check can pass without a
+  # working engine. Inspecting the error text from the version query distinguishes a refused client
+  # from an unresponsive daemon so that each fault condition emits its own dedicated check row.
+  server="$(px_compose_call merged 30 version --format '{{.Server.Version}}')" || status=$?
+  if [ "$status" != 0 ] || [ -z "$server" ]; then
+    server="$(printf '%s\n' "$server" | sed -n '/./{p;q;}')"
+    case "$server" in
+    *[Pp]ermission\ denied* | *[Uu]nauthori[sz]ed* | *[Aa]ccess\ denied*)
+      px_tsv_row engine_responsive warn "not judged, the engine refused the client"
+      px_tsv_row engine_credentials fail \
+        "the client is not authorised against the engine: $(px_tsv_clean "$server")"
+      ;;
+    *)
+      px_tsv_row engine_responsive fail \
+        "the engine did not answer a version request: $(px_tsv_clean "${server:-no text}")"
+      ;;
+    esac
+    return "$SB_EXIT_ANOMALY"
+  fi
+  server="$(printf '%s\n' "$server" | sed -n '$p')"
   floor="$PX_COMPOSE_ENGINE_FLOOR_MAJOR.$PX_COMPOSE_ENGINE_FLOOR_MINOR"
-  if [ -z "$server" ]; then
-    px_tsv_row engine_responsive fail "the engine did not answer a version request"
-    failed=1
+  px_tsv_row engine_responsive ok "server $server"
+  if px_compose_version_at_least "$server" \
+    "$PX_COMPOSE_ENGINE_FLOOR_MAJOR" "$PX_COMPOSE_ENGINE_FLOOR_MINOR"; then
+    px_tsv_row engine_version ok "$server"
   else
-    px_tsv_row engine_responsive ok "server $server"
-    if px_compose_version_at_least "$server" \
-      "$PX_COMPOSE_ENGINE_FLOOR_MAJOR" "$PX_COMPOSE_ENGINE_FLOOR_MINOR"; then
-      px_tsv_row engine_version ok "$server"
-    else
-      px_tsv_row engine_version fail "engine $server is below the floor $floor"
-      failed=1
-    fi
+    px_tsv_row engine_version fail "engine $server is below the floor $floor"
+    failed=1
   fi
   if px_compose_engine 30 info --format '{{.ID}}' >/dev/null 2>&1; then
     px_tsv_row engine_credentials ok "the client is authorised against the engine"
@@ -1149,6 +1134,15 @@ sb_preflight() {
     ;;
   *)
     px_tsv_row engine_memory ok "$memory bytes reported by the engine"
+    ;;
+  esac
+  cpus="$(px_compose_engine 30 info --format '{{.NCPU}}')" || cpus=""
+  case "$cpus" in
+  '' | *[!0-9]*)
+    px_tsv_row engine_cpus warn "the engine reported no processor count"
+    ;;
+  *)
+    px_tsv_row engine_cpus ok "$cpus processors reported by the engine"
     ;;
   esac
   names="$(px_compose_port_names)"
@@ -2177,20 +2171,40 @@ px_compose_inspect() {
   fi
 }
 
-## @description  Report the number of times the container runtime has restarted an instance.
+# Queries the cumulative container restart count for every instance in the scope by combining one
+# container inventory listing with one batch inspection across all containers in the scope.
+## @description  Report the runtime restart count for each instance of one scope in a single pass.
 ## @param        scope_id: the scope ID returned by sb_scope_create
-## @param        role: the target role name
-## @param        index: the zero-based instance index
-## @return       Write the restart count to stdout and exit 0, exit 1 when the runtime does not
-##               respond, exit 2 on invalid usage, or exit 6 if no such instance exists.
+## @return       Write one restart TSV row per instance to stdout and exit 0, exit 1 when the
+##               runtime does not respond, or exit 2 on invalid usage.
 sb_restart_count() {
-  local count
-  px_compose_instance "${1:-}" "${2:-}" "${3:-}" || return $?
-  count="$(px_compose_inspect "$PX_PS_ID" '{{.RestartCount}}')" || return $?
-  case "$count" in
-  '' | *[!0-9]*) count=0 ;;
-  esac
-  printf '%s\n' "$count"
+  local scope=${1:-} rows line names="" counts name count id
+  px_compose_scope_load "$scope" || return $?
+  rows="$(px_compose_ps "$scope")" || return "$SB_EXIT_FAIL"
+  set --
+  while IFS= read -r line; do
+    px_compose_ps_split "$line" || continue
+    names="$names$PX_PS_NAME$PX_TAB$PX_PS_ROLE/$PX_PS_INDEX$PX_NL"
+    set -- "$@" "$PX_PS_ID"
+  done <<EOF
+$rows
+EOF
+  [ $# -gt 0 ] || return 0
+  if ! counts="$(px_compose_engine 30 inspect --format '{{.Name}}|{{.RestartCount}}' "$@")"; then
+    px_error "the runtime did not answer an inspection of scope $scope"
+    return "$SB_EXIT_FAIL"
+  fi
+  # Container inspection prefixes each reported container name with a leading slash.
+  while IFS='|' read -r name count; do
+    [ -n "$name" ] || continue
+    id="$(sb_row_get "${name#/}" "$names")" || continue
+    case "$count" in
+    '' | *[!0-9]*) count=0 ;;
+    esac
+    px_tsv_row "${id%%/*}" "${id#*/}" "$count"
+  done <<EOF
+$counts
+EOF
 }
 
 ## @description  Report normalized termination evidence for an instance in the shared vocabulary.

@@ -129,13 +129,17 @@
 #
 # WHAT A DRIVER TEST BECOMES
 #   For a driver-backed test, px-suite delegates execution to px-run using the command form:
-#     px-run --driver <driver> --timeout <seconds> [--class <name>]
-#            -- [--overrides <path>] <declared arguments>
+#     px-run <driver> --timeout <seconds>
+#            [--class <name>] [--config <file>...] -- [--overrides <path>]
+#            <declared arguments>
+#   forwarding only the operator-supplied configuration so that px-run loads its own run class.
 #   px-run allocates its own run directory and writes that path to its data channel, which px-suite
-#   captures in the test's stdout.txt file. While px-run enforces the declared test timeout around
-#   the driver itself, px-suite wraps the outer px-run process in that timeout plus a fixed grace
-#   margin so px-run has time to capture pre- and post-run snapshots and record its result outside
-#   the driver's execution bound.
+#   captures in the test's stdout.txt file. While px-run enforces the test's declared time limit
+#   around the driver itself, px-suite bounds the outer px-run process using that time limit plus a
+#   fixed margin, the quiet-host wait duration, and one poll interval from the test's own run class,
+#   giving px-run time to wait for a quiet host, take pre- and post-run snapshots, and record its
+#   result outside the driver bound. Because the suite session owns the cluster lifecycle, each
+#   individual test leaves the cluster running and the session tears it down upon completion.
 #
 # ORDER, BOUNDARIES AND FILTERS
 #   1. The parser records tests in the exact order they appear in the suite file.
@@ -170,9 +174,10 @@ set -euo pipefail
 # this single list.
 SUITE_REQUIREMENTS="yarn"
 
-# Extra grace period, in seconds, granted to px-run beyond a test's own driver timeout. This
-# margin accommodates the pre-run and post-run diagnostic snapshots and result-row serialization
-# performed by px-run so that px-suite does not terminate px-run before it finishes reporting.
+# Base grace period, in seconds, granted to px-run beyond a test's own driver time limit to cover
+# the pre-run and post-run snapshots and result-row recording. Because the quiet-host wait duration
+# and one poll interval of the test's run class are added on top of this margin, px-suite's outer
+# timeout never terminates px-run before px-run finishes reporting its result.
 SUITE_RUN_MARGIN_S=300
 
 # Regular expression defining the valid syntax for a test identifier.
@@ -254,41 +259,35 @@ RUN_STATUS=0
 RUN_REASON=""
 RUN_ELAPSED=0
 
-## @description  Prints the command-line usage and option reference for px-suite.
-## @return       Writes the usage text to stdout and exits 0.
-usage() {
-  cat <<'EOF'
-Usage: px-suite [options] <suite>
-
-Runs a declarative suite file. <suite> is a path, or a name under PX_SUITE_DIR
-with or without the .suite extension.
-
-Options:
-  -n, --dry-run               print the execution plan and run nothing
-      --from ID               the first test of the ordered plan, inclusive
-      --to ID                 the last test of the ordered plan, inclusive
-      --only ID[,ID...]       run exactly these tests
-      --skip ID[,ID...]       do not run these tests
-      --continue-on-failure   record a failure and continue, then report the
-                              worst severity of the session
-  -c, --class NAME            the run class of every test, over the class that
-                              the suite declares
-  -f, --config FILE           one configuration file, repeatable, read before
-                              the defaults
-  -e, --set NAME=VALUE        one configuration value, repeatable
-  -v, --verbose               report detail
-  -k, --keep                  keep the temporary files of this session
-  -h, --help                  show this text
-
-Exit codes: 0 pass, skip or advisory, 1 a test failed or every test was
-skipped (inconclusive), 2 usage, 3 a harness or cluster fault, 6 no such suite
-or test.
-
-Output: stdout carries TSV rows. A dry run writes the plan, a run writes one
-result row per test. The session directory holds the same rows with the output
-of every test.
+px_cli_spec <<'EOF'
+about Runs a declarative suite file as one session.
+about SUITE is a path, or a name under PX_SUITE_DIR with or without the .suite
++ extension.
+about When the session ends, by a pass, a failure or an interrupt, it stops the role
++ groups it started, unless --keep or PX_KEEP=1 keeps them. The cluster stays up;
++ px-cluster down removes it.
+shared --cluster --class --backend
+operands SUITE
+opt --from ID PX_SUITE_FROM | the first test of the ordered plan, inclusive
+opt --to ID PX_SUITE_TO | the last test of the ordered plan, inclusive
+opt --only IDS PX_SUITE_FILTER | run exactly these tests, comma separated
+opt --skip IDS OPT_SKIP | do not run these tests, comma separated
+opt --continue-on-failure - PX_SUITE_CONTINUE=1 | record a failure and continue, then report the
++ worst severity of the session
+opt --keep - PX_KEEP=1 | keep the role groups that the session started and
++ the temporary files
+output TSV rows on stdout: a dry run writes the plan, a run writes one result
++ row per test (position, id, severity, code, elapsed ms, reason, bundle), then
++ result, the session result, the code and the session directory. The session
++ directory holds the test rows with the output of every test. --class, else the
++ class of the cluster record, sets the run class of every test, over the class
++ that the suite declares.
+verdicts The worst severity of the session decides the code, and a session in which
++ every test was skipped is INCONCLUSIVE:
+exits 6 also means no such suite or test.
+example px-suite smoke --class validation
+example px-suite functional --class validation --from second --continue-on-failure
 EOF
-}
 
 # When no candidate path is readable, the function writes nothing and still exits 0 so that callers
 # invoking it inside a command substitution do not trigger the failure trap.
@@ -932,6 +931,61 @@ px_suite_untrapped() {
   return "$status"
 }
 
+# Launches a test command in the background with standard input detached and waits for completion so
+# that a trapped INT or TERM signal interrupts the wait immediately and lets the exit hook stop the
+# child process.
+## @description  Executes a test child process (out, log, command...) in the background and waits.
+## @return       Returns the exit status of the child process.
+px_suite_child() {
+  local out=$1 log=$2 status=0
+  shift 2
+  px_suite_untrapped "$@" </dev/null >"$out" 2>"$log" &
+  SUITE_CHILD=$!
+  wait "$SUITE_CHILD" || status=$?
+  SUITE_CHILD=""
+  return "$status"
+}
+
+# Terminates the active test child and its entire descendant process tree using the same escalation
+# sequence as an expired time limit: SIGTERM, a two-second grace period, and then SIGKILL.
+## @description  Stops the active test child process and all of its descendants.
+## @return       Exits 0.
+px_suite_child_stop() {
+  [ -z "$SUITE_CHILD" ] || px_kill_tree "$SUITE_CHILD" || true
+}
+
+# Computes the outer execution time limit for px-run on a driver test (index) by summing the test's
+# declared timeout, the fixed suite margin, and the quiet-host wait and single poll interval of the
+# test's own run class.
+## @description  Calculates the outer px-run timeout bound in whole seconds for a driver test
+##               (index).
+## @return       Writes the computed timeout in whole seconds to stdout and exits 0.
+px_suite_run_limit() {
+  local index=$1 dump wait poll whole file
+  local -a args=()
+  if [ -n "${TEST_CLASS[$index]}" ]; then
+    args=(--class "${TEST_CLASS[$index]}")
+  fi
+  for file in ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; do
+    args=(${args[@]+"${args[@]}"} --config "$file")
+  done
+  # Query the configuration that px-run itself will load so that the timing parameters reflect the
+  # individual test's run class rather than the outer session's run class.
+  dump="$(px_config_child "$PX_HOME/bin/px-cluster" ${args[@]+"${args[@]}"} config \
+    2>/dev/null || exit "$?")" || dump=""
+  wait="$(px_tsv_get PX_QUIET_HOST_WAIT_S "$dump" || exit "$?")" || wait=""
+  wait=${wait%%"$PX_TAB"*}
+  [[ $wait =~ $PX_RE_INT ]] || wait=0
+  poll="$(px_tsv_get PX_POLL_INTERVAL_S "$dump" || exit "$?")" || poll=""
+  poll=${poll%%"$PX_TAB"*}
+  whole=${poll%%.*}
+  [[ $whole =~ $PX_RE_INT ]] || whole=0
+  case "$poll" in
+  *.*[1-9]*) whole=$((10#$whole + 1)) ;;
+  esac
+  printf '%s\n' "$((TEST_TIMEOUT[index] + SUITE_RUN_MARGIN_S + 10#$wait + 10#$whole))"
+}
+
 ## @description  Maps a test process exit code onto the harness severity lattice.
 ## @return       Writes the corresponding severity label to stdout and exits 0.
 px_suite_severity_of_code() {
@@ -947,7 +1001,7 @@ px_suite_severity_of_code() {
 ## @description  Executes a single test within its configured execution time limit.
 ## @return       Sets RUN_SEVERITY, RUN_STATUS, RUN_REASON, and RUN_ELAPSED, then exits 0.
 px_suite_run_one() {
-  local index=$1 id dir out log timeout limit status=0 started finished worst
+  local index=$1 id dir out log timeout limit status=0 started finished worst file
   local verdicts reported
   local -a argv
   id=${TEST_ID[$index]}
@@ -981,17 +1035,22 @@ px_suite_run_one() {
   BASH_ENV="$PX_HOME/lib/common.sh"
   export BASH_ENV
   limit=$timeout
-  # Detach standard input by redirecting from /dev/null so tests never block on terminal input,
-  # while px_timeout bounds the entire process tree spawned by the test rather than only the parent.
+  # Run the test as a background child with standard input redirected from /dev/null so it never
+  # blocks on terminal input. Waiting on the background child allows a session INT or TERM signal
+  # to interrupt the wait immediately so the exit hook can terminate the child, while the time
+  # limit terminates the entire process tree spawned by the test rather than only the test process.
   if [ -n "${TEST_DRIVER[$index]}" ]; then
-    # Delegate driver lifecycle and run-directory management to px-run, passing the driver name,
-    # run class, and timeout as px-run options and forwarding all arguments after "--" to the
-    # driver.
+    # Delegate driver lifecycle and run-directory management to px-run, passing the driver, run
+    # class, configuration files, and time limit as px-run options and forwarding all arguments
+    # after the "--" separator directly to the driver.
     argv=("$PX_HOME/bin/px-run" --driver "${TEST_DRIVER[$index]}"
-      --timeout "$timeout")
+      --timeout "$timeout" --set PX_TEARDOWN=0)
     if [ -n "${TEST_CLASS[$index]}" ]; then
       argv=("${argv[@]}" --class "${TEST_CLASS[$index]}")
     fi
+    for file in ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}; do
+      argv=("${argv[@]}" --config "$file")
+    done
     argv=("${argv[@]}" --)
     if [ -n "${TEST_OVERRIDES[$index]}" ]; then
       argv=("${argv[@]}" --overrides "${TEST_OVERRIDES[$index]}")
@@ -1002,14 +1061,16 @@ px_suite_run_one() {
       argv=("${argv[@]}"
         "${SUITE_ARGV[@]:TEST_ARG_FIRST[index]:TEST_ARG_COUNT[index]}")
     fi
-    limit=$((timeout + SUITE_RUN_MARGIN_S))
-    px_suite_untrapped px_timeout "$limit" "${argv[@]}" \
-      </dev/null >"$out" 2>"$log" || status=$?
+    limit="$(px_suite_run_limit "$index")"
+    px_debug "test $id: px-run gets a bound of ${limit}s"
+    # Invoke px-run with only the operator's initial configuration environment so that px-run loads
+    # its own run class without having those settings masked by values loaded in this process.
+    px_suite_child "$out" "$log" px_config_child px_timeout "$limit" "${argv[@]}" ||
+      status=$?
   else
     # shellcheck disable=SC2016  # the child shell expands this text, not this one
-    px_suite_untrapped px_timeout "$limit" "${BASH:-bash}" \
-      -c 'cd "$1" || exit 2; eval "$2"' \
-      px-suite-action "$dir" "${TEST_ACTION[$index]}" </dev/null >"$out" 2>"$log" ||
+    px_suite_child "$out" "$log" px_timeout "$limit" "${BASH:-bash}" \
+      -c 'cd "$1" || exit 2; eval "$2"' px-suite-action "$dir" "${TEST_ACTION[$index]}" ||
       status=$?
   fi
   px_suite_group_release
@@ -1204,11 +1265,16 @@ fi
 # PX_OUT is inherited by all child processes.
 px_out_root >/dev/null
 px_suite_session_create
-# Register role-group release on the EXIT trap in addition to the per-test loop so an interrupted
-# session still tears down active role groups. Because an untrapped signal terminates the shell
-# without running the EXIT trap, convert INT and TERM into explicit exit calls that trigger
-# cleanup.
+# Exit hooks run in reverse registration order on every exit: the active test child stops first
+# (via SIGTERM, a two-second wait, and SIGKILL, since background jobs ignore SIGINT), followed by
+# any role groups started by the session, ensuring that an interruption never leaves behind a
+# running test or active role group while leaving the cluster itself running. Because an untrapped
+# signal would terminate the shell without firing the EXIT trap, trapping INT and TERM converts
+# both operator signals into normal exits while immediately interrupting any active wait on a test
+# child process.
+SUITE_CHILD=""
 px_on_exit px_suite_group_release end
+px_on_exit px_suite_child_stop
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -1233,4 +1299,6 @@ px_result_row "$SESSION_RESULT" "$EXIT_CODE" "$SESSION_DIR"
 px_exit_noted "$EXIT_CODE" "session $SESSION_ID ends at $SESSION_RESULT:" \
   "$COUNT_PASS pass, $COUNT_SKIP skip, $COUNT_ADVISORY advisory," \
   "$COUNT_FAIL fail, $COUNT_ERROR error (exit $EXIT_CODE, $(px_exit_name "$EXIT_CODE"))"
-exit "$EXIT_CODE"
+# A failing session exits explicitly with its non-zero status code, whereas a passing session falls
+# through to the end of the script with status 0; the registered exit hooks execute on both paths.
+[ "$EXIT_CODE" = 0 ] || exit "$EXIT_CODE"

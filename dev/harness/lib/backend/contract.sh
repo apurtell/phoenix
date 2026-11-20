@@ -145,7 +145,8 @@ sb_valid_value() {
 }
 
 # Reports the ordered field names for a contract schema. The supported schemas are instance, ready,
-# stopped, group, phase, term, oom, event, sample, capability, check, kv, endpoint, and image.
+# stopped, group, phase, term, oom, event, sample, capability, check, kv, endpoint, image, and
+# restart.
 ## @description  Outputs the ordered field names for a contract schema.
 ## @param        schema: The schema name to inspect.
 ## @return       Writes the space-separated names to stdout; exits 0, or 6 for an unknown schema.
@@ -168,6 +169,7 @@ sb_schema_fields() {
   kv) printf '%s\n' 'key value' ;;
   endpoint) printf '%s\n' 'host port' ;;
   image) printf '%s\n' 'image_ref image_id' ;;
+  restart) printf '%s\n' 'role index count' ;;
   *) return "$SB_EXIT_NO_OBJECT" ;;
   esac
 }

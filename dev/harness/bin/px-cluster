@@ -48,6 +48,11 @@
 # subsequent command targeting that cluster loads the record as a configuration stage. The scale
 # subcommand updates the recorded instance count in place, and down removes the record.
 #
+# While a cluster is running, two host-level safeguards execute alongside it: a sleep inhibitor
+# keeps the host awake for the lifetime of the cluster, and the health monitor (px-tool monitor)
+# tears the cluster down if available host memory becomes critically low. The up subcommand starts
+# both safeguards, and every teardown path stops them.
+#
 # The matrix subcommand executes a single test suite across multiple version sets. Each version set
 # is defined by a configuration file, and every lifecycle phase for that set (build, bring-up,
 # suite execution, and teardown) executes as a child command that loads that file. Because each
@@ -97,6 +102,8 @@ PX_TIMEOUT_EXEC PX_TIMEOUT_TEARDOWN PX_TIMEOUT_DRAIN PX_TIMEOUT_SCALE
 PX_TIMEOUT_GROUP PX_TIMEOUT_STOP"
 PC_SECONDS_NAMES="PX_POLL_INTERVAL_S"
 
+# Holds the scope identifier of an in-progress cluster bring-up so the exit hook can tear it down.
+PC_UP_SCOPE=""
 PC_CHECKS=""
 PC_FAILS=0
 PC_ARGS=()
@@ -188,8 +195,11 @@ Usage: px-cluster up [--timeout S] [--ready-timeout S] [--no-wait] [DIR]
   --timeout S        provision timeout, default PX_TIMEOUT_PROVISION
   --ready-timeout S  readiness timeout, default PX_TIMEOUT_READY
   --no-wait          create the instances and do not wait for readiness
-  A start that fails tears the cluster down, unless PX_TEARDOWN is 0 or
-  --keep is given.
+  While the cluster is up, a sleep inhibitor holds the host awake and the
+  health monitor (px-tool monitor) samples its memory; px-cluster down
+  stops both. A start that fails or is interrupted tears the cluster down,
+  unless PX_TEARDOWN is 0 or --keep is given. A preflight exits 1 when the
+  engine does not answer and 5 when it refuses the client.
 EOF
     ;;
   down) cat <<'EOF'
@@ -471,16 +481,19 @@ pc_scope_save() {
   px_debug "recorded scope $1 in $file"
 }
 
-# Deletes the persisted scope record once the underlying scope has been removed so subsequent
-# subcommands report no such object rather than acting on an identifier that no longer exists.
-## @description  Removes the persisted scope record after the cluster scope has been destroyed.
+# Preserves any record belonging to a different scope because a caller can target an explicit scope
+# via PX_SCOPE_ID.
+## @description  Removes the scope record, cluster record, and deployment record for the cluster
+##               once its scope (id) has been removed.
 ## @return       Exits with 0.
 pc_scope_forget() {
-  local file status=0
+  local file status=0 recorded=""
   file="$(sb_scope_record)" || status=$?
-  if [ "$status" != 0 ]; then
+  if [ "$status" != 0 ] || [ ! -f "$file" ]; then
     return 0
   fi
+  IFS= read -r recorded <"$file" || true
+  [ "$recorded" = "${1:-}" ] || return 0
   rm -f "$file" || px_debug "cannot remove $file"
   pc_record_forget
   file="$(sb_deployment_record)" || return 0
@@ -647,9 +660,9 @@ pc_render_guard() {
 
 # Executes the host preflight check (verifying container engine health, port availability, and total
 # memory capacity) against a rendered deployment directory.
-## @description  Runs the host preflight checks (engine, ports, memory sum) against a deployment.
-## @return       Exits 0 when the host can hold the deployment, or exits with the preflight status:
-##               1 when a figure cannot be measured, 2 on usage, 3 when refused, or 4 on expiration.
+## @description  Runs the host preflight (engine, ports, memory sum) against a deployment directory.
+## @return       Exits 0 if the host can hold it, or with the preflight status: 1 on no engine reply
+##               or measurement, 2 on usage, 3 if refused, 4 on expiration, or 5 on client refusal.
 pc_preflight() {
   local status=0
   # Export private configuration variables so the child process sees the container engine bound by
@@ -702,11 +715,42 @@ pc_check() {
   fi
 }
 
-## @description  Tears down and removes every instance belonging to a single cluster scope.
-## @return       Exits with 0, or returns the backend status when instance teardown or scope removal
-##               fails.
+# Serializes teardown of a scope (scope, keep) under its down lock so that a concurrent second
+# removal waits for the first to finish and then succeeds as already complete.
+## @description  Tears down and removes every instance of a single scope under its teardown lock.
+## @return       Exits 0, 1 if the lock wait expired, or the status of the failed backend step.
 pc_teardown() {
+  local scope=$1 lock bound=${PX_TIMEOUT_TEARDOWN:-} status=0
+  lock="$(px_guard_path down "$scope")" || return $?
+  # A single removal executes both sb_teardown and sb_scope_delete, each bounded by
+  # PX_TIMEOUT_TEARDOWN, so the lock wait allows twice that duration. The backend falls back to 300
+  # seconds whenever the configured value is not a positive integer number of seconds, and the lock
+  # applies the same fallback so a malformed setting cannot block teardown.
+  case "$bound" in
+  '' | *[!0-9]*) bound=300 ;;
+  esac
+  [ "$((10#$bound))" -gt 0 ] || bound=300
+  px_lock "$lock" $((2 * 10#$bound)) || return "$PX_EXIT_FAIL"
+  pc_teardown_locked "$@" || status=$?
+  px_unlock "$lock"
+  return "$status"
+}
+
+## @description  Removes every instance of a scope (scope, keep) while pc_teardown holds the lock.
+## @return       Exits 0 (including when another removal already deleted the scope), or returns the
+##               backend status when instance teardown or scope removal fails.
+pc_teardown_locked() {
   local scope=$1 keep=$2 status=0
+  sb_call sb_scope_exists "$scope" || status=$?
+  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
+    px_info "scope $scope already came down"
+    # When a scope has already disappeared, such as after a crash, its host guards and persisted
+    # state records are stale and should be cleaned up.
+    pc_guards_stop "$scope"
+    [ "$keep" = 1 ] || pc_scope_forget "$scope"
+    return 0
+  fi
+  status=0
   # Discovered endpoints may hold background port-forwarding processes; release them before
   # tearing down instances when the backend implements this optional contract function so that
   # teardown leaves no orphaned processes behind.
@@ -719,16 +763,56 @@ pc_teardown() {
     px_error "teardown of scope $scope did not complete"
     return "$status"
   fi
+  # Because no instances remain running, stop the sleep inhibitor and the health monitor even when
+  # the scope data is retained for diagnostic inspection.
+  pc_guards_stop "$scope"
   if [ "$keep" = 1 ]; then
     px_info "scope $scope and its data stay for a diagnosis"
     return 0
   fi
   sb_call sb_scope_delete "$scope" || status=$?
-  pc_scope_forget
+  pc_scope_forget "$scope"
   if [ "$status" != 0 ]; then
     px_error "scope $scope could not be removed"
     return "$status"
   fi
+}
+
+## @description  Starts the sleep inhibitor and the health monitor for a newly provisioned cluster
+##               (scope); both remain active until stopped by pc_guards_stop.
+## @return       Exits with 0, emitting a warning if the health monitor fails to start.
+pc_guards_start() {
+  local scope=$1 dir record status=0
+  px_inhibit_start "cluster-$scope"
+  record="$(px_guard_path monitor "$scope")" || return 0
+  px_guard_stop "$record"
+  dir="$(px_run_dir monitor)" || status=$?
+  if [ "$status" != 0 ]; then
+    px_warn "no run directory for the health monitor of scope $scope"
+    return 0
+  fi
+  # Because the monitor daemon outlives this process, redirect its standard streams to its run
+  # directory so it does not hold open any file descriptors inherited from the caller.
+  (PX_RUN_DIR=$dir px_with_private "$PX_HOME/bin/px-tool" monitor -e "PX_SCOPE_ID=$scope") \
+    </dev/null >"$dir/monitor.out" 2>"$dir/monitor.log" &
+  px_wait_until 10 0.1 test -f "$record" ||
+    px_warn "the health monitor of scope $scope did not start, see $dir/monitor.log"
+}
+
+## @description  Stops the health monitor and releases the sleep inhibitor for a cluster (scope).
+## @return       Exits with 0.
+pc_guards_stop() {
+  px_guard_release monitor "$1"
+  px_guard_release inhibit "cluster-$1"
+}
+
+## @description  Applies the failure teardown policy when the exit hook detects an unfinished
+##               cluster bring-up caused by an abort, an interrupt, or a termination signal.
+## @return       Exits with 0.
+pc_up_abandon() {
+  [ -n "$PC_UP_SCOPE" ] || return 0
+  px_warn "the bring-up of scope $PC_UP_SCOPE did not finish"
+  pc_up_failed "$PC_UP_SCOPE"
 }
 
 ## @description  Applies the failure teardown policy when cluster bring-up does not succeed.
@@ -736,7 +820,8 @@ pc_teardown() {
 ##               status of the failed start.
 pc_up_failed() {
   local scope=$1 status=0
-  if px_is_keep || ! px_is_true "${PX_TEARDOWN:-1}"; then
+  PC_UP_SCOPE=""
+  if px_is_keep; then
     px_info "scope $scope stays for a diagnosis: run px-cluster down to remove it"
     return 0
   fi
@@ -813,9 +898,13 @@ pc_up() {
     px_die "$status" "cannot create a scope for cluster $PX_CLUSTER_ID." \
       "A cluster of that name may be up already: run px-cluster down."
   fi
+  # Once the scope exists, any unfinished bring-up (including one interrupted by a signal) is torn
+  # down according to the teardown policy via pc_up_abandon in the exit hook.
+  PC_UP_SCOPE=$scope
   pc_scope_save "$scope"
   pc_deployment_save "$dir"
   pc_record_save "$dir"
+  pc_guards_start "$scope"
   px_info "provisioning cluster $PX_CLUSTER_ID in scope $scope from $dir"
   rows="$(sb_call sb_provision "$scope" "$dir" "$timeout")" || status=$?
   pc_table instance <<EOF
@@ -827,6 +916,7 @@ EOF
     exit "$status"
   fi
   if [ "$PC_WAIT" = 0 ]; then
+    PC_UP_SCOPE=""
     px_info "readiness not waited for: run px-cluster ready when you need it"
     return 0
   fi
@@ -838,6 +928,7 @@ EOF
     px_error "readiness: $(sb_exit_name "$status")"
     pc_up_failed "$scope"
   fi
+  PC_UP_SCOPE=""
   exit "$status"
 }
 
@@ -1431,30 +1522,6 @@ pc_config_init() {
   fi
 }
 
-## @description  Executes a harness command (command...) with only the operator's environment and
-##               command-line configuration, stripping any values loaded from files by this process.
-## @return       Exits with the status of the executed command.
-pc_matrix_child() {
-  local line names=""
-  while IFS= read -r line; do
-    case "${line#*"$PX_TAB"}" in
-    '' | environment | cli) ;;
-    *) names="$names ${line%%"$PX_TAB"*}" ;;
-    esac
-  done <<EOF
-$PX_CONFIG_ORIGINS
-EOF
-  # Because configuration values loaded from files are exported into the environment, they would
-  # otherwise reach the child process at the highest file-precedence stage and mask the child's own
-  # version set configuration.
-  (
-    for line in $names; do
-      unset "$line"
-    done
-    px_with_private "$@"
-  )
-}
-
 # Keeps the current matrix version set flagged as active until its teardown completes so that the
 # exit hook retries any teardown interrupted by a signal or an earlier failure.
 ## @description  Tears down the cluster belonging to the currently active matrix version set.
@@ -1517,34 +1584,42 @@ pc_matrix() {
     session="${dir##*/}-$n"
     status=0
     px_info "version set $n: $file"
+    severity=ERROR
     step=build
-    pc_matrix_child "$PX_HOME/scripts/build-phoenix.sh" "${files[@]}" >&2 || status=$?
-    if [ "$status" = 0 ]; then
-      step=stage
-      pc_matrix_child "$PX_HOME/scripts/stage-artifacts.sh" "${files[@]}" >&2 || status=$?
-    fi
+    px_config_child "$SELF/px-cluster" "${files[@]}" build >&2 || status=$?
     if [ "$status" = 0 ]; then
       step=up
-      pc_matrix_child "$SELF/px-cluster" "${files[@]}" up >&2 || status=$?
+      # Because this parent shell processes a signal only after the child up command exits, mark the
+      # version set as active before launching bring-up; if bring-up never recorded a scope, down
+      # exits cleanly with 0.
+      PC_MATRIX_FILES=("${files[@]}")
+      PC_MATRIX_UP=1
+      px_config_child "$SELF/px-cluster" "${files[@]}" up >&2 || status=$?
+      [ "$status" = 0 ] || PC_MATRIX_UP=0
     fi
     if [ "$status" = 0 ]; then
       step=run
-      PX_SESSION_ID=$session pc_matrix_child "$SELF/px-suite" "${files[@]}" \
+      PX_SESSION_ID=$session px_config_child "$SELF/px-suite" "${files[@]}" \
         ${class[@]+"${class[@]}"} "$suite" >&2 || status=$?
+      severity="$(px_tsv_get severity "$(cat "$(px_out_root)/sessions/$session/summary.tsv" \
+        2>/dev/null)" || true)"
+      severity=${severity:-ERROR}
       # Always tear the cluster down after its version set completes, even when the test suite
       # fails.
       down=0
-      pc_matrix_child "$SELF/px-cluster" "${files[@]}" down >&2 || down=$?
+      pc_matrix_down || down=$?
+      [ "$down" = 0 ] || severity="$(sx_severity_worse "$severity" FAIL)"
       if [ "$status" = 0 ]; then
         step=down
         status=$down
       fi
     fi
+    worst="$(sx_severity_worse "$worst" "$severity")"
     case "$step" in
     run | down) ;;
     *) session="" ;;
     esac
-    dump="$(pc_matrix_child "$SELF/px-cluster" "${files[@]}" config)" || dump=""
+    dump="$(px_config_child "$SELF/px-cluster" "${files[@]}" config)" || dump=""
     rows="$(px_versions_rows "$dump")"
     px_tsv_row "$n" "$file" "$(px_tsv_get hbase_profile "$rows")" \
       "$(px_tsv_get hbase_version "$rows")" "$(px_tsv_get hadoop_version "$rows")" \
@@ -1666,5 +1741,13 @@ pc_main() {
 # Subcommands terminate the process directly whenever they report an expected domain exit status,
 # such as exit code 4 on an expired readiness wait. Keeping set -e and failure handling active
 # across the entire execution ensures that any non-zero status reaching this top-level call
-# represents an unhandled fault whose origin will be reported by the failure trap.
+# represents an unhandled fault whose origin will be reported by the failure trap. Interrupt and
+# termination signals are converted into normal process exits so that the registered exit hooks
+# can tear down an in-progress cluster bring-up or the cluster of an active matrix version set and
+# remove the temporary scratch render produced by a dry run.
+px_on_exit pc_up_abandon
+px_on_exit pc_matrix_abandon
+px_on_exit pc_plan_clean
+trap 'exit 130' INT
+trap 'exit 143' TERM
 pc_main "$@"

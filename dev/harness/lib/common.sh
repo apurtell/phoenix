@@ -387,8 +387,22 @@ px_run_class_require() {
   esac
 }
 
-# Installed as the ERR handler by px_trap_enable; logs diagnostic details without terminating the
-# shell so the caller retains control of its exit path.
+# Invoke this helper as x="$(px_int_setting ...)" || exit $? so that a validation refusal inside the
+# command substitution terminates the calling shell as well.
+## @description  Reads and validates a whole-number setting from a variable name, a fallback
+##               default, and a smallest allowed value.
+## @return       Writes the number to stdout and exits 0, or exits 2 if non-numeric or too small.
+px_int_setting() {
+  local value=${!1:-$2}
+  if ! [[ $value =~ $PX_RE_INT ]] || [ "$((10#$value))" -lt "$3" ]; then
+    px_die "$PX_EXIT_USAGE" "$(px_setting_label "$1") needs a whole number of at least $3, got" \
+      "'$value'"
+  fi
+  printf '%s\n' "$((10#$value))"
+}
+
+# Installed as the ERR trap handler by px_trap_enable; this callback only reports the failure
+# without terminating the shell.
 ## @description  Reports the exit status, source line number, and command string of a failed
 ##               command.
 ## @return       Writes the failure diagnostic to stderr and exits 0.
@@ -2268,29 +2282,31 @@ px_nproc() {
   printf '%s\n' "$count"
 }
 
-# Reads physical host memory from /proc/meminfo or sysctl; preflight capacity checks instead use
-# the container engine's memory pool reported by the active backend.
+# Parses a "KEY: N kB" entry from /proc/meminfo and converts the kilobyte value N into bytes by
+# multiplying by 1024.
+## @description  Reads a named memory field (key) from /proc/meminfo and converts it to bytes.
+## @return       Writes N times 1024 to stdout and exits 0, or returns 5 when /proc/meminfo is
+##               unreadable or the field is absent or not a number.
+px_meminfo_bytes() {
+  local key value
+  [ -r /proc/meminfo ] || return "$PX_EXIT_UNSUPPORTED"
+  while IFS=': ' read -r key value _; do
+    [ "$key" = "${1:-}" ] || continue
+    case "$value" in '' | *[!0-9]*) break ;; esac
+    printf '%s\n' "$((value * 1024))"
+    return 0
+  done </proc/meminfo
+  return "$PX_EXIT_UNSUPPORTED"
+}
+
+# Preflight capacity checks do not use this host figure; they instead query the container engine's
+# memory pool reported by the active backend.
 ## @description  Reports the total physical memory of the host machine in bytes.
 ## @return       Writes the byte count to stdout and exits 0, or returns 5 when no host memory
 ##               source is available.
 px_mem_total_bytes() {
-  local value="" line field
-  if [ -r /proc/meminfo ]; then
-    while IFS= read -r line; do
-      case "$line" in
-      MemTotal:*)
-        field=${line#MemTotal:}
-        px_trim_var field
-        value=${field%% *}
-        break
-        ;;
-      esac
-    done </proc/meminfo
-    case "$value" in
-    '' | *[!0-9]*) value="" ;;
-    *) value=$((value * 1024)) ;;
-    esac
-  fi
+  local value
+  value="$(px_meminfo_bytes MemTotal)" || value=""
   if [ -z "$value" ] && command -v sysctl >/dev/null 2>&1; then
     value="$(sysctl -n hw.memsize 2>/dev/null)" || value=""
     case "$value" in
@@ -2319,6 +2335,40 @@ px_with_private() {
   )
 }
 
+# Unsets every configuration value this process loaded or derived (any origin other than the
+# process environment or the command line, such as files, plug-ins, the target file, and derived
+# version tags) so the child inherits only the operator's environment and command-line values.
+# PX_OUT and PX_STATE_DIR are preserved across this boundary because every child process shares the
+# output root of its parent.
+## @description  Executes a harness command (command...) retaining only operator-supplied
+##               configuration from the process environment and command-line flags.
+## @return       Returns the exit status of the executed command.
+px_config_child() {
+  local line names=""
+  while IFS= read -r line; do
+    case "${line#*"$PX_TAB"}" in
+    '' | environment | cli) ;;
+    *)
+      case "${line%%"$PX_TAB"*}" in
+      PX_OUT | PX_STATE_DIR) ;;
+      *) names="$names ${line%%"$PX_TAB"*}" ;;
+      esac
+      ;;
+    esac
+  done <<EOF
+$PX_CONFIG_ORIGINS
+EOF
+  # Because loaded configuration variables are exported, they would otherwise enter the child
+  # process at the highest-precedence environment stage and mask the child's own run class or
+  # component version set.
+  (
+    for line in $names; do
+      unset "$line"
+    done
+    px_with_private "$@"
+  )
+}
+
 # Invokes scripts/preflight.sh --phase memory under PX_TIMEOUT_DEFAULT before starting an on-demand
 # role group and redirects its report to stderr so stdout remains clean.
 ## @description  Re-evaluates container memory capacity via scripts/preflight.sh before group start.
@@ -2342,6 +2392,279 @@ px_memory_recheck() {
     ;;
   esac
   return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# Host safety, sleep inhibition, and workstation resource guards.
+# ---------------------------------------------------------------------------
+# Because the harness often runs on an interactive workstation that the operator uses concurrently,
+# these helpers keep the host awake while a cluster is up or a run is active, measure host load and
+# available memory, and tear down a cluster whenever its health monitor detects low host memory.
+# Host metrics and process tables are queried via standard utilities resolved on PATH (uname,
+# uptime, vm_stat for Darwin memory, and ps), whereas Linux memory statistics are read directly
+# from /proc/meminfo. This design allows tests to inject fake implementations by prepending stubs
+# to PATH, and a stubbed uname reporting Darwin selects the vm_stat memory path on any platform.
+
+# Identifies the holder name reported by the Linux systemd sleep inhibitor.
+PX_INHIBIT_WHO="phoenix-harness"
+
+# Reclaims and removes a stale lock directory automatically if its recorded owner process is no
+# longer running.
+## @description  Acquires the lock directory LOCK, waiting up to WAIT_S seconds (default 30).
+## @return       Exits 0 when this process holds the lock, or returns 1 if another process holds it
+##               past the wait timeout.
+px_lock() {
+  local lock=${1:-} wait=${2:-30} owner waited=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner="$(cat "$lock/pid" 2>/dev/null)" || owner=""
+    case "$owner" in
+    '' | *[!0-9]*) owner="" ;;
+    esac
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      px_warn "removing the stale lock $lock of process $owner"
+      rm -f "$lock/pid"
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
+    if [ "$waited" -ge "$wait" ]; then
+      px_error "another process holds the lock $lock"
+      return "$PX_EXIT_FAIL"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf '%s\n' "$$" >"$lock/pid" || true
+  return 0
+}
+
+## @description  Releases the lock directory LOCK previously acquired by px_lock.
+## @return       Removes the owner record and lock directory and exits 0.
+px_unlock() {
+  rm -f "${1:-}/pid"
+  rmdir "${1:-}" 2>/dev/null || true
+  return 0
+}
+
+## @description  Computes the state-directory record file path for a host guard (KIND and KEY).
+## @return       Writes the path to stdout and exits 0, or propagates exit code 2 or 1 from
+##               px_state_dir.
+px_guard_path() {
+  local dir key=${2:-}
+  dir="$(px_state_dir)" || return $?
+  printf '%s/%s-%s\n' "$dir" "${1:-guard}" "${key//[!A-Za-z0-9._-]/_}"
+}
+
+## @description  Lists all descendant process IDs beneath a root process ID in breadth-first
+##               (children-first) order.
+## @return       Writes one process ID per line to stdout and exits 0.
+px_child_pids() {
+  ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="${1:-}" '
+    { parent[$1] = $2; order[NR] = $1 }
+    END {
+      keep[root] = 1
+      do {
+        added = 0
+        for (i = 1; i <= NR; i++) {
+          p = order[i]
+          if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; print p; added = 1 }
+        }
+      } while (added)
+    }'
+}
+
+## @description  Terminates a target process ID and all of its descendants by sending SIGTERM,
+##               waiting up to two seconds, and escalating to SIGKILL.
+## @return       Exits 0 when every process has terminated, or returns 1 if any survived SIGKILL.
+px_kill_tree() {
+  local pid=${1:-} kids tries=0 left="" p
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  # Enumerate descendant processes before sending SIGTERM; once the parent terminates, surviving
+  # children are reparented and no longer appear beneath the original process ID.
+  kids="$(px_child_pids "$pid")"
+  kill -s TERM "$pid" 2>/dev/null || true
+  for p in $kids; do
+    kill -s TERM "$p" 2>/dev/null || true
+  done
+  # Direct child processes of this shell remain zombies until reaped by wait, whereas wait returns
+  # immediately when the target process belongs to another parent.
+  wait "$pid" 2>/dev/null || true
+  while :; do
+    left=""
+    for p in "$pid" $kids; do
+      ! kill -s 0 "$p" 2>/dev/null || left="$left $p"
+    done
+    [ -n "$left" ] || return 0
+    [ "$tries" -lt 20 ] || break
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  for p in $left; do
+    kill -s KILL "$p" 2>/dev/null || true
+  done
+  wait "$pid" 2>/dev/null || true
+  sleep 0.1
+  for p in $left; do
+    ! kill -s 0 "$p" 2>/dev/null || return "$PX_EXIT_FAIL"
+  done
+  return 0
+}
+
+# Stops the recorded process only if its live command line still matches the program name stored in
+# the guard record, logging a warning if the process survives termination.
+## @description  Terminates the guard process identified by a guard record path and removes the
+##               record file.
+## @return       Always exits 0, emitting a warning if the target process fails to stop.
+px_guard_stop() {
+  local record=${1:-} pid="" prog="" args
+  [ -f "$record" ] || return 0
+  IFS="$PX_TAB" read -r pid prog _ <"$record" || true
+  case "$pid" in
+  '' | *[!0-9]*) ;;
+  *)
+    # Because operating systems recycle process IDs, verifying the live command line prevents a
+    # guard release from signaling an unrelated process or an inhibitor started directly by the
+    # operator.
+    args="$(ps -p "$pid" -o args= 2>/dev/null)" || args=""
+    if [ -n "$prog" ]; then
+      case "$args" in
+      *"$prog"*) px_kill_tree "$pid" || px_warn "process $pid of $record did not stop" ;;
+      esac
+    fi
+    ;;
+  esac
+  rm -f "$record"
+}
+
+# Launches caffeinate on Darwin or systemd-inhibit on Linux to keep the host awake for KEY (bound
+# to an optional owner PID) and records the inhibitor PID in the state directory under PX_OUT.
+## @description  Starts a background host sleep inhibitor for KEY and an optional owner PID.
+## @return       Exits 0 (with a warning if no inhibitor holds), or 2 or 1 if the state directory
+##               is refused or cannot be created.
+px_inhibit_start() {
+  local key=${1:-} owner=${2:-} record os prog path pid
+  local args=()
+  record="$(px_guard_path inhibit "$key")" || return $?
+  os="$(uname -s 2>/dev/null)" || os=""
+  # Binding the inhibitor to an owner PID terminates the inhibitor automatically when the owner
+  # exits, even if the owner is killed with SIGKILL; without an owner PID, the inhibitor persists
+  # until explicitly released.
+  case "$os" in
+  Darwin)
+    prog=caffeinate
+    # Pass -i to prevent idle sleep and -s to prevent system sleep while running on AC power.
+    args=(-i -s ${owner:+-w "$owner"})
+    ;;
+  Linux)
+    prog=systemd-inhibit
+    args=(--what=sleep:idle "--who=$PX_INHIBIT_WHO" "--why=$key" --mode=block)
+    if [ -n "$owner" ]; then
+      args+=(sh -c "while kill -0 \"\$1\" 2>/dev/null; do sleep 1; done" px-inhibit "$owner")
+    else
+      args+=(sleep 2147483647)
+    fi
+    ;;
+  *) prog="" ;;
+  esac
+  path=""
+  if [ -n "$prog" ]; then
+    path="$(type -P "$prog" 2>/dev/null)" || path=""
+  fi
+  if [ -z "$path" ]; then
+    px_warn "no sleep inhibitor on this host (${os:-unknown}, ${prog:-none known}):" \
+      "the host can sleep while $key holds it"
+    return 0
+  fi
+  px_guard_stop "$record"
+  # Because a non-interactive shell without job control ignores terminal interrupts in background
+  # jobs, the inhibitor stops only when explicitly released or when its owner process exits. The
+  # subshell replaces itself via exec so the recorded PID belongs directly to the inhibitor binary
+  # and a signal delivered before exec cannot trigger the parent shell's exit hooks.
+  (exec "$path" ${args[@]+"${args[@]}"}) </dev/null >/dev/null 2>&1 &
+  pid=$!
+  sleep 0.2
+  if ! kill -s 0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    px_warn "the sleep inhibitor $prog ended at once: the host can sleep while $key holds it"
+    return 0
+  fi
+  px_tsv_row "$pid" "$prog" "$key" >"$record" ||
+    px_warn "cannot record the sleep inhibitor $pid in $record"
+  px_debug "sleep inhibitor $prog $pid holds the host for $key"
+}
+
+## @description  Stops and removes the host guard for KIND and KEY (such as inhibit and run-<id>).
+## @return       Always exits 0.
+px_guard_release() {
+  local record
+  record="$(px_guard_path "${1:-}" "${2:-}" 2>/dev/null)" || return 0
+  px_guard_stop "$record"
+}
+
+# Sums the free, inactive, and speculative page counts from vm_stat on Darwin, or reads
+# MemAvailable from /proc/meminfo on Linux.
+## @description  Reports the host memory available without swapping, in bytes.
+## @return       Writes the available byte count to stdout and exits 0, or returns 5 when no memory
+##               source is available.
+px_mem_available_bytes() {
+  local line value="" page="" pages=0 n
+  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+    while IFS= read -r line; do
+      case "$line" in
+      *'page size of '*)
+        page=${line#*page size of }
+        page=${page%% *}
+        ;;
+      'Pages free:'* | 'Pages inactive:'* | 'Pages speculative:'*)
+        n=${line##* }
+        n=${n%.}
+        case "$n" in '' | *[!0-9]*) ;; *) pages=$((pages + n)) ;; esac
+        ;;
+      esac
+    done <<PX_EOF
+$(vm_stat 2>/dev/null)
+PX_EOF
+    case "$page" in '' | *[!0-9]*) ;; *) value=$((pages * page)) ;; esac
+  else
+    value="$(px_meminfo_bytes MemAvailable)" || value=""
+  fi
+  [ -n "$value" ] || return "$PX_EXIT_UNSUPPORTED"
+  printf '%s\n' "$value"
+}
+
+# Reads the one-minute load average from uptime, which ships on both Linux and Darwin, and scales
+# it by the host processor count.
+## @description  Reports the one-minute host load average as a whole percentage of its processors.
+## @return       Writes the percentage to stdout and exits 0, or returns 5 when uptime reports no
+##               load average.
+px_load_pct() {
+  local out load whole frac
+  out="$(LC_ALL=C uptime 2>/dev/null)" || out=""
+  case "$out" in
+  *'load average'*) ;;
+  *) return "$PX_EXIT_UNSUPPORTED" ;;
+  esac
+  # Normalize the uptime output across platforms: Linux formats the label as "load average: 0.52,
+  # 0.58", whereas Darwin writes "load averages: 1.48 1.61".
+  load=${out##*load average}
+  load=${load#*:}
+  load=${load//,/ }
+  read -r load _ <<<"$load" || true
+  whole=${load%%.*}
+  frac=${load#"$whole"}
+  frac=${frac#.}00
+  case "$whole${frac:0:2}" in
+  '' | *[!0-9]*) return "$PX_EXIT_UNSUPPORTED" ;;
+  esac
+  printf '%s\n' "$(((10#$whole * 100 + 10#${frac:0:2}) / $(px_nproc)))"
+}
+
+# Delegates teardown to px-cluster down, which also releases the sleep inhibitor and stops the
+# background monitor associated with the cluster.
+## @description  Tears down the cluster identified by a scope ID via px-cluster down.
+## @return       Propagates the px-cluster down exit code: 0 on clean removal or if the scope is
+##               already down, or 1 if residual resources remain.
+px_cluster_down() {
+  PX_SCOPE_ID=${1:-} px_with_private "$PX_HOME/bin/px-cluster" down >&2
 }
 
 # ---------------------------------------------------------------------------

@@ -15,9 +15,10 @@
 # limitations under the License.
 
 # This script serves as the administrative and diagnostic entry point for the test harness. It
-# houses operational tasks that fall outside cluster lifecycle management and test execution,
-# specifically opening an interactive shell inside an individual instance and generating the first
-# diagnostic report an operator consults when the harness misbehaves.
+# houses operational work that is neither cluster lifecycle management nor a test run: opening a
+# shell inside a single instance, generating the initial diagnostic report an operator consults
+# when the harness misbehaves, running the cluster health monitor, and executing the quiet-host
+# check that guards a measurement.
 #
 # Three architectural principles govern this file:
 #   1. It encodes no knowledge of role names, network ports, or resource sizing. Because cluster
@@ -105,6 +106,24 @@ Options:
 Examples:
   px-tool shell --role client
   px-tool doctor --config-only
+  px-tool monitor --scope px-default
+  PX_QUIET_HOST_WAIT_S=60 px-tool quiet-host
+
+monitor samples every PX_MONITOR_INTERVAL_S (default 30) seconds. It records
+the memory of each instance and its limit in samples.tsv. Only a host whose
+free memory falls below PX_MONITOR_HOST_FREE_MIB is a breach: the monitor
+then writes the sample to breach.tsv in its run directory, removes the
+cluster with px-cluster down and exits 3. It refreshes the heartbeat
+<state>/monitor-<scope>.heartbeat at each sample. px-cluster up starts it and
+px-cluster down stops it.
+
+quiet-host compares the one-minute load of the host, a percent of its
+processors, with PX_QUIET_HOST_LOAD_PCT, and waits up to
+PX_QUIET_HOST_WAIT_S for it to fall. A wait of 0 takes one sample. The check
+is off, and takes no sample, only when PX_REQUIRE_QUIET_HOST is also 0. It
+writes sample rows and one result row: quiet, contaminated, refused,
+unmeasured or off. When a quiet host is required, it exits 4 when the host
+stays busy and 5 when the load cannot be measured. Else it exits 0.
 
 Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
 5 unsupported, 6 no such object.
@@ -302,6 +321,201 @@ tool_doctor() {
   px_info "every check passed"
 }
 
+# ---------------------------------------------------------------------------
+# Cluster health monitor.
+# ---------------------------------------------------------------------------
+# Because exhausting host memory can destabilize the entire workstation, a host memory breach
+# tears down the cluster immediately. By contrast, an instance that reaches its own memory limit
+# remains isolated within its cgroup, and the R-052 abort logic in px-run reports its kill.
+
+TOOL_STOP=0
+TOOL_NAP=""
+TOOL_RECORD=""
+
+## @description  Sleeps for one interval in seconds so that TERM or INT ends the wait immediately.
+## @return       Exits 0.
+tool_nap() {
+  sleep "$1" &
+  TOOL_NAP=$!
+  wait "$TOOL_NAP" 2>/dev/null || true
+  TOOL_NAP=""
+}
+
+## @description  Removes the monitor state record if it still identifies the current process.
+## @return       Exits 0.
+tool_monitor_forget() {
+  local pid=""
+  [ -n "$TOOL_RECORD" ] && [ -f "$TOOL_RECORD" ] || return 0
+  IFS="$PX_TAB" read -r pid _ <"$TOOL_RECORD" || true
+  [ "$pid" != "$$" ] || rm -f "$TOOL_RECORD"
+}
+
+## @description  Captures one resource sample (scope, directory, floor MiB) into samples.tsv and
+##               records a host below the floor in breach.tsv along with its reason.
+## @return       Exits 0 when host memory is at or above the floor, or exits 3 on a breach.
+tool_monitor_sample() {
+  local scope=$1 dir=$2 floor=$3 rows row free status=0 breach now why
+  now="$(px_epoch_ms)"
+  rows="$(sb_call sb_sample_resources "$scope" || exit "$?")" || status=$?
+  if [ "$status" != 0 ]; then
+    px_tsv_row skip "$now" sample_resources "exit $status" >>"$dir/samples.tsv"
+    rows=""
+  fi
+  while IFS= read -r row; do
+    [ -z "$row" ] || printf 'instance%s%s\n' "$PX_TAB" "$row" >>"$dir/samples.tsv"
+  done <<EOF
+$rows
+EOF
+  status=0
+  free="$(px_mem_available_bytes 2>/dev/null || exit "$?")" || status=$?
+  if [ "$status" != 0 ]; then
+    px_tsv_row skip "$now" host_memory "no source on this host" >>"$dir/samples.tsv"
+    return 0
+  fi
+  row="$(px_tsv_row host "$now" "$free")"
+  printf '%s\n' "$row" >>"$dir/samples.tsv"
+  [ $((free / 1048576)) -lt "$floor" ] || return 0
+  why="the host has $((free / 1048576)) MiB free, below the floor of $floor MiB"
+  breach="$(px_tsv_row breach "$why")$PX_NL$row$PX_NL"
+  printf '%s' "$breach" >>"$dir/breach.tsv"
+  px_error "health monitor breach in scope $scope: $why"
+  return "$PX_EXIT_ANOMALY"
+}
+
+# Polls instance and host memory for the target scope until interrupted by a stop signal, the scope
+# disappears, or a host memory breach triggers an automatic cluster teardown.
+## @description  Runs the health monitor for a scope until stopped, the scope is gone, or a breach.
+## @return       Exits 0 when stopped or the scope is gone, 3 when a breach removed the cluster, 1
+##               if removal or the monitor record failed, 2 on usage error, or 6 if no such scope.
+tool_monitor() {
+  local interval floor dir heartbeat status=0
+  interval="$(px_int_setting PX_MONITOR_INTERVAL_S 30 1)" || exit $?
+  floor="$(px_int_setting PX_MONITOR_HOST_FREE_MIB 1024 0)" || exit $?
+  tool_require_scope
+  if [ -n "${PX_RUN_DIR:-}" ]; then
+    dir="$(px_out_subdir "$PX_RUN_DIR")" || exit $?
+  else
+    dir="$(px_run_dir monitor)" || exit $?
+  fi
+  TOOL_RECORD="$(px_guard_path monitor "$TOOL_SCOPE")" || exit $?
+  heartbeat="$TOOL_RECORD.heartbeat"
+  px_tsv_row "$$" "px-tool monitor" "$dir" >"$TOOL_RECORD" ||
+    px_die "$PX_EXIT_FAIL" "cannot write the monitor record $TOOL_RECORD"
+  px_on_exit tool_monitor_forget
+  trap 'TOOL_STOP=1; [ -z "$TOOL_NAP" ] || kill "$TOOL_NAP" 2>/dev/null || true' TERM INT
+  px_info "monitor of scope $TOOL_SCOPE: every ${interval}s, host floor $floor MiB," \
+    "samples in $dir"
+  : >"$heartbeat"
+  while :; do
+    tool_nap "$interval"
+    [ "$TOOL_STOP" = 0 ] || break
+    status=0
+    sb_scope_exists "$TOOL_SCOPE" || status=$?
+    if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
+      px_info "scope $TOOL_SCOPE is gone, the monitor ends"
+      break
+    fi
+    status=0
+    tool_monitor_sample "$TOOL_SCOPE" "$dir" "$floor" || status=$?
+    : >"$heartbeat"
+    [ "$status" = 0 ] || break
+  done
+  [ "$status" = "$PX_EXIT_ANOMALY" ] || return 0
+  # Remove the monitor record before invoking px-cluster down; teardown stops any monitor still
+  # recorded for the scope, and this process must outlive the teardown call it initiates.
+  tool_monitor_forget
+  px_error "the monitor removes the cluster of scope $TOOL_SCOPE, the breach is in" \
+    "$dir/breach.tsv"
+  status=0
+  px_cluster_down "$TOOL_SCOPE" || status=$?
+  if [ "$status" != 0 ]; then
+    px_error "the removal after the breach reported $(px_exit_name "$status")"
+    return "$PX_EXIT_FAIL"
+  fi
+  return "$PX_EXIT_ANOMALY"
+}
+
+# ---------------------------------------------------------------------------
+# Quiet-host check.
+# ---------------------------------------------------------------------------
+# Performance timing results are meaningful only when measured on a quiet host.
+
+# Records the specific outcome state of the check in the quiet_host row and translates that state
+# into a normalized status in the closing result row: quiet maps to ok, off maps to skip,
+# contaminated and non-required unmeasured states map to warn, and a refused or unmeasured host when
+# a quiet host is required maps to fail.
+## @description  Emits the quiet_host detail row (state, samples, elapsed, load) followed by the
+##               summary result row carrying the check's exit code (code).
+## @return       Writes both rows to standard output and exits 0.
+tool_quiet_rows() {
+  local status
+  case "$1:$5" in
+  quiet:*) status=ok ;;
+  off:*) status=skip ;;
+  contaminated:* | unmeasured:0) status=warn ;;
+  *) status=fail ;;
+  esac
+  px_tsv_row quiet_host "$1" "$2" "$3" "$4"
+  px_result_row "$status" "$5" host
+}
+
+# Polls host processor load until it falls within the quiet threshold or the configured wait window
+# expires. A wait of 0 with no quiet-host requirement disables the check completely, and exit codes
+# 4 and 5 are returned only when a quiet host is required.
+## @description  Samples the host load until the host is quiet or the configured wait expires.
+## @return       Exits 0 when quiet, contaminated, unmeasured, or off; 4 when busy; 5 when
+##               unmeasured; or 2 on invalid usage.
+tool_quiet_host() {
+  local wait pct require=0 start now load samples=0 status
+  wait="$(px_int_setting PX_QUIET_HOST_WAIT_S 0 0)" || exit $?
+  pct="$(px_int_setting PX_QUIET_HOST_LOAD_PCT 25 1)" || exit $?
+  ! px_is_true "${PX_REQUIRE_QUIET_HOST:-0}" || require=1
+  if [ "$wait" = 0 ] && [ "$require" = 0 ]; then
+    px_is_dry_run && return 0
+    tool_quiet_rows off 0 0 "" 0
+    px_info "the quiet-host check is off: PX_QUIET_HOST_WAIT_S is 0 and no quiet host is required"
+    return 0
+  fi
+  px_plan sample load "$pct" "$wait" && return 0
+  start="$(px_epoch_s)"
+  while :; do
+    status=0
+    load="$(px_load_pct || exit "$?")" || status=$?
+    now="$(px_epoch_s)"
+    if [ "$status" != 0 ]; then
+      if [ "$require" = 1 ]; then
+        tool_quiet_rows unmeasured "$samples" "$((now - start))" "" "$PX_EXIT_UNSUPPORTED"
+        px_error "the host load cannot be measured, so the host is not proven quiet"
+        return "$PX_EXIT_UNSUPPORTED"
+      fi
+      tool_quiet_rows unmeasured "$samples" "$((now - start))" "" 0
+      px_warn "the host load cannot be measured: the run is contaminated"
+      return 0
+    fi
+    samples=$((samples + 1))
+    px_tsv_row sample "$(px_epoch_ms)" "$load" "$pct"
+    if [ "$load" -le "$pct" ]; then
+      tool_quiet_rows quiet "$samples" "$((now - start))" "$load" 0
+      px_info "the host is quiet: load $load% of its processors, threshold $pct%"
+      return 0
+    fi
+    [ $((now - start)) -lt "$wait" ] || break
+    px_warn "the host is busy: load $load% of its processors is above $pct%," \
+      "waited $((now - start)) of ${wait}s"
+    sleep "${PX_POLL_INTERVAL_S:-2}"
+  done
+  if [ "$require" = 1 ]; then
+    tool_quiet_rows refused "$samples" "$((now - start))" "$load" "$PX_EXIT_TIMEOUT"
+    px_error "the host is still busy after ${wait}s: load $load% of its processors is" \
+      "above $pct%, and the run requires a quiet host"
+    return "$PX_EXIT_TIMEOUT"
+  fi
+  tool_quiet_rows contaminated "$samples" "$((now - start))" "$load" 0
+  px_warn "the host is still busy after ${wait}s: load $load% of its processors is above" \
+    "$pct%. The run proceeds contaminated, and its time verdicts are ADVISORY"
+  return 0
+}
+
 TOOL_SUBCOMMAND=""
 TOOL_ROLE=""
 TOOL_INDEX=""
@@ -352,6 +566,8 @@ TOOL_STATUS=0
 case "$TOOL_SUBCOMMAND" in
 shell) tool_shell "$@" || TOOL_STATUS=$? ;;
 doctor) tool_doctor || TOOL_STATUS=$? ;;
+monitor) tool_monitor || TOOL_STATUS=$? ;;
+quiet-host) tool_quiet_host || TOOL_STATUS=$? ;;
 *)
   px_die "$PX_EXIT_UNSUPPORTED" \
     "px-tool $TOOL_SUBCOMMAND arrives with round $TOOL_ROUND"

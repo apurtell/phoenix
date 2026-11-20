@@ -84,7 +84,7 @@ directory printed by the command, as nothing useful is left inside the repositor
 | `px-cluster` | Manages lifecycle: provision, wait, inspect, faults, teardown, version matrix. |
 | `px-suite` | Executes a declarative suite file: dependencies, boundaries, filters, and dry run. |
 | `px-run` | Executes one test: one run directory, one driver, snapshots, disruptions, exit code. |
-| `px-tool` | Runs administration and diagnosis tasks: an instance shell and the doctor report. |
+| `px-tool` | Runs administration: a shell, the doctor report, the health monitor, the quiet host. |
 | `px-collect` | Samples host and container resource utilization and writes the telemetry to CSV. |
 | `px-profile` | Orchestrates sampling profiler sessions against selected cluster roles. |
 | `px-jfr` | Captures Java Flight Recorder profiling sessions against selected cluster roles. |
@@ -139,23 +139,25 @@ new path beneath the repository root.
 ### One cluster per host
 
 Only a single active cluster is permitted on a host at any given time. Scope creation acquires a
-host-level lock and aborts if any harness container is already present on the machine or if the
-state directory contains an existing scope record, because concurrent clusters compete for host
-memory and loopback ports and invalidate performance measurements for both runs. Operators must
-tear down an existing deployment with `px-cluster down` before starting another. If a scope record
-persists after its underlying containers have disappeared, setting `PX_FORCE=1` authorizes the
-harness to reclaim the stale state.
+host-level lock and refuses to start if any harness container is already present on the host or if
+the state directory records another scope, because concurrent clusters on one host contend for
+memory and loopback ports and invalidate performance measurements for both runs. The refusal message
+identifies the project and the cluster currently holding the host. Operators must tear down the
+existing cluster with `px-cluster down` before starting another. A scope record that outlives its
+underlying cluster is treated as stale, and setting `PX_FORCE=1` authorizes the harness to reclaim
+it.
 
 ### Teardown by default
 
-Clusters are automatically torn down as soon as the operation that created them concludes.
-Rendered deployments disable automatic container restarts across all instances, and every readiness
-or completion wait enforces a finite bound. If `px-cluster up` encounters a failure during
-bring-up, it automatically dismantles the partially provisioned cluster, and `px-suite` stops every
-role group it launched when the suite session finishes. Specifying `PX_TEARDOWN=0` or `--keep`
-preserves the running instances for post-failure triage, though this serves strictly as a
-diagnostic aid rather than a normal operating mode. Manual cleanup is performed via
-`px-cluster down`.
+**Teardown by default.** By default, every command tears down only the resources that it
+provisioned. If px-cluster up fails or is interrupted, it tears down the partially provisioned
+cluster; similarly, px-pherf run and px-cluster matrix tear down any clusters they bring up, and a
+px-suite session stops the role groups it started. A cluster provisioned directly by px-cluster up
+remains running until an explicit px-cluster down invocation, which is idempotent and serves as the
+final cleanup step in every HOWTO workflow and script exit trap. Passing --keep preserves the
+resources that a command would otherwise remove to support post-failure triage. All rendered
+deployments disable automatic restarts, and every readiness or completion wait enforces a finite
+bound.
 
 ## The output directory
 
@@ -178,6 +180,10 @@ $PX_OUT/
     collect-<cluster>.tsv       the collections of the cluster that may hold a
                                 live collector, one directory per line
     deployment-<backend>-<cluster>  the deployment directory that up provisioned
+    inhibit-<holder>            the sleep inhibitor of a cluster or a run
+    monitor-<scope>             the health monitor of a cluster, and its
+                                .heartbeat
+    down-<scope>                the lock that one px-cluster down holds
     compose/                    the Compose backend: its scope records, its
                                 capability table and its host lock
   deploy/<cluster>/    the rendered deployment directory: compose.yaml,
@@ -191,6 +197,7 @@ $PX_OUT/
   images/<context>/    the staged build context of the image: the tag, each : and / as _
   images/<context>.staged.tsv  the version set of that context
   matrix/<run-id>/     one directory per px-cluster matrix: matrix.tsv
+  monitor/<run-id>/    one directory per health monitor: samples.tsv, breach.tsv
 ```
 
 Each run identifier combines a chronologically sortable UTC timestamp with a compact disambiguating
@@ -443,24 +450,94 @@ or it disappeared entirely. For every affected instance, the run record captures
 termination reason and the out-of-memory flag so operators can distinguish an unexpected process
 restart from an out-of-memory kill.
 
+While the driver is running, `px-run` also compares the live cluster against the initial snapshot
+once every `PX_POLL_INTERVAL_S`. The first unplanned restart, exit, disappearance, or out-of-memory
+kill immediately aborts the run with exit code 3 regardless of what the driver would return:
+`px-run` terminates the driver, writes an `abort` row recording the affected instance and its state
+change, and captures the second snapshot to preserve the failure evidence. Because a workload
+executing against a broken cluster produces no valid measurements, the run does not wait for the
+driver to finish.
+
 An action qualifies as planned only when `px-cluster` (`kill`, `signal`, `restart`, `scale`, or
-`group`) or a scheduled disruption managed by `px-run` logs an entry to the planned-action ledger
-prior to executing the change. Only entries recorded within the time bounds of the active run are
-honored, ensuring that disruptions from earlier runs never mask new failures. The schema and
-semantics of this ledger are detailed in `docs/backends.md`.
+`group`) or a scheduled disruption managed by `px-run` logs an entry in the planned-action record
+prior to executing the change. Only rows written during the active run are honored, ensuring that
+disruptions from earlier runs never excuse new failures. The schema and semantics of this record are
+described in `docs/backends.md`.
 
 The `sb_exec` function returns the exit status of the command it executes and reserves status codes
 124 through 127 for substrate framing errors, as detailed in `docs/backends.md`.
 
+## Host safety
+
+Because the harness executes on a workstation that its operator also uses, it enforces host-level
+safeguards. These safeguards read host state from standard utilities on `PATH`: `uname`, `uptime`,
+`vm_stat`, `df`, `getconf`, and `ps`, while Linux host memory is read from `/proc/meminfo`. The
+self-test suite places mock implementations first on `PATH`, and a mock `uname` reporting Darwin
+selects the `vm_stat` memory source on any host platform.
+
+**The preflight.** `scripts/preflight.sh` executes a fast phase followed by a memory phase. The fast
+phase queries the backend to verify the container engine, client credentials, component versions,
+and loopback ports, stopping at the first engine fault. Any refusal in the fast phase terminates the
+preflight before the memory phase runs, so each fault returns immediately with its specific exit
+code and diagnostic message: code 1 if the engine did not respond, code 5 if the engine refused the
+client, or code 3 if a port in the port map is already in use. The memory phase compares the sum of
+the container memory limits against total engine memory less 4 GiB, and requires at least
+`PX_PREFLIGHT_MIN_DISK_MIB` of free disk space beneath `$PX_OUT` on the host and at least
+`PX_PREFLIGHT_MIN_CPUS` processors. The processor requirement is evaluated against the lesser of the
+host processor count and the engine processor count, and the diagnostic message reports both values.
+Any measurement below its required threshold refuses the deployment with exit code 3 and names both
+the resource and the measured value. The active run class defines both requirements.
+
+**Sleep inhibition.** While a cluster is up or a test run is active, a sleep inhibitor keeps the
+host awake using `caffeinate -i -s` on macOS or `systemd-inhibit --what=sleep:idle` on Linux, or
+emits a warning on a host with neither tool. `px-cluster up` starts the cluster-scoped inhibitor and
+every teardown path releases it. `px-run` maintains its own inhibitor for the duration of the run
+and releases it across every exit path, including interrupt and termination signals. That inhibitor
+also terminates automatically with `px-run` on both platforms, even after a KILL signal: via `-w` on
+its process ID on macOS, and under `systemd-inhibit` on Linux via a watchdog command that exits as
+soon as the `px-run` process disappears. An inhibitor that exits immediately produces the same
+warning as a host with no inhibitor utility. The inhibitor process ID is recorded in
+`$PX_OUT/state/inhibit-<holder>`. Releasing an inhibitor stops only that recorded process, and only
+while its command line still names the inhibitor, ensuring that an inhibitor started independently
+by the operator is never stopped.
+
+**The health monitor.** `px-cluster up` launches `px-tool monitor` for the cluster, and every
+teardown stops it. Every `PX_MONITOR_INTERVAL_S` seconds (default 30), the monitor samples the
+memory usage of every instance via `sb_sample_resources`, appends the results to `samples.tsv`, and
+samples the free memory of the host. A breach is declared only when available host memory falls
+below `PX_MONITOR_HOST_FREE_MIB` (default 1024), because host memory exhaustion compromises the
+entire workstation, whereas an instance reaching its own memory limit remains confined to its
+container where `px-run` reports its out-of-memory kill. Upon detecting a breach, the monitor writes
+the triggering sample to `breach.tsv` in its run directory at `$PX_OUT/monitor/<run-id>`, tears the
+cluster down with `px-cluster down`, and exits with code 3. Any active `px-run` copies that
+`breach.tsv` file into its own run directory and references it in its abort row. Concurrent
+`px-cluster down` invocations against the same scope execute sequentially, and the second call
+succeeds as already down. Each sampling cycle also refreshes the heartbeat file
+`$PX_OUT/state/monitor-<scope>.heartbeat`, whose age is verified by the monitors subject of the
+bootstrap probe whenever `PX_MONITOR_HEARTBEATS` names it.
+
+**The quiet-host check.** Timing measurements are meaningful only on a quiet host. Before starting
+the test driver, `px-run` invokes `px-tool quiet-host`, which compares the host's one-minute load
+average, expressed as a percentage of its processor count, against `PX_QUIET_HOST_LOAD_PCT`. Two
+settings control this check: the wait duration `PX_QUIET_HOST_WAIT_S` bounds how long the check
+pauses for the host load to subside (a wait of 0 takes a single sample), and
+`PX_REQUIRE_QUIET_HOST=1` causes the run to fail with exit code 4 if the host remains busy when the
+wait expires. The check is disabled and takes no sample only when the wait duration is 0 and no
+quiet host is required, which is the configuration of the validation run class. Both a disabled
+check and a busy host on a run that does not require a quiet host mark the run as contaminated: the
+run record receives a `contamination quiet-host` row, every timing verdict of the run is downgraded
+to ADVISORY, and the driver receives `PX_CONTAMINATION=quiet-host`. The measurement run class waits
+up to 300 seconds and requires a quiet host.
+
 ## The host memory check
 
-Starting an additional role group commits its container memory limits against the container engine;
-accordingly, both `px-cluster group start` and the `requires` directive handling in `px-suite`
-execute `scripts/preflight.sh --phase memory` prior to starting each group via `px_memory_recheck`
-in `lib/common.sh`, which defines the invocation contract and its exit codes. Any exit status other
-than 0 blocks the group from starting. This check evaluates only the `engine_memory` row reported by
-the backend preflight, since the full preflight's host port assertions would fail while a cluster is
-already running.
+Starting an additional role group commits its container resource limits against the container
+engine; accordingly, both `px-cluster group start` and the `requires` directive handling in
+`px-suite` execute `scripts/preflight.sh --phase memory` prior to starting each group via
+`px_memory_recheck` in `lib/common.sh`, which defines the invocation contract and its exit codes.
+Any exit status other than 0 blocks the group from starting. This check evaluates only the
+`engine_memory` and `engine_cpus` rows reported by the backend preflight, since the full preflight's
+host port checks would fail against a cluster that is already running.
 
 ## Verdict severity
 

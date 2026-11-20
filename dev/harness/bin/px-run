@@ -24,7 +24,8 @@
 #   3. Start the workload driver and inject the disruptions defined by the schedule.
 #   4. Capture the post-run snapshot and compare each instance against its pre-run state and
 #      restart count.
-#   5. Report a single exit code from the shared exit-code vocabulary.
+#   5. Tear down the cluster by default and report a single exit code from the shared exit-code
+#      vocabulary.
 #
 # Because the driver owns the verdict for its workload, its exit status passes through unchanged
 # unless overridden by a cluster anomaly: an unplanned instance change replaces an exit code of 0
@@ -33,6 +34,15 @@
 # change is unplanned when no planned action recorded during the run covers that instance, showing
 # that the failure originated in the cluster rather than the workload so that callers can tell the
 # two apart.
+#
+# This instance comparison also executes once per poll interval while the driver is running.
+# Detecting an unplanned change during execution aborts the run immediately: the harness stops the
+# driver, appends an abort row with the cause to the run record, and terminates the run with exit
+# code 3 regardless of the status returned by the driver, because running a workload against a
+# broken cluster produces no valid measurement.
+#
+# Host safety: the usage text below describes the host safeguards enforced during a run, and the
+# "Host safety" section of the README explains their design rationale.
 #
 # Because every cluster query and fault injection goes through the substrate contract, this script
 # references no specific container runtime and executes unchanged across every supported backend.
@@ -53,12 +63,22 @@
 #   diff      role index before after verdict pre_state post_state
 #   term      role index <the term schema of the contract>
 #   oom       role index <the oom schema of the contract>
+#   quiet     sample ts_ms load_pct threshold_pct, or
+#             result state samples waited_s load_pct
+#   monitor   phase dir
+#   contamination  source detail
+#   abort     ts_ms role index change
 #   driver    elapsed_ms exit_code log
 #   skip      phase subject reason
+#   breach    path
+#   teardown  exit_code name
 #   result    exit_code name anomaly
 # Each diff row carries a verdict of unchanged, planned, unplanned, vanished, or unknown. Every
 # unplanned or vanished instance is also accompanied by a term row and an oom row containing
-# evidence of the underlying cause. A record file that ends without a result row indicates an
+# evidence of the underlying cause. A quiet result row reports a state of quiet, contaminated,
+# refused, unmeasured, or off, and any contamination row makes every time verdict of the run
+# ADVISORY. A monitor row records the run directory of the health monitor, while a breach row names
+# the local copy of its breach.tsv file. A record file that ends without a result row indicates an
 # interrupted run.
 #
 # A dry run neither creates a run directory nor invokes the backend; instead, it writes the same
@@ -100,8 +120,8 @@ Options:
   -f, --config FILE       one configuration file, repeatable
   -n, --dry-run           print the plan, call no backend, make no run
                           directory
-  -k, --keep              keep temporary files, and give the switch to the
-                          driver
+  -k, --keep              keep the cluster and temporary files, and give the
+                          switch to the driver
   -v, --verbose           report progress in detail
   -h, --help              print this text
 
@@ -120,6 +140,12 @@ Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
 through unchanged. An unplanned restart, an unplanned exit of a running
 instance, or an instance that vanished replaces 0 or 1 with 3. A planned
 action of this run, or of px-cluster during this run, explains a change.
+Such a change found while the driver runs aborts the run at once with 3.
+4 also means that the host stayed busy and the run requires a quiet host.
+
+The run holds the host awake. When it ends, also by a failure or an
+interrupt, it tears the cluster down with px-cluster down, unless --keep,
+PX_KEEP=1 or PX_TEARDOWN=0 keeps the cluster.
 
 Output: a real run writes the run directory to stdout and its record to
 run-record.tsv in that directory. A dry run writes the plan to stdout.
@@ -148,8 +174,13 @@ DRIVER_TIMEOUT=0
 DRIVER_TIMED_OUT=0
 SNAPSHOT_FAILED=0
 ANOMALY=0
+ABORTED=0
+CONTAMINATION=""
+MONITOR_DIR=""
 PRE_RESTARTS=""
 POST_RESTARTS=""
+SNAP_ROWS=""
+SNAP_LIST=""
 PLANNED_SINCE_MS=0
 DISRUPT_COUNT=0
 DISRUPT_KIND=()
@@ -298,9 +329,11 @@ driver_terminate() {
   } 2>/dev/null
 }
 
-## @description  Monitors the driver until it exits or exceeds its timeout bound, firing any timed
-##               disruptions as their scheduled offsets arrive.
-## @return       Sets DRIVER_TIMED_OUT when the timeout bound expires and exits 0.
+# Polls the running driver until it exits or exceeds its timeout bound, firing scheduled time-offset
+# disruptions as their offsets arrive and terminating the driver immediately if an unplanned cluster
+# instance change is detected.
+## @description  Monitors the active driver process for completion, timeout, or cluster anomalies.
+## @return       Sets DRIVER_TIMED_OUT on timeout or ABORTED on an unplanned change, and exits 0.
 driver_watch() {
   local interval now
   interval=${PX_POLL_INTERVAL_S:-1}
@@ -313,6 +346,11 @@ driver_watch() {
       return 0
     fi
     disrupt_due "$now"
+    if ! anomaly_watch; then
+      ABORTED=1
+      driver_terminate
+      return 0
+    fi
     sleep "$interval"
   done
 }
@@ -395,50 +433,129 @@ snapshot_samples() {
   record_rows "sample$PX_TAB$phase$PX_TAB" "$rows"
 }
 
-# Captures a cluster snapshot by reading the instance inventory, the state and restart count of
-# every instance, the substrate tooling versions, and a resource utilization sample.
-## @description  Captures a full cluster snapshot for the given phase.
-## @return       Exits 0 on success, or exits 1 when the cluster inventory cannot be read.
-snapshot_take() {
-  local phase=$1 rows row role index state count list="" status=0
+# Queries the cluster inventory into SNAP_ROWS and assembles the role, index, state, and restart
+# count of every instance into SNAP_LIST without writing any rows to the run record.
+## @description  Reads the live cluster inventory and instance restart counts into memory.
+## @return       Exits 0 on success, or returns the sb_list exit status if the inventory read fails.
+snapshot_read() {
+  local row role index state count restarts status=0
   local role_col index_col state_col
   role_col="$(sb_schema_index instance role)"
   index_col="$(sb_schema_index instance index)"
   state_col="$(sb_schema_index instance state)"
-  rows="$(sb_call sb_list "$SCOPE")" || status=$?
+  SNAP_LIST=""
+  SNAP_ROWS="$(sb_call sb_list "$SCOPE")" || status=$?
+  [ "$status" = 0 ] || return "$status"
+  status=0
+  restarts="$(sb_call sb_restart_count "$SCOPE")" || status=$?
+  if [ "$status" != 0 ]; then
+    px_warn "no restart counts in scope $SCOPE, exit $status"
+    restarts=""
+  fi
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    role="$(px_tsv_field "$role_col" "$row")" || continue
+    index="$(px_tsv_field "$index_col" "$row")" || continue
+    state="$(px_tsv_field "$state_col" "$row")" || state=unknown
+    # Because tab-delimited read splitting collapses consecutive tabs, every field must be
+    # non-empty to preserve column alignment across the line.
+    [ -n "$state" ] || state=unknown
+    count="$(snapshot_lookup "$restarts" "$role" "$index")" || count=""
+    SNAP_LIST="$SNAP_LIST$role$PX_TAB$index$PX_TAB$state$PX_TAB$count$PX_NL"
+  done <<EOF
+$SNAP_ROWS
+EOF
+  return 0
+}
+
+# Captures a cluster snapshot by recording the instance inventory, the state and restart count of
+# every instance, the substrate tooling versions, and a resource utilization sample.
+## @description  Captures and records a complete cluster snapshot for the specified phase.
+## @return       Exits 0 on success, or exits 1 when the cluster inventory cannot be read.
+snapshot_take() {
+  local phase=$1 role index count status=0
+  snapshot_read || status=$?
   if [ "$status" != 0 ]; then
     px_error "the $phase snapshot cannot read the inventory of scope $SCOPE"
     record_row skip "$phase" inventory "exit $status"
     return "$PX_EXIT_FAIL"
   fi
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    record_line "instance$PX_TAB$phase$PX_TAB$row"
-    role="$(px_tsv_field "$role_col" "$row")" || continue
-    index="$(px_tsv_field "$index_col" "$row")" || continue
-    state="$(px_tsv_field "$state_col" "$row")" || state=unknown
-    status=0
-    count="$(sb_call sb_restart_count "$SCOPE" "$role" "$index")" || status=$?
-    if [ "$status" != 0 ]; then
-      px_warn "no restart count for $role/$index, exit $status"
-      count=""
-    fi
+  record_rows "instance$PX_TAB$phase$PX_TAB" "$SNAP_ROWS"
+  while IFS="$PX_TAB" read -r role index _ count; do
+    [ -n "$role" ] || continue
     record_row restart "$phase" "$role" "$index" "$count"
-    list="$list$role$PX_TAB$index$PX_TAB$state$PX_TAB$count$PX_NL"
   done <<EOF
-$rows
+$SNAP_LIST
 EOF
   if [ "$phase" = pre ]; then
-    PRE_RESTARTS=$list
+    PRE_RESTARTS=$SNAP_LIST
   else
-    POST_RESTARTS=$list
+    POST_RESTARTS=$SNAP_LIST
   fi
   snapshot_versions "$phase"
   snapshot_samples "$phase"
   return 0
 }
 
-## @description  Records the failure evidence for an anomalous instance, capturing both its
+# Compares two observations of an instance (state before, count before, state after, count after) to
+# detect whether its restart count increased or a previously running instance stopped running.
+## @description  Describes how an instance changed between two snapshots (pre-state, pre-count,
+##               post-state, post-count).
+## @return       Writes a description of the change to stdout (or an empty line if none), exits 0.
+change_of() {
+  local pre_state=$1 before=$2 post_state=$3 after=$4 changed=""
+  # Skip numerical comparison when either restart count is empty or is not a valid decimal integer.
+  case "$before:$after" in
+  *[!0-9:]* | :* | *:) ;;
+  *) [ "$after" -le "$before" ] || changed="restarted $before to $after" ;;
+  esac
+  if [ "$pre_state" = running ]; then
+    case "$post_state" in
+    exited | dead | unknown)
+      changed="${changed:+$changed and }went from running to $post_state"
+      ;;
+    esac
+  fi
+  printf '%s\n' "$changed"
+}
+
+# Compares the live cluster state against the pre-run snapshot while the driver is running. An
+# unreadable inventory is treated as inconclusive rather than as evidence of a fault, whereas the
+# first unplanned instance change sets ANOMALY and records an abort row.
+## @description  Polls the live cluster against the pre-run snapshot to detect unplanned changes.
+## @return       Exits 0 when no unplanned change is observed, or exits 3 on the first anomaly.
+anomaly_watch() {
+  local rest role index pre_state before changed status
+  [ -n "$SCOPE" ] && [ -n "$PRE_RESTARTS" ] || return 0
+  snapshot_read 2>/dev/null || return 0
+  while IFS="$PX_TAB" read -r role index pre_state before; do
+    [ -n "$role" ] || continue
+    status=0
+    rest="$(snapshot_lookup "$SNAP_LIST" "$role" "$index")" || status=$?
+    if [ "$status" != 0 ]; then
+      changed=vanished
+    else
+      changed="$(change_of "$pre_state" "$before" "${rest%%"$PX_TAB"*}" "${rest#*"$PX_TAB"}")"
+    fi
+    [ -n "$changed" ] || continue
+    ! planned_covers "$role" "$index" || continue
+    ANOMALY=1
+    # Because the health monitor writes breach.tsv before tearing down the cluster, the presence of
+    # that file distinguishes a protective monitor shutdown from an intrinsic cluster fault.
+    if [ -n "$MONITOR_DIR" ] && [ -f "$MONITOR_DIR/breach.tsv" ]; then
+      changed="$changed; the health monitor removed the cluster, see breach.tsv"
+    fi
+    px_error "instance $role/$index $changed with no planned action while the driver" \
+      "runs: the run aborts with $PX_EXIT_ANOMALY"
+    record_row abort "$(px_epoch_ms)" "$role" "$index" "$changed"
+    return "$PX_EXIT_ANOMALY"
+  done <<EOF
+$PRE_RESTARTS
+EOF
+  return 0
+}
+
+## @description  Records failure diagnostic evidence for an anomalous instance by capturing both its
 ##               termination reason and its out-of-memory kill status.
 ## @return       Exit 0.
 evidence_record() {
@@ -498,17 +615,7 @@ restart_diff() {
     comparable=1
     case "$before" in '' | *[!0-9]*) comparable=0 ;; esac
     case "$after" in '' | *[!0-9]*) comparable=0 ;; esac
-    changed=""
-    if [ "$comparable" = 1 ] && [ "$after" -gt "$before" ]; then
-      changed="restarted $before to $after"
-    fi
-    if [ "$pre_state" = running ]; then
-      case "$post_state" in
-      exited | dead | unknown)
-        changed="${changed:+$changed and }went from running to $post_state"
-        ;;
-      esac
-    fi
+    changed="$(change_of "$pre_state" "$before" "$post_state" "$after")"
     if [ -n "$changed" ]; then
       if planned_covers "$role" "$index"; then
         verdict=planned
@@ -735,6 +842,87 @@ disrupt_sweep() {
 }
 
 # ---------------------------------------------------------------------------
+# Host safety and lifecycle guards
+# ---------------------------------------------------------------------------
+
+# Invokes the px-tool quiet-host check before starting the workload driver. Any non-quiet result
+# that still permits the driver to start, including when the check is off, sets CONTAMINATION and
+# records a contamination row in the run record.
+## @description  Verifies host load quiescence via px-tool before launching the driver.
+## @return       Exits 0 when the driver may start, or returns the px-tool failure status (2 usage,
+##               4 busy, 5 unmeasured).
+quiet_check() {
+  local rows status=0 state detail
+  rows="$("$PX_HOME/bin/px-tool" quiet-host || exit "$?")" || status=$?
+  record_rows "quiet$PX_TAB" "$(printf '%s\n' "$rows" | grep -v "^result$PX_TAB" || true)"
+  state="$(px_tsv_get quiet_host "$rows")" || state=""
+  state=${state%%"$PX_TAB"*}
+  [ "$status" = 0 ] || return "$status"
+  case "$state" in
+  quiet) return 0 ;;
+  off) detail="the quiet-host check is off" ;;
+  *) detail="the host was ${state:-not measured}" ;;
+  esac
+  CONTAMINATION=quiet-host
+  record_row contamination quiet-host "$detail, so every time verdict is ADVISORY"
+}
+
+# Looks up the run directory of the active health monitor for the current scope, stores it in
+# MONITOR_DIR, and records a monitor row; if the monitor triggers a protective shutdown, it leaves
+# its breach.tsv artifact in that directory.
+## @description  Locates and records the health monitor run directory for the active cluster scope.
+## @return       Exits 0.
+monitor_find() {
+  local record line=""
+  record="$(px_guard_path monitor "$SCOPE" 2>/dev/null)" || return 0
+  [ -f "$record" ] || return 0
+  IFS= read -r line <"$record" || true
+  MONITOR_DIR="$(px_tsv_field 3 "$line")" || MONITOR_DIR=""
+  [ -z "$MONITOR_DIR" ] || record_row monitor pre "$MONITOR_DIR"
+}
+
+# Tears down the run's cluster at most once unless retention policy preserves it. Because this
+# function is also registered as an exit hook, interrupted runs tear down their cluster as well; the
+# teardown status is recorded in the run record without overriding the run's own exit code.
+## @description  Tears down the active cluster once at the end of the run unless kept by policy.
+## @return       Always exits 0; records the teardown status in the run record.
+run_teardown() {
+  local status=0
+  [ "$TEARDOWN_DONE" = 0 ] && [ -n "$SCOPE" ] || return 0
+  TEARDOWN_DONE=1
+  if ! px_teardown_wanted; then
+    px_info "scope $SCOPE stays up: --keep, PX_KEEP or PX_TEARDOWN=0"
+    record_row skip run teardown "the cluster is kept"
+    return 0
+  fi
+  px_info "the run ends, so scope $SCOPE comes down (teardown by default)"
+  px_cluster_down "$SCOPE" || status=$?
+  [ "$status" = 0 ] || px_warn "the teardown of scope $SCOPE reported $(px_exit_name "$status")"
+  record_row teardown "$status" "$(px_exit_name "$status")"
+}
+
+## @description  Preserves any health-monitor breach artifact, tears down the cluster, records the
+##               final result row, and terminates the process with the specified exit code.
+## @return       Exits the process with the caller-supplied exit code.
+run_finish() {
+  local code=$1 seen=no
+  # Because the health monitor writes breach.tsv into its own run directory, copying the file into
+  # PX_RUN_DIR preserves the triggering resource sample alongside the test run that it terminated.
+  if [ -n "$MONITOR_DIR" ] && [ -f "$MONITOR_DIR/breach.tsv" ]; then
+    if cp "$MONITOR_DIR/breach.tsv" "$PX_RUN_DIR/breach.tsv"; then
+      record_row breach "$PX_RUN_DIR/breach.tsv"
+    else
+      px_warn "cannot copy $MONITOR_DIR/breach.tsv into $PX_RUN_DIR"
+    fi
+  fi
+  run_teardown
+  [ "$ANOMALY" = 0 ] || seen=yes
+  record_row result "$code" "$(px_exit_name "$code")" "$seen"
+  px_info "run $RUN_ID ends with exit $code, $(px_exit_name "$code")"
+  exit "$code"
+}
+
+# ---------------------------------------------------------------------------
 # Dry-run execution plan
 # ---------------------------------------------------------------------------
 
@@ -754,10 +942,18 @@ plan_print() {
   record_row plan driver_arguments "${#DRIVER_ARGS[@]}"
   record_row plan driver_timeout_s "$DRIVER_TIMEOUT"
   record_row plan snapshot_pre "sb_list sb_restart_count sb_version_info sb_sample_resources"
+  record_row plan quiet_host_wait_s "${PX_QUIET_HOST_WAIT_S:-0}"
   record_row plan disruptions "$DISRUPT_COUNT"
   disrupt_rows
   record_row plan snapshot_post "sb_list sb_restart_count sb_version_info sb_sample_resources"
   record_row plan diff "an unplanned restart, exit or loss gives exit $PX_EXIT_ANOMALY"
+  if [ -z "$SCOPE" ]; then
+    record_row plan teardown "none, no cluster"
+  elif px_teardown_wanted; then
+    record_row plan teardown "px-cluster down $SCOPE"
+  else
+    record_row plan teardown "kept"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -863,7 +1059,15 @@ printf '%s\n' "$RUN_DIR"
 px_info "run $RUN_ID in $RUN_DIR"
 
 sb_load
+# Exit hooks execute in reverse registration order on every exit: the workload driver stops first,
+# the cluster is torn down next, and the host sleep inhibitor is released last. Converting INT and
+# TERM signals into normal exits ensures that interrupted runs execute the full cleanup sequence.
+px_inhibit_start "run-$RUN_ID" "$$"
+px_on_exit px_guard_release inhibit "run-$RUN_ID"
+px_on_exit run_teardown
 px_on_exit driver_terminate
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 record_row run "$RUN_ID" "${PX_RUN_CLASS:-}" "$(sb_bound_backend)" "$SCOPE" "$DRIVER_PATH"
 # Open the planned-action timestamp window before reaching the first phase that can trigger a
@@ -878,6 +1082,7 @@ if [ -n "$SCOPE" ]; then
     px_die "$SCOPE_STATUS" "the scope $SCOPE is not usable"
   fi
   snapshot_take pre || px_die "$PX_EXIT_FAIL" "the run needs a pre-run snapshot"
+  monitor_find
 else
   px_warn "no scope id and no recorded cluster: px-run takes no snapshot and" \
     "checks no instance"
@@ -885,6 +1090,15 @@ else
 fi
 phase_reached snapshot_pre
 
+QUIET_STATUS=0
+quiet_check || QUIET_STATUS=$?
+if [ "$QUIET_STATUS" != 0 ]; then
+  record_row skip run driver "the host is not proven quiet"
+  run_finish "$QUIET_STATUS"
+fi
+# Export the run's contamination status so the driver can tag every emitted metric record with it.
+PX_CONTAMINATION=$CONTAMINATION
+export PX_CONTAMINATION
 driver_start
 phase_reached driver_start
 driver_watch
@@ -915,13 +1129,17 @@ disrupt_rows
 # ---------------------------------------------------------------------------
 # Final run verdict
 # ---------------------------------------------------------------------------
-# The workload verdict belongs to the driver, so its exit code passes through directly whenever it
-# falls within the shared exit-code vocabulary. Any driver exit status outside that vocabulary
-# (such as 143 from a termination signal) is normalized to a general failure (exit code 1), while
-# the run record preserves the raw numeric status emitted by the driver.
+# The workload verdict belongs to the driver, so its exit status passes through whenever it falls
+# within the shared exit-code vocabulary. Any driver status outside that vocabulary (such as 143
+# from a termination signal) is normalized to a general failure, while the run record preserves the
+# raw numeric status. However, if the run was aborted due to an unplanned cluster change while the
+# driver was executing, the final verdict is always the cluster-anomaly exit code regardless of the
+# status the driver returned after being stopped.
 
 EXIT_CODE=$DRIVER_STATUS
-if [ "$DRIVER_TIMED_OUT" = 1 ]; then
+if [ "$ABORTED" = 1 ]; then
+  EXIT_CODE=$PX_EXIT_ANOMALY
+elif [ "$DRIVER_TIMED_OUT" = 1 ]; then
   EXIT_CODE=$PX_EXIT_TIMEOUT
 else
   case "$EXIT_CODE" in
@@ -941,8 +1159,4 @@ if [ "$EXIT_CODE" = 0 ] && [ "$SNAPSHOT_FAILED" = 1 ]; then
   EXIT_CODE=$PX_EXIT_FAIL
 fi
 
-ANOMALY_SEEN=no
-[ "$ANOMALY" = 0 ] || ANOMALY_SEEN=yes
-record_row result "$EXIT_CODE" "$(px_exit_name "$EXIT_CODE")" "$ANOMALY_SEEN"
-px_info "run $RUN_ID ends with exit $EXIT_CODE, $(px_exit_name "$EXIT_CODE")"
-exit "$EXIT_CODE"
+run_finish "$EXIT_CODE"

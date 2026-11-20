@@ -19,21 +19,26 @@
 # compatibility module of the active profile.
 #
 # During the fast phase, the script delegates all engine-level queries to the backend preflight
-# entrypoint, sb_preflight. That check confirms that the engine is present and responsive, that the
+# entrypoint, sb_preflight, which verifies that the engine is present and responsive, that the
 # client is authorized, that component versions meet their minimum floors, and that every port
 # published by the deployment, meaning every port in the rendered port map, is free on 127.0.0.1 of
-# the host. This script emits those result rows unmodified and adds no engine logic of its own, so
-# it never names a specific container runtime.
+# the host. This script emits those result rows unchanged and adds no engine logic of its own, so
+# it never names a container runtime. The backend stops at the first engine fault, and the first
+# failed row determines the exit code: 1 when the engine does not answer, 5 when it refuses the
+# client, and 3 for any other refusal. Any refusal during the fast phase terminates the preflight
+# before the memory phase begins.
 #
-# During the memory phase, the script aggregates the container memory limits declared across the
-# rendered deployment and compares that sum against the memory reported by the engine minus a host
-# headroom reservation of 4 GiB. The engine capacity is taken from the engine_memory row emitted by
-# sb_preflight, because a desktop engine runs inside a virtual machine with its own allocation
-# limit, making physical host memory the wrong figure to consult. When the sum exceeds the budget,
-# the phase refuses the deployment with a message showing the budget arithmetic and the memory
-# share of each role. It also refuses any service whose configured heap is not strictly below its
-# container limit, and it reports both the free disk space under the output root and the processor
-# count of the host.
+# During the memory phase, the script sums the container memory limits declared across the rendered
+# deployment and compares that total against the memory reported by the engine minus a host
+# headroom reservation of 4 GiB. The engine memory figure comes from the engine_memory row emitted
+# by sb_preflight, because a desktop engine runs inside a virtual machine with its own allocation
+# limit, making host memory the wrong figure to consult. A total above the budget refuses the
+# deployment with a diagnostic showing the budget arithmetic and the memory share of each role. The
+# phase also refuses any service whose heap is not below its container limit, refuses processor
+# counts below PX_PREFLIGHT_MIN_CPUS on either the host or the engine (taken from the engine_cpus
+# row), and refuses free disk space below PX_PREFLIGHT_MIN_DISK_MIB under the output root on the
+# host. That disk check covers only the bundles and logs stored under PX_OUT rather than the
+# internal disk of the engine, and the run class sets both minimum requirements.
 #
 # The memory sum includes every service in the deployment, including on-demand groups, because a
 # group started later still adds its container limits to the same engine. A deployment that cannot
@@ -62,6 +67,7 @@ PF_PHASE=""
 PF_DIR=""
 PF_CONFIG_FILES=()
 PF_REFUSED=0
+PF_REASON=""
 PF_UNMEASURED=0
 PF_SB_DONE=0
 PF_SB_ROWS=""
@@ -78,45 +84,32 @@ PF_S_MEM=()
 PF_S_HEAP=()
 PF_S_COUNT=()
 
-## @description  Prints the command-line usage documentation and option reference.
-## @return       Writes the help text to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: preflight.sh [option...]
-
-Checks that the host can hold the rendered deployment. With no --phase it
-runs both phases, the fast phase first.
-
-Options:
-  --phase PHASE       fast: the engine, its credentials, its version and the
-                      loopback ports of the port map, from the backend
-                      preflight. memory: the sum of the container memory
-                      limits against the engine memory less 4 GiB, the heap
-                      of each service against its limit, the free disk and
-                      the processors.
-  --deployment DIR    the rendered deployment directory, default
-                      PX_DEPLOYMENT_DIR, else the directory that px-cluster
-                      up recorded, else $PX_OUT/deploy/<cluster>
-  -n, --dry-run       ask no backend, and check only the deployment files
-  --config FILE       an extra configuration file, repeatable
-  -v, --verbose       report detail
-  -h, --help          show this text
-
-stdout: check rows: check, status (ok, fail or warn) and detail.
-
-Exit codes: 0 the host can hold the deployment, 1 a figure could not be
-measured, 2 usage, or an HBase release outside the range of the profile, 3 a
-check refused the deployment.
+px_cli_spec <<'EOF'
+about Checks that the host can hold the rendered deployment, by default
++ $PX_OUT/deploy/<cluster>.
+about The fast phase checks that the engine answers, the client is authorised, the
++ versions, and the loopback ports of the port map, from the backend preflight; it
++ stops at the first engine fault. The memory phase checks the sum of the
++ container memory limits against the engine memory less 4 GiB, the heap of each
++ service against its limit, the free disk under PX_OUT against
++ PX_PREFLIGHT_MIN_DISK_MIB and the processors against PX_PREFLIGHT_MIN_CPUS. A
++ dry run asks no backend and checks only the deployment files.
+exits 1 also means that the engine did not answer or a figure could not be measured,
++ 2 an HBase release outside the range of the profile, 3 a check refused the
++ deployment, 5 the engine refused the client. The message names the check and
++ its measured value.
+example preflight.sh --phase fast
 EOF
-}
 
-## @description  Emits one check row (name, status, detail...) and records a refusal on failure.
+## @description  Emits one check row (name, status, detail...) and records a status 3 refusal on
+##               the first failed row.
 ## @return       Writes one TSV row to stdout and exits with status 0.
 pf_check() {
   local name=$1 status=$2
   shift 2
-  if [ "$status" = fail ]; then
-    PF_REFUSED=1
+  if [ "$status" = fail ] && [ "$PF_REFUSED" = 0 ]; then
+    PF_REFUSED=$PX_EXIT_ANOMALY
+    PF_REASON="$name: $*"
   fi
   px_tsv_row "$name" "$status" "$(px_tsv_clean "$*")"
 }
@@ -322,25 +315,38 @@ pf_backend() {
   fi
 }
 
-## @description  Runs the fast preflight phase, emitting the backend preflight rows unchanged.
+# Emits the backend preflight rows unchanged and assigns the refusal exit code from the first
+# failed row: 1 when the engine does not answer, or 5 when it refuses the client.
+## @description  Executes the fast preflight phase by streaming the backend preflight rows.
 ## @return       Writes check rows to stdout and exits with 0, or exits with 2 or 1 as pf_backend
 ##               does.
 pf_phase_fast() {
-  local row status_col status counted=0
+  local row status_col name_col detail_col status name counted=0
   if px_is_dry_run; then
     pf_check preflight warn "dry run, the backend preflight was not called"
     return 0
   fi
   pf_backend
   status_col="$(sb_schema_index check status)"
+  name_col="$(sb_schema_index check check)"
+  detail_col="$(sb_schema_index check detail)"
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     printf '%s\n' "$row"
     status="$(px_tsv_field "$status_col" "$row")" || status=""
-    if [ "$status" = fail ]; then
-      PF_REFUSED=1
-      counted=1
-    fi
+    [ "$status" = fail ] || continue
+    counted=1
+    [ "$PF_REFUSED" = 0 ] || continue
+    name="$(px_tsv_field "$name_col" "$row")" || name=""
+    # Callers branch on the resulting exit code: an unresponsive engine may recover on retry, a
+    # refused client requires operator intervention, and a host refusal requires either a smaller
+    # deployment or a freed port.
+    case "$name" in
+    engine_binary | engine_responsive) PF_REFUSED=$PX_EXIT_FAIL ;;
+    engine_credentials) PF_REFUSED=$PX_EXIT_UNSUPPORTED ;;
+    *) PF_REFUSED=$PX_EXIT_ANOMALY ;;
+    esac
+    PF_REASON="$name: $(px_tsv_field "$detail_col" "$row" || true)"
   done <<EOF
 $PF_SB_ROWS
 EOF
@@ -350,17 +356,19 @@ EOF
   fi
 }
 
-## @description  Extracts the engine memory from the leading integer of an ok engine_memory row.
-## @return       Writes the byte count to stdout and exits with 0, or 6 when the backend reported
-##               no total.
-pf_engine_bytes() {
+# Reads the leading numeric value from the ok row matching the requested backend check name, such
+# as engine_memory or engine_cpus.
+## @description  Extracts one engine figure from the named ok row of the backend preflight output.
+## @return       Writes the number to stdout and exits with 0, or exits with 6 when the backend
+##               reported none.
+pf_engine_figure() {
   local row name_col status_col detail_col detail
   name_col="$(sb_schema_index check check)"
   status_col="$(sb_schema_index check status)"
   detail_col="$(sb_schema_index check detail)"
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    [ "$(px_tsv_field "$name_col" "$row")" = engine_memory ] || continue
+    [ "$(px_tsv_field "$name_col" "$row")" = "${1:-}" ] || continue
     [ "$(px_tsv_field "$status_col" "$row")" = ok ] || continue
     detail="$(px_tsv_field "$detail_col" "$row")" || continue
     detail=${detail%%[!0-9]*}
@@ -462,7 +470,7 @@ pf_phase_memory() {
       "the engine was not asked for its memory"
   else
     pf_backend
-    if ! engine="$(pf_engine_bytes)"; then
+    if ! engine="$(pf_engine_figure engine_memory)"; then
       pf_unmeasured memory_fit "the backend reported no engine memory total, so the" \
         "limits of $(pf_size "$total") cannot be checked"
     else
@@ -488,21 +496,51 @@ pf_phase_memory() {
     fi
   fi
   pf_disk
-  pf_check host_cpus ok "$(px_nproc) processors on the host"
+  pf_cpus
 }
 
-# Measures free disk space under the output root by reading field 4 of line 2 from df -Pk.
-## @description  Reports the available free disk space under the output root via df -Pk.
+# Measures free disk space under the output root on the host from field 4 of line 2 of df -Pk and
+# compares it against PX_PREFLIGHT_MIN_DISK_MIB.
+## @description  Verifies free host disk space under the output root against the minimum threshold.
 ## @return       Writes one check row to stdout and exits with 0, or exits with 2 or 1 as
 ##               px_out_root does.
 pf_disk() {
-  local root kib=""
+  local root kib="" need
   root="$(px_out_root)" || exit $?
+  need="$(px_int_setting PX_PREFLIGHT_MIN_DISK_MIB 4096 0)" || exit $?
   read -r _ _ _ kib _ <<<"$(df -Pk "$root" 2>/dev/null | sed -n 2p)" || kib=""
-  if [[ $kib =~ $PX_RE_INT ]]; then
-    pf_check disk_free ok "$(pf_size $((kib * 1024))) free under $root"
+  if ! [[ $kib =~ $PX_RE_INT ]]; then
+    pf_check disk_free warn "the free disk under $root on the host is unknown"
+  elif [ $((kib / 1024)) -lt "$need" ]; then
+    pf_check disk_free fail "disk: $(pf_size $((kib * 1024))) free under $root on the host," \
+      "below the $need MiB that the deployment requires"
   else
-    pf_check disk_free warn "the free disk under $root is unknown"
+    pf_check disk_free ok "$(pf_size $((kib * 1024))) free under $root on the host," \
+      "$need MiB required"
+  fi
+}
+
+# Compares PX_PREFLIGHT_MIN_CPUS against the lesser of the host and engine processor counts, or
+# against the host count alone when the engine reports no processor figure.
+## @description  Verifies that the available processor count meets PX_PREFLIGHT_MIN_CPUS.
+## @return       Writes one check row to stdout and exits with 0, or exits with 2 when the
+##               configured requirement is malformed.
+pf_cpus() {
+  local host engine have need detail
+  host="$(px_nproc)"
+  need="$(px_int_setting PX_PREFLIGHT_MIN_CPUS 2 0)" || exit $?
+  have=$host
+  if engine="$(pf_engine_figure engine_cpus)"; then
+    [ "$engine" -ge "$host" ] || have=$engine
+    detail="host $host, engine $engine"
+  else
+    detail="host $host, the engine reported none"
+  fi
+  if [ "$have" -lt "$need" ]; then
+    pf_check cpus fail "processors: $have ($detail), below the $need that the deployment" \
+      "requires"
+  else
+    pf_check cpus ok "processors: $have ($detail), $need required"
   fi
 }
 
@@ -540,13 +578,15 @@ fi
 if [ -z "$PF_PHASE" ] || [ "$PF_PHASE" = fast ]; then
   pf_phase_fast
 fi
-if [ -z "$PF_PHASE" ] || [ "$PF_PHASE" = memory ]; then
+# Because the memory phase is the slower check, any refusal in the fast phase ends the preflight
+# immediately so that an absent engine or a busy port is reported at once.
+if [ "$PF_REFUSED" = 0 ] && { [ -z "$PF_PHASE" ] || [ "$PF_PHASE" = memory ]; }; then
   pf_phase_memory
 fi
 
 if [ "$PF_REFUSED" != 0 ]; then
-  px_error "the preflight refused the deployment, see the failed rows"
-  exit "$PX_EXIT_ANOMALY"
+  px_error "the preflight refused the deployment: $PF_REASON"
+  exit "$PF_REFUSED"
 fi
 if [ "$PF_UNMEASURED" != 0 ]; then
   px_error "the preflight could not measure a figure, see the failed rows"

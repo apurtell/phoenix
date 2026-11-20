@@ -102,10 +102,18 @@ Three functions deviate from this rule, as noted in their individual specificati
 `sb_exec` reports an unresponsive runtime as exit code 125, while `sb_events` and
 `sb_sample_resources` report it as exit code 5.
 
-`sb_exec` is the only contract function that propagates an external exit status, returning the exit
-code of the command executed inside the instance. Four exit codes are reserved so that callers can
-distinguish substrate execution-framing failures from command execution failures; programs running
-inside a role must never exit with any of these four codes.
+Exit code 3 serves as the single cluster-anomaly code across every backend. Each backend reports
+the underlying diagnostic evidence—the restart count, the termination reason, and the
+out-of-memory verdict—while `px-run` evaluates that evidence to make the anomaly decision. While
+the workload driver executes, `px-run` continuously compares the active cluster against its initial
+snapshot, and the first unplanned restart, unexpected exit, instance loss, or out-of-memory kill
+aborts the run at once with exit 3. Section "Exit codes" in the README defines this rule,
+and the driver contract in A5 lists the code.
+
+`sb_exec` is the sole contract function that propagates an external exit status, returning the exit
+status of the command it executed inside the instance. Four exit codes remain reserved so that
+callers can distinguish a substrate execution-framing failure from a command execution failure. A
+program running inside a role must never exit with any of these four codes.
 
 | Code | Constant | Meaning |
 |---|---|---|
@@ -165,6 +173,8 @@ endpoint    host port
 image       image_ref image_id
             sb_image_ref, sb_image_build, sb_image_present,
             sb_image_base_digest
+restart     role index count
+            sb_restart_count
 ```
 
 `sb_schema_fields <schema>` outputs the schema's field names in order,
@@ -578,28 +588,33 @@ rather than failing on unsupported operations.
 
 #### `sb_preflight scope_id`
 
-Executes the backend-specific portion of host preflight validation, verifying whether the runtime
-engine is installed and reachable, whether the caller is authorized, whether tool versions meet
-their minimum floors, whether the mapped ports are free, and how much memory is available to the
-engine. The host-level portion—which sums configured resource limits against available memory, disk
-space, and processors—resides in `scripts/preflight.sh` (see the README). Because `sb_preflight`
-verifies that mapped ports are free, a full check fails against a cluster that is already running.
-The memory check executed prior to starting a role group also invokes `sb_preflight`, but inspects
-only the `engine_memory` row and ignores the port availability result.
+Executes the backend half of host preflight validation, verifying whether the runtime engine is
+present and reachable, whether the caller is authorized, whether tool versions meet their minimum
+floors, whether the mapped ports are free, and how much memory and how many processors the engine
+holds. The host half—which sums the configured resource limits against available memory, disk space,
+and processors—resides in `scripts/preflight.sh` (see the README) and reads the `engine_memory` and
+`engine_cpus` rows. Because `sb_preflight` checks that mapped ports are free, a full preflight check
+fails against a cluster that is already running. The memory check executed before starting a role
+group also calls it, but reads only those two rows and ignores the port availability result.
 
 * **stdout** Emits `check` rows containing the check name, a status of `ok`, `fail`, or `warn`, and
   an explanatory detail string.
 * **exit** Returns exit code 0 when no check fails, 3 when at least one check fails, and 2 on
-  invalid usage or when the configuration loader rejects a malformed port-map line. A `warn` row
-  does not alter the exit code.
+  invalid usage or when the configuration loader rejects a port-map line. A `warn` row does not
+  alter the exit code.
 * **Compose** Evaluates the checks `engine_binary`, `engine_responsive`, `engine_version` (minimum
-  floor 20.10), `engine_credentials`, `compose_version` (minimum floor 2), `engine_memory`, and
-  `port_availability`. When no engine binary is found, the function terminates early after emitting
-  two `fail` rows. `engine_memory` reports the total memory available to the engine—which on
-  desktop hosts runs inside a virtual machine with its own memory ceiling—and reports `warn` when
-  the engine reports no memory total. `port_availability` fails when any port in the loaded port
-  map (the set of ports published by the deployment) already accepts a connection on 127.0.0.1 of
-  the host, and reports `warn` when no port map is loaded.
+  floor 20.10), `engine_credentials`, `compose_version` (minimum floor 2), `engine_memory`,
+  `engine_cpus`, and `port_availability`. Evaluation stops at the first engine fault. When no engine
+  binary is found, the function returns after emitting two `fail` rows. When the version query
+  fails, evaluation also stops immediately: `engine_credentials` fails after an `engine_responsive`
+  row of `warn` when the error text indicates that the engine refused the client (permission denied,
+  unauthorized, or access denied), whereas `engine_responsive` fails otherwise. `engine_memory`
+  reports the total memory available to the engine—which on a desktop host runs inside a virtual
+  machine with a limit of its own—and reports `warn` when the engine reports no total. `engine_cpus`
+  reports the processor count of the engine from `info {{.NCPU}}` and reports `warn` when the engine
+  reports no number. `port_availability` fails when any port in the loaded map (the set of ports the
+  deployment publishes) already accepts a connection on 127.0.0.1 of the host, and reports `warn`
+  when no port map is loaded.
 
 ### Scope
 
@@ -620,11 +635,12 @@ subsequent cluster operation accepts as its first argument.
   concurrency gate executes under the host lock `$(px_state_dir)/compose/host.lock`, waiting up to
   30 seconds and reclaiming stale locks left by terminated processes. The gate refuses creation if
   any existing container on the host carries a harness cluster label, if the backend already holds
-  a scope record for another cluster, or if it already holds a record for the requested scope;
-  setting `PX_FORCE=1` overrides the two record-based refusals to recover from stale state files.
-  Once the gate passes, the backend writes its internal scope record to
+  a scope record for another scope, or if it already holds a record for the requested scope;
+  setting `PX_FORCE=1` overrides the two record-based refusals to recover from a stale record. When
+  the gate refuses because of an existing container, the refusal message identifies both its Compose
+  project and its cluster. Once the gate passes, the backend writes its internal scope record to
   `$(px_state_dir)/compose/scope-<scope>.tsv` and sets `PX_SCOPE_ID` in the current process. This
-  backend record is distinct from the contract-level scope record managed by `px-cluster`.
+  backend record is separate from the contract-level scope record managed by `px-cluster`.
 
 #### `sb_scope_exists scope_id`
 
@@ -931,15 +947,18 @@ this function.
   `restarting` to `pending`, `paused` to `stopped`, `exited` to `exited`, and any other runtime
   status to `unknown`.
 
-#### `sb_restart_count scope_id role index`
+#### `sb_restart_count scope_id`
 
-Reports the cumulative involuntary restart count for an instance, which `px-run` samples before and
-after executing a test workload.
+Reports the cumulative involuntary-restart evidence across all instances in the scope. `px-run`
+queries this function before a run begins, at each polling interval while the workload driver
+executes, and again after the driver completes.
 
-* **stdout** Outputs a single line containing a decimal integer.
-* **exit** Returns exit code 0 on success, 1 if the runtime fails to respond, 2 on invalid usage,
-  and 6 if the target instance does not exist.
-* **Compose** Extracts the container restart count directly from container inspection metadata.
+* **stdout** Emits one `restart` row per instance containing the role, the instance index, and the
+  restart count as a decimal integer.
+* **exit** Returns exit code 0 on success, 1 if the runtime fails to respond, and 2 on invalid
+  usage.
+* **Compose** Performs a single container listing for the scope followed by a single inspection call
+  covering every container in that scope. Any restart count that is not numeric is reported as 0.
 
 #### `sb_termination_reason scope_id role index [which]`
 
@@ -986,19 +1005,18 @@ or out-of-memory findings.
 
 #### `sb_sample_resources scope_id` (optional)
 
-Captures a point-in-time resource utilization snapshot across all running instances in the scope.
-`px-collect` polls this function at a fixed interval, and the health monitor introduced in
-milestone A3 uses it to determine whether resource exhaustion requires tearing down the cluster.
+Captures a point-in-time resource utilization snapshot across every running instance in the scope.
+`px-collect` calls this function at a fixed interval, and the health monitor, `px-tool monitor`,
+records its output in `samples.tsv` on each sampling pass.
 
-* **stdout** Emits `sample` rows, one for each running instance; if no instances are currently
-  running, no rows are emitted.
+* **stdout** Emits `sample` rows, one per running instance; if no instances are currently running,
+  no rows are emitted.
 * **exit** Returns exit code 0 on success, 5 if the runtime fails to respond or refuses a stats
-  query, and 2 on invalid usage.
+  pass, and 2 on invalid usage.
 * **Compose** Executes a single non-streaming stats pass and populates `mem_limit_bytes` from a
-  container inspection of the configured memory limit so that the health monitor evaluates memory
-  consumption against the container's configured ceiling rather than total host memory. If a
-  container defines no explicit memory limit, the column reports the limit value returned by the
-  stats pass.
+  single inspection of the configured container memory limit so that recorded samples compare memory
+  usage against that configured limit rather than total host memory. A container without a
+  configured limit reports the limit value returned by the stats pass.
 
 ### Addressing and images
 

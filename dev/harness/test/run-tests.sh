@@ -337,11 +337,12 @@ t_pc() { t_sweep "$T_BASH" "$T_BIN/px-cluster" --cluster sweep "$@"; }
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_suite() { t_run env "PX_SESSION_ID=$1" "$T_BASH" "$T_BIN/px-suite" "${@:2}"; }
 
-## @description  Executes px-run under the fake runtime with a stub driver (name, argument...).
+## @description  Executes px-run under the fake runtime with a stub driver (name, argument...),
+##               leaving the cluster running so subsequent test cases can discover it.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_px_run() {
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 --scope px-selftest \
-    --driver "$T_WORK/drivers/$1.sh" "${@:2}"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 -e PX_TEARDOWN=0 \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/$1.sh" "${@:2}"
 }
 
 ## @description  Verifies exit codes for contract calls (name, lines of code, function, arguments).
@@ -629,6 +630,10 @@ if [ -n "${PX_FAKE_DOCKER_LOG:-}" ]; then
 fi
 fake_state=${PX_FAKE_STATE_DIR:-/nonexistent}
 fake_inv="$fake_state/instances.txt"
+if [ -e "$fake_state/denied" ]; then
+  printf 'permission denied while trying to connect to the Docker daemon socket\n' >&2
+  exit 1
+fi
 if [ -e "$fake_state/unreachable" ]; then
   printf 'fake: the engine does not answer\n' >&2
   exit 1
@@ -738,6 +743,7 @@ version)
 info)
   case "$*" in
   *MemTotal*) cat "$fake_state/mem-total" 2>/dev/null || printf '25165824000\n' ;;
+  *NCPU*) cat "$fake_state/ncpu" 2>/dev/null || printf '9\n' ;;
   *) printf 'fake-engine\n' ;;
   esac
   ;;
@@ -767,8 +773,9 @@ ps)
     case "$fake_format" in
     '{{.ID}}|'*) ;;
     *)
-      # Any other format is the host gate, which asks for the cluster label.
-      printf '%s\n' "$fake_cluster"
+      # Any other format is the host gate, which asks for the cluster label
+      # and the project label.
+      printf '%s|px-%s\n' "$fake_cluster" "$fake_cluster"
       continue
       ;;
     esac
@@ -807,7 +814,9 @@ inspect)
       fake_oom=true
     fi
     case "$fake_template" in
-    *RestartCount*) cat "$fake_state/restart-count" 2>/dev/null || printf '0\n' ;;
+    *RestartCount*)
+      printf '/%s|%s\n' "$f_name" "$(cat "$fake_state/restart-count" 2>/dev/null || echo 0)"
+      ;;
     *State.Status*)
       printf '%s|%s|%s|2026-01-01T00:00:00Z\n' "$f_state" "$fake_code" "$fake_oom"
       ;;
@@ -833,9 +842,10 @@ stats)
     ;;
   esac
   shift 3
+  fake_mem="$(cat "$fake_state/stats-mem" 2>/dev/null || printf '128MiB / 1GiB')"
   for fake_id in "$@"; do
     fake_find "$fake_id" || exit 1
-    printf '%s|1.50%%|128MiB / 1GiB|1.2kB / 3.4kB|5.6kB / 7.8kB\n' "$f_name"
+    printf '%s|1.50%%|%s|1.2kB / 3.4kB|5.6kB / 7.8kB\n' "$f_name" "$fake_mem"
   done
   ;;
 kill)
@@ -1573,6 +1583,143 @@ A2_EOF
   done
 }
 
+## @description  Materializes the host-program fakes, drivers, and state for the host-safety test
+##               cases, placing the inhibitors and uptime first on PATH for the entire run.
+## @return       Exit 0.
+t_fixtures_a3() {
+  local name os real_uname
+  T_A3="$T_WORK/a3"
+  T_HOST_DIR="$T_WORK/host"
+  T_A3_STATE="$T_A3/state"
+  mkdir -p "$T_HOST_DIR" "$T_A3_STATE" "$T_A3/out" "$T_A3/Darwin" "$T_A3/Linux" \
+    "$T_A3/SunOS" "$T_A3/lowdisk" "$T_A3/onecpu" "$T_A3/quickexit"
+  T_A3_OUT="$(px_realpath "$T_A3/out")"
+  : >"$T_HOST_DIR/inhibit.log"
+  : >"$T_HOST_DIR/uptime.log"
+  # Each fake inhibitor records its argument list and blocks in the same manner as the real utility:
+  # a single process executing under the program's own name. The fake caffeinate blocks for two
+  # minutes, whereas the fake systemd-inhibit executes the command following its options just as the
+  # real binary does so that an owner loop terminates it.
+  sed -e "s|@HOST@|$T_HOST_DIR|" >"$T_HOST_DIR/caffeinate" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for caffeinate.
+printf '%s %s\n' "${0##*/}" "$*" >>"@HOST@/inhibit.log"
+exec -a "${0##*/}" sleep 120
+A3_EOF
+  sed -e "s|@HOST@|$T_HOST_DIR|" >"$T_HOST_DIR/systemd-inhibit" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for systemd-inhibit. It runs the command after its
+# options under its own name.
+printf '%s %s\n' "${0##*/}" "$*" >>"@HOST@/inhibit.log"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --*) shift ;;
+  *) break ;;
+  esac
+done
+exec -a "${0##*/}" "$@"
+A3_EOF
+  sed -e "s|@HOST@|$T_HOST_DIR|" >"$T_HOST_DIR/uptime" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for uptime. It records each call and reports the
+# load that the file load holds, else an idle host.
+printf 'uptime\n' >>"@HOST@/uptime.log"
+load="$(cat "@HOST@/load" 2>/dev/null || printf '0.00')"
+printf ' 1:05  up 6 days, 2 users, load averages: %s %s %s\n' "$load" "$load" "$load"
+A3_EOF
+  real_uname="$(command -v uname)"
+  for os in Darwin Linux SunOS; do
+    sed -e "s|@OS@|$os|" -e "s|@REAL@|$real_uname|" >"$T_A3/$os/uname" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that names one kernel and passes every other question on.
+if [ "${1:-}" = -s ]; then
+  printf '%s\n' "@OS@"
+  exit 0
+fi
+exec "@REAL@" "$@"
+A3_EOF
+  done
+  sed -e "s|@HOST@|$T_HOST_DIR|" >"$T_A3/Darwin/vm_stat" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for vm_stat. The file free-pages holds the free
+# pages, else 4 GiB of them.
+pages="$(cat "@HOST@/free-pages" 2>/dev/null || printf '1048576')"
+printf 'Mach Virtual Memory Statistics: (page size of 4096 bytes)\n'
+printf 'Pages free:%30s.\nPages active:%28s.\n' "$pages" 1000
+printf 'Pages inactive:%26s.\nPages speculative:%23s.\n' 0 0
+A3_EOF
+  cat >"$T_A3/lowdisk/df" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for df. It reports 1 MiB free.
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf '/dev/fake 10240 9216 1024 90%% /\n'
+A3_EOF
+  cat >"$T_A3/heartbeat-probe.sh" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that runs the monitors check of the bootstrap probe, from the
+# image library its first argument names.
+. "$1/lib/image.sh" && img_check_monitors && printf '%s\n' "$IMG_REASON"
+A3_EOF
+  cat >"$T_A3/onecpu/getconf" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for getconf. The host has one processor.
+printf '1\n'
+A3_EOF
+  cat >"$T_A3/quickexit/caffeinate" <<'A3_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for a caffeinate that ends at once.
+exit 0
+A3_EOF
+  chmod +x "$T_HOST_DIR"/* "$T_A3"/Darwin/* "$T_A3"/Linux/* "$T_A3"/SunOS/* "$T_A3"/lowdisk/* \
+    "$T_A3"/onecpu/* "$T_A3"/quickexit/*
+  cat >"$T_WORK/drivers/restart-wait.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver. It raises the restart count, then works on for 30 seconds.
+printf '1\n' >"$PX_FAKE_STATE_DIR/restart-count"
+exec sleep 30
+DRIVER_EOF
+  cat >"$T_WORK/drivers/oom-wait.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver. An out-of-memory kill ends the one instance, then the driver
+# works on for 30 seconds.
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee000001 regionserver \
+  px-selftest-regionserver-1 exited 'Exited (137) 1 second ago' \
+  phoenix-harness:selftest regionserver 1 0 >"$PX_FAKE_STATE_DIR/instances.txt"
+printf 'c0ffee000001\n' >"$PX_FAKE_STATE_DIR/oom-ids"
+exec sleep 30
+DRIVER_EOF
+  cat >"$T_WORK/drivers/sleep.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver. It records its process id in the run directory, then works
+# for the seconds its first argument names.
+[ -z "${PX_RUN_DIR:-}" ] || printf '%s\n' "$$" >"$PX_RUN_DIR/driver.pid"
+exec sleep "${1:-30}"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/host-probe.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver. It prints the sleep inhibitor record of its run and the
+# contamination of the run. It also prints its owner, px-run. Then it ends with
+# the status its first argument names.
+cat "$PX_OUT/state/inhibit-run-$PX_RUN_ID" 2>/dev/null || printf 'no record\n'
+printf 'contamination [%s]\n' "${PX_CONTAMINATION:-}"
+printf 'owner %s\n' "$PPID"
+exit "${1:-0}"
+DRIVER_EOF
+  chmod +x "$T_WORK/drivers"/*.sh
+}
+
+## @description  Stops every monitor and sleep inhibitor identified by a fixture state record.
+## @return       Exit 0.
+t_daemons_stop() {
+  local record
+  while IFS= read -r record; do
+    [ -z "$record" ] || px_guard_stop "$record"
+  done <<EOF
+$(find "$T_WORK" -type f \( -name 'monitor-*' -o -name 'inhibit-*' \) ! -name '*.heartbeat' \
+    2>/dev/null)
+EOF
+}
+
 ## @description  Executes a command with the deployment-layer tool fakes and fake container runtime.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_a2() {
@@ -1711,6 +1858,13 @@ t_setup() {
   mkdir -p "$T_WORK/out"
   PX_OUT="$(px_realpath "$T_WORK/out")"
   export PX_OUT
+  # Place the fake inhibitors and fake uptime first on PATH so every command resolves them ahead of
+  # host binaries. Configure any monitor started during cluster bring-up to sleep for an hour so it
+  # takes no samples while a test case reads the runtime log, and rely on the exit hook to stop it.
+  PATH="$T_WORK/host:$PATH"
+  PX_MONITOR_INTERVAL_S=3600
+  export PATH PX_MONITOR_INTERVAL_S
+  px_on_exit t_daemons_stop
   t_fixtures_suites
   t_fixtures_drivers
   t_fixtures_shim
@@ -1719,6 +1873,7 @@ t_setup() {
   t_fixtures_scan
   t_fixtures_probes
   t_fixtures_a2
+  t_fixtures_a3
 }
 
 # ---------------------------------------------------------------------------
@@ -3360,11 +3515,21 @@ t_group_sweep_access() {
 ## @description  Sweeps the diagnostic evidence verbs, signal delivery, and drain-aware restarts.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_evidence() {
+  local count
   printf '# verb sweep: evidence, signal and drain-aware restart\n'
   t_sb sb_image_ref px-sweep master 0
   t_outcome sweep_sb_image_ref 0 "$(t_rows 2 px:selftest sha256:ms01)"
-  t_sb sb_restart_count px-sweep master 0
-  t_outcome sweep_sb_restart_count 0 0
+  t_sb sb_list px-sweep
+  count="$(printf '%s\n' "$T_STDOUT" | grep -c .)"
+  t_shim_log_reset
+  t_sb sb_restart_count px-sweep
+  t_equals sweep_sb_restart_count "0 yes $count" "$T_STATUS $(t_flag "$(t_rows 3 master 0 0)" \
+    "$T_STDOUT") $(printf '%s\n' "$T_STDOUT" | grep -c .)"
+  # A single inspection call queries every instance in the scope at once, so no call targets a
+  # single container in isolation.
+  t_equals sweep_restart_count_inspects_every_instance_at_once "1 0" \
+    "$(grep -c RestartCount "$T_SHIM_LOG") $(awk '/RestartCount/ && NF == 4' "$T_SHIM_LOG" |
+      grep -c .)"
   t_sb sb_termination_reason px-sweep master 0
   t_outcome sweep_sb_termination_reason 0 \
     "$(t_rows 4 running 0 '' 2026-01-01T00:00:00Z)"
@@ -3375,12 +3540,12 @@ t_group_sweep_evidence() {
 5 sb_termination_reason px-sweep master 0 previous
 2 sb_termination_reason px-sweep master 0 bogus
 6 sb_termination_reason px-sweep master 9
-6 sb_restart_count px-sweep master 9
+2 sb_restart_count not-a-scope
 6 sb_oom_killed px-sweep master 9
 6 sb_image_ref px-sweep master 9"
   : >"$T_SWEEP_STATE/inspect-fails"
   t_sb_codes sweep_inspection_failure_is_failure "
-1 sb_restart_count px-sweep master 0
+1 sb_restart_count px-sweep
 1 sb_termination_reason px-sweep master 0
 1 sb_oom_killed px-sweep master 0
 1 sb_image_ref px-sweep master 0"
@@ -3476,7 +3641,7 @@ t_group_sweep_scale() {
   t_sb sb_preflight px-sweep
   t_outcome_columns sweep_sb_preflight 0 2 "$(t_rows 2 engine_binary ok \
     engine_responsive ok engine_version ok engine_credentials ok \
-    compose_version ok engine_memory ok port_availability ok)"
+    compose_version ok engine_memory ok engine_cpus ok port_availability ok)"
   printf '19.03.12\n' >"$T_SWEEP_STATE/server-version"
   t_sb sb_preflight px-sweep
   t_equals sweep_preflight_refuses_an_old_engine 3 "$T_STATUS"
@@ -3507,7 +3672,7 @@ t_group_sweep_teardown() {
 1 sb_copy_in px-sweep master 0 /etc/hosts /tmp/x
 1 sb_copy_out px-sweep master 0 /etc/hosts copies/x
 1 sb_endpoint px-sweep master 0 ui
-1 sb_restart_count px-sweep master 0
+1 sb_restart_count px-sweep
 1 sb_termination_reason px-sweep master 0
 1 sb_oom_killed px-sweep master 0
 1 sb_image_ref px-sweep master 0
@@ -3579,14 +3744,14 @@ t_group_cluster() {
     'nodemanager 0 nm01 pending unready px:selftest localhost' "$text"
   t_contains cluster_up_waits_past_a_stopped_group 'nodemanager 0 stopped' "$text"
   t_equals cluster_up_records_the_scope px-sweep "$(cat "$record" 2>/dev/null)"
-  # A subsequent CLI invocation in a separate process must discover the active cluster scope via
-  # the persisted scope record.
-  t_sweep "$T_BASH" "$T_BIN/px-run" --driver "$T_WORK/drivers/exit-code.sh" -- 0
+  # A command running in a new process discovers the scope through the persisted scope record.
+  t_sweep PX_TEARDOWN=0 "$T_BASH" "$T_BIN/px-run" --driver "$T_WORK/drivers/exit-code.sh" \
+    -- 0
   t_equals run_resolves_the_recorded_scope 0 "$T_STATUS"
   t_contains run_snapshots_the_recorded_scope "$(t_rows 4 instance pre master 0)" \
     "$(cat "$T_STDOUT/run-record.tsv" 2>/dev/null)"
   t_shim_log_reset
-  t_sweep PX_SESSION_ID=selftest-requires "$T_BASH" "$T_BIN/px-suite" \
+  t_sweep PX_SESSION_ID=selftest-requires PX_TEARDOWN=0 "$T_BASH" "$T_BIN/px-suite" \
     "$T_WORK/suites/requires.suite"
   t_equals suite_requirement_runs_with_its_group 0 "$T_STATUS"
   t_called suite_requirement_starts_the_group 'compose -p px-sweep start nodemanager'
@@ -4541,7 +4706,7 @@ A2_EOF
   : >"$T_A2_STATE/unreachable"
   t_a2 "$T_BASH" "$pf" --phase fast --deployment "$hand/fast"
   status_seen="$status_seen $T_STATUS"
-  t_equals preflight_fast_phase_refuses_a_silent_engine 3 "$T_STATUS"
+  t_equals preflight_fast_phase_refuses_a_silent_engine 1 "$T_STATUS"
   rm -f "$T_A2_STATE/unreachable"
   t_a2 "$T_BASH" "$pf" --phase slow
   t_equals preflight_unknown_phase 2 "$T_STATUS"
@@ -5287,7 +5452,671 @@ t_a2_trace() {
 }
 
 # ---------------------------------------------------------------------------
-# Command-line argument parsing and test suite execution
+# A3: Host safety verification
+# ---------------------------------------------------------------------------
+# Each host safety guard is exercised against the simulated container runtime and host utility
+# shims. Any test case explicitly named by a requirement preserves that exact identifier.
+
+## @description  Executes a single command against the fake runtime using the A3 state directory
+##               and the A3 output root.
+## @return       Populates T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a3() {
+  t_with_shim "PX_FAKE_STATE_DIR=$T_A3_STATE" "PX_OUT=$T_A3_OUT" PX_POLL_INTERVAL_S=0.2 "$@"
+}
+
+## @description  Determines whether a given process ID is currently alive, reporting yes or no.
+## @return       Writes yes or no to stdout. Exit 0.
+t_alive() { if kill -s 0 "${1:-x}" 2>/dev/null; then printf yes; else printf no; fi; }
+
+## @description  Computes the elapsed time in milliseconds since a given start timestamp (ms).
+## @return       Writes the elapsed millisecond count to stdout. Exit 0.
+t_ms_since() { printf '%s\n' "$(($(px_epoch_ms) - $1))"; }
+
+## @description  Verifies that the elapsed time since a start timestamp remains strictly below a
+##               specified threshold (bound MS, start time in ms).
+## @return       Writes yes, or no followed by the elapsed milliseconds, to stdout. Exit 0.
+t_within() { local n; n=$(t_ms_since "$2"); local r=("no, ${n}ms" yes); echo "${r[n < $1]}"; }
+
+## @description  Retrieves the execution record of the most recent px-run invocation, resolving the
+##               run directory from the first line of its captured stdout.
+## @return       Writes the run record contents to stdout. Exit 0.
+t_record() { cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/run-record.tsv" 2>/dev/null || true; }
+
+## @description  Counts the number of entries in the simulated runtime log that match a given
+##               substring (needle).
+## @return       Writes the matching call count to stdout. Exit 0.
+t_calls() { grep -c -- "$1" "$T_SHIM_LOG" 2>/dev/null || true; }
+
+# The first line of T_A3_RUN_OUT identifies the active run directory, and T_A3_RUN and
+# T_A3_INHIBITOR record its location and sleep inhibitor state.
+## @description  Checks whether the most recent background command run has progressed to its driver
+##               execution stage.
+## @return       Exit 0 when the driver has started; Exit 1 otherwise.
+t_a3_driver_started() {
+  local dir
+  dir="$(sed -n 1p "${T_A3_RUN_OUT:-$T_OUT}" 2>/dev/null)"
+  [ -n "$dir" ] && grep -q "^stage${PX_TAB}driver_start" "$dir/run-record.tsv" 2>/dev/null ||
+    return 1
+  T_A3_RUN=$dir
+  T_A3_INHIBITOR="$(cut -f 1 "$PX_OUT/state/inhibit-run-${dir##*/}" 2>/dev/null)"
+  return 0
+}
+
+# A shell process that was launched with SIGINT (INT) ignored propagates that disposition to every
+# child process, and no child can override it.
+## @description  Probes whether an INT signal is delivered to a background job spawned by the
+##               current shell.
+## @return       Exit 0 when the INT signal terminates the job; Exit 1 otherwise.
+t_int_delivers() {
+  local pid
+  set -m
+  sleep 5 &
+  pid=$!
+  set +m
+  # The forked background job inherits this shell's exit trap until it execs sleep. Delivering an
+  # INT signal before that point would trigger the exit hook and delete the test fixtures, so pause
+  # briefly to allow the job to reach sleep first.
+  sleep 0.3
+  kill -s INT "$pid" 2>/dev/null || true
+  sleep 0.3
+  if kill -s 0 "$pid" 2>/dev/null; then
+    kill -s KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+## @description  Launches a command (signal, command...) under job control, delivers the specified
+##               signal once the run reaches its driver stage, and waits for termination.
+## @return       Populates T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_run_interrupted() {
+  local sig=$1 pid tries=0
+  shift
+  : >"$T_OUT"
+  # Enabling job control preserves default INT handling for the child command. Without job control,
+  # background jobs automatically ignore INT, which would prevent the test case from exercising
+  # signal delivery.
+  set -m
+  "$@" </dev/null >"$T_OUT" 2>"$T_ERR" &
+  pid=$!
+  set +m
+  while [ "$tries" -lt 150 ] && ! t_a3_driver_started; do
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  T_A3_SIGNALLED="$(px_epoch_ms)"
+  kill -s "$sig" "$pid" 2>/dev/null || true
+  T_STATUS=0
+  wait "$pid" 2>/dev/null || T_STATUS=$?
+  T_STDOUT="$(cat "$T_OUT")"
+  T_STDERR="$(cat "$T_ERR")"
+}
+
+## @description  Verifies the fast and memory phases of preflight validation (R-042, R-043).
+## @return       Records test assertions. Exit 0.
+t_a3_preflight_cases() {
+  local pf="$PX_HOME/scripts/preflight.sh" dir="$T_A3/fast" start bad="" seen=""
+  local deploy="$T_A2_OUT/deploy/v"
+  printf '# preflight: the fast phase and the host facts\n'
+  mkdir -p "$dir"
+  cp "$T_DEPLOY/compose.yaml" "$dir/"
+  # R-042: Exercise an unresponsive container engine, a client refused by the engine, and an
+  # occupied port. Each fault must fail immediately with its own distinct exit code and diagnostic
+  # message.
+  : >"$T_A2_STATE/unreachable"
+  printf 'PX_PORT_MASTER_UI=1\n' >"$dir/ports.generated.env"
+  start="$(px_epoch_ms)"
+  t_a2 "$T_BASH" "$pf" --deployment "$dir"
+  [ "$(t_ms_since "$start")" -lt 1000 ] || bad="$bad unresponsive=$(t_ms_since "$start")ms"
+  rm -f "$T_A2_STATE/unreachable"
+  t_equals preflight_unresponsive_engine "1 yes" "$T_STATUS $(t_flag \
+    'refused the deployment: engine_responsive: the engine did not answer' "$T_STDERR")"
+  t_absent preflight_fast_refusal_skips_the_memory_phase memory_fit "$T_STDOUT"
+  seen="$T_STATUS"
+  : >"$T_A2_STATE/denied"
+  start="$(px_epoch_ms)"
+  t_a2 "$T_BASH" "$pf" --deployment "$dir"
+  [ "$(t_ms_since "$start")" -lt 1000 ] || bad="$bad denied=$(t_ms_since "$start")ms"
+  rm -f "$T_A2_STATE/denied"
+  t_equals preflight_logged_out_engine "5 yes" "$T_STATUS $(t_flag \
+    'engine_credentials: the client is not authorised against the engine' "$T_STDERR")"
+  seen="$seen $T_STATUS"
+  t_empty preflight_engine_faults_answer_in_under_a_second "$bad"
+  t_equals preflight_engine_faults_have_distinct_codes "1 5" "$seen"
+  if t_zk_start; then
+    printf 'PX_PORT_MASTER_UI=%s\n' "$T_ZK_PORT" >"$dir/ports.generated.env"
+    start="$(px_epoch_ms)"
+    t_a2 "$T_BASH" "$pf" --deployment "$dir"
+    bad=""
+    [ "$(t_ms_since "$start")" -lt 1000 ] || bad="port=$(t_ms_since "$start")ms"
+    t_zk_stop
+    t_equals preflight_occupied_port "3 yes" "$T_STATUS $(t_flag \
+      "port_availability: loopback ports already in use: $T_ZK_PORT" "$T_STDERR")"
+    t_empty preflight_occupied_port_answers_in_under_a_second "$bad"
+    t_equals preflight_fast_faults_have_distinct_codes "1 5 3" "$seen $T_STATUS"
+  else
+    t_skip preflight_occupied_port "nc is absent, so no port can be held"
+  fi
+  # R-043: Drive each host capacity metric below its required threshold in turn.
+  printf '%s\n' "$((1024 * 1048576))" >"$T_A2_STATE/mem-total"
+  t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory --deployment "$deploy"
+  t_equals preflight_low_memory "3 yes" "$T_STATUS $(t_flag \
+    'refused the deployment: memory_fit: the limits' "$T_STDERR")"
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory --deployment "$deploy"
+  t_equals preflight_admits_enough_of_each 0 "$T_STATUS"
+  t_a2 PX_CLUSTER_ID=v "PATH=$T_A3/lowdisk:$T_A2_BIN:$T_SHIM_DIR:$PATH" "$T_BASH" "$pf" \
+    --phase memory --deployment "$deploy"
+  t_equals preflight_low_disk "3 yes" "$T_STATUS $(t_flag \
+    'refused the deployment: disk_free: disk: 1 MiB (0.00 GiB) free' "$T_STDERR")"
+  t_a2 PX_CLUSTER_ID=v "PATH=$T_A3/onecpu:$T_A2_BIN:$T_SHIM_DIR:$PATH" "$T_BASH" "$pf" \
+    --phase memory --deployment "$deploy"
+  t_equals preflight_few_processors "3 yes" "$T_STATUS $(t_flag \
+    'refused the deployment: cpus: processors: 1 (host 1, engine 9), below the 2' "$T_STDERR")"
+  # Simulate a container engine configured with fewer processors than the underlying host.
+  printf '1\n' >"$T_A2_STATE/ncpu"
+  t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory --deployment "$deploy"
+  rm -f "$T_A2_STATE/ncpu"
+  t_equals preflight_few_engine_processors "3 yes" "$T_STATUS $(t_flag \
+    "cpus: processors: 1 (host $(px_nproc), engine 1), below the 2" "$T_STDERR")"
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+## @description  Verifies sleep inhibitor lifecycle management across individual runs and active
+##               clusters (R-044).
+## @return       Records test assertions. Exit 0.
+t_a3_inhibit_cases() {
+  local pid manual run dir os prog logs="" sig code name run_name owner before tries=0
+  printf '# sleep inhibition\n'
+  t_shim_state_reset
+  # Start an independent operator-owned sleep inhibitor process that harness teardown must never
+  # terminate.
+  "$T_HOST_DIR/caffeinate" -i </dev/null >/dev/null 2>&1 &
+  manual=$!
+  for os in Darwin Linux; do
+    prog=caffeinate
+    [ "$os" = Darwin ] || prog=systemd-inhibit
+    : >"$T_HOST_DIR/inhibit.log"
+    t_with_shim "PATH=$T_A3/$os:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
+      -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh" -- 0
+    run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+    pid="$(cut -f 1 "$run/driver.log" 2>/dev/null | sed -n 1p)"
+    logs="$logs$(cat "$T_HOST_DIR/inhibit.log")$PX_NL"
+    t_equals "inhibit_${os}_uses_$prog" "0 yes" "$T_STATUS $(t_flag "$prog " \
+      "$(cat "$T_HOST_DIR/inhibit.log")")"
+    t_contains "inhibit_${os}_records_the_pid" "$prog${PX_TAB}run-${run##*/}" \
+      "$(cat "$run/driver.log" 2>/dev/null)"
+    t_equals "inhibit_${os}_released_after_the_run" "no no" \
+      "$(t_alive "$pid") $(t_exists "$PX_OUT/state/inhibit-run-${run##*/}")"
+    if [ "$os" = Linux ]; then
+      owner="$(sed -n 's/^owner //p' "$run/driver.log" 2>/dev/null)"
+      t_contains inhibit_linux_follows_its_owner \
+        "sh -c while kill -0 \"\$1\" 2>/dev/null; do sleep 1; done px-inhibit ${owner:-none}" \
+        "$(cat "$T_HOST_DIR/inhibit.log")"
+    fi
+  done
+  t_contains inhibit_darwin_follows_its_owner 'caffeinate -i -s -w ' "$logs"
+  t_contains inhibit_linux_blocks_sleep '--what=sleep:idle --who=phoenix-harness' "$logs"
+  # Verify that a Linux sleep inhibitor terminates automatically with its owning process, even when
+  # the owner is killed with SIGKILL (KILL).
+  sleep 30 &
+  owner=$!
+  (PATH="$T_A3/Linux:$PATH" px_inhibit_start a3-owner "$owner") 2>/dev/null
+  pid="$(cut -f 1 "$PX_OUT/state/inhibit-a3-owner" 2>/dev/null)"
+  before="$(t_alive "$pid")"
+  kill -s KILL "$owner" 2>/dev/null || true
+  wait "$owner" 2>/dev/null || true
+  while [ "$tries" -lt 50 ] && [ "$(t_alive "$pid")" = yes ]; do
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  t_equals inhibit_linux_ends_with_its_owner "yes no" "$before $(t_alive "$pid")"
+  px_guard_release inhibit a3-owner
+  # When a sleep inhibitor process exits immediately, it holds no lock, so the run emits a warning
+  # and leaves no inhibitor state record.
+  t_with_shim "PATH=$T_A3/quickexit:$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" \
+    "$T_BIN/px-run" -e PX_TEARDOWN=0 --scope px-selftest \
+    --driver "$T_WORK/drivers/host-probe.sh" -- 0
+  run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  t_equals inhibit_that_ends_at_once_is_a_warning "0 yes yes" "$T_STATUS $(t_flag \
+    'the sleep inhibitor caffeinate ended at once' "$T_STDERR") $(t_flag 'no record' \
+    "$(cat "$run/driver.log" 2>/dev/null)")"
+  t_empty inhibit_that_ends_at_once_leaves_no_record \
+    "$(find "$PX_OUT/state" -name "inhibit-run-${run##*/}" 2>/dev/null)"
+  t_with_shim "PATH=$T_A3/SunOS:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
+    -e PX_TEARDOWN=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh" -- 0
+  t_equals inhibit_absent_is_a_warning "0 yes yes" "$T_STATUS $(t_flag \
+    'no sleep inhibitor on this host (SunOS' "$T_STDERR") $(t_flag 'no record' \
+    "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/driver.log" 2>/dev/null)")"
+  # Verify that an injected driver failure still releases the active sleep inhibitor on exit.
+  t_with_shim "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
+    -e PX_TEARDOWN=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh" -- 1
+  run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  pid="$(cut -f 1 "$run/driver.log" 2>/dev/null | sed -n 1p)"
+  t_contains inhibit_failed_run_recorded_its_inhibitor "caffeinate${PX_TAB}run-${run##*/}" \
+    "$(cat "$run/driver.log" 2>/dev/null)"
+  t_equals inhibit_released_after_a_failure "1 no" "$T_STATUS $(t_alive "$pid")"
+  # Delivering an interrupt signal releases the sleep inhibitor, terminates the active driver, and
+  # tears down the cluster. If the parent shell started with INT ignored, INT cannot reach the run,
+  # so this test case falls back to sending TERM.
+  sig=INT code=130 name=an_interrupt run_name=interrupted
+  if ! t_int_delivers; then
+    t_skip inhibit_released_after_an_interrupt "this shell ignores INT, the case sends TERM"
+    sig=TERM code=143 name=a_terminate run_name=terminated
+  fi
+  t_shim_state_reset
+  t_shim_log_reset
+  T_A3_INHIBITOR=""
+  t_run_interrupted "$sig" env "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" \
+    "PX_DOCKER_BIN=$T_SHIM_DIR/docker" "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" \
+    "PX_FAKE_STATE_DIR=$T_SHIM_STATE" "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=0.2 \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/sleep.sh" -- 30
+  t_nonempty inhibit_interrupted_run_recorded_its_inhibitor "$T_A3_INHIBITOR"
+  t_equals "inhibit_released_after_$name" "$code no" "$T_STATUS $(t_alive "$T_A3_INHIBITOR")"
+  # R-051: A run never tears down a cluster that it did not bring up, even when interrupted.
+  t_equals "${run_name}_run_leaves_the_cluster_up" 0 "$(t_calls 'compose -p px-selftest down')"
+  t_equals inhibit_never_stops_the_inhibitor_of_the_operator yes "$(t_alive "$manual")"
+  kill "$manual" 2>/dev/null || true
+  wait "$manual" 2>/dev/null || true
+  # A standalone cluster maintains both a sleep inhibitor and a background health monitor from the
+  # time it comes up until it is torn down.
+  rm -rf "${T_A3_STATE:?}"/*
+  cp "$T_SWEEP_STATE/provision.txt" "$T_A3_STATE/"
+  printf 'sweep\n' >"$T_A3_STATE/cluster"
+  dir="$T_A3_OUT/state"
+  t_a3 "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-cluster" --cluster sweep up \
+    --timeout 5 "$T_DEPLOY"
+  pid="$(cut -f 1 "$dir/inhibit-cluster-px-sweep" 2>/dev/null)"
+  t_equals inhibit_held_while_a_cluster_is_up "0 yes" "$T_STATUS $(t_alive "$pid")"
+  T_A3_MONITOR="$(cut -f 1 "$dir/monitor-px-sweep" 2>/dev/null)"
+  t_equals monitor_runs_while_a_cluster_is_up "yes yes" \
+    "$(t_alive "$T_A3_MONITOR") $(t_exists "$dir/monitor-px-sweep.heartbeat")"
+  t_a3 "$T_BASH" "$T_BIN/px-cluster" --cluster sweep down
+  t_equals inhibit_released_when_the_cluster_is_down "0 no no" \
+    "$T_STATUS $(t_alive "$pid") $(t_exists "$dir/inhibit-cluster-px-sweep")"
+  t_equals monitor_stops_when_the_cluster_is_down "no no" \
+    "$(t_alive "$T_A3_MONITOR") $(t_exists "$dir/monitor-px-sweep")"
+}
+
+## @description  Verifies default cluster teardown behavior after individual runs and full suite
+##               sessions (R-051).
+## @return       Records test assertions. Exit 0.
+t_a3_teardown_cases() {
+  local suite="$T_A3/teardown.suite" code pid
+  printf '# teardown by default\n'
+  for code in 0 1; do
+    t_shim_state_reset
+    t_shim_log_reset
+    t_with_shim "$T_BASH" "$T_BIN/px-run" --scope px-selftest \
+      --driver "$T_WORK/drivers/exit-code.sh" -- "$code"
+    t_equals "teardown_after_a_run_with_exit_$code" "$code 1" \
+      "$T_STATUS $(t_calls 'compose -p px-selftest down')"
+    t_contains "teardown_${code}_is_recorded" "$(t_rows 3 teardown 0 ok)" "$(t_record)"
+  done
+  t_shim_state_reset
+  t_shim_log_reset
+  t_with_shim "$T_BASH" "$T_BIN/px-run" --keep --scope px-selftest \
+    --driver "$T_WORK/drivers/exit-code.sh" -- 0
+  t_equals teardown_skipped_with_keep "0 0" \
+    "$T_STATUS $(t_calls 'compose -p px-selftest down')"
+  t_contains teardown_skip_is_recorded "$(t_rows 4 skip run teardown 'the cluster is kept')" \
+    "$(t_record)"
+  # During a suite session, the session itself owns the cluster lifecycle: individual tests leave
+  # the cluster running, and session completion tears it down once.
+  printf 'suite: a3-teardown\ntimeout: 60\n\ntest: one\n  driver: %s\n  args: 0\n\n' \
+    "$T_WORK/drivers/exit-code.sh" >"$suite"
+  printf 'test: two\n  needs: one\n  driver: %s\n  args: 0\n' \
+    "$T_WORK/drivers/exit-code.sh" >>"$suite"
+  t_shim_state_reset
+  t_shim_log_reset
+  t_with_shim PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-teardown "$T_BASH" "$T_BIN/px-suite" \
+    "$suite"
+  t_equals teardown_once_after_a_session "0 1" \
+    "$T_STATUS $(t_calls 'compose -p px-selftest down')"
+  t_shim_state_reset
+  t_shim_log_reset
+  t_with_shim PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-teardown-keep "$T_BASH" \
+    "$T_BIN/px-suite" --keep "$suite"
+  t_equals teardown_skipped_after_a_kept_session "0 0" \
+    "$T_STATUS $(t_calls 'compose -p px-selftest down')"
+  # Delivering a TERM signal immediately aborts the session's wait on its active test. The session
+  # exit hook then terminates the test process, its driver, and its sleep inhibitor before tearing
+  # down the cluster.
+  printf 'suite: a3-interrupt\ntimeout: 60\n\ntest: one\n  driver: %s\n  args: 30\n' \
+    "$T_WORK/drivers/sleep.sh" >"$suite"
+  t_shim_state_reset
+  t_shim_log_reset
+  T_A3_RUN=""
+  T_A3_INHIBITOR=""
+  T_A3_RUN_OUT="$PX_OUT/sessions/a3-interrupt/tests/one/stdout.txt"
+  t_run_interrupted TERM env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
+    "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" \
+    PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-interrupt PX_POLL_INTERVAL_S=0.2 "$T_BASH" \
+    "$T_BIN/px-suite" "$suite"
+  T_A3_RUN_OUT=""
+  pid="$(cat "$T_A3_RUN/driver.pid" 2>/dev/null)"
+  t_equals terminated_session_leaves_the_cluster_up "143 yes 0" "$T_STATUS $(t_within 10000 \
+    "$T_A3_SIGNALLED") $(t_calls 'compose -p px-selftest down')"
+  t_equals teardown_terminated_session_stops_driver_and_inhibitor "no no" \
+    "$(t_alive "${pid:-x}") $(t_alive "${T_A3_INHIBITOR:-x}")"
+  t_nonempty teardown_terminated_session_found_its_driver "$pid$T_A3_INHIBITOR"
+  # The overall execution time bound enforced on px-run combines the test timeout with a safety
+  # margin, plus the quiet-host wait window and one poll interval for the test's run class.
+  printf 'suite: a3-bound\ntimeout: 60\n\ntest: one\n  driver: %s\n  class: %s\n' \
+    "$T_WORK/drivers/exit-code.sh" measurement >"$suite"
+  t_shim_state_reset
+  t_with_shim PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-bound PX_POLL_INTERVAL_S=0.5 \
+    "$T_BASH" "$T_BIN/px-suite" -v "$suite"
+  t_equals teardown_session_bound_covers_the_quiet_wait "0 yes" "$T_STATUS $(t_flag \
+    "test one: px-run gets a bound of $((60 + 300 + 300 + 1))s" "$T_STDERR")"
+  t_shim_state_reset
+}
+
+## @description  Verifies that concurrent teardown requests targeting the same scope are serialized
+##               one after another (F3).
+## @return       Records test assertions. Exit 0.
+t_a3_down_lock_cases() {
+  local lock="$PX_OUT/state/down-px-selftest" holder pid status kind
+  printf '# one removal at a time\n'
+  for kind in released removed; do
+    t_shim_state_reset
+    t_shim_log_reset
+    mkdir -p "$lock"
+    sleep 60 &
+    holder=$!
+    printf '%s\n' "$holder" >"$lock/pid"
+    env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
+      "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" \
+      PX_SCOPE_ID=px-selftest "$T_BASH" "$T_BIN/px-cluster" down \
+      </dev/null >"$T_OUT" 2>"$T_ERR" &
+    pid=$!
+    sleep 2.5
+    t_equals "down_lock_${kind}_waits_for_the_holder" "yes 0" \
+      "$(t_alive "$pid") $(t_calls 'compose -p px-selftest down')"
+    # In the second scenario, simulate the lock holder completing scope removal while the contender
+    # is still waiting on the teardown lock.
+    if [ "$kind" = removed ]; then
+      : >"$T_SHIM_STATE/instances.txt"
+      rm -f "$PX_OUT/state/compose/scope-px-selftest.tsv"
+    fi
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rm -rf "$lock"
+    status=0
+    wait "$pid" || status=$?
+    if [ "$kind" = released ]; then
+      t_equals down_lock_released_then_down "0 1" \
+        "$status $(t_calls 'compose -p px-selftest down')"
+    else
+      t_equals down_lock_scope_gone_counts_as_down "0 yes 0" "$status $(t_flag \
+        'scope px-selftest already came down' "$(cat "$T_ERR")") $(t_calls \
+        'compose -p px-selftest down')"
+    fi
+  done
+  # When the configured teardown timeout bound is not a positive integer number of seconds, the
+  # backend falls back to its default timeout so cluster removal still completes cleanly without
+  # leaving residual instances behind.
+  for value in abc 300s 0; do
+    t_shim_state_reset
+    t_shim_log_reset
+    t_with_shim PX_SCOPE_ID=px-selftest "PX_TIMEOUT_TEARDOWN=$value" "$T_BASH" \
+      "$T_BIN/px-cluster" down
+    t_equals "down_with_teardown_bound_${value}_removes_the_cluster" "0 1 0" \
+      "$T_STATUS $(t_calls 'compose -p px-selftest down') $(grep -c . \
+      "$T_SHIM_STATE/instances.txt" 2>/dev/null)"
+  done
+  t_shim_state_reset
+}
+
+## @description  Verifies that an unplanned service restart or an out-of-memory (OOM) kill triggers
+##               an immediate run abort (R-052).
+## @return       Records test assertions. Exit 0.
+t_a3_abort_cases() {
+  local start record driver name change
+  printf '# the immediate abort\n'
+  # Iterate over one three-field tuple per fault scenario: the fault-injecting driver script, the
+  # test case identifier, and the expected state transition in the abort record row. The OOM kill
+  # scenario runs last so that its run record remains available for the post-loop evidence
+  # assertions.
+  while read -r driver name change; do
+    t_shim_state_reset
+    start="$(px_epoch_ms)"
+    # Because px-run honors the first value assigned to any configuration variable, pass the fast
+    # poll interval explicitly on this invocation.
+    t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=0.2 -e PX_TEARDOWN=0 \
+      -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/$driver.sh"
+    t_equals "abort_on_${name}_is_at_once" yes "$(t_within 15000 "$start")"
+    record="$(t_record)"
+    t_equals "abort_on_$name" 3 "$T_STATUS"
+    t_contains "abort_${name}_records_its_change" "$(t_rows 3 regionserver 0 "$change")" \
+      "$(printf '%s\n' "$record" | grep '^abort' | cut -f 3-)"
+  done <<'A3_EOF'
+restart-wait an_unplanned_restart restarted 0 to 1
+oom-wait an_oom_kill went from running to exited
+A3_EOF
+  t_contains abort_records_the_oom_reason "$(t_rows 4 term regionserver 0 oom)" "$record"
+  t_contains abort_records_the_oom_evidence "$(t_rows 4 oom regionserver 0 yes)" "$record"
+  t_contains abort_code_is_documented_in_the_readme '| 3 | anomaly |' \
+    "$(cat "$PX_HOME/README.md")"
+  t_contains abort_code_is_documented_for_backends 'aborts the run at once with exit 3' \
+    "$(tr -s ' \n' ' ' <"$PX_HOME/docs/backends.md")"
+  t_shim_state_reset
+}
+
+## @description  Verifies quiet-host contention detection and contamination tagging (R-047, R-048).
+## @return       Records test assertions. Exit 0.
+t_a3_quiet_cases() {
+  local want record
+  printf '# the quiet-host check\n'
+  t_shim_state_reset
+  : >"$T_HOST_DIR/uptime.log"
+  printf '0.00\n' >"$T_HOST_DIR/load"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" --class validation -e PX_TEARDOWN=0 \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
+  t_equals quiet_validation_takes_no_sample "0 0" \
+    "$T_STATUS $(grep -c . "$T_HOST_DIR/uptime.log")"
+  record="$(t_record)"
+  t_contains quiet_validation_records_the_check_off "$(t_rows 3 quiet quiet_host off)" "$record"
+  t_contains quiet_off_check_contaminates_the_run \
+    "$(t_rows 3 contamination quiet-host 'the quiet-host check is off')" "$record"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
+  record="$(t_record)"
+  t_equals quiet_measurement_on_a_quiet_host "0 1" \
+    "$T_STATUS $(grep -c . "$T_HOST_DIR/uptime.log")"
+  t_contains quiet_records_the_quiet_result "$(t_rows 3 quiet quiet_host quiet)" "$record"
+  t_absent quiet_record_holds_no_result_trailer "quiet${PX_TAB}result$PX_TAB" "$record"
+  t_absent quiet_host_is_not_contaminated contamination "$record"
+  # Simulate a heavily contended host with a load average far exceeding the quiet-host threshold on
+  # any processor count.
+  printf '99.00\n' >"$T_HOST_DIR/load"
+  want="load $((9900 / $(px_nproc)))% of its processors is above 25%"
+  : >"$T_HOST_DIR/uptime.log"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+    -e PX_QUIET_HOST_WAIT_S=1 -e PX_POLL_INTERVAL_S=0.2 -e PX_SCOPE_ID=px-selftest \
+    "$T_WORK/drivers/host-probe.sh"
+  record="$(t_record)"
+  t_equals quiet_busy_host_fails_a_measurement 4 "$T_STATUS"
+  t_contains quiet_reports_the_contention_with_its_value "$want" "$T_STDERR"
+  t_equals quiet_busy_host_pauses_and_retries yes \
+    "$([ "$(grep -c . "$T_HOST_DIR/uptime.log")" -ge 2 ] && echo yes || echo no)"
+  t_contains quiet_records_the_refusal "$(t_rows 3 quiet quiet_host refused)" "$record"
+  t_equals quiet_refusal_runs_no_driver 0 "$(printf '%s\n' "$record" | grep -c "^driver$PX_TAB")"
+  # Configuring a quiet-host wait duration of 0 takes a single load sample and immediately enforces
+  # the quiet-host requirement.
+  : >"$T_HOST_DIR/uptime.log"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+    -e PX_QUIET_HOST_WAIT_S=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh"
+  t_equals quiet_wait_0_takes_one_sample_and_decides "4 1" \
+    "$T_STATUS $(grep -c . "$T_HOST_DIR/uptime.log")"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+    -e PX_QUIET_HOST_WAIT_S=1 -e PX_REQUIRE_QUIET_HOST=0 -e PX_POLL_INTERVAL_S=0.2 \
+    --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh"
+  record="$(t_record)"
+  t_equals quiet_not_required_proceeds 0 "$T_STATUS"
+  t_contains quiet_contaminated_run_carries_the_tag \
+    "$(t_rows 2 contamination quiet-host)" "$record"
+  t_contains quiet_driver_learns_the_contamination 'contamination [quiet-host]' \
+    "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/driver.log" 2>/dev/null)"
+  t_contains quiet_measurement_requires_by_default 'PX_REQUIRE_QUIET_HOST=1' \
+    "$(cat "$T_ENVD/class-measurement.env")"
+  # Verify O4 and O5: the check states are reported in the quiet_host row, and the stream
+  # concludes with a single result row carrying a check status.
+  want=""
+  for line in 99.00:1 0.00:1 99.00:0; do
+    printf '%s\n' "${line%%:*}" >"$T_HOST_DIR/load"
+    t_run env PX_QUIET_HOST_WAIT_S=1 PX_POLL_INTERVAL_S=0.2 \
+      "PX_REQUIRE_QUIET_HOST=${line##*:}" "$T_BASH" "$T_BIN/px-tool" quiet-host
+    want="$want|$T_STATUS $(t_last_line "$T_STDOUT" | tr '\t' ' ') $(printf '%s\n' \
+      "$T_STDOUT" | grep -c "^result$PX_TAB") $(printf '%s\n' "$T_STDOUT" | tail -n 2 |
+      sed -n 1p | cut -f 1,2 | tr '\t' ' ')"
+  done
+  t_run env PX_QUIET_HOST_WAIT_S=0 PX_REQUIRE_QUIET_HOST=0 "$T_BASH" "$T_BIN/px-tool" quiet-host
+  t_equals quiet_host_ends_with_a_result_row "|4 result fail 4 host 1 quiet_host refused|0 result\
+ ok 0 host 1 quiet_host quiet|0 result warn 0 host 1 quiet_host contaminated|0 $(t_rows 5 \
+    quiet_host off 0 0 '')$PX_NL$(t_rows 4 result skip 0 host)" "$want|$T_STATUS $T_STDOUT"
+  printf '0.00\n' >"$T_HOST_DIR/load"
+  t_shim_state_reset
+}
+
+## @description  Verifies the background host and container health monitor (R-049).
+## @return       Records test assertions. Exit 0.
+t_a3_monitor_cases() {
+  local dir="$PX_OUT/a3-monitor" start hb pid seed="$T_A3/r049" record run
+  printf '# the health monitor\n'
+  t_run env -u PX_MONITOR_INTERVAL_S "$T_BASH" "$T_BIN/px-cluster" config
+  t_contains monitor_interval_is_30_seconds "$(t_rows 3 PX_MONITOR_INTERVAL_S 30 defaults)" \
+    "$T_STDOUT"
+  # Simulate host memory exhaustion to trigger a safety breach: the monitor must tear down the
+  # cluster within a single sampling interval and persist the triggering sample in breach.tsv.
+  t_shim_state_reset
+  t_shim_log_reset
+  rm -rf "$dir"
+  printf '1000\n' >"$T_HOST_DIR/free-pages"
+  start="$(px_epoch_ms)"
+  t_with_shim "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "PX_RUN_DIR=$dir" PX_MONITOR_INTERVAL_S=2 \
+    "$T_BASH" "$T_BIN/px-tool" monitor -e PX_SCOPE_ID=px-selftest
+  t_equals monitor_breach_within_one_interval "1 yes" \
+    "$(grep -c '^host' "$dir/samples.tsv" 2>/dev/null) $(t_within 8000 "$start")"
+  t_equals monitor_breach_tears_down "3 1" "$T_STATUS $(t_calls 'compose -p px-selftest down')"
+  t_contains monitor_writes_the_triggering_sample \
+    "$(t_rows 2 breach 'the host has 3 MiB free, below the floor of 1024 MiB')" \
+    "$(cat "$dir/breach.tsv" 2>/dev/null)"
+  t_contains monitor_breach_holds_the_sample "${PX_TAB}4096000" \
+    "$(grep '^host' "$dir/breach.tsv" 2>/dev/null)"
+  rm -f "$T_HOST_DIR/free-pages"
+  # A service instance approaching its own container memory limit is logged in the sample history
+  # without triggering a host-level breach; any resulting container OOM stays bounded within the
+  # container and is reported by the px-run abort check. Meanwhile, the monitor refreshes its
+  # heartbeat file for the bootstrap probe and shuts down cleanly upon receiving TERM.
+  t_shim_state_reset
+  t_shim_log_reset
+  rm -rf "$dir"
+  printf '1000MiB / 1GiB\n' >"$T_SHIM_STATE/stats-mem"
+  (
+    env "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
+      "PX_FAKE_STATE_DIR=$T_SHIM_STATE" "PX_RUN_DIR=$dir" PX_MONITOR_INTERVAL_S=1 \
+      "$T_BASH" "$T_BIN/px-tool" monitor -e PX_SCOPE_ID=px-selftest </dev/null >/dev/null 2>&1 &
+  )
+  sleep 3
+  hb="$PX_OUT/state/monitor-px-selftest.heartbeat"
+  pid="$(cut -f 1 "$PX_OUT/state/monitor-px-selftest" 2>/dev/null)"
+  t_equals monitor_records_an_instance_near_its_limit "yes no" \
+    "$(t_flag "${PX_TAB}1048576000${PX_TAB}1073741824${PX_TAB}" \
+      "$(grep '^instance' "$dir/samples.tsv" 2>/dev/null)") $(t_exists "$dir/breach.tsv")"
+  t_image "PX_MONITOR_HEARTBEATS=$hb" -- "$T_BASH" "$T_A3/heartbeat-probe.sh" "$T_IMG"
+  t_equals monitor_heartbeat_satisfies_the_bootstrap_probe \
+    "0 1 monitor heartbeats are fresh" "$T_STATUS $T_STDOUT"
+  px_guard_stop "$PX_OUT/state/monitor-px-selftest"
+  t_equals monitor_stops_on_a_term "no no" \
+    "$(t_alive "$pid") $(t_exists "$PX_OUT/state/monitor-px-selftest")"
+  rm -f "$T_SHIM_STATE/stats-mem"
+  # Passing a non-integer configuration value is rejected as a usage error. That validation failure
+  # terminates the caller of px_int_setting immediately, ensuring the monitor removes nothing.
+  t_shim_log_reset
+  t_with_shim PX_MONITOR_INTERVAL_S=30s "$T_BASH" "$T_BIN/px-tool" monitor \
+    -e PX_SCOPE_ID=px-selftest
+  t_equals monitor_refuses_a_malformed_interval "2 0" \
+    "$T_STATUS $(t_calls 'compose -p px-selftest down')"
+  t_with_shim PX_QUIET_HOST_LOAD_PCT=25% "$T_BASH" "$T_BIN/px-tool" quiet-host
+  t_equals quiet_host_refuses_a_malformed_threshold 2 "$T_STATUS"
+  # When a monitor breach terminates an active px-run invocation, the run copies the monitor breach
+  # record into its own run directory and references that file in its abort row. The synthetic
+  # monitor state file cites process 1, whose command line never matches the monitor binary, so no
+  # guard release can signal it.
+  t_shim_state_reset
+  mkdir -p "$seed"
+  px_tsv_row breach 'the host has 3 MiB free, below the floor of 1024 MiB' >"$seed/breach.tsv"
+  px_tsv_row 1 "px-tool monitor" "$seed" >"$PX_OUT/state/monitor-px-selftest"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=0.2 -e PX_TEARDOWN=0 \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/oom-wait.sh"
+  rm -f "$PX_OUT/state/monitor-px-selftest"
+  record="$(t_record)"
+  run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  t_equals monitor_breach_reaches_the_run "3 yes" "$T_STATUS $(t_exists "$run/breach.tsv")"
+  t_contains monitor_breach_is_cited_by_the_abort 'the health monitor removed the cluster, see' \
+    "$(printf '%s\n' "$record" | grep '^abort')"
+  t_contains monitor_breach_run_records_the_monitor "$(t_rows 3 monitor pre "$seed")" "$record"
+  t_contains monitor_breach_run_records_the_copy "$(t_rows 2 breach "$run/breach.tsv")" "$record"
+  t_shim_state_reset
+}
+
+## @description  Verifies the container restart policy, the single-cluster host admission gate, and
+##               the finite RegionServer drain timeout (R-045, R-046, R-050).
+## @return       Records test assertions. Exit 0.
+t_a3_policy_cases() {
+  local dir="$T_A2_OUT/deploy/m" count start bound
+  printf '# restart policy, one cluster per host, finite drain\n'
+  count="$(grep -c '^  [a-z-]*-[0-9]:$' "$dir/compose.yaml" 2>/dev/null)"
+  t_equals restart_policy_no_on_every_service "$count" \
+    "$(grep -cxF '    restart: "no"' "$dir/compose.yaml" 2>/dev/null)"
+  t_empty no_service_restarts_itself \
+    "$(grep -E 'restart: *"?(always|unless-stopped|on-failure)' "$dir/compose.yaml")"
+  # R-046: Simulate an existing container belonging to another harness cluster on the same host.
+  rm -rf "${T_A3_STATE:?}"/*
+  printf 'other\n' >"$T_A3_STATE/cluster"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' ot01 regionserver px-other-regionserver-1 running \
+    'Up 1 minute' px:o regionserver 1 0 >"$T_A3_STATE/instances.txt"
+  t_a3 "$T_BASH" "$T_BIN/px-cluster" --cluster gate up "$T_DEPLOY"
+  t_equals one_cluster_per_host_refuses_a_second "1 yes" "$T_STATUS $(t_flag \
+    'a harness cluster is already on this host: project px-other (cluster other)' "$T_STDERR")"
+  t_equals one_cluster_per_host_records_nothing no \
+    "$(t_exists "$T_A3_OUT/state/scope-compose-gate")"
+  # R-050: Verify that a RegionServer whose region drain hangs is bounded by the drain timeout.
+  t_equals drain_wait_has_a_finite_timeout 600 \
+    "$(t_env_value "$T_ENVD/defaults.env" PX_TIMEOUT_DRAIN)"
+  rm -rf "${T_A3_STATE:?}"/*
+  printf 'a3\n' >"$T_A3_STATE/cluster"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||%s\n' a3rs01 regionserver px-a3-regionserver-1 \
+    running 'Up 1 minute (healthy)' px:a3 regionserver 1 0 regionmover \
+    >"$T_A3_STATE/instances.txt"
+  start="$(px_epoch_ms)"
+  t_a3 "PX_REGION_MOVER_CMD=sleep 30" "$T_BASH" "$T_WORK/probe/sb.sh" sb_restart_drain px-a3 \
+    regionserver 0 1 5
+  bound="$(t_within 10000 "$start")"
+  t_outcome_columns drain_never_draining_server_times_out 4 2 \
+    "$(t_rows 2 drain fail stop skip start skip ready skip rebalance skip)"
+  t_equals drain_wait_ends_at_its_timeout yes "$bound"
+  rm -rf "${T_A3_STATE:?}"/*
+}
+
+## @description  Executes the complete suite of round A3 host safety guard verifications.
+## @return       Records test assertions. Exit 0.
+t_group_a3() {
+  t_a3_preflight_cases
+  t_a3_policy_cases
+  t_a3_abort_cases
+  t_a3_quiet_cases
+  t_a3_monitor_cases
+  t_a3_teardown_cases
+  t_a3_down_lock_cases
+  t_a3_inhibit_cases
+}
+
+# ---------------------------------------------------------------------------
+# Command-line option parsing and test suite execution
 # ---------------------------------------------------------------------------
 
 while getopts ":kh" T_OPTION; do
@@ -5352,8 +6181,10 @@ t_group_a2_dist
 t_group_a2_platform
 t_group_a2_cluster
 t_group_a2_matrix
+t_group_a3
 t_group_tree
 
+t_daemons_stop
 printf '1..%s\n' "$T_NUMBER"
 if [ -n "$T_SKIPPED" ]; then
   printf '# skipped, so not proven on this host:\n'
