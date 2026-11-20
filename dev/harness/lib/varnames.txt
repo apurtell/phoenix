@@ -17,14 +17,15 @@
 # PX_* name that is not declared here, so a misspelled name fails closed
 # instead of becoming a silent default.
 #
-# One name per line. A comment and a blank line are ignored. A name that ends
-# with an asterisk declares a family, and every name with that prefix counts
-# as declared. The word private after a name keeps that name in the process
+# A line holds one name or several names. A comment and a blank line are
+# ignored. A name that ends with an asterisk declares a family, alone on
+# its line, and every name with that prefix counts as declared. The word
+# private after a name, alone on its line, keeps that name in the process
 # that loads it: the loader never exports it to a child process.
 #
-# This file holds the harness-generic names only. A later round appends its
-# own group: role, sizing and version names arrive with the topology
-# generator, and the Kubernetes names arrive with the second backend.
+# A round appends its own group. The harness-generic names come first, then
+# the topology, image, version and build names of the deployment generator.
+# The Kubernetes names arrive with the second backend.
 
 # --- Layout -----------------------------------------------------------------
 PX_HOME                  # the dev/harness directory, resolved from lib/common.sh
@@ -40,7 +41,7 @@ PX_LOCAL_ENV             # stage 3, the local environment overrides
 PX_CLASS_ENV             # stage 4, the run class defaults
 PX_DEFAULTS_ENV          # stage 5, the baseline defaults, the mandatory stage
 PX_VERSIONS_ENV          # stage 6, the version definitions
-PX_VERSIONS_LOCAL_ENV    # stage 7, the local version pins recorded on first use
+PX_VERSIONS_LOCAL_ENV    # stage 7, the pins an operator records by hand, such as base digests
 PX_PORT_MAP_ENV          # stage 8, the port map, default in the deployment directory
 PX_STRICT_CONFIG         # 1 refuses an undeclared PX_* name, read from the environment only
 
@@ -54,7 +55,6 @@ PX_LOG_FILE              # a file under PX_OUT that receives a copy of every mes
 # --- Backend binding --------------------------------------------------------
 PX_BACKEND               # the substrate backend to bind, for example compose
 PX_DOCKER_BIN   private  # the engine binary of the Compose backend, set in env/local.env
-PX_COMPOSE_FLAVOUR       # plugin or standalone, how the backend reaches compose
 PX_LABEL_PREFIX          # label namespace that scopes every object, default px.harness
 PX_PROJECT_PREFIX        # name prefix of a scope, default px
 PX_REGION_MOVER_CMD      # the drain command template of the Compose backend
@@ -85,6 +85,8 @@ PX_TIMEOUT_SCALE         # a change of instance count
 PX_TIMEOUT_GROUP         # a role group stop or start
 PX_TIMEOUT_STOP          # a stop that keeps state
 PX_POLL_INTERVAL_S       # the interval a readiness poll waits between probes
+PX_TIMEOUT_FETCH         # one download of a pinned distribution
+PX_TIMEOUT_BUILD         # the Maven build of Phoenix, or one image build
 
 # --- Suites, runs and drivers -----------------------------------------------
 PX_SUITE_DIR             # directory of the .suite files, default suites
@@ -110,5 +112,90 @@ PX_TRACE_TARGETS         # the roles the tracer attaches to
 # --- Test fixtures ----------------------------------------------------------
 # The self-test sets these. No shipped component reads them.
 PX_FAKE_*                # the family of fixture controls used by test/run-tests.sh
-PX_FAKE_DOCKER_LOG       # the file the fake runtime shim appends its argv to
-PX_FAKE_STATE_DIR        # the fixture state the fake runtime shim answers from
+
+# --- Topology (docker/compose.gen.sh, the run class files) ------------------
+# The run class files set these. The generator validates them and renders the
+# deployment directory from them.
+PX_YARN                  # 1 renders the YARN tier, group yarn, started on demand
+PX_SNN                   # 1 renders the Secondary NameNode
+PX_DN_COUNT              # DataNode instances, 1 to 9
+PX_NM_COUNT              # NodeManager instances, 1 to 9
+PX_RS_COUNT              # RegionServer instances, 1 to 9
+PX_HDFS_REPLICATION      # the requested replication; topology.env holds it clamped
+PX_HBASE_BLOCKCACHE_SIZE # hfile.block.cache.size, a fraction
+PX_HBASE_MEMSTORE_SIZE   # the global memstore fraction, with the cache at most 0.8
+PX_NM_RESOURCE_MIB       # the YARN memory that each NodeManager offers
+PX_NM_VCORES             # the YARN cores that each NodeManager offers
+PX_YARN_MIN_ALLOC_MIB    # the smallest YARN container
+PX_YARN_MAX_ALLOC_MIB    # the largest YARN container
+PX_MR_AM_MIB             # the container of a MapReduce application master
+PX_MR_TASK_MIB           # the container of a MapReduce map or reduce task
+
+# --- Sizing ------------------------------------------------------------------
+# Four names for each role key, as docker/env/class-measurement.env explains.
+PX_ZK_MEM_MIB PX_ZK_HEAP_MIB PX_ZK_DIRECT_MIB PX_ZK_JDK
+PX_NN_MEM_MIB PX_NN_HEAP_MIB PX_NN_DIRECT_MIB PX_NN_JDK
+PX_SNN_MEM_MIB PX_SNN_HEAP_MIB PX_SNN_DIRECT_MIB PX_SNN_JDK
+PX_DN_MEM_MIB PX_DN_HEAP_MIB PX_DN_DIRECT_MIB PX_DN_JDK
+PX_RM_MEM_MIB PX_RM_HEAP_MIB PX_RM_DIRECT_MIB PX_RM_JDK
+PX_NM_MEM_MIB PX_NM_HEAP_MIB PX_NM_DIRECT_MIB PX_NM_JDK
+PX_JHS_MEM_MIB PX_JHS_HEAP_MIB PX_JHS_DIRECT_MIB PX_JHS_JDK
+PX_MASTER_MEM_MIB PX_MASTER_HEAP_MIB PX_MASTER_DIRECT_MIB PX_MASTER_JDK
+PX_RS_MEM_MIB PX_RS_HEAP_MIB PX_RS_DIRECT_MIB PX_RS_JDK
+PX_CLIENT_MEM_MIB PX_CLIENT_HEAP_MIB PX_CLIENT_DIRECT_MIB PX_CLIENT_JDK
+PX_TOOLING_MEM_MIB PX_TOOLING_HEAP_MIB PX_TOOLING_DIRECT_MIB PX_TOOLING_JDK
+PX_SETUP_MEM_MIB PX_SETUP_HEAP_MIB PX_SETUP_DIRECT_MIB PX_SETUP_JDK
+
+# --- The topology record (topology.env) --------------------------------------
+# The generator writes these. Every service reads the file as environment,
+# and the bundle keeps it as the record of what was deployed.
+PX_BIND_HOST             # the bind address of every daemon: every interface, 0.0.0.0
+PX_HDFS_REPLICATION_REQUESTED # the replication the configuration asked for
+PX_GROUPS                # the role groups of the deployment
+PX_GROUP_*               # PX_GROUP_<GROUP> its roles, PX_GROUP_<GROUP>_MEM_MIB its limits
+PX_TOPOLOGY_*            # the service count and the memory sums of the deployment
+
+# --- The instance environment (docker/image) ---------------------------------
+# The generator injects the first seven for each service. The image definition
+# sets the layout names, and a later round sets the hooks.
+PX_ROLE                  # the role of one instance
+PX_INSTANCE_INDEX        # the zero-based index of one instance
+PX_HOSTNAME              # the hostname of one instance on the harness network
+PX_JDK                   # the JDK major version of one instance
+PX_HEAP_MIB              # the fixed heap of one instance
+PX_DIRECT_MIB            # the direct memory limit of one instance
+PX_MEM_MIB               # the container memory limit of one instance
+PX_DATA_DIR              # the data directory of one instance
+PX_LOG_DIR               # the log directory of one instance
+PX_CONF_DIR              # the rendered configuration of one instance
+PX_HADOOP_HOME           # the Hadoop distribution in the image
+PX_HBASE_HOME            # the HBase distribution in the image
+PX_PHOENIX_HOME          # the Phoenix jars in the image
+PX_JDK_ROOT              # the directory of the JDK homes 11, 17 and 21
+PX_TOOLS_DIR             # the profiling tools in the image
+PX_CONF_OVERLAY_DIR      # templates that render after the base set
+PX_JVM_DEBUG             # 1 adds the debug agent and publishes the debug port, at render
+PX_JVM_OPTS_EXTRA        # JVM options that come last
+PX_BOOTSTRAP_SETUP_DIR   # the workload setup hooks of the bootstrap probe
+PX_MONITOR_HEARTBEATS    # the heartbeat files that the bootstrap probe checks
+PX_MONITOR_STALE_S       # the largest heartbeat age, default 90 seconds
+PX_RENDER_*              # values the image derives before it renders a template
+
+# --- Versions and the image (docker/versions.env, scripts/) ------------------
+PX_DIST_*                # the pinned distributions that fetch-dist.sh retrieves
+PX_PHOENIX_HBASE_PROFILE # the HBase profile of the Phoenix build, -Dhbase.profile
+PX_PHOENIX_HBASE_PROFILE_DEFAULT # the profile when no stage selects one
+PX_IMAGE_TAG             # the one local image that every service runs
+PX_IMAGE_BASE_*          # the JDK base images and their digest pins
+PX_STAGED_*              # build arguments: the context path of each staged file
+PX_UID                   # build argument: the host user id of the image user
+PX_GID                   # build argument: the host group id of the image user
+PX_ARCH                  # build argument: the architecture of the build
+PX_PHOENIX_VERSION       # build argument: the Phoenix version of the build record
+PX_HBASE_VERSION         # build argument: the HBase release of the cluster
+PX_HADOOP_VERSION        # build argument: the Hadoop release of the cluster
+PX_ZOOKEEPER_VERSION     # build argument and topology: the ZooKeeper that HBase ships
+PX_HBASE_HADOOP_VERSION  # build argument and topology: the Hadoop client that HBase ships
+PX_BUILD_JDK             # the JDK major version of the Maven build, 11, 17 or 21
+PX_BUILD_JAVA_HOME       # the JDK home of the Maven build, of that version
+PX_BUILD_DISTRIBUTED     # 1 also builds phoenix-pherf-distributed

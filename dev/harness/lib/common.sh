@@ -56,10 +56,10 @@ export PX_HOME
 # harness lives outside a working tree, such as a test fixture, leaving no repository to protect.
 PX_TREE_ROOT=""
 
-# Walks upward from the library directory PX_LIB_DIR and stops at the first ancestor directory that
-# carries a repository marker (.git or pom.xml), leaving PX_TREE_ROOT empty if none is found.
-## @description  Locates the enclosing working tree root for this harness instance.
-## @return       Populates PX_TREE_ROOT (empty when outside a working tree) and exits 0.
+# Walks upward from the library directory and assigns PX_TREE_ROOT to the first ancestor directory
+# containing a repository marker, or leaves PX_TREE_ROOT empty when no marker is found.
+## @description  Locates the enclosing repository working tree root for this harness instance.
+## @return       Populates PX_TREE_ROOT and exits 0.
 px_tree_root_find() {
   local dir=$PX_LIB_DIR
   while [ -n "$dir" ] && [ "$dir" != "/" ]; do
@@ -95,6 +95,9 @@ PX_RE_INT='^[0-9]+$'
 PX_RE_SECONDS='^[0-9]+(\.[0-9]+)?$'
 PX_RE_NUMBER='^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$'
 
+# Enumerates the supported JDK major versions that cluster roles and Maven builds may select.
+PX_JDKS="11 17 21"
+
 # ---------------------------------------------------------------------------
 # Shared exit-code vocabulary for harness commands and the substrate contract.
 # ---------------------------------------------------------------------------
@@ -129,9 +132,8 @@ PX_EXIT_TIMEOUT=4
 PX_EXIT_UNSUPPORTED=5
 PX_EXIT_NO_OBJECT=6
 
-## @description  Translates an exit code from the shared vocabulary into its human-readable name.
-## @param        code The numeric exit status to translate.
-## @return       Writes the corresponding exit-code name to stdout and always exits 0.
+## @description  Translates a numeric exit code from the shared vocabulary into its symbolic name.
+## @return       Writes the exit-code name (or undeclared) to stdout and exits 0.
 px_exit_name() {
   case "${1:-}" in
   "$PX_EXIT_OK") printf 'ok\n' ;;
@@ -209,8 +211,9 @@ if command -v gdate >/dev/null 2>&1; then
   PX_DATE_MS_BIN=gdate
 fi
 
-## @description  Reports the current UNIX epoch time in seconds, preferring printf over a fork.
-## @return       Writes the current epoch seconds to stdout and exits 0.
+# Prefers the shell printf time-formatting builtin over forking an external date process.
+## @description  Reports the current UNIX epoch time in whole seconds.
+## @return       Writes the epoch seconds to stdout and exits 0.
 px_epoch_s() {
   if [ "$PX_HAVE_PRINTF_TIME" = 1 ]; then
     printf '%(%s)T\n' -1
@@ -219,10 +222,10 @@ px_epoch_s() {
   fi
 }
 
-# Falls back to second resolution padded with zeros when the host date binary lacks millisecond
-# formatting support.
+# Falls back to epoch seconds multiplied by 1000 on hosts where the date utility lacks a
+# millisecond formatting field.
 ## @description  Reports the current UNIX epoch time in milliseconds.
-## @return       Writes the current epoch milliseconds to stdout and exits 0.
+## @return       Writes the epoch milliseconds to stdout and exits 0.
 px_epoch_ms() {
   local value
   value="$("$PX_DATE_MS_BIN" -u '+%s%3N' 2>/dev/null)" || value=""
@@ -235,11 +238,10 @@ px_epoch_ms() {
   printf '%s\n' "$value"
 }
 
-# Performs pure local integer arithmetic to populate PX_UTC_TEXT (YYYY-MM-DDTHH:MM:SSZ) and
-# PX_UTC_COMPACT (YYYYMMDDTHHMMSSZ), ensuring the conversion never depends on the TZ variable.
-## @description  Converts an epoch-second timestamp into standard and compact UTC strings.
-## @param        epoch_seconds The UNIX epoch time in seconds to convert.
-## @return       Sets PX_UTC_TEXT and PX_UTC_COMPACT in the current shell and exits 0.
+# Converts an epoch-second timestamp into PX_UTC_TEXT (YYYY-MM-DDTHH:MM:SSZ) and PX_UTC_COMPACT
+# (YYYYMMDDTHHMMSSZ) using pure integer arithmetic so the result remains independent of TZ.
+## @description  Populates standard and compact UTC timestamp variables from epoch seconds.
+## @return       Sets PX_UTC_TEXT and PX_UTC_COMPACT and exits 0.
 px_utc_fields() {
   local t=$1 days secs era doe yoe doy mp y m d hh mm ss z
   days=$((t / 86400))
@@ -262,10 +264,9 @@ px_utc_fields() {
   printf -v PX_UTC_COMPACT '%04d%02d%02dT%02d%02d%02dZ' "$y" "$m" "$d" "$hh" "$mm" "$ss"
 }
 
-# Uses the printf time builtin to avoid forking when available, or falls back to a single date
-# invocation on older shells.
-## @description  Generates an ISO-8601 UTC timestamp for diagnostic log messages.
-## @return       Writes the formatted UTC timestamp to stdout and exits 0.
+# Avoids forking a child process whenever the shell printf builtin supports time formatting.
+## @description  Produces a formatted UTC timestamp suitable for a diagnostic message line.
+## @return       Writes the UTC timestamp to stdout and exits 0.
 px_timestamp() {
   local now
   if [ "$PX_HAVE_PRINTF_TIME" = 1 ]; then
@@ -290,9 +291,10 @@ px_timestamp() {
 # admission and continue teeing log lines to the admitted file.
 _PX_LOG_ADMITTED="${_PX_LOG_ADMITTED:-}"
 
-## @description  Formats and writes a diagnostic line to stderr and to an admitted PX_LOG_FILE.
-## @param        level, message... The severity label followed by the message tokens.
-## @return       Writes the formatted message to stderr (and PX_LOG_FILE if admitted) and exits 0.
+# Accepts a severity level followed by message words, formats a single timestamped diagnostic line
+# to stderr, and appends a copy to PX_LOG_FILE when that path has been admitted by px_log_file_set.
+## @description  Emits a formatted diagnostic message line to stderr and any admitted log file.
+## @return       Writes the message line and exits 0.
 px_log() {
   local level=$1 line ts
   shift
@@ -304,25 +306,21 @@ px_log() {
   fi
 }
 
-## @description  Logs an informational progress message at the INFO severity level.
-## @param        message... The progress message text to log.
-## @return       Writes the formatted message to stderr and exits 0.
+## @description  Logs an informational progress message to stderr.
+## @return       Writes the message to stderr and exits 0.
 px_info() { px_log INFO "$@"; }
 
-## @description  Logs a warning for a non-fatal condition that does not halt the current operation.
-## @param        message... The warning message text to log.
-## @return       Writes the formatted message to stderr and exits 0.
+## @description  Logs a warning for an anomalous condition that does not stop the operation.
+## @return       Writes the warning to stderr and exits 0.
 px_warn() { px_log WARN "$@"; }
 
-## @description  Logs a failure at the ERROR level while leaving control flow to the caller.
-## @param        message... The error message text to log.
-## @return       Writes the formatted message to stderr and exits 0.
+## @description  Logs a failure message while leaving the decision to continue or abort to the
+##               caller.
+## @return       Writes the error message to stderr and exits 0.
 px_error() { px_log ERROR "$@"; }
 
-# Diagnostic output is gated by PX_VERBOSE so that standard runs remain quiet.
-## @description  Logs detailed diagnostic information needed only for troubleshooting.
-## @param        message... The diagnostic message text to log.
-## @return       Writes the message to stderr when PX_VERBOSE is enabled and exits 0.
+## @description  Logs detailed diagnostic information only when PX_VERBOSE is enabled.
+## @return       Writes the diagnostic message to stderr when PX_VERBOSE is true and exits 0.
 px_debug() {
   px_is_verbose || return 0
   px_log DEBUG "$@"
@@ -332,11 +330,10 @@ px_debug() {
 # Boolean predicate helpers for execution switches.
 # ---------------------------------------------------------------------------
 
-# Because Bash 3.2 lacks case-modifying parameter expansion, the pattern match explicitly lists both
-# uppercase and lowercase character classes.
+# Explicitly matches both uppercase and lowercase character classes in the case pattern because
+# Bash 3.2 does not support case-modifying parameter expansion.
 ## @description  Evaluates whether a configuration switch value represents boolean true.
-## @param        value The string value to test (1, true, yes, or on, case-insensitively).
-## @return       Exits 0 when the value represents true, or exits 1 for any other value.
+## @return       Exits 0 for 1, true, yes, or on, or exits 1 for any other value.
 px_is_true() {
   case "${1:-}" in
   1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
@@ -344,15 +341,14 @@ px_is_true() {
   esac
 }
 
-## @description  Determines whether verbose diagnostic logging is enabled via PX_VERBOSE.
+## @description  Determines whether verbose diagnostic output is enabled.
 ## @return       Exits 0 when PX_VERBOSE is true, or exits 1 otherwise.
 px_is_verbose() { px_is_true "${PX_VERBOSE:-0}"; }
 
-## @description  Determines whether the current invocation must perform a non-mutating dry run.
+## @description  Determines whether the current invocation is a dry run that must not mutate state.
 ## @return       Exits 0 when PX_DRY_RUN is true, or exits 1 otherwise.
 px_is_dry_run() { px_is_true "${PX_DRY_RUN:-0}"; }
 
-# Consulted by cluster teardown and temporary-directory cleanup routines before deleting artifacts.
 ## @description  Determines whether the operator requested preserving runtime state for diagnosis.
 ## @return       Exits 0 when PX_KEEP is true, or exits 1 otherwise.
 px_is_keep() { px_is_true "${PX_KEEP:-0}"; }
@@ -361,52 +357,55 @@ px_is_keep() { px_is_true "${PX_KEEP:-0}"; }
 # Process termination, error trapping, and exit hook management.
 # ---------------------------------------------------------------------------
 
-## @description  Logs a fatal error and terminates the process with a shared-vocabulary exit code.
-## @param        exit_code, message... The numeric exit code followed by the diagnostic message.
-## @return       Writes the error to stderr and exits with exit_code (or 1 if non-numeric).
+# When a process has parsed its command line through the CLI framework, the final exit hook in
+# px_on_exit_run logs the numeric status and symbolic exit name, so px_die omits that suffix here;
+# processes that source this library without activating the CLI parser append the suffix directly.
+## @description  Logs a fatal error message (taking the exit code followed by the message words)
+##               and terminates the calling process.
+## @return       Exits the process with the supplied exit code.
 px_die() {
   local code=${1:-}
   shift
-  if ! [[ $code =~ $PX_RE_INT ]]; then
-    px_error "px_die needs a numeric exit code, got '$code': $*"
-    exit "$PX_EXIT_FAIL"
+  if [ "${PX_CLI_ACTIVE:-0}" = 1 ]; then
+    px_error "$*"
+  else
+    px_error "$* (exit $code, $(px_exit_name "$code"))"
   fi
-  px_error "$* (exit $code, $(px_exit_name "$code"))"
   exit "$code"
 }
 
-## @description  Logs a usage error, prints the caller's usage function if defined, and terminates.
-## @param        message... The usage error description to report.
-## @return       Writes the error and optional usage text to stderr and exits 2.
-px_usage_error() {
-  px_error "$*"
-  if declare -F usage >/dev/null 2>&1; then
-    usage >&2
-  fi
-  exit "$PX_EXIT_USAGE"
+# Validates the supplied run class argument, defaulting to PX_RUN_CLASS when omitted.
+## @description  Verifies that the active run class is either validation or measurement.
+## @return       Returns 0 when valid, or exits 2 on any other value.
+px_run_class_require() {
+  case "${1-${PX_RUN_CLASS:-}}" in
+  validation | measurement) ;;
+  *)
+    px_die "$PX_EXIT_USAGE" "PX_RUN_CLASS needs validation or measurement," \
+      "got '${1-${PX_RUN_CLASS:-}}'"
+    ;;
+  esac
 }
 
-# Installed via px_trap_enable to log failing commands without forcing immediate termination, so the
-# caller retains control of the exit path. Because the ERR trap fires under the same conditions
-# where set -e exits, callers that expect a non-zero status (such as exit code 6 from an absence
-# probe) must guard the call with "if cmd; then" or "cmd || status=$?" to keep both the trap and
-# set -e silent.
-## @description  Logs the failing command, source location, and exit status when an ERR trap fires.
-## @param        status, line, command The exit status, line number, and failed command string.
+# Installed as the ERR handler by px_trap_enable; logs diagnostic details without terminating the
+# shell so the caller retains control of its exit path.
+## @description  Reports the exit status, source line number, and command string of a failed
+##               command.
 ## @return       Writes the failure diagnostic to stderr and exits 0.
 px_err_trap() {
   local status=$1 line=$2 command=$3 where=${BASH_SOURCE[1]:-unknown}
   px_error "command failed with status $status at $where line $line: $command"
 }
 
-# Enables set -E so shell functions inherit the ERR trap, and ensures the EXIT cleanup trap is
-# installed; callers that should abort on the first unhandled failure pair this with set -e.
-## @description  Arms the ERR diagnostic trap and the EXIT cleanup trap in the calling shell.
-## @return       Configures shell trap state and exits 0.
+## @description  Installs the ERR diagnostic trap in the calling shell; pair with set -e when the
+##               command should abort upon the first unhandled failure.
+## @return       Arms the ERR trap and exits 0.
 px_trap_enable() {
+  # Enabling set -E propagates the ERR trap into shell functions. Because the trap fires under the
+  # same conditions where set -e exits, callers that expect a non-zero status guard the invocation
+  # with "if cmd; then" or "cmd || status=$?" so the trap remains silent.
   set -E
   trap 'px_err_trap "$?" "$LINENO" "$BASH_COMMAND"' ERR
-  px_on_exit_install
 }
 
 PX_EXIT_HOOKS=""
@@ -420,42 +419,33 @@ PX_EXIT_NOTE=""
 # inherits a different ID and suppresses its own exit line, ensuring that a single exit line closes
 # the diagnostic stream of a failing command.
 _PX_EXIT_OWNER="${_PX_EXIT_OWNER:-}"
-PX_EXIT_HOOKS_INSTALLED=""
 
-# This library owns the process EXIT trap; commands register cleanup actions via px_on_exit rather
-# than overwriting the trap directly. Installation occurs at source time at the top level of the
-# calling command.
-## @description  Installs the centralized harness EXIT trap if it is not already active.
-## @return       Registers px_on_exit_run on EXIT and exits 0.
-px_on_exit_install() {
-  if [ -z "$PX_EXIT_HOOKS_INSTALLED" ]; then
-    PX_EXIT_HOOKS_INSTALLED=1
-    trap px_on_exit_run EXIT
-  fi
-}
-
-# Hooks execute in reverse registration order (LIFO) so inner resources are released before outer
-# ones. Callers must invoke this from the top-level shell because registrations made inside a
-# command substitution vanish when that subshell exits.
-## @description  Pushes a cleanup command onto the process exit hook stack.
-## @param        command... The cleanup command string to evaluate upon process exit.
-## @return       Prepends the hook to PX_EXIT_HOOKS, ensures the EXIT trap is armed, and exits 0.
+# Cleanup hooks execute in reverse registration order (last-in, first-out). Callers must invoke
+# this at the top level of the shell rather than inside a command substitution so the registration
+# persists in the main process.
+## @description  Registers a cleanup command to run when the process exits.
+## @return       Prepends the command to the exit hook stack and exits 0.
 px_on_exit() {
   PX_EXIT_HOOKS="$*
 $PX_EXIT_HOOKS"
-  px_on_exit_install
 }
 
-# Subshells must not execute registered hooks because the tracked resources belong to the parent
-# process that registered them; therefore, this function returns immediately whenever BASH_SUBSHELL
-# is non-zero. All hook strings originate from internal harness code rather than operator input.
-## @description  Executes all registered exit hooks in reverse order and cleans up temporary dirs.
-## @return       Always exits 0 without altering the process exit status.
+# Returns immediately when invoked inside a subshell because registered resources belong exclusively
+# to the top-level parent process.
+# After running all hooks and temporary directory cleanup, a process that parsed its command line
+# and terminates with a non-zero status (or a status matching px_exit_noted) emits either the custom
+# closing message recorded by px_exit_noted or, if the process is _PX_EXIT_OWNER, the standard exit
+# diagnostic line so that the termination summary is written once as the final line on stderr.
+## @description  Executes all registered exit hooks in reverse order, removes temporary directories
+##               created by this process, and emits the final exit diagnostic line.
+## @return       Always exits 0 without altering the exit status of the process.
 px_on_exit_run() {
-  local hook
+  local status=$? hook
   if [ "${BASH_SUBSHELL:-0}" != 0 ]; then
     return 0
   fi
+  # Registered hook commands originate exclusively from internal harness code and never from
+  # untrusted operator input.
   while IFS= read -r hook; do
     [ -n "$hook" ] || continue
     eval "$hook" || px_debug "exit hook failed: $hook"
@@ -464,46 +454,742 @@ $PX_EXIT_HOOKS
 EOF
   PX_EXIT_HOOKS=""
   px_tmp_cleanup
+  if [ "$status" = "$PX_EXIT_NOTED" ]; then
+    [ -z "$PX_EXIT_NOTE" ] || px_info "$PX_EXIT_NOTE"
+  elif [ "${PX_CLI_ACTIVE:-0}" = 1 ] && [ "$status" != 0 ] && [ "$_PX_EXIT_OWNER" = "$$" ]; then
+    px_error "${PX_CLI_SUB:-$PX_PROG} ends (exit $status, $(px_exit_name "$status"))"
+  fi
 }
 
-# Prevents a flag with an omitted argument from silently consuming or misinterpreting the remaining
-# arguments. Must be invoked directly in the calling shell rather than inside a command substitution
-# so that px_usage_error terminates the main process instead of a subshell.
-## @description  Validates that a command-line option was supplied with a non-empty argument value.
-## @param        option_name, value The option flag name and its candidate value argument.
-## @return       Exits 0 when a non-empty value is present, or exits 2 when absent or empty.
-px_cli_need_value() {
-  if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-    px_usage_error "$1 needs a value"
+# Accepts an expected exit status code followed by optional message words to emit from the exit
+# hook in place of the standard non-zero termination line; when no message words are provided, the
+# exit hook suppresses the termination line for that status code.
+## @description  Records a custom exit status and optional closing summary line for the exit hook.
+## @return       Populates PX_EXIT_NOTED and PX_EXIT_NOTE and exits 0.
+px_exit_noted() {
+  PX_EXIT_NOTED=${1:-}
+  shift
+  PX_EXIT_NOTE="$*"
+}
+
+# ---------------------------------------------------------------------------
+# Declarative command-line specification grammar, argument parser, and help formatter.
+# ---------------------------------------------------------------------------
+# Every harness entry point, utility script, and generator declares its command-line interface once
+# as a declarative specification loaded from a heredoc via px_cli_spec. Both px_cli_parse and
+# px_cli_help interpret that single specification so argument parsing and help output cannot drift
+# apart. Each line in a specification begins with one of the following keywords:
+#   about TEXT           Declares the command purpose on the first occurrence and extended
+#                        description paragraphs on subsequent occurrences; inside a sub block, the
+#                        first occurrence serves as the subcommand summary.
+#   shared WORD...       Enables optional shared selectors supported by the command: --cluster,
+#                        --class, and --backend; when declared inside a sub block, these selectors
+#                        apply only to that subcommand.
+#   operands WORD...     Defines the positional operand synopsis for a command without subcommands.
+#   sub NAME [WORD...]   Begins a subcommand block named NAME with its optional operand synopsis.
+#   rest WORD...         Declares that the current block accepts passthrough arguments after --,
+#                        using WORD... as their synopsis.
+#   opt NAME ARG TARGET | TEXT
+#                        Declares an option within the current block; ARG is - for a boolean flag
+#                        or a value placeholder token, TARGET names the destination binding, and
+#                        TEXT provides the help description.
+#   output, exits, verdicts, example TEXT
+#                        Contributes a line to the Output, Exit codes, or Examples section of the
+#                        rendered help output.
+#   + TEXT               Appends a continuation line to the immediately preceding directive.
+#
+# Positional operand tokens in a synopsis may be required (ROLE), optional ([ROLE]), repeatable
+# (FILE... or [ROLE...]), or constrained to a fixed alternation (start|stop|status). An option
+# TARGET takes one of six forms: PX_NAME binds a configuration setting, PX_NAME=V defines a flag
+# that assigns constant V to a setting, PX_NAME+S defines a repeatable setting whose values are
+# joined by separator S, NAME binds a local shell variable, NAME=V defines a flag that assigns V to
+# a shell variable, and NAME+ appends each occurrence to a shell array. Configuration settings are
+# recorded with the cli origin in command-line order so that the earliest occurrence takes
+# precedence, matching the precedence model across configuration stages. Only the shared options -h,
+# -v, -n, and -e provide short flags, and options may appear in any position prior to --.
+
+PX_CLI_SPEC=""
+PX_CLI_SUB=""
+PX_CLI_ARGS=()
+PX_CLI_REST=()
+PX_CLI_FILES=()
+PX_CLI_SHARED=()
+PX_CLI_ACTIVE=0
+# Maps each configuration setting assigned on the command line to the flag that set it, stored as
+# one "NAME<TAB>OPTION" row per entry so error messages report the exact option the operator typed.
+PX_CLI_OPTIONS=""
+# In-memory index arrays and scalars populated by px_cli_index from PX_CLI_SPEC, storing the enabled
+# shared selectors, the operand and passthrough synopses for the top-level block and each subcommand
+# block, and parallel per-option arrays recording option names, value placeholders, targets, and
+# owning blocks.
+_PXC_SEL=""
+_PXC_SEL_ANY=""
+_PXC_SUB_SEL=()
+_PXC_TOP_OPS=""
+_PXC_TOP_REST=""
+_PXC_SUBS=()
+_PXC_SUB_OPS=()
+_PXC_SUB_REST=()
+_PXC_OPT_NAME=()
+_PXC_OPT_ARG=()
+_PXC_OPT_TGT=()
+_PXC_OPT_BLK=()
+_PXC_MIN=0
+_PXC_MAX=0
+_PXC_NEED=""
+_PXC_REQ=()
+
+## @description  Appends a command-line specification read from standard input (typically a quoted
+##               heredoc) to PX_CLI_SPEC.
+## @return       Updates PX_CLI_SPEC and exits 0.
+px_cli_spec() {
+  local text=""
+  IFS= read -r -d '' text || true
+  PX_CLI_SPEC="$PX_CLI_SPEC$text"
+}
+
+## @description  Parses PX_CLI_SPEC into the internal index of shared selectors, operand synopses,
+##               and option descriptors for each block.
+## @return       Populates the _PXC_* index variables and exits 0.
+px_cli_index() {
+  local line key rest block="" last
+  local -a field=()
+  _PXC_SEL="" _PXC_SEL_ANY="" _PXC_TOP_OPS="" _PXC_TOP_REST=""
+  _PXC_SUBS=() _PXC_SUB_OPS=() _PXC_SUB_REST=() _PXC_SUB_SEL=()
+  _PXC_OPT_NAME=() _PXC_OPT_ARG=() _PXC_OPT_TGT=() _PXC_OPT_BLK=()
+  while IFS= read -r line; do
+    px_trim_var line
+    key=${line%%[[:space:]]*}
+    rest=${line#"$key"}
+    px_trim_var rest
+    case "$key" in
+    shared)
+      _PXC_SEL_ANY="$_PXC_SEL_ANY $rest "
+      if [ -z "$block" ]; then
+        _PXC_SEL=" $rest "
+      else
+        last=$((${#_PXC_SUBS[@]} - 1))
+        _PXC_SUB_SEL[last]=" $rest "
+      fi
+      ;;
+    operands) _PXC_TOP_OPS=$rest ;;
+    sub)
+      block=${rest%%[[:space:]]*}
+      rest=${rest#"$block"}
+      px_trim_var rest
+      _PXC_SUBS+=("$block")
+      _PXC_SUB_OPS+=("$rest")
+      _PXC_SUB_REST+=("")
+      _PXC_SUB_SEL+=("")
+      ;;
+    rest)
+      if [ -z "$block" ]; then
+        _PXC_TOP_REST=$rest
+      else
+        last=$((${#_PXC_SUBS[@]} - 1))
+        _PXC_SUB_REST[last]=$rest
+      fi
+      ;;
+    opt)
+      read -r -a field <<<"${rest%%|*}" || true
+      _PXC_OPT_NAME+=("${field[0]:-}")
+      _PXC_OPT_ARG+=("${field[1]:-}")
+      _PXC_OPT_TGT+=("${field[2]:-}")
+      _PXC_OPT_BLK+=("$block")
+      ;;
+    esac
+  done <<EOF
+$PX_CLI_SPEC
+EOF
+}
+
+# Tokens enclosed in square brackets are optional, so synopses such as [ROLE [INDEX]] and
+# [-- ARGUMENT...] contribute no required operands. Populates _PXC_MIN with the minimum count,
+# _PXC_MAX with the maximum count (-1 when unbounded), and _PXC_NEED and _PXC_REQ with the required
+# operand tokens.
+## @description  Derives operand count bounds and required operand tokens from a synopsis string.
+## @return       Populates _PXC_MIN, _PXC_MAX, _PXC_NEED, and _PXC_REQ and exits 0.
+px_cli_counts() {
+  local word open close depth=0
+  local -a words=()
+  _PXC_MIN=0 _PXC_MAX=0 _PXC_NEED=""
+  _PXC_REQ=()
+  read -r -a words <<<"${1:-}" || true
+  for word in ${words[@]+"${words[@]}"}; do
+    open=${word//[^[]/}
+    close=${word//[^]]/}
+    if [ "$depth" = 0 ] && [ -z "$open" ]; then
+      _PXC_MIN=$((_PXC_MIN + 1))
+      _PXC_NEED="$_PXC_NEED $word"
+      _PXC_REQ+=("$word")
+    fi
+    depth=$((depth + ${#open} - ${#close}))
+    case "$word" in
+    *...*) _PXC_MAX=-1 ;;
+    *) [ "$_PXC_MAX" = -1 ] || _PXC_MAX=$((_PXC_MAX + 1)) ;;
+    esac
+  done
+}
+
+## @description  Formats argument words as a disjunctive English list ("a", "a or b", or
+##               "a, b or c").
+## @return       Writes the formatted list to stdout and exits 0.
+px_cli_or() {
+  local text=""
+  while [ $# -gt 1 ]; do
+    text="$text${text:+, }$1"
+    shift
+  done
+  printf '%s%s\n' "$text${text:+ or }" "${1:-}"
+}
+
+# Initial token scanning passes '*' to match any block because the active subcommand is not known
+# until all positional operands have been collected; specifications assign consistent flag or value
+# arity to an option across every block that declares it.
+## @description  Locates an option by name within the top-level block, a named subcommand block, or
+##               any block when the block argument is '*'.
+## @return       Sets PX_AT to the matching option index and returns 0, or returns 1 when not found.
+px_cli_opt() {
+  local i=0
+  while [ "$i" -lt "${#_PXC_OPT_NAME[@]}" ]; do
+    if [ "${_PXC_OPT_NAME[i]}" = "$1" ] && { [ "$2" = '*' ] || [ -z "${_PXC_OPT_BLK[i]}" ] ||
+      [ "${_PXC_OPT_BLK[i]}" = "$2" ]; }; then
+      PX_AT=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Because a subsequent command-line option for a setting that already has a value never takes
+# effect, only the initial option that assigns the setting is recorded.
+## @description  Records the command-line option (name, option) that assigns a setting.
+## @return       Appends the mapping to PX_CLI_OPTIONS and exits 0.
+px_cli_option() {
+  [ -z "$(px_config_origin "$1" || true)" ] || return 0
+  PX_CLI_OPTIONS="$PX_CLI_OPTIONS$1$PX_TAB$2$PX_NL"
+}
+
+## @description  Resolves the display label for a setting (name) to the command-line option that
+##               assigned it, or falls back to the setting name itself.
+## @return       Writes the resolved label to stdout and exits 0.
+px_setting_label() { px_tsv_get "${1:-}" "$PX_CLI_OPTIONS" || printf '%s\n' "${1:-}"; }
+
+# Must be invoked directly in the calling shell rather than inside a command substitution so that
+# configuration assignments, output variables (PX_CLI_SUB, PX_CLI_ARGS, PX_CLI_REST, PX_CLI_FILES,
+# PX_CLI_SHARED, and option targets), and process termination for --help or usage errors take
+# effect in the main command process.
+## @description  Parses command-line arguments against PX_CLI_SPEC into the CLI state variables and
+##               declared option targets.
+## @return       Returns 0 on success, exits 0 after --help, or exits 2 on a usage error.
+px_cli_parse() {
+  local _pxc_w _pxc_v _pxc_i _pxc_j _pxc_k _pxc_n _pxc_t _pxc_err="" _pxc_help=0 _pxc_dd=0
+  local _pxc_syn _pxc_rsyn _pxc_done=" " _pxc_or _pxc_sel
+  local -a _pxc_ops=() _pxc_rest=() _pxc_on=() _pxc_ov=() _pxc_oi=() _pxc_set=()
+  PX_CLI_ACTIVE=1
+  if [ -z "$_PX_EXIT_OWNER" ]; then
+    _PX_EXIT_OWNER=$$
+    export _PX_EXIT_OWNER
   fi
+  PX_CLI_SUB=""
+  PX_CLI_ARGS=() PX_CLI_REST=() PX_CLI_FILES=() PX_CLI_SHARED=()
+  PX_CLI_OPTIONS=""
+  px_cli_index
+  _pxc_sel=$_PXC_SEL
+  # Perform an initial pass to collect positional operands, passthrough arguments following --, and
+  # option-value pairs. Deferred error reporting retains the first syntax error while allowing a
+  # subsequent -h or --help flag to take precedence.
+  while [ $# -gt 0 ]; do
+    _pxc_w=$1
+    shift
+    if [ "$_pxc_dd" = 1 ]; then
+      _pxc_rest+=("$_pxc_w")
+      continue
+    fi
+    _pxc_j=""
+    case "$_pxc_w" in
+    --)
+      _pxc_dd=1
+      continue
+      ;;
+    -h | --help)
+      _pxc_help=1
+      continue
+      ;;
+    -v | --verbose | -n | --dry-run | --strict) _pxc_j=flag ;;
+    -e | --set | --config) _pxc_j=value ;;
+    --cluster | --class | --backend)
+      case "$_PXC_SEL_ANY" in
+      *" $_pxc_w "*) _pxc_j=value ;;
+      esac
+      ;;
+    esac
+    if [ -z "$_pxc_j" ]; then
+      case "$_pxc_w" in
+      -?*) ;;
+      *)
+        _pxc_ops+=("$_pxc_w")
+        continue
+        ;;
+      esac
+      if ! px_cli_opt "$_pxc_w" '*'; then
+        _pxc_err=${_pxc_err:-"unknown option $_pxc_w"}
+        continue
+      fi
+      _pxc_j=$PX_AT
+    fi
+    _pxc_k=1
+    case "$_pxc_j" in
+    flag) _pxc_k=0 ;;
+    value) ;;
+    *) [ "${_PXC_OPT_ARG[_pxc_j]}" != - ] || _pxc_k=0 ;;
+    esac
+    _pxc_v=""
+    if [ "$_pxc_k" = 1 ]; then
+      if [ $# -eq 0 ] || [ -z "$1" ]; then
+        _pxc_err=${_pxc_err:-"$_pxc_w needs a value"}
+        [ $# -eq 0 ] || shift
+        continue
+      fi
+      _pxc_v=$1
+      shift
+    fi
+    _pxc_on+=("$_pxc_w")
+    _pxc_ov+=("$_pxc_v")
+    _pxc_oi+=("$_pxc_j")
+    case "$_pxc_j" in
+    flag) PX_CLI_SHARED+=("$_pxc_w") ;;
+    value) PX_CLI_SHARED+=("$_pxc_w" "$_pxc_v") ;;
+    esac
+  done
+  # Help detection stops at the -- separator so that passthrough commands retain their own --help.
+  if [ "$_pxc_help" = 1 ]; then
+    _pxc_w=""
+    if [ "${#_PXC_SUBS[@]}" -gt 0 ] && [ "${#_pxc_ops[@]}" -gt 0 ] &&
+      px_word_at "${_pxc_ops[0]}" "${_PXC_SUBS[@]}"; then
+      _pxc_w=${_pxc_ops[0]}
+    fi
+    px_cli_help "$_pxc_w"
+    exit "$PX_EXIT_OK"
+  fi
+  [ -z "$_pxc_err" ] || px_die "$PX_EXIT_USAGE" "$_pxc_err"
+  _pxc_syn=$_PXC_TOP_OPS
+  _pxc_rsyn=$_PXC_TOP_REST
+  if [ "${#_PXC_SUBS[@]}" -gt 0 ]; then
+    _pxc_or="$(px_cli_or "${_PXC_SUBS[@]}")"
+    [ "${#_pxc_ops[@]}" -gt 0 ] || px_die "$PX_EXIT_USAGE" "name a subcommand: $_pxc_or"
+    if ! px_word_at "${_pxc_ops[0]}" "${_PXC_SUBS[@]}"; then
+      px_die "$PX_EXIT_USAGE" "unknown subcommand ${_pxc_ops[0]}: use $_pxc_or"
+    fi
+    PX_CLI_SUB=${_pxc_ops[0]}
+    _pxc_sel="$_pxc_sel${_PXC_SUB_SEL[PX_AT]}"
+    _pxc_syn=${_PXC_SUB_OPS[PX_AT]}
+    _pxc_rsyn=${_PXC_SUB_REST[PX_AT]}
+    _pxc_ops=(${_pxc_ops[@]+"${_pxc_ops[@]:1}"})
+  fi
+  # When a block declares no passthrough rest synopsis, words following -- are treated as normal
+  # positional operands so callers can pass operand values that begin with a hyphen.
+  if [ -n "$_pxc_rsyn" ]; then
+    PX_CLI_REST=(${_pxc_rest[@]+"${_pxc_rest[@]}"})
+    px_cli_counts "$_pxc_rsyn"
+    if [ "$((_pxc_dd + ${#_pxc_rest[@]}))" -lt "$_PXC_MIN" ]; then
+      px_die "$PX_EXIT_USAGE" "${PX_CLI_SUB:-$PX_PROG} needs$_PXC_NEED"
+    fi
+  else
+    _pxc_ops+=(${_pxc_rest[@]+"${_pxc_rest[@]}"})
+  fi
+  px_cli_counts "$_pxc_syn"
+  _pxc_n=${#_pxc_ops[@]}
+  [ "$_pxc_n" -ge "$_PXC_MIN" ] || px_die "$PX_EXIT_USAGE" "${PX_CLI_SUB:-$PX_PROG} needs$_PXC_NEED"
+  if [ "$_PXC_MAX" != -1 ] && [ "$_pxc_n" -gt "$_PXC_MAX" ]; then
+    px_die "$PX_EXIT_USAGE" "unexpected argument ${_pxc_ops[_PXC_MAX]}"
+  fi
+  _pxc_i=0
+  for _pxc_w in ${_PXC_REQ[@]+"${_PXC_REQ[@]}"}; do
+    case "$_pxc_w" in
+    *'|'*)
+      case "|$_pxc_w|" in
+      *"|${_pxc_ops[_pxc_i]}|"*) ;;
+      *)
+        IFS='|' read -r -a _pxc_set <<<"$_pxc_w" || true
+        px_die "$PX_EXIT_USAGE" "unknown subcommand ${_pxc_ops[_pxc_i]}:" \
+          "use $(px_cli_or "${_pxc_set[@]}")"
+        ;;
+      esac
+      ;;
+    esac
+    _pxc_i=$((_pxc_i + 1))
+  done
+  PX_CLI_ARGS=(${_pxc_ops[@]+"${_pxc_ops[@]}"})
+  # Verify that every supplied option belongs to the top-level grammar or the selected subcommand
+  # block, and validate all selector values and --set assignments before mutating configuration.
+  _pxc_i=0
+  while [ "$_pxc_i" -lt "${#_pxc_on[@]}" ]; do
+    _pxc_w=${_pxc_on[_pxc_i]}
+    _pxc_v=${_pxc_ov[_pxc_i]}
+    case "$_pxc_w" in
+    -e | --set)
+      [ "${_pxc_v%%=*}" != "$_pxc_v" ] ||
+        px_die "$PX_EXIT_USAGE" "--set takes NAME=VALUE, got '$_pxc_v'"
+      ;;
+    --cluster | --class | --backend)
+      case "$_pxc_sel" in
+      *" $_pxc_w "*) ;;
+      *) px_die "$PX_EXIT_USAGE" "$_pxc_w does not apply to $PX_CLI_SUB" ;;
+      esac
+      ;;
+    esac
+    case "$_pxc_w" in
+    --class) px_run_class_require "$_pxc_v" ;;
+    --backend)
+      case "$_pxc_v" in
+      compose | k8s) ;;
+      *) px_die "$PX_EXIT_USAGE" "--backend takes compose or k8s, got '$_pxc_v'" ;;
+      esac
+      ;;
+    esac
+    case "${_pxc_oi[_pxc_i]}" in
+    flag | value) ;;
+    *)
+      px_cli_opt "$_pxc_w" "$PX_CLI_SUB" ||
+        px_die "$PX_EXIT_USAGE" "$_pxc_w does not apply to $PX_CLI_SUB"
+      _pxc_oi[_pxc_i]=$PX_AT
+      ;;
+    esac
+    _pxc_i=$((_pxc_i + 1))
+  done
+  # Enable strict configuration checking before applying option bindings so that -e and --set
+  # reject undeclared variable names regardless of flag ordering on the command line.
+  if px_word_at --strict ${_pxc_on[@]+"${_pxc_on[@]}"} || px_is_true "${PX_STRICT_CONFIG:-0}"; then
+    PX_CONFIG_STRICT=1
+  fi
+  _pxc_i=0
+  while [ "$_pxc_i" -lt "${#_pxc_on[@]}" ]; do
+    _pxc_w=${_pxc_on[_pxc_i]}
+    _pxc_v=${_pxc_ov[_pxc_i]}
+    _pxc_i=$((_pxc_i + 1))
+    case "$_pxc_w" in
+    -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
+    -n | --dry-run) px_config_set PX_DRY_RUN 1 cli ;;
+    --strict) px_config_set PX_STRICT_CONFIG 1 cli ;;
+    -e | --set) px_config_set "${_pxc_v%%=*}" "${_pxc_v#*=}" cli ;;
+    --config) PX_CLI_FILES+=("$_pxc_v") ;;
+    --cluster) px_config_set PX_CLUSTER_ID "$_pxc_v" cli ;;
+    --class) px_config_set PX_RUN_CLASS "$_pxc_v" cli ;;
+    --backend) px_config_set PX_BACKEND "$_pxc_v" cli ;;
+    *)
+      _pxc_t=${_PXC_OPT_TGT[${_pxc_oi[_pxc_i - 1]}]}
+      case "$_pxc_t" in
+      PX_*+*)
+        # Consolidate all occurrences of a repeatable setting at the position of its first
+        # appearance on the command line.
+        _pxc_n=${_pxc_t%%+*}
+        case "$_pxc_done" in
+        *" $_pxc_n "*) continue ;;
+        esac
+        _pxc_done="$_pxc_done$_pxc_n "
+        _pxc_v=""
+        _pxc_j=0
+        while [ "$_pxc_j" -lt "${#_pxc_on[@]}" ]; do
+          if [ "${_pxc_on[_pxc_j]}" = "$_pxc_w" ]; then
+            _pxc_v="$_pxc_v${_pxc_v:+${_pxc_t#*+}}${_pxc_ov[_pxc_j]}"
+          fi
+          _pxc_j=$((_pxc_j + 1))
+        done
+        px_cli_option "$_pxc_n" "$_pxc_w"
+        px_config_set "$_pxc_n" "$_pxc_v" cli
+        ;;
+      PX_*=*) px_config_set "${_pxc_t%%=*}" "${_pxc_t#*=}" cli ;;
+      PX_*)
+        px_cli_option "$_pxc_t" "$_pxc_w"
+        px_config_set "$_pxc_t" "$_pxc_v" cli
+        ;;
+      # Safe to evaluate because the target array name originates from the internal command
+      # specification rather than untrusted command-line input.
+      *+) eval "${_pxc_t%+}+=(\"\$_pxc_v\")" ;;
+      *)
+        _pxc_n=${_pxc_t%%=*}
+        case "$_pxc_done" in
+        *" $_pxc_n "*) continue ;;
+        esac
+        _pxc_done="$_pxc_done$_pxc_n "
+        [ "$_pxc_n" = "$_pxc_t" ] || _pxc_v=${_pxc_t#*=}
+        printf -v "$_pxc_n" '%s' "$_pxc_v"
+        ;;
+      esac
+      ;;
+    esac
+  done
+  px_debug "parsed ${PX_CLI_SUB:-$PX_PROG}: ${#PX_CLI_ARGS[@]} operands, ${#PX_CLI_REST[@]}" \
+    "words after --"
+}
+
+## @description  Renders all specification entries matching a directive keyword and block name
+##               (including continuation lines) in their target help-section layout.
+## @return       Writes the formatted section lines to stdout and exits 0.
+px_cli_print() {
+  local want=$1 blk=$2 line key text block="" last="" n=0 label table=0
+  local -a field=()
+  while IFS= read -r line; do
+    px_trim_var line
+    key=${line%%[[:space:]]*}
+    text=${line#"$key"}
+    px_trim_var text
+    # Emit the verdict table immediately after the verdicts text and all of its continuation lines
+    # have been printed.
+    if [ "$table" = 1 ] && [ "$key" != + ]; then
+      printf '  %s.\n' "$(px_verdict_text)"
+      table=0
+    fi
+    case "$key" in
+    sub)
+      block=${text%%[[:space:]]*}
+      last=""
+      continue
+      ;;
+    +)
+      if [ "$last" != "$want" ] || [ "$block" != "$blk" ]; then
+        continue
+      fi
+      case "$want" in
+      about) printf '%s\n' "$text" ;;
+      opt) printf '%28s%s\n' "" "$text" ;;
+      example) printf '    %s\n' "$text" ;;
+      *) printf '  %s\n' "$text" ;;
+      esac
+      continue
+      ;;
+    esac
+    last=$key
+    [ "$key" = "$want" ] && [ "$block" = "$blk" ] || continue
+    n=$((n + 1))
+    case "$want" in
+    about)
+      [ "$n" = 1 ] || printf '\n'
+      printf '%s\n' "$text"
+      ;;
+    output)
+      if [ "$n" = 1 ]; then printf 'Output: %s\n' "$text"; else printf '  %s\n' "$text"; fi
+      ;;
+    opt)
+      read -r -a field <<<"${text%%|*}" || true
+      label=${field[0]:-}
+      [ "${field[1]:--}" = - ] || label="$label ${field[1]}"
+      text=${text#*|}
+      px_trim_var text
+      px_cli_row "$label" "$text"
+      ;;
+    verdicts)
+      printf '  %s\n' "$text"
+      table=1
+      ;;
+    *) printf '  %s\n' "$text" ;;
+    esac
+  done <<EOF
+$PX_CLI_SPEC
+EOF
+  [ "$table" = 0 ] || printf '  %s.\n' "$(px_verdict_text)"
+}
+
+# Aligns the description text at column 28, wrapping it onto the following line whenever the left
+# label exceeds 25 characters.
+## @description  Formats a two-column help table row from a label and description string.
+## @return       Writes the formatted row to stdout and exits 0.
+px_cli_row() {
+  if [ "${#1}" -le 25 ]; then
+    printf '  %-26s%s\n' "$1" "$2"
+  else
+    printf '  %s\n%28s%s\n' "$1" "" "$2"
+  fi
+}
+
+## @description  Renders the Subcommands help section, pairing each subcommand synopsis with its
+##               summary description.
+## @return       Writes the formatted subcommand rows to stdout and exits 0.
+px_cli_print_subs() {
+  local line key text label="" state=0 at=-1
+  while IFS= read -r line; do
+    px_trim_var line
+    key=${line%%[[:space:]]*}
+    text=${line#"$key"}
+    px_trim_var text
+    case "$key $state" in
+    "sub "*)
+      at=$((at + 1))
+      label="$text${_PXC_SUB_REST[at]:+ ${_PXC_SUB_REST[at]}}"
+      state=1
+      ;;
+    "about 1")
+      px_cli_row "$label" "$text"
+      state=2
+      ;;
+    "+ 2") printf '%28s%s\n' "" "$text" ;;
+    *" 2") state=0 ;;
+    esac
+  done <<EOF
+$PX_CLI_SPEC
+EOF
+}
+
+# Emits help sections in a fixed canonical order: usage synopsis, purpose and description,
+# subcommands, command options, shared options, output contract, exit codes, and examples.
+## @description  Renders the complete help documentation for the command or an optional named
+##               subcommand from PX_CLI_SPEC.
+## @return       Writes the formatted help text to stdout and exits 0.
+px_cli_help() {
+  local want=${1:-} text code sel
+  px_cli_index
+  sel=$_PXC_SEL_ANY
+  if [ -n "$want" ] && px_word_at "$want" ${_PXC_SUBS[@]+"${_PXC_SUBS[@]}"}; then
+    sel="$_PXC_SEL${_PXC_SUB_SEL[PX_AT]}"
+    text="$want${_PXC_SUB_OPS[PX_AT]:+ ${_PXC_SUB_OPS[PX_AT]}} [option...]"
+    text="$text${_PXC_SUB_REST[PX_AT]:+ ${_PXC_SUB_REST[PX_AT]}}"
+  elif [ "${#_PXC_SUBS[@]}" -gt 0 ]; then
+    want=""
+    text="SUBCOMMAND [OPERAND...] [option...]"
+  else
+    want=""
+    text="${_PXC_TOP_OPS:+$_PXC_TOP_OPS }[option...]${_PXC_TOP_REST:+ $_PXC_TOP_REST}"
+  fi
+  printf 'Usage: %s %s\n\n' "$PX_PROG" "$text"
+  if [ -n "$want" ]; then
+    # In a subcommand block, the first about directive is phrased as a brief summary fragment for
+    # the Subcommands table and wrapped to fit that column; when rendering the subcommand's own
+    # help screen, join and rewrap that fragment at 80 columns as a complete sentence with a
+    # capitalized leading letter and a trailing period.
+    px_cli_print about "$want" | awk '
+      function flush(n, i, w, line) {
+        p = toupper(substr(p, 1, 1)) substr(p, 2)
+        sub(/[^.]$/, "&.", p)
+        n = split(p, w, " ")
+        for (i = 1; i <= n; i++) {
+          if (line != "" && length(line) + 1 + length(w[i]) > 80) { print line; line = "" }
+          line = line (line == "" ? "" : " ") w[i]
+        }
+        print line
+      }
+      !end && $0 != "" { p = p (p == "" ? "" : " ") $0; next }
+      !end { end = 1; flush(); print; next }
+      { print }
+      END { if (!end) flush() }'
+  else
+    px_cli_print about ""
+  fi
+  if [ -z "$want" ] && [ "${#_PXC_SUBS[@]}" -gt 0 ]; then
+    printf '\nSubcommands:\n'
+    px_cli_print_subs
+    printf "\nRun '%s SUBCOMMAND --help' for its options.\n" "$PX_PROG"
+  fi
+  text="$(px_cli_print opt "")"
+  if [ -n "$want" ]; then
+    code="$(px_cli_print opt "$want")"
+    text="$text${text:+${code:+$PX_NL}}$code"
+  fi
+  [ -z "$text" ] || printf '\nOptions:\n%s\n' "$text"
+  printf '\nShared options:\n'
+  # Filter the shared-options table so that selector flags (--cluster, --class, and --backend)
+  # appear only when explicitly enabled by the command's shared directive, while any indented
+  # continuation line inherits the visibility decision of the option line immediately preceding it.
+  awk -v sel="$sel" '/^  +-/ { keep = $1 !~ /^--(cluster|class|backend)$/ ||
+    index(sel, " " $1 " ") } keep' <<'EOF'
+  -h, --help                print this help on stdout and exit 0
+  -v, --verbose             log debug detail on stderr
+  -n, --dry-run             print the plan on stdout and change nothing
+  -e, --set NAME=VALUE      set one configuration value (repeatable)
+      --config FILE         read one more configuration file (repeatable;
+                            earlier is stronger)
+      --strict              refuse a PX_* name that lib/varnames.txt does not
+                            declare
+      --cluster ID          the harness cluster, default "default"
+      --class NAME          validation or measurement, default the class of
+                            the cluster record, else PX_RUN_CLASS
+      --backend NAME        compose or k8s, default the backend of the
+                            cluster record, else compose
+EOF
+  text="$(px_cli_print output "$want")"
+  [ -z "$text" ] || printf '\n%s\n' "$text"
+  text="Exit codes:"
+  for code in 0 1 2 3 4 5; do
+    text="$text $code $(px_exit_name "$code"),"
+  done
+  printf '\n%s\n  %s %s.\n' "$text" "$PX_EXIT_NO_OBJECT" "$(px_exit_name "$PX_EXIT_NO_OBJECT")"
+  px_cli_print verdicts "$want"
+  px_cli_print exits "$want"
+  text="$(px_cli_print example "$want")"
+  [ -z "$text" ] || printf '\nExamples:\n%s\n' "$text"
+}
+
+# During a dry run, mutating operations emit a plan record in place of performing their action,
+# whereas read-only steps execute normally so that child commands inheriting PX_DRY_RUN continue to
+# return answers.
+## @description  Emits a dry-run plan row for a step name and its arguments when dry-run mode is
+##               active.
+## @return       Writes "plan STEP WORDS" to stdout and exits 0 in a dry run, or returns 1.
+px_plan() {
+  local step=${1:-}
+  px_is_dry_run || return 1
+  shift
+  printf 'plan\t%s\t%s\n' "$step" "$*"
 }
 
 # ---------------------------------------------------------------------------
 # In-place string manipulation utilities.
 # ---------------------------------------------------------------------------
 
-# Uses pure parameter expansion so parsing large files never forks external processes. The local
-# scratch variable uses the reserved name __px_trim so that it cannot collide with and shadow the
-# caller's target variable name.
-## @description  Strips leading and trailing whitespace from the named shell variable in place.
-## @param        variable_name The name of the variable to trim in place.
-## @return       Updates the named variable in the caller's scope and exits 0.
+## @description  Strips leading and trailing whitespace from the named shell variable in place
+##               using parameter expansion without forking.
+## @return       Updates the named variable in place and exits 0.
 px_trim_var() {
+  # The temporary scratch variable uses a reserved prefix so it cannot collide with and shadow the
+  # caller's target variable name, which would otherwise discard the trimmed result.
   local __px_trim=${!1}
   __px_trim=${__px_trim#"${__px_trim%%[![:space:]]*}"}
   __px_trim=${__px_trim%"${__px_trim##*[![:space:]]}"}
   printf -v "$1" '%s' "$__px_trim"
 }
 
+## @description  Converts a token into canonical configuration-variable form by uppercasing ASCII
+##               letters and replacing hyphens and dots with underscores.
+## @return       Writes the normalized uppercase identifier to stdout and exits 0.
+px_upper() {
+  # Enumerates the full ASCII alphabet explicitly because character range expressions in tr depend
+  # on the active locale collation order.
+  printf '%s\n' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz.-' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ__'
+}
+
+## @description  Constructs the port-map variable name PX_PORT_<ROLE>_<NAME>[_<INDEX>] from a role,
+##               a port name, and an optional instance index.
+## @return       Writes the port variable name to stdout and exits 0.
+px_port_var() {
+  printf 'PX_PORT_%s%s\n' "$(px_upper "${1:-}_${2:-}")" "${3:+_$3}"
+}
+
+PX_AT=""
+
+## @description  Locates a target word (the first argument) among the remaining arguments and sets
+##               PX_AT to its zero-based index.
+## @return       Exits 0 when found, or returns 6 (leaving PX_AT empty) when no word matches.
+px_word_at() {
+  local want=${1:-} word
+  shift
+  PX_AT=0
+  for word in "$@"; do
+    [ "$word" != "$want" ] || return 0
+    PX_AT=$((PX_AT + 1))
+  done
+  PX_AT=""
+  return "$PX_EXIT_NO_OBJECT"
+}
+
 # ---------------------------------------------------------------------------
 # Lexical path normalization, physical path resolution, and containment checks.
 # ---------------------------------------------------------------------------
 
-# Collapses redundant slashes and "." segments and resolves ".." segments purely through string
-# manipulation without accessing the filesystem.
-## @description  Lexically normalizes a path into an absolute canonical form.
-## @param        path The relative or absolute path string to normalize.
-## @return       Writes the lexically normalized absolute path to stdout and exits 0.
+# Performs purely lexical path normalization without accessing the filesystem, stripping empty and
+# single-dot (.) segments while resolving parent-directory (..) segments.
+## @description  Lexically normalizes a relative or absolute path into canonical absolute form.
+## @return       Writes the normalized absolute path to stdout and exits 0.
 px_path_normalize() {
   local path=${1:-} out="" seg had_noglob=""
   case "$path" in
@@ -532,12 +1218,11 @@ px_path_normalize() {
   printf '%s\n' "${out:-/}"
 }
 
-# Follows symbolic links in both the final path component and every intermediate directory. When the
-# target path does not yet exist, resolution anchors at its longest existing ancestor directory so
-# callers can validate a destination path before creating it.
-## @description  Resolves a path to its absolute physical filesystem location.
-## @param        path The existing or prospective filesystem path to resolve.
-## @return       Writes the physical path to stdout and exits 0, or exits 1 if an ancestor fails.
+# Traverses symbolic links across existing ancestor directories so paths that do not exist yet can
+# still be resolved to their canonical physical location before creation.
+## @description  Resolves a path to its absolute physical location through every symbolic link.
+## @return       Writes the path to stdout and exits 0, or returns 1 if an ancestor cannot be
+##               entered.
 px_realpath() {
   local path=${1:-} head tail base dir link hops=0
   path="$(px_path_normalize "$path")"
@@ -574,14 +1259,13 @@ px_realpath() {
   fi
 }
 
-# Walks up the candidate path and compares directory inode identity (-ef) rather than string
-# prefixes, ensuring that alternate names for the same directory (such as case variants on a
-# case-insensitive volume) still match. Callers should pass a path resolved by px_realpath so that
-# no unexpanded symbolic links remain.
-## @description  Determines whether an absolute path equals or resides within a target directory.
-## @param        absolute_path, directory The resolved path to test and the boundary directory.
-## @return       Exits 0 when the path is the directory or lies inside it, or exits 1 otherwise.
+## @description  Determines whether a resolved path equals or resides within a target directory by
+##               comparing directory inode identity rather than string prefixes.
+## @return       Exits 0 when the path is the directory or lies inside it, or returns 1 otherwise.
 px_path_within() {
+  # Compares directory identity (-ef) rather than lexical text so that alternate names for the same
+  # directory, such as case variants on a case-insensitive filesystem, are still recognized as
+  # contained within the boundary.
   local path=${1:-} dir=${2:-}
   [ -n "$dir" ] || return 1
   while :; do
@@ -605,9 +1289,11 @@ px_path_within() {
 
 PX_OUT_RESOLVED=""
 
-# Rejects relative paths, the filesystem root (/), and any location inside PX_TREE_ROOT.
-## @description  Validates, resolves, and creates the root output directory PX_OUT.
-## @return       Writes the resolved root to stdout and exits 0; exits 2 if refused or 1 on error.
+# Rejects relative paths, the filesystem root (/), and any location inside the working tree
+# (PX_TREE_ROOT) so harness artifacts stay strictly isolated from the repository.
+## @description  Validates, resolves, and creates the harness output root directory PX_OUT.
+## @return       Writes the resolved root to stdout and exits 0; exits 2 on a refused path or 1 on
+##               resolution or creation failure.
 px_out_root() {
   local raw resolved
   # Invocations in the current shell cache the resolved path in PX_OUT_RESOLVED and update PX_OUT
@@ -649,22 +1335,16 @@ px_out_root() {
   printf '%s\n' "$PX_OUT_RESOLVED"
 }
 
-# Relative paths are anchored against PX_OUT, and the target path does not need to exist yet. As
-# the lowest-level enforcement point for the output isolation policy, sb_copy_out invokes this
-# function before every artifact copy. Exits 2 when the path is empty, escapes the output root, or
-# lies inside the working tree, exits 1 when the path cannot be resolved, and propagates the status
-# of px_out_root when the output root itself is refused (2) or cannot be created (1).
-## @description  Resolves and validates a destination path under the output root PX_OUT.
-## @param        path The relative or absolute destination path to validate.
-## @return       Writes the resolved path to stdout and exits 0, or exits 2 or 1 on failure.
+# Anchors relative paths under the output root and rejects empty paths, paths that escape PX_OUT,
+# and paths that resolve inside the working tree.
+## @description  Resolves and validates a relative or absolute destination path under PX_OUT.
+## @return       Writes the path to stdout and exits 0; exits 2 on a policy violation or empty
+##               path, or 1 when the path cannot be resolved.
 px_out_resolve() {
-  local root path resolved status=0
-  # Propagate any non-zero status from px_out_root unchanged because it exits with usage code 2 on
-  # a policy refusal, and substrate contract callers branch directly on that exit code.
-  root="$(px_out_root)" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  local root path resolved
+  # Propagate any non-zero exit status from px_out_root unchanged so callers of the substrate
+  # contract can branch directly on usage exit code 2.
+  root="$(px_out_root)" || return $?
   path=${1:-}
   if [ -z "$path" ]; then
     px_die "$PX_EXIT_USAGE" "px_out_resolve needs a path"
@@ -687,50 +1367,34 @@ px_out_resolve() {
   printf '%s\n' "$resolved"
 }
 
-# Once admitted, the target file receives a copy of every message logged by this process. Exporting
-# PX_LOG_FILE passes the path to child px-* commands (which re-admit it via px_config_load), while
-# child shells that source this file without running configuration loading inherit _PX_LOG_ADMITTED
-# from the parent. Invoke this directly in the current shell so the admission persists for
-# subsequent log calls.
-## @description  Validates and admits a log file path under the output isolation policy.
-## @param        path The log file destination, either relative to PX_OUT or absolute.
-## @return       Exits 0 on admission, or returns px_out_resolve status (2 on violation, 1 on fail).
+# Must be invoked directly in the calling shell rather than inside a command substitution so the
+# admitted log file path and admission token persist and are exported to child processes.
+## @description  Validates a log file path under the output policy and enables log mirroring to it.
+## @return       Exits 0 on success, or propagates the status of px_out_resolve (2 or 1).
 px_log_file_set() {
-  local resolved status=0
-  resolved="$(px_out_resolve "${1:-}")" || status=$?
-  if [ "$status" != 0 ]; then
-    _PX_LOG_ADMITTED=""
-    return "$status"
-  fi
+  local resolved
+  _PX_LOG_ADMITTED=""
+  resolved="$(px_out_resolve "${1:-}")" || return $?
   PX_LOG_FILE="$resolved"
   _PX_LOG_ADMITTED="$resolved"
   export PX_LOG_FILE _PX_LOG_ADMITTED
 }
 
-## @description  Validates, resolves, and creates a subdirectory under the output root PX_OUT.
-## @param        relative_or_absolute_path The directory path to resolve and create under PX_OUT.
-## @return       Writes the resolved directory to stdout and exits 0, or exits 1 if mkdir fails.
+## @description  Resolves and creates a subdirectory under the output root PX_OUT.
+## @return       Writes the directory path to stdout and exits 0; returns the status of
+##               px_out_resolve (2 or 1) on policy or resolution failure, or exits 1 if mkdir fails.
 px_out_subdir() {
-  local dir status=0
-  dir="$(px_out_resolve "${1:-}")" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  local dir
+  dir="$(px_out_resolve "${1:-}")" || return $?
   mkdir -p "$dir" || px_die "$PX_EXIT_FAIL" "cannot create directory: $dir"
   printf '%s\n' "$dir"
 }
 
-# Backends store their scope records, capability caches, and port-forwarding records in this
-# directory so that no runtime state ever resides inside the working tree. An operator may relocate
-# the directory via PX_STATE_DIR provided the destination still resolves inside PX_OUT.
-## @description  Resolves and creates the backend runtime state directory under the output root.
-## @return       Writes the directory path to stdout and exits 0, or exits 2 if outside PX_OUT.
+## @description  Resolves and creates the backend runtime state directory (PX_STATE_DIR, defaulting
+##               to state) under the output root.
+## @return       Writes the state directory path to stdout and exits 0, or exits 2 or 1 on failure.
 px_state_dir() {
-  if [ -n "${PX_STATE_DIR:-}" ]; then
-    px_out_subdir "$PX_STATE_DIR"
-  else
-    px_out_subdir "state"
-  fi
+  px_out_subdir "${PX_STATE_DIR:-state}"
 }
 
 # ---------------------------------------------------------------------------
@@ -740,8 +1404,8 @@ px_state_dir() {
 PX_ID_SEQ=0
 PX_BASE36="0123456789abcdefghijklmnopqrstuvwxyz"
 
-## @description  Formats a non-negative integer in base 36, zero-padded to a fixed character width.
-## @param        value, width The non-negative integer to encode and the required output width.
+## @description  Encodes a non-negative integer (given value and width) in base 36, zero-padded to
+##               the requested character width.
 ## @return       Writes the base-36 digit string to stdout and exits 0.
 px_base36() {
   local value=$1 width=$2 out="" digit
@@ -755,33 +1419,30 @@ px_base36() {
 }
 
 # Formats each identifier as a compact UTC timestamp, a hyphen, and a four-character base-36 suffix
-# composed of one process-ID digit, two random digits, and one per-shell sequence counter digit.
-# The sequence counter distinguishes successive calls in the same shell, while the random digits
-# separate calls executed inside command substitutions (where subshell counter increments do not
-# persist to the caller); px_run_dir closes any remaining collision window via atomic mkdir.
-## @description  Generates a chronologically sortable unique run identifier.
-## @return       Writes the generated run identifier to stdout and exits 0.
+# encoding the process ID, two random characters, and a per-shell sequence counter.
+## @description  Generates a chronologically sortable run identifier for a harness execution.
+## @return       Writes the run identifier to stdout and exits 0.
 px_run_id() {
-  local now a b c
+  # The sequence counter distinguishes successive calls within the same shell. Because invocations
+  # inside a command substitution cannot advance the parent shell's counter, the random characters
+  # separate subshell calls while px_run_dir closes any remaining collision window via an exclusive
+  # mkdir call.
+  local now suffix
   now="$(px_epoch_s)"
   px_utc_fields "$now"
   PX_ID_SEQ=$((PX_ID_SEQ + 1))
-  a="$(px_base36 $(($$ % 36)) 1)"
-  b="$(px_base36 $((RANDOM % 1296)) 2)"
-  c="$(px_base36 $((PX_ID_SEQ % 36)) 1)"
-  printf '%s-%s%s%s\n' "$PX_UTC_COMPACT" "$a" "$b" "$c"
+  suffix="$(px_base36 $(((($$ % 36) * 1296 + RANDOM % 1296) * 36 + PX_ID_SEQ % 36)) 4)"
+  printf '%s-%s\n' "$PX_UTC_COMPACT" "$suffix"
 }
 
-# Uses atomic directory creation (mkdir without -p) across up to 16 attempts so concurrent
-# processes starting within the same second cannot share a run directory.
-## @description  Allocates and exclusively creates a unique run directory under PX_OUT/runs.
-## @return       Writes the new directory path to stdout and exits 0, or exits 1 if none is free.
+# Allocates an exclusive directory using a freshly minted run identifier under the specified parent
+# subdirectory of PX_OUT (defaulting to runs), retrying up to 16 times on collision.
+## @description  Exclusively creates a fresh run directory under a parent directory of PX_OUT.
+## @return       Writes the directory path to stdout and exits 0; exits 2 on policy refusal or 1
+##               when directory creation fails or no identifier is free.
 px_run_dir() {
-  local runs id dir attempt=0 status=0
-  runs="$(px_out_subdir "runs")" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  local runs id dir attempt=0
+  runs="$(px_out_subdir "${1:-runs}")" || return $?
   while [ "$attempt" -lt 16 ]; do
     id="$(px_run_id)"
     dir="$runs/$id"
@@ -791,28 +1452,31 @@ px_run_dir() {
     fi
     attempt=$((attempt + 1))
   done
-  px_die "$PX_EXIT_FAIL" "no free run identifier under $runs after 16 attempts"
+  px_die "$PX_EXIT_FAIL" "no free identifier under $runs after 16 attempts"
 }
 
 # ---------------------------------------------------------------------------
 # Multi-stage configuration loader, variable registry validation, and provenance tracking.
 # ---------------------------------------------------------------------------
-# Configuration is managed by a single loader that enforces one strict precedence hierarchy and
-# records the provenance of every variable. Stages are evaluated from highest to lowest priority,
+# Configuration is governed by a single loader that enforces a deterministic precedence hierarchy
+# and records the provenance of every variable. The loader evaluates stages in the following order,
 # and the first stage that defines a variable wins:
 #   1. The inherited process environment.
-#   2. Any explicit configuration files specified on the command line.
+#   2. Explicit configuration files specified on the command line.
 #   3. Local environment overrides in <layout>/env/local.env.
-#   4. Run-class default settings in <layout>/env/class-<class>.env.
-#   5. Baseline default settings in <layout>/env/defaults.env (mandatory).
+#   4. Run-class defaults in <layout>/env/class-<class>.env.
+#   5. Baseline defaults in <layout>/env/defaults.env (mandatory).
 #   6. Component version definitions in <layout>/versions.env.
 #   7. Local version overrides in <layout>/versions.local.env.
 #   8. The generated port map in <deployment>/ports.generated.env.
-# Because lower-priority stages never overwrite values established by earlier stages, explicit
-# overrides always prevail over defaults. Consequently, stage 7 (<layout>/versions.local.env) only
-# supplies version pins that are absent from stage 6 (<layout>/versions.env), which is how
-# trust-on-first-use pins are recorded; an operator who wishes to override an already-declared pin
-# places the override in local.env (stage 3).
+# Because later stages never overwrite values established by earlier stages, explicit overrides
+# always prevail over defaults. Stage 7 holds pins recorded manually by an operator, such as base
+# image digests or promoted download pins, together with version selections that re-pin a component
+# release. Stage 6 defines only default version values rather than active selections; the loader
+# derives any unset selection from its default after all stages complete. The trust-on-first-use
+# download pins recorded by scripts/fetch-dist.sh are not part of this configuration hierarchy: they
+# reside in $PX_OUT/dist/pins.env and are read directly by fetch-dist.sh. An operator who wishes to
+# override a declared pin in stage 6 places the replacement in local.env (stage 3).
 #
 # The deployment generator writes ports.generated.env into the deployment directory under PX_OUT,
 # ensuring that stage 8 never reads generated state from the working tree. Stage 8 runs
@@ -831,11 +1495,11 @@ PX_VARNAMES_PREFIXES=""
 PX_VARNAMES_PRIVATE=""
 PX_VARNAMES_READY=""
 
-# The variable registry enables strict mode to fail closed on misspelled PX_* names. Each entry
-# declares a single variable name, or a prefix family when terminated by an asterisk (*); a
-# trailing "private" keyword prevents the variable from being exported to child processes.
+# Loads the variable registry from lib/varnames.txt at most once per shell process so strict mode
+# can fail closed on misspelled or undeclared PX_* names.
 ## @description  Loads the declared registry of recognized PX_* configuration variable names.
-## @return       Exits 0 when loaded (or skipped in lax mode), or exits 1 in strict mode if missing.
+## @return       Exits 0 when loaded (or skipped in lax mode), or exits 1 in strict mode when the
+##               registry file is missing.
 px_varnames_load() {
   local file line name
   [ -z "$PX_VARNAMES_READY" ] || return 0
@@ -850,37 +1514,41 @@ px_varnames_load() {
     return 0
   fi
   PX_VARNAMES_READY=1
+  # Each non-empty line declares a prefix family ending with an asterisk (*), a single variable name
+  # followed by the "private" keyword, or one or more whitespace-separated variable names. Matching
+  # the wildcard prefix case before unquoted word splitting ensures that trailing asterisks never
+  # trigger filesystem pathname expansion.
   while IFS= read -r line || [ -n "$line" ]; do
     line=${line%%#*}
     px_trim_var line
-    [ -n "$line" ] || continue
-    name=${line%%[![:graph:]]*}
-    line=${line#"$name"}
-    px_trim_var line
-    if [ "$line" = private ]; then
+    case "$line" in
+    '') ;;
+    *\*) PX_VARNAMES_PREFIXES="$PX_VARNAMES_PREFIXES ${line%\*}" ;;
+    *[[:space:]]private)
+      name=${line%%[[:space:]]*}
       PX_VARNAMES_PRIVATE="$PX_VARNAMES_PRIVATE $name "
-    fi
-    case "$name" in
-    *\*) PX_VARNAMES_PREFIXES="$PX_VARNAMES_PREFIXES ${name%\*}" ;;
-    *) PX_VARNAMES="$PX_VARNAMES
-$name" ;;
+      PX_VARNAMES="$PX_VARNAMES$PX_NL$name"
+      ;;
+    *)
+      for name in $line; do
+        PX_VARNAMES="$PX_VARNAMES$PX_NL$name"
+      done
+      ;;
     esac
   done <"$file"
-  PX_VARNAMES="$PX_VARNAMES
-"
+  PX_VARNAMES="$PX_VARNAMES$PX_NL"
 }
 
-## @description  Checks whether a configuration variable name matches the declared registry.
-## @param        name The configuration variable name to look up.
-## @return       Exits 0 when the variable name is declared, or exits 1 otherwise.
+# Treats all variable names as declared when the registry file is absent in non-strict mode.
+## @description  Checks whether a configuration variable name is declared in the variable registry.
+## @return       Exits 0 when declared, returns 1 when undeclared, or exits 1 under strict mode
+##               when the registry file is missing.
 px_config_known() {
   local name=${1:-} prefix
   px_varnames_load
   [ -n "$PX_VARNAMES" ] || return 0
   case "$PX_VARNAMES" in
-  *"
-$name
-"*) return 0 ;;
+  *"$PX_NL$name$PX_NL"*) return 0 ;;
   esac
   for prefix in $PX_VARNAMES_PREFIXES; do
     case "$name" in
@@ -890,14 +1558,11 @@ $name
   return 1
 }
 
-# When a variable was already set by a higher-precedence stage, the existing value is retained and
-# logged at debug level. Accepted values are exported so generators, child px-* commands, and
-# containers share the same environment, except for variables marked "private" in the registry,
-# which remain local to the current process. Exits 2 on an invalid identifier, an undeclared PX_*
-# name under strict mode, or a read-only harness constant.
-## @description  Assigns a configuration variable if unset and records its stage origin.
-## @param        name, value, origin The variable name, literal value, and source stage label.
-## @return       Exits 0 on success, or exits 2 on an invalid, undeclared, or read-only name.
+# Assigns a variable (given name, value, and stage origin) only if no earlier stage has set it, and
+# exports the variable to child processes unless the registry marks it private.
+## @description  Sets a configuration variable under first-wins precedence and records its origin.
+## @return       Exits 0 on success, exits 2 on an invalid, undeclared (under strict mode), or
+##               read-only name, or exits 1 under strict mode when the registry is missing.
 px_config_set() {
   local name=${1:-} value=${2:-} origin=${3:-caller} previous attributes
   if ! [[ $name =~ $PX_RE_VARNAME ]]; then
@@ -946,34 +1611,15 @@ px_config_set() {
 }
 
 ## @description  Reports the configuration stage origin that established a variable's value.
-## @param        name The configuration variable name to query.
-## @return       Writes the origin label to stdout and exits 0, or exits 6 if never set by loader.
-px_config_origin() {
-  local name=${1:-} line
-  case "$PX_CONFIG_ORIGINS" in
-  "$name$PX_TAB"* | *"
-$name$PX_TAB"*) ;;
-  *) return "$PX_EXIT_NO_OBJECT" ;;
-  esac
-  while IFS= read -r line; do
-    case "$line" in
-    "$name$PX_TAB"*)
-      printf '%s\n' "${line#*"$PX_TAB"}"
-      return 0
-      ;;
-    esac
-  done <<EOF
-$PX_CONFIG_ORIGINS
-EOF
-  return "$PX_EXIT_NO_OBJECT"
-}
+## @return       Writes the origin label to stdout and exits 0, or returns 6 when the loader never
+##               set the named variable.
+px_config_origin() { px_tsv_get "${1:-}" "$PX_CONFIG_ORIGINS"; }
 
-# Accepts only comments, blank lines, and literal KEY=VALUE assignments while rejecting all other
-# syntax (including "export" prefixes) so that shell constructs in data files fail closed instead
-# of executing.
-## @description  Parses a single environment data file and applies its assignments to a stage.
-## @param        path, origin The filesystem path of the environment file and its stage origin tag.
-## @return       Exits 0 on success, returns 6 when the file is absent, or exits 2 on invalid lines.
+# Parses an environment data file (given path and origin label) containing only comments, blank
+# lines, and literal KEY=VALUE assignments without executing shell syntax.
+## @description  Parses a single environment data file and applies its assignments for a stage.
+## @return       Exits 0 on success, returns 6 if absent, exits 2 on any invalid line or rejected
+##               name, or exits 1 under strict mode when the registry is missing.
 px_config_parse_file() {
   local path=$1 origin=$2 line name value lineno=0
   [ -f "$path" ] || return "$PX_EXIT_NO_OBJECT"
@@ -1008,10 +1654,11 @@ px_config_parse_file() {
   return 0
 }
 
-# Empty environment values are treated as unset so that an empty export in the caller's shell
-# cannot accidentally shadow a baseline default.
+# Treats empty environment variables as unset so an empty export in the caller's shell cannot
+# shadow a lower-precedence file or baseline default.
 ## @description  Captures all non-empty exported PX_* variables as the highest-precedence stage.
-## @return       Records inherited environment variables under the "environment" origin and exits 0.
+## @return       Exits 0 on success, exits 2 on an undeclared name under strict mode, or exits 1
+##               under strict mode when the registry is missing.
 px_config_stage_env() {
   local line name value
   while IFS= read -r line; do
@@ -1030,21 +1677,19 @@ $(env)
 EOF
 }
 
-# Evaluates all configuration stages in precedence order, requiring only the baseline defaults file
-# (defaults.env) to be present. Accepts --strict to reject undeclared PX_* names, --lax (the
-# default) to permit them, and any number of explicit file arguments (evaluated in the order given
-# as the highest-precedence file stage, such as for --config or a target environment file). Fails
-# with exit code 2 on malformed lines, undeclared variables in strict mode, late definitions of
-# PX_RUN_CLASS or PX_STRICT_CONFIG, or a PX_LOG_FILE path rejected by the output policy.
-## @description  Executes the full multi-stage configuration loading sequence in precedence order.
-## @param        [--strict|--lax] [file...] Optional strictness flags followed by config file paths.
-## @return       Exits 0 on success, 6 if a named file is missing, 1 if defaults are missing, or 2.
+# Accepts [--strict] [--no-record] [--] followed by optional stage 2 configuration file paths and
+# evaluates all configuration stages in precedence order. Passing --no-record resolves the cluster
+# record path without loading its contents, because cluster bring-up writes a fresh record rather
+# than reading an existing one.
+## @description  Executes the multi-stage configuration loading sequence in precedence order.
+## @return       Exits 0 on success, 6 on an absent named file, 1 without defaults, or 2 on a
+##               rejected line or name, PX_LOG_FILE, late PX_STRICT_CONFIG, or mismatched backend.
 px_config_load() {
-  local file env_dir class_file had_class=0
+  local file env_dir record=1
   while [ $# -gt 0 ]; do
     case "$1" in
     --strict) PX_CONFIG_STRICT=1 ;;
-    --lax) PX_CONFIG_STRICT=0 ;;
+    --no-record) record=0 ;;
     --) shift; break ;;
     -*) px_die "$PX_EXIT_USAGE" "px_config_load: unknown option $1" ;;
     *) break ;;
@@ -1054,7 +1699,6 @@ px_config_load() {
   if px_is_true "${PX_STRICT_CONFIG:-0}"; then
     PX_CONFIG_STRICT=1
   fi
-  px_varnames_load
   px_config_stage_env
   for file in "$@"; do
     px_config_parse_file "$file" "$file" ||
@@ -1062,12 +1706,10 @@ px_config_load() {
   done
   env_dir="${PX_ENV_DIR:-$PX_HOME/$PX_DEPLOY_SUBDIR/env}"
   px_config_set PX_ENV_DIR "$env_dir" derived
-  env_dir="$PX_ENV_DIR"
   px_config_parse_file "${PX_LOCAL_ENV:-$env_dir/local.env}" local || true
   if [ -n "${PX_RUN_CLASS:-}" ]; then
-    had_class=1
-    class_file="${PX_CLASS_ENV:-$env_dir/class-$PX_RUN_CLASS.env}"
-    px_config_parse_file "$class_file" "class:$PX_RUN_CLASS" || true
+    px_config_parse_file "${PX_CLASS_ENV:-$env_dir/class-$PX_RUN_CLASS.env}" \
+      "class:$PX_RUN_CLASS" || true
   fi
   file="${PX_DEFAULTS_ENV:-$env_dir/defaults.env}"
   px_config_parse_file "$file" defaults ||
@@ -1077,19 +1719,8 @@ px_config_load() {
   px_config_parse_file \
     "${PX_VERSIONS_LOCAL_ENV:-$PX_HOME/$PX_DEPLOY_SUBDIR/versions.local.env}" \
     versions-local || true
-  if [ -n "${PX_PORT_MAP_ENV:-}" ] || [ -n "${PX_DEPLOYMENT_DIR:-}" ]; then
-    px_config_load_ports "${PX_DEPLOYMENT_DIR:-}"
-  fi
-  # Because the run-class file is evaluated before baseline defaults, defining PX_RUN_CLASS in
-  # defaults.env or a later stage arrives too late to take effect and is rejected rather than
-  # silently ignored.
-  if [ "$had_class" = 0 ] && [ -n "${PX_RUN_CLASS:-}" ]; then
-    class_file="${PX_CLASS_ENV:-$env_dir/class-$PX_RUN_CLASS.env}"
-    if [ -f "$class_file" ]; then
-      px_die "$PX_EXIT_USAGE" \
-        "name the run class on the command line or in the environment, not in $file"
-    fi
-  fi
+  px_config_load_ports "${PX_DEPLOYMENT_DIR:-}"
+  px_versions_resolve
   # Because strict variable validation must be active before stage 1 runs, enabling PX_STRICT_CONFIG
   # inside a configuration file arrives too late and is rejected rather than silently ignored.
   if [ "$PX_CONFIG_STRICT" = 0 ] && px_is_true "${PX_STRICT_CONFIG:-0}"; then
@@ -1103,12 +1734,10 @@ px_config_load() {
   return 0
 }
 
-# Reads PX_PORT_MAP_ENV when explicitly set, or falls back to ports.generated.env inside the
-# supplied deployment directory. Invoked automatically by px_config_load when PX_DEPLOYMENT_DIR is
-# known upfront, or called directly by commands that determine the deployment directory later.
-## @description  Loads stage 8 of configuration from the generated deployment port map.
-## @param        deployment_directory The deployment directory path (optional if PX_PORT_MAP_ENV).
-## @return       Exits 0 (including when the file is absent), or exits 2 on syntax/strict errors.
+# Loads PX_PORT_MAP_ENV when set, or falls back to ports.generated.env inside the supplied
+# deployment directory when one is provided.
+## @description  Loads stage 8 port-map assignments from the deployment port map file.
+## @return       Exits 0 (including when no port map file exists), or exits 2 on a refused line.
 px_config_load_ports() {
   local dir=${1:-} file
   file="${PX_PORT_MAP_ENV:-}"
@@ -1122,9 +1751,9 @@ px_config_load_ports() {
   return 0
 }
 
-# Provides the primary diagnostic view for troubleshooting configuration precedence surprises.
-## @description  Emits all loaded configuration variables, their values, and their origins sorted.
-## @return       Writes TSV rows of (name, value, origin) to stdout and exits 0.
+## @description  Emits every loaded configuration variable with its value and provenance, sorted by
+##               variable name.
+## @return       Writes tab-separated rows of name, value, and origin to stdout and exits 0.
 px_config_dump() {
   local line name
   while IFS= read -r line; do
@@ -1137,15 +1766,150 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Component version resolution and Phoenix HBase profile compatibility matrix.
+# ---------------------------------------------------------------------------
+# A version set comprises a Phoenix HBase profile, the cluster HBase release, the cluster Hadoop
+# release, and the build and role JDK selections. The committed version definitions establish only
+# the default for each selection. After the final configuration stage completes, the loader derives
+# any unset selection from its default, allowing every stage (including local version overrides) to
+# re-pin a component selection.
+#
+# The Phoenix Maven build selects a profile via -Dhbase.profile, which activates a single HBase
+# compatibility module admitting a bounded range of HBase releases at run time. Each row in
+# PX_HBASE_PROFILES defines one profile using five space-separated fields: the profile identifier,
+# its compatibility module, the HBase minor line, and the lowest and highest admitted patch
+# releases (where * admits every subsequent patch release on that minor line). The root pom.xml maps
+# each profile to its compatibility module (hbase.compat.version), while the lowest admitted patch
+# release corresponds to the check-hbase-compatibility enforcer rule in phoenix-core-client/pom.xml.
+# Because Phoenix introduces a new compatibility module whenever HBase modifies an interface that
+# the module consumes, the upper patch bound of a module is one patch release below the lower bound
+# of the next compatibility module on the same minor line. Whenever the repository's compatibility
+# modules change, this table must be updated; until then, the harness build rejects any pom.xml that
+# disagrees with it.
+PX_HBASE_PROFILES="2.5.0 2.5.0 2.5 0 3
+2.5.4 2.5.4 2.5 4 *
+2.5 2.5.4 2.5 4 *
+2.6.0 2.6.0 2.6 0 3
+2.6.3 2.6.0 2.6 0 3
+2.6 2.6.4 2.6 4 *"
+
+## @description  Looks up a Phoenix HBase profile in PX_HBASE_PROFILES and reports its compatibility
+##               module, minor release line, lowest admitted patch, and highest admitted patch.
+## @return       Writes the four fields to stdout and exits 0, or returns 6 for an unknown profile.
+px_hbase_profile() {
+  local profile rest
+  while read -r profile rest; do
+    if [ "$profile" = "${1:-}" ]; then
+      printf '%s\n' "$rest"
+      return 0
+    fi
+  done <<EOF
+$PX_HBASE_PROFILES
+EOF
+  return "$PX_EXIT_NO_OBJECT"
+}
+
+## @description  Derives any version selection or image tag that no configuration stage set from its
+##               corresponding default value.
+## @return       Exits 0 on success, or exits 2 if strict mode rejects a derived variable name.
+px_versions_resolve() {
+  local name tag
+  if [ -z "${PX_PHOENIX_HBASE_PROFILE:-}" ] &&
+    [ -n "${PX_PHOENIX_HBASE_PROFILE_DEFAULT:-}" ]; then
+    px_config_set PX_PHOENIX_HBASE_PROFILE "$PX_PHOENIX_HBASE_PROFILE_DEFAULT" derived
+  fi
+  # Because each Phoenix HBase profile defines its own default HBase distribution version, a
+  # re-pinned profile automatically inherits the default HBase release for that profile.
+  if [ -z "${PX_DIST_HBASE_VERSION:-}" ] && [ -n "${PX_PHOENIX_HBASE_PROFILE:-}" ]; then
+    name="PX_DIST_HBASE_DEFAULT_$(px_upper "$PX_PHOENIX_HBASE_PROFILE")"
+    if [[ $name =~ $PX_RE_VARNAME ]] && [ -n "${!name:-}" ]; then
+      px_config_set PX_DIST_HBASE_VERSION "${!name}" derived
+    fi
+  fi
+  if [ -z "${PX_DIST_HADOOP_VERSION:-}" ] && [ -n "${PX_DIST_HADOOP_DEFAULT:-}" ]; then
+    px_config_set PX_DIST_HADOOP_VERSION "$PX_DIST_HADOOP_DEFAULT" derived
+  fi
+  # Assigns a distinct container image tag to each HBase, Hadoop, and profile combination so
+  # different version sets never collide on a shared image. Role JDK selections are omitted from
+  # the image tag because the container image bundles all supported JDK versions simultaneously.
+  tag="hbase-${PX_DIST_HBASE_VERSION:-}-hadoop-${PX_DIST_HADOOP_VERSION:-}"
+  tag="px-harness:$tag-profile-${PX_PHOENIX_HBASE_PROFILE:-}"
+  if [ -z "${PX_IMAGE_TAG:-}" ] && [ -n "${PX_DIST_HBASE_VERSION:-}" ] &&
+    [ -n "${PX_DIST_HADOOP_VERSION:-}" ] && [ -n "${PX_PHOENIX_HBASE_PROFILE:-}" ]; then
+    px_config_set PX_IMAGE_TAG "$tag" derived
+  fi
+}
+
+## @description  Verifies that the configured HBase release falls within the patch range admitted by
+##               the compatibility module of the selected Phoenix HBase profile.
+## @return       Exits 0 when compatible, or exits 2 on an unknown profile or out-of-range release.
+px_versions_check() {
+  local profile=${PX_PHOENIX_HBASE_PROFILE:-} release=${PX_DIST_HBASE_VERSION:-}
+  local module="" minor="" low="" high="" patch="" range names="" row
+  read -r module minor low high <<<"$(px_hbase_profile "$profile" || true)"
+  if [ -z "$module" ]; then
+    while read -r row _; do
+      names="$names $row"
+    done <<EOF
+$PX_HBASE_PROFILES
+EOF
+    px_die "$PX_EXIT_USAGE" "PX_PHOENIX_HBASE_PROFILE='$profile' is not a Phoenix HBase" \
+      "profile. The profiles are$names"
+  fi
+  range="$minor.$low to $minor.$high"
+  [ "$high" != '*' ] || range="$minor.$low and every later $minor release"
+  case "$release" in
+  "$minor".*) patch=${release#"$minor".} ;;
+  esac
+  if ! [[ $patch =~ $PX_RE_INT ]] || [ "$patch" -lt "$low" ] ||
+    { [ "$high" != '*' ] && [ "$patch" -gt "$high" ]; }; then
+    px_die "$PX_EXIT_USAGE" "HBase '$release' (PX_DIST_HBASE_VERSION) is outside the range" \
+      "of profile $profile: its compatibility module $module admits HBase $range"
+  fi
+}
+
+## @description  Extracts the active version set from a configuration dump (name, value, origin).
+## @return       Writes key-value TSV rows for the HBase profile, HBase version, Hadoop version, and
+##               JDK selections to stdout and exits 0.
+px_versions_rows() {
+  local dump=${1:-} line name key jdks=""
+  for key in hbase_profile:PX_PHOENIX_HBASE_PROFILE hbase_version:PX_DIST_HBASE_VERSION \
+    hadoop_version:PX_DIST_HADOOP_VERSION; do
+    line="$(px_tsv_get "${key#*:}" "$dump")" || line=""
+    px_tsv_row "${key%%:*}" "${line%%"$PX_TAB"*}"
+  done
+  while IFS= read -r line; do
+    name=${line%%"$PX_TAB"*}
+    case "$name" in
+    PX_*_JDK)
+      line=${line#*"$PX_TAB"}
+      jdks="$jdks $name=${line%%"$PX_TAB"*}"
+      ;;
+    esac
+  done <<EOF
+$dump
+EOF
+  px_tsv_row jdks "${jdks# }"
+}
+
+## @description  Converts a container image tag into a filesystem-safe staging directory name under
+##               $PX_OUT/images by replacing every colon (:) and slash (/) with an underscore (_).
+## @return       Writes the sanitized image staging name to stdout and exits 0.
+px_image_stage_name() {
+  local name=${1//:/_}
+  printf '%s\n' "${name//\//_}"
+}
+
+# ---------------------------------------------------------------------------
 # Bounded polling and retry execution primitives.
 # ---------------------------------------------------------------------------
 # Every wait operation in the harness has a finite bound. When a wait expires, it returns exit code
 # 4 (PX_EXIT_TIMEOUT), leaving the caller to decide whether expiration constitutes a hard failure
 # or a skipped condition.
 
-## @description  Polls a command at a fixed interval until it succeeds or the timeout expires.
-## @param        timeout_s, interval_s, command... Timeout in seconds, poll interval, and command.
-## @return       Exits 0 when the command succeeds, returns 4 on expiry, or exits 2 on usage error.
+## @description  Repeatedly executes a command (given timeout_s, interval_s, and command arguments)
+##               until it succeeds or the deadline expires.
+## @return       Exits 0 on command success, returns 4 on timeout expiry, or exits 2 on bad usage.
 px_wait_until() {
   local timeout=${1:-} interval=${2:-} deadline now
   shift 2
@@ -1168,9 +1932,9 @@ px_wait_until() {
   done
 }
 
-## @description  Executes a command up to a bounded number of attempts with a delay between tries.
-## @param        attempts, sleep_s, command... Maximum attempt count (>= 1), pause seconds, and cmd.
-## @return       Returns 0 on success, the last attempt's exit status on exhaustion, or 2 on usage.
+## @description  Executes a command (given attempts, sleep_s, and command arguments) up to a bounded
+##               number of attempts with a fixed pause between retries.
+## @return       Returns the exit status of the final attempt, or exits 2 on invalid usage.
 px_retry() {
   local attempts=${1:-} pause=${2:-} attempt=1 status=0
   shift 2
@@ -1199,10 +1963,8 @@ px_retry() {
 # ---------------------------------------------------------------------------
 # Cross-platform compatibility wrappers for macOS and Linux differences.
 # ---------------------------------------------------------------------------
-# Operating system differences between macOS and Linux are encapsulated behind dedicated helper
-# functions in this section so that no other script in the harness needs platform conditionals.
-
-PX_TMP_SEQ=0
+# Operating system differences between macOS and Linux are isolated behind the helper functions in
+# this section so that no other script in the harness needs platform-specific conditionals.
 
 # Fixed grace period in seconds between sending SIGTERM and escalating to SIGKILL when terminating
 # an expired command. This is an internal harness constant rather than a configurable parameter.
@@ -1215,8 +1977,9 @@ PX_TIMEOUT_GRACE_S=2
 # runs once at source time so calls inside command substitutions reuse the cached path.
 PX_TIMEOUT_BIN=""
 
-## @description  Probes PATH for a timeout executable (gtimeout or timeout) supporting GNU options.
-## @return       Sets PX_TIMEOUT_BIN to the executable path (or empty if unavailable) and exits 0.
+## @description  Probes PATH for a timeout executable accepting GNU options (--foreground and -k)
+##               and stores its resolved path in PX_TIMEOUT_BIN, or leaves it empty if unavailable.
+## @return       Populates PX_TIMEOUT_BIN and exits 0.
 px_timeout_probe() {
   local candidate path
   for candidate in gtimeout timeout; do
@@ -1230,21 +1993,13 @@ px_timeout_probe() {
 }
 px_timeout_probe
 
-# Preserves the caller's stdin, controlling terminal, and terminal signals while enforcing a time
-# limit. Prefers a GNU timeout binary when available: when stdin is not a terminal, timeout
-# expiration terminates the entire process group of the command, whereas when stdin is a terminal
-# (and on the shell watchdog fallback path), expiration terminates only the immediate command
-# process. When no GNU timeout binary is installed, the command runs in the foreground while a
-# background watchdog process enforces the deadline. Returns 124 on SIGTERM expiry or 137 when the
-# command outlives the grace period after SIGTERM and takes SIGKILL; the watchdog path returns 125
-# when it cannot start the command, exits 1 when it cannot create its mark file, and exits 2 on
-# invalid usage. As with external timeout binaries, the command must be an executable program and
-# not a shell function.
-## @description  Executes an external command under a finite timeout in whole seconds.
-## @param        timeout_s, command... Positive integer timeout in seconds and the command to run.
-## @return       Returns command status, 124 on expiry, 137 on KILL, 125 on start error, or 1 or 2.
+# Preserves the caller's standard input, controlling terminal, and signal delivery while enforcing a
+# whole-second execution deadline (given timeout_s and command arguments).
+## @description  Executes an external program under a finite timeout while keeping terminal signals.
+## @return       Returns the command status, 124 when expired, 137 when killed, 125 or 1 on a
+##               watchdog fault, or exits 2 on invalid usage.
 px_timeout() {
-  local timeout=${1:-} mark status=0 watch_pid line expiry=""
+  local timeout=${1:-} mark status=0 watch_pid line expiry="" fg=""
   shift
   if ! [[ $timeout =~ $PX_RE_INT ]] || [ "$timeout" -lt 1 ]; then
     px_die "$PX_EXIT_USAGE" "px_timeout needs a whole number of seconds above zero"
@@ -1253,15 +2008,14 @@ px_timeout() {
   if [ -n "$PX_TIMEOUT_BIN" ]; then
     # When standard input is a terminal, keep the command in the foreground process group so it
     # retains terminal access and signals; otherwise, run it in a separate process group so timeout
-    # expiration also terminates any child processes it spawned.
-    if [ -t 0 ]; then
-      "$PX_TIMEOUT_BIN" --foreground -k "$PX_TIMEOUT_GRACE_S" "$timeout" "$@" ||
-        status=$?
-    else
-      "$PX_TIMEOUT_BIN" -k "$PX_TIMEOUT_GRACE_S" "$timeout" "$@" || status=$?
-    fi
+    # expiration also terminates any child processes that the command spawned.
+    if [ -t 0 ]; then fg=--foreground; fi
+    "$PX_TIMEOUT_BIN" ${fg:+"$fg"} -k "$PX_TIMEOUT_GRACE_S" "$timeout" "$@" ||
+      status=$?
     return "$status"
   fi
+  # When no GNU timeout executable is available, run the command in the foreground and spawn a
+  # background watchdog process that signals only the immediate command upon expiration.
   mark="$(mktemp "${TMPDIR:-/tmp}/px.timeout.XXXXXXXX")" ||
     px_die "$PX_EXIT_FAIL" "cannot create the mark file of a timeout"
   px_timeout_watch "$timeout" "$mark" >/dev/null 2>&1 &
@@ -1291,13 +2045,11 @@ px_timeout() {
   return "$status"
 }
 
-# Runs in the background to enforce a command deadline: upon expiration it appends 124 to the mark
-# file and sends SIGTERM, waits PX_TIMEOUT_GRACE_S seconds, and if the process still exists appends
-# 137 and sends SIGKILL. Receiving SIGTERM from px_timeout aborts the watchdog and its active sleep
-# immediately.
-## @description  Background watchdog that signals an expired command after its timeout elapses.
-## @param        timeout_s, mark_file The timeout in seconds and mark file holding the target PID.
-## @return       Always exits 0.
+# Sleeps for timeout_s seconds and, unless it was stopped, no PID was recorded, or the calling shell
+# has exited, appends 124 and sends SIGTERM; after the grace period, if the target is still alive,
+# appends 137 and sends SIGKILL.
+## @description  Enforces a command deadline in the background and signals the process upon expiry.
+## @return       Exits 0.
 px_timeout_watch() {
   local timeout=$1 mark=$2 pid="" nap="" stop=""
   # The SIGTERM trap terminates any active background sleep with SIGKILL and reaps it. Because a
@@ -1322,12 +2074,9 @@ px_timeout_watch() {
   exit 0
 }
 
-# Records the background sleep PID in nap and checks the watchdog stop flag. If px_timeout sent
-# SIGTERM before nap was assigned, this helper kills and reaps the sleep process and exits the
-# watchdog so no orphaned sleep process outlives the timeout call.
-## @description  Executes an interruptible background sleep stage for px_timeout_watch.
-## @param        seconds The duration in seconds to sleep.
-## @return       Returns 0 when the sleep completes, or exits the watchdog with 0 if stopped.
+## @description  Sleeps for one interval stage of px_timeout_watch, terminating the sleep process
+##               and exiting the watchdog immediately when the stop flag is set.
+## @return       Returns 0 after the full sleep elapses, or exits the watchdog with 0 when stopped.
 px_timeout_nap() {
   sleep "$1" &
   nap=$!
@@ -1342,21 +2091,17 @@ px_timeout_nap() {
   nap=""
 }
 
-# Tracks created temporary directories in a per-process file rather than a shell variable because
-# callers invoke px_mktemp_dir inside command substitutions where variable mutations would be lost
-# when the subshell exits. Including $$ in the filename ensures each process removes only the
-# directories it created.
-## @description  Computes the filesystem path of the current process's temporary-directory registry.
+# Persists tracked directory paths in a per-process file rather than a shell variable so that
+# registrations made inside a command-substitution subshell survive when the subshell exits.
+## @description  Reports the filesystem path of the temporary-directory registry for this process.
 ## @return       Writes the registry file path to stdout and exits 0.
 px_tmp_registry() {
   local root=${TMPDIR:-/tmp}
   printf '%s/px.tmpdirs.%s\n' "${root%/}" "$$"
 }
 
-# Directories recorded in the process registry are removed automatically on exit unless PX_KEEP is
-# enabled for post-mortem diagnosis.
-## @description  Creates a temporary directory and registers it for automatic cleanup on exit.
-## @param        label An optional prefix label incorporated into the temporary directory name.
+## @description  Creates a temporary directory incorporating an optional label in its name and
+##               registers it for automatic removal on process exit unless PX_KEEP is enabled.
 ## @return       Writes the created directory path to stdout and exits 0, or exits 1 on failure.
 px_mktemp_dir() {
   local label=${1:-px} dir root=${TMPDIR:-/tmp}
@@ -1366,9 +2111,9 @@ px_mktemp_dir() {
   printf '%s\n' "$dir"
 }
 
-# Invoked automatically by the EXIT trap; idempotent and safe to call multiple times.
-## @description  Deletes all temporary directories registered by the current process unless PX_KEEP.
-## @return       Removes registered temporary directories (if PX_KEEP is unset) and exits 0.
+## @description  Removes all temporary directories registered by the current process unless PX_KEEP
+##               is true; idempotent and safe to invoke multiple times.
+## @return       Exits 0.
 px_tmp_cleanup() {
   local dir registry
   registry="$(px_tmp_registry)"
@@ -1384,53 +2129,130 @@ px_tmp_cleanup() {
   rm -f "$registry"
 }
 
-# Probes GNU stat (-c %s) first and falls back to BSD stat (-f %z) only when the GNU flag fails.
-## @description  Reports the size of a filesystem entry in bytes across GNU and BSD platforms.
-## @param        path The filesystem path to inspect.
-## @return       Writes the byte size to stdout and exits 0, returns 6 if absent, or 1 on failure.
-px_stat_size() {
-  local path=${1:-}
-  [ -e "$path" ] || return "$PX_EXIT_NO_OBJECT"
-  if stat -c %s "$path" 2>/dev/null || stat -f %z "$path" 2>/dev/null; then
+## @description  Computes the SHA-512 digest of a file using the first available utility among
+##               sha512sum, gsha512sum, shasum, and openssl.
+## @return       Writes 128 hex digits to stdout and exits 0; returns 1 on failure or 5 if no tool.
+px_sha512() {
+  local file=$1 prog out
+  for prog in sha512sum gsha512sum 'shasum -a 512' 'openssl dgst -sha512 -r'; do
+    command -v "${prog%% *}" >/dev/null 2>&1 || continue
+    if ! out="$($prog "$file")"; then
+      px_error "cannot compute the SHA-512 of $file"
+      return "$PX_EXIT_FAIL"
+    fi
+    # GNU coreutils checksum programs prefix the output line with a leading backslash whenever the
+    # target filename contains a backslash or newline character.
+    out=${out#\\}
+    printf '%s\n' "${out%%[[:space:]]*}" | tr 'ABCDEF' 'abcdef'
     return 0
-  fi
-  px_error "no usable stat on this host"
+  done
+  px_error "no SHA-512 program on this host: install sha512sum or shasum"
+  return "$PX_EXIT_UNSUPPORTED"
+}
+
+## @description  Determines the major version of the JDK at a given JAVA_HOME directory by parsing
+##               its java -version output (normalizing legacy 1.x strings such as 1.8 to 8).
+## @return       Writes the major version number to stdout and exits 0, or returns 1 on failure.
+px_java_major() {
+  local home=$1 out line major re
+  re='version "([0-9]+)(\.([0-9]+))?'
+  out="$("$home/bin/java" -version 2>&1)" || return "$PX_EXIT_FAIL"
+  while IFS= read -r line; do
+    if [[ $line =~ $re ]]; then
+      major=${BASH_REMATCH[1]}
+      if [ "$major" = 1 ]; then
+        major=${BASH_REMATCH[3]}
+      fi
+      printf '%s\n' "$major"
+      return 0
+    fi
+  done <<EOF
+$out
+EOF
   return "$PX_EXIT_FAIL"
 }
 
-# Because BSD sed and GNU sed require incompatible syntax for the -i flag, this function writes the
-# transformed output to a temporary sibling file and overwrites the target via cat redirection,
-# preserving both the permissions mode and the inode of the original file.
-## @description  Applies a sed script to one or more files in place without relying on sed -i.
-## @param        expression, file... The sed expression to apply followed by one or more file paths.
-## @return       Exits 0 when all files are updated in place, or returns 1 when an edit fails.
-px_sed_inplace() {
-  local expression=${1:-} file tmp
-  shift
-  [ $# -gt 0 ] || px_die "$PX_EXIT_USAGE" "px_sed_inplace needs a file"
-  for file in "$@"; do
-    if [ ! -f "$file" ]; then
-      px_error "no such file: $file"
-      return "$PX_EXIT_FAIL"
+# Resolves a JDK installation from PX_BUILD_JAVA_HOME or the host operating system's standard JDK
+# registry (/usr/libexec/java_home on macOS or /usr/lib/jvm/* on Linux), intentionally ignoring any
+# java binary on PATH so builds remain reproducible.
+## @description  Locates the installation home directory for a requested JDK major version.
+## @return       Writes the JDK home path to stdout and exits 0, returns 2 when PX_BUILD_JAVA_HOME
+##               does not match the requested version, or returns 5 when no matching JDK is found.
+px_java_home() {
+  local want=$1 home=${PX_BUILD_JAVA_HOME:-} code=$PX_EXIT_USAGE candidate major
+  if [ -z "$home" ]; then
+    code=$PX_EXIT_UNSUPPORTED
+    if [ -x /usr/libexec/java_home ]; then
+      home="$(/usr/libexec/java_home -v "$want" 2>/dev/null)" || home=""
     fi
-    PX_TMP_SEQ=$((PX_TMP_SEQ + 1))
-    tmp="$file.px.$$.$PX_TMP_SEQ"
-    if ! sed -e "$expression" "$file" >"$tmp"; then
-      rm -f "$tmp"
-      px_error "sed failed on $file"
-      return "$PX_EXIT_FAIL"
+    if [ -z "$home" ]; then
+      for candidate in /usr/lib/jvm/*; do
+        [ -x "$candidate/bin/java" ] || continue
+        major="$(px_java_major "$candidate")" || continue
+        if [ "$major" = "$want" ]; then
+          home=$candidate
+          break
+        fi
+      done
     fi
-    if ! cat "$tmp" >"$file"; then
-      rm -f "$tmp"
-      px_error "cannot write $file"
-      return "$PX_EXIT_FAIL"
-    fi
-    rm -f "$tmp"
-  done
+  fi
+  major=""
+  if [ -n "$home" ] && [ -x "$home/bin/java" ]; then
+    major="$(px_java_major "$home")" || major=""
+  fi
+  if [ "$major" != "$want" ]; then
+    px_error "no JDK $want at ${home:-any known place} (found ${major:-no java})." \
+      "Install it, or set PX_BUILD_JAVA_HOME to its home"
+    return "$code"
+  fi
+  printf '%s\n' "$home"
 }
 
-## @description  Reports the number of online logical processors available on the host.
-## @return       Writes the processor count (defaulting to 1) to stdout and exits 0.
+# Determines the target Maven build JDK version from PX_BUILD_JDK and populates PX_BUILD_JDK_SEL,
+# PX_BUILD_HOME, and PX_BUILD_TIMEOUT in the calling shell.
+## @description  Resolves and validates the JDK installation and timeout settings for a Maven build.
+## @return       Exits 0 on success, returns 2 or 5 from px_java_home, or exits 2 on an unsupported
+##               JDK version or invalid PX_TIMEOUT_BUILD value.
+px_build_jdk() {
+  PX_BUILD_JDK_SEL=${PX_BUILD_JDK:-17}
+  case " $PX_JDKS " in
+  *" $PX_BUILD_JDK_SEL "*) ;;
+  *) px_die "$PX_EXIT_USAGE" "the JDK must be one of $PX_JDKS, got '$PX_BUILD_JDK_SEL'" ;;
+  esac
+  PX_BUILD_TIMEOUT=${PX_TIMEOUT_BUILD:-3600}
+  if ! [[ $PX_BUILD_TIMEOUT =~ $PX_RE_INT ]] || [ "$PX_BUILD_TIMEOUT" -lt 1 ]; then
+    px_die "$PX_EXIT_USAGE" "PX_TIMEOUT_BUILD needs whole seconds above zero," \
+      "got '$PX_BUILD_TIMEOUT'"
+  fi
+  PX_BUILD_HOME="$(px_java_home "$PX_BUILD_JDK_SEL")"
+}
+
+# Redirects Maven build output to the specified log file and prints the final 40 lines to stderr
+# when a non-timeout build failure occurs.
+## @description  Executes Maven (given log file path and mvn arguments) using the JDK and timeout
+##               configured by px_build_jdk.
+## @return       Exits 0 on success, 5 if mvn is missing, 4 on timeout expiry, or 1 on build error.
+px_maven_run() {
+  local log=$1 status=0
+  shift
+  command -v mvn >/dev/null 2>&1 ||
+    px_die "$PX_EXIT_UNSUPPORTED" "Maven is required: no mvn on the PATH"
+  px_timeout "$PX_BUILD_TIMEOUT" env "JAVA_HOME=$PX_BUILD_HOME" \
+    "PATH=$PX_BUILD_HOME/bin:$PATH" mvn "$@" >"$log" 2>&1 || status=$?
+  case "$status" in
+  0) ;;
+  124 | 137)
+    px_die "$PX_EXIT_TIMEOUT" "the build expired after ${PX_BUILD_TIMEOUT}s, see $log"
+    ;;
+  *)
+    tail -n 40 "$log" >&2 || true
+    px_die "$PX_EXIT_FAIL" "the build failed with status $status, see $log"
+    ;;
+  esac
+}
+
+## @description  Reports the number of online logical processors available on the host (at least 1).
+## @return       Writes the processor count to stdout and exits 0.
 px_nproc() {
   local count=""
   count="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || count=""
@@ -1446,11 +2268,11 @@ px_nproc() {
   printf '%s\n' "$count"
 }
 
-# Reports physical host memory from /proc/meminfo or sysctl hw.memsize; preflight checks compare
-# container memory limits against the container engine's reported memory pool supplied by the
-# active backend.
+# Reads physical host memory from /proc/meminfo or sysctl; preflight capacity checks instead use
+# the container engine's memory pool reported by the active backend.
 ## @description  Reports the total physical memory of the host machine in bytes.
-## @return       Writes total memory in bytes to stdout and exits 0, or returns 5 if unsupported.
+## @return       Writes the byte count to stdout and exits 0, or returns 5 when no host memory
+##               source is available.
 px_mem_total_bytes() {
   local value="" line field
   if [ -r /proc/meminfo ]; then
@@ -1482,27 +2304,37 @@ px_mem_total_bytes() {
   printf '%s\n' "$value"
 }
 
-# Re-runs the host memory capacity check before starting an on-demand role group, since adding a
-# role group commits additional container memory limits on the host. Invokes the documented host
-# preflight interface "$PX_HOME/scripts/preflight.sh --phase memory" under PX_TIMEOUT_DEFAULT and
-# redirects its report to stderr so the caller's stdout remains a clean data channel. That script
-# owns the summation of configured container memory limits; if the script is not installed, startup
-# proceeds with a warning. Backend preflight is never used as a substitute because its host port
-# availability checks would fail against an already-running cluster.
-## @description  Re-evaluates host memory capacity via preflight.sh before starting a role group.
-## @return       Exits 0 if admitted or absent, 1 if not executable, 4 on timeout, 2 on bad timeout,
-##               or returns the preflight script's exit status.
+# Temporarily exports non-empty variables marked "private" in the registry within a subshell so
+# internal child scripts such as scripts/preflight.sh inherit settings like the discovered container
+# engine without exposing them to unrelated processes.
+## @description  Executes a harness command in a subshell with private configuration variables
+##               exported.
+## @return       Returns the exit status of the executed command.
+px_with_private() {
+  (
+    for _px_name in $PX_VARNAMES_PRIVATE; do
+      [ -z "${!_px_name:-}" ] || export "${_px_name?}"
+    done
+    "$@"
+  )
+}
+
+# Invokes scripts/preflight.sh --phase memory under PX_TIMEOUT_DEFAULT before starting an on-demand
+# role group and redirects its report to stderr so stdout remains clean.
+## @description  Re-evaluates container memory capacity via scripts/preflight.sh before group start.
+## @return       Returns 0 to admit, 1 if the script is missing or not executable, 4 on timeout
+##               expiry, or the exit status of preflight.sh.
 px_memory_recheck() {
+  # Although the memory phase invokes sb_preflight, it inspects only the engine_memory row; host
+  # port availability checks inside sb_preflight fail against an already-running cluster, so the
+  # memory phase ignores their outcome.
   local script="$PX_HOME/scripts/preflight.sh" status=0
-  if [ ! -e "$script" ]; then
-    px_warn "the memory check is not installed, no $script: the group starts unchecked"
-    return 0
-  fi
   if [ ! -x "$script" ]; then
-    px_error "the memory check $script is not executable"
+    px_error "the memory check $script is missing or not executable"
     return "$PX_EXIT_FAIL"
   fi
-  px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" --phase memory >&2 || status=$?
+  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" --phase memory >&2 ||
+    status=$?
   case "$status" in
   124 | 137)
     px_error "the memory check expired after ${PX_TIMEOUT_DEFAULT:-300}s"
@@ -1520,9 +2352,9 @@ px_memory_recheck() {
 # containing those characters rather than writing a malformed row that downstream parsers cannot
 # split reliably.
 
-## @description  Emits a single tab-separated row from the supplied field arguments.
-## @param        field... The column values to join with tab delimiters.
-## @return       Writes the TSV row to stdout and exits 0, or returns 1 if any field has tab/NL.
+## @description  Formats and writes a single tab-separated row from the supplied field arguments.
+## @return       Writes the TSV row to stdout and exits 0, or returns 1 without writing anything
+##               when any field contains a tab or a newline.
 px_tsv_row() {
   local field index=0 out=""
   for field in "$@"; do
@@ -1583,11 +2415,9 @@ px_awk_glob() {
 }'
 }
 
-# Replaces tabs and newlines with spaces and strips carriage returns so free-form text such as log
-# messages can be safely embedded inside a single TSV column.
-## @description  Sanitizes arbitrary text so it can be safely emitted as a single TSV field.
-## @param        text The raw text string to sanitize.
-## @return       Writes the sanitized single-line field to stdout and exits 0.
+## @description  Sanitizes text for a single TSV field by replacing tabs and newlines with spaces
+##               and stripping carriage returns.
+## @return       Writes the sanitized field to stdout and exits 0.
 px_tsv_clean() {
   local value=${1:-}
   value=${value//$'\t'/ }
@@ -1596,37 +2426,37 @@ px_tsv_clean() {
   printf '%s\n' "$value"
 }
 
-# Callers reading substrate contract schemas query contract.sh for column positions rather than
-# hard-coding numeric column indices by hand.
-## @description  Extracts a 1-based positional field from a tab-separated row.
-## @param        index, row The 1-based column index and the TSV row string.
-## @return       Writes the field value to stdout and exits 0, or returns 6 if the column is absent.
+## @description  Extracts a 1-based positional field (given column index and row) from a TSV row,
+##               where schema column indices are defined in contract.sh.
+## @return       Writes the field to stdout and exits 0, or returns 6 when no such field exists.
 px_tsv_field() {
-  local index=${1:-} count=1 field rest=${2:-}
-  # Slice fields explicitly with parameter expansion rather than IFS word splitting: because the
-  # shell treats tab as whitespace in IFS, consecutive tabs would collapse into a single delimiter
-  # and shift subsequent columns whenever an optional field (such as an unavailable metric in the
-  # sample schema) is empty.
-  while :; do
+  # Slices columns explicitly with parameter expansion rather than IFS word splitting: because the
+  # shell classifies tab as IFS whitespace, consecutive tabs would collapse into a single delimiter
+  # and drop empty columns. Since the sample schema leaves columns empty whenever a metrics source
+  # has no equivalent metric, empty columns must preserve their positions; the trailing tab acts as
+  # a termination sentinel.
+  local index=${1:-} count=1 rest="${2:-}$PX_TAB"
+  [[ $index =~ $PX_RE_INT ]] && [ "$index" -ge 1 ] || return "$PX_EXIT_NO_OBJECT"
+  while [ "$count" -lt "$index" ]; do
     case "$rest" in
-    *"$PX_TAB"*)
-      field=${rest%%"$PX_TAB"*}
-      rest=${rest#*"$PX_TAB"}
-      ;;
-    *)
-      if [ "$count" = "$index" ]; then
-        printf '%s\n' "$rest"
-        return 0
-      fi
-      return "$PX_EXIT_NO_OBJECT"
-      ;;
+    *"$PX_TAB"*"$PX_TAB"*) rest=${rest#*"$PX_TAB"} ;;
+    *) return "$PX_EXIT_NO_OBJECT" ;;
     esac
-    if [ "$count" = "$index" ]; then
-      printf '%s\n' "$field"
-      return 0
-    fi
     count=$((count + 1))
   done
+  printf '%s\n' "${rest%%"$PX_TAB"*}"
+}
+
+## @description  Extracts the remainder of the first line in a multi-line TSV text that begins with
+##               the specified key followed by a tab delimiter.
+## @return       Writes the value to stdout and exits 0, or returns 6 when no line matches the key.
+px_tsv_get() {
+  local key=${1:-} rest="$PX_NL${2:-}"
+  case "$rest" in
+  *"$PX_NL$key$PX_TAB"*) rest=${rest#*"$PX_NL$key$PX_TAB"} ;;
+  *) return "$PX_EXIT_NO_OBJECT" ;;
+  esac
+  printf '%s\n' "${rest%%"$PX_NL"*}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1643,12 +2473,9 @@ PX_JSON_KEY=""
 PX_JSON_VALUE=""
 PX_JSON_SPACES="                                                                "
 
-# Escapes double quotes, backslashes, and all ASCII control characters, and replaces any invalid
-# UTF-8 byte sequence with the Unicode replacement character (\ufffd) so raw log excerpts cannot
-# inject malformed UTF-8 into a JSON manifest.
-## @description  Escapes a string for inclusion inside a JSON string literal.
-## @param        text The raw string to escape.
-## @return       Writes the escaped content (without surrounding quotes) to stdout and exits 0.
+## @description  Escapes a string for JSON by escaping double quotes, backslashes, and control
+##               characters while replacing invalid UTF-8 sequences with U+FFFD (\ufffd).
+## @return       Writes the escaped text without surrounding quotes to stdout and exits 0.
 px_json_escape() {
   local LC_ALL=C text=${1:-} out="" index=0 length byte ord width seq invalid=0
   case "$text" in
@@ -1705,12 +2532,12 @@ px_json_escape() {
 
 PX_UTF8_WIDTH=0
 
-# Rejects overlong encodings, UTF-16 surrogate halves, and code points above the Unicode maximum so
-# only well-formed multi-byte UTF-8 sequences are accepted.
-## @description  Determines the byte length of the UTF-8 sequence starting at a string byte offset.
-## @param        text, index The input byte string and the 0-based byte offset to inspect.
-## @return       Sets PX_UTF8_WIDTH to 1, 2, 3, or 4 (or 0 when invalid) and exits 0.
+## @description  Determines the byte width (1 to 4) of the UTF-8 sequence starting at a byte index
+##               in a string, setting PX_UTF8_WIDTH to that width or to 0 when invalid.
+## @return       Populates PX_UTF8_WIDTH and exits 0.
 px_utf8_width() {
+  # Rejects overlong encodings, UTF-16 surrogate code points, and values exceeding the Unicode
+  # maximum so that only valid UTF-8 byte sequences pass through.
   local LC_ALL=C text=$1 index=$2 need lead second ord low=128 high=191 step
   PX_UTF8_WIDTH=0
   printf -v lead '%d' "'${text:$index:1}" 2>/dev/null || return 0
@@ -1746,31 +2573,25 @@ px_utf8_width() {
   PX_UTF8_WIDTH=$need
 }
 
-## @description  Emits the comma separator, indentation, and optional property key for a JSON item.
-## @param        key The object property key, or an empty string when emitting inside an array.
-## @return       Writes the prefix to stdout, marks the level started, or exits 1 if no container.
+## @description  Emits the comma separator, indentation, and property key (empty inside an array)
+##               for a JSON member and marks the current nesting level as started.
+## @return       Exits 0 on success, or exits 1 when no container is open.
 px_json_prefix() {
-  local key=$1 depth=${#PX_JSON_STACK} pad
-  if [ "$depth" = 0 ]; then
-    px_die "$PX_EXIT_FAIL" "px_json: no open container"
-  fi
+  local key=$1 depth=${#PX_JSON_STACK}
+  [ "$depth" != 0 ] || px_die "$PX_EXIT_FAIL" "px_json: no open container"
   if [ "${PX_JSON_FIRST:$((depth - 1)):1}" = 0 ]; then
     printf ','
   fi
-  pad=$((depth * 2))
-  if [ "$pad" -gt ${#PX_JSON_SPACES} ]; then pad=${#PX_JSON_SPACES}; fi
-  printf '\n%s' "${PX_JSON_SPACES:0:$pad}"
+  printf '\n%s' "${PX_JSON_SPACES:0:$((depth * 2))}"
   if [ -n "$key" ]; then
     printf '"%s": ' "$(px_json_escape "$key")"
   fi
   PX_JSON_FIRST="${PX_JSON_FIRST:0:$((depth - 1))}0"
 }
 
-# Object members require two arguments (key and value), whereas array members require a single
-# value argument.
-## @description  Parses member arguments according to the innermost open JSON container type.
-## @param        argument... Either (value) inside an array or (key, value) inside an object.
-## @return       Populates PX_JSON_KEY and PX_JSON_VALUE and exits 0, or exits 2 on bad arity.
+## @description  Populates PX_JSON_KEY and PX_JSON_VALUE from member arguments (taking a key and a
+##               value inside an object, or a value alone inside an array).
+## @return       Exits 0 on success, or exits 2 when the argument count does not match.
 px_json_args() {
   local depth=${#PX_JSON_STACK}
   PX_JSON_KEY=""
@@ -1789,92 +2610,62 @@ px_json_args() {
   fi
 }
 
-# A property key is required when nesting inside an object and must be omitted at the document root
-# or inside an array.
-## @description  Opens a new JSON object container at the current nesting depth.
-## @param        key The property key when the parent container is an object (omitted otherwise).
-## @return       Writes the opening brace to stdout and exits 0.
-px_json_open() {
-  local depth=${#PX_JSON_STACK}
-  if [ "$depth" = 0 ]; then
-    printf '{'
-  else
+## @description  Opens a nested JSON container (given opening bracket, kind o or a, caller name,
+##               and the property key required when nesting inside an open object).
+## @return       Exits 0 on success, or exits 2 when an object member is missing its key.
+px_json_container() {
+  local bracket=$1 kind=$2 name=$3 depth=${#PX_JSON_STACK}
+  shift 3
+  if [ "$depth" != 0 ]; then
     if [ "${PX_JSON_STACK:$((depth - 1)):1}" = a ]; then
       px_json_prefix ""
     else
-      [ $# -eq 1 ] ||
-        px_die "$PX_EXIT_USAGE" "px_json_open: a member of an object needs a key"
+      [ $# -eq 1 ] || px_die "$PX_EXIT_USAGE" "$name: a member of an object needs a key"
       px_json_prefix "$1"
     fi
-    printf '{'
   fi
-  PX_JSON_STACK="${PX_JSON_STACK}o"
+  printf '%s' "$bracket"
+  PX_JSON_STACK="$PX_JSON_STACK$kind"
   PX_JSON_FIRST="${PX_JSON_FIRST}1"
 }
 
-## @description  Opens a new JSON array container at the current nesting depth.
-## @param        key The property key when the parent container is an object (omitted otherwise).
-## @return       Writes the opening bracket to stdout and exits 0.
-px_json_arr() {
-  local depth=${#PX_JSON_STACK}
-  if [ "$depth" = 0 ]; then
-    printf '['
-  else
-    if [ "${PX_JSON_STACK:$((depth - 1)):1}" = a ]; then
-      px_json_prefix ""
-    else
-      [ $# -eq 1 ] ||
-        px_die "$PX_EXIT_USAGE" "px_json_arr: a member of an object needs a key"
-      px_json_prefix "$1"
-    fi
-    printf '['
-  fi
-  PX_JSON_STACK="${PX_JSON_STACK}a"
-  PX_JSON_FIRST="${PX_JSON_FIRST}1"
-}
+## @description  Opens a JSON object container (requiring a property key only when nested inside an
+##               open object).
+## @return       Exits 0 on success, or exits 2 when nested inside an object without a key.
+px_json_open() { px_json_container '{' o px_json_open "$@"; }
 
-# Closing the outermost root container terminates the JSON document with a trailing newline.
-## @description  Closes the innermost open JSON object or array container.
-## @return       Writes the closing delimiter to stdout and exits 0, or exits 1 if none is open.
+## @description  Opens a JSON array container (requiring a property key only when nested inside an
+##               open object).
+## @return       Exits 0 on success, or exits 2 when nested inside an object without a key.
+px_json_arr() { px_json_container '[' a px_json_arr "$@"; }
+
+## @description  Closes the innermost open JSON container, terminating the document with a trailing
+##               newline when closing the outermost root container.
+## @return       Exits 0 on success, or exits 1 when no container is open.
 px_json_close() {
-  local depth=${#PX_JSON_STACK} kind first pad
-  if [ "$depth" = 0 ]; then
-    px_die "$PX_EXIT_FAIL" "px_json_close: no open container"
+  local depth=${#PX_JSON_STACK} bracket='}'
+  [ "$depth" != 0 ] || px_die "$PX_EXIT_FAIL" "px_json_close: no open container"
+  [ "${PX_JSON_STACK:$((depth - 1)):1}" = o ] || bracket=']'
+  if [ "${PX_JSON_FIRST:$((depth - 1)):1}" = 0 ]; then
+    printf '\n%s' "${PX_JSON_SPACES:0:$(((depth - 1) * 2))}"
   fi
-  kind=${PX_JSON_STACK:$((depth - 1)):1}
-  first=${PX_JSON_FIRST:$((depth - 1)):1}
+  printf '%s' "$bracket"
   PX_JSON_STACK=${PX_JSON_STACK:0:$((depth - 1))}
   PX_JSON_FIRST=${PX_JSON_FIRST:0:$((depth - 1))}
-  if [ "$first" = 1 ]; then
-    if [ "$kind" = a ]; then printf ']'; else printf '}'; fi
-  else
-    pad=$(((depth - 1) * 2))
-    if [ "$pad" -gt ${#PX_JSON_SPACES} ]; then pad=${#PX_JSON_SPACES}; fi
-    if [ "$kind" = a ]; then
-      printf '\n%s]' "${PX_JSON_SPACES:0:$pad}"
-    else
-      printf '\n%s}' "${PX_JSON_SPACES:0:$pad}"
-    fi
-  fi
-  if [ -z "$PX_JSON_STACK" ]; then
-    printf '\n'
-  fi
+  [ -n "$PX_JSON_STACK" ] || printf '\n'
 }
 
-## @description  Serializes a JSON string member into the current open object or array.
-## @param        [key], value The property key (required inside an object only) and string value.
-## @return       Writes the escaped, quoted JSON string member to stdout and exits 0.
+## @description  Emits a JSON string member (taking a key inside an object, followed by the value).
+## @return       Exits 0 on success, exits 2 on a wrong argument count, or 1 with no open container.
 px_json_str() {
   px_json_args "$@"
   px_json_prefix "$PX_JSON_KEY"
   printf '"%s"' "$(px_json_escape "$PX_JSON_VALUE")"
 }
 
-# Rejects values that do not match the JSON number grammar so malformed metrics fail immediately at
-# emission time rather than when a consumer parses the output.
-## @description  Validates and serializes a numeric JSON member into the current open container.
-## @param        [key], value The property key (required inside an object only) and numeric value.
-## @return       Writes the numeric literal to stdout and exits 0, or exits 1 if not a valid number.
+## @description  Emits a JSON numeric member (taking a key inside an object, followed by the value).
+## @return       Exits 0 on success, exits 2 on a wrong argument count, or exits 1 when no container
+##               is open or the value is not a valid JSON number (failing at write time).
 px_json_num() {
   px_json_args "$@"
   if ! [[ $PX_JSON_VALUE =~ $PX_RE_NUMBER ]]; then
@@ -1887,66 +2678,36 @@ px_json_num() {
 # ---------------------------------------------------------------------------
 # Runtime execution traps that forbid direct container and Kubernetes CLI invocations.
 # ---------------------------------------------------------------------------
-# Only a backend implementation is permitted to invoke a container runtime or Kubernetes CLI tool,
-# which it does by calling the binary via the "command" builtin and a privately held path (since
-# "command" bypasses shell functions by definition). Because every px-* process sources this
-# library, any stray direct invocation from a driver, check, hook, suite action, or collector is
-# intercepted by these shell function traps and terminated with usage exit code 2. The function
-# definitions below carry the waiver marker expected by the static scan in test/run-tests.sh.
+# Only a backend implementation is permitted to invoke a container runtime or a Kubernetes tool,
+# which it accomplishes by invoking the executable through the "command" builtin and a privately
+# held path (since "command" bypasses shell functions by definition). Because every px-* process
+# sources this file, any stray direct call from a driver, check, hook, suite action, or collector is
+# intercepted by these trap functions and fails with usage exit code 2. The loop below defines one
+# trap function for each forbidden tool name, and its inline waiver marker satisfies the static scan
+# in test/run-tests.sh.
 
-## @description  Aborts an unauthorized direct invocation of a container runtime or cluster tool.
-## @param        argv... The blocked executable name and argument vector so the caller sees it.
-## @return       Logs the blocked command line and exits 2.
+## @description  Rejects a direct call to a container runtime or Kubernetes tool and reports the
+##               attempted command line in the error message so the author can identify it.
+## @return       Exits 2.
 px_runtime_blocked() {
   px_die "$PX_EXIT_USAGE" "container runtime call blocked: $*" \
     "- use the substrate contract in lib/backend/contract.sh"
 }
 
-## @description  Intercepts and blocks direct invocations of this container runtime.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-docker() { px_runtime_blocked docker "$@"; } # px-allow-docker: the trap itself
-
-## @description  Intercepts and blocks direct invocations of this container runtime.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-docker-compose() { px_runtime_blocked docker-compose "$@"; } # px-allow-docker: trap
-
-## @description  Intercepts and blocks direct invocations of this container runtime.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-podman() { px_runtime_blocked podman "$@"; } # px-allow-docker: the trap itself
-
-## @description  Intercepts and blocks direct invocations of this container runtime.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-nerdctl() { px_runtime_blocked nerdctl "$@"; } # px-allow-docker: the trap itself
-
-## @description  Intercepts and blocks direct invocations of this Kubernetes tool.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-kubectl() { px_runtime_blocked kubectl "$@"; } # px-allow-docker: the trap itself
-
-## @description  Intercepts and blocks direct invocations of this Kubernetes tool.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-k3d() { px_runtime_blocked k3d "$@"; } # px-allow-docker: the trap itself
-
-## @description  Intercepts and blocks direct invocations of this Kubernetes tool.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-helm() { px_runtime_blocked helm "$@"; } # px-allow-docker: the trap itself
-
-## @description  Intercepts and blocks direct invocations of this container runtime client.
-## @param        argv... The arguments passed to the intercepted command.
-## @return       Exits 2 via px_runtime_blocked.
-crictl() { px_runtime_blocked crictl "$@"; } # px-allow-docker: the trap itself
+## @description  Defines a shell trap function for each container runtime and Kubernetes CLI tool.
+## @return       Each generated trap function exits 2.
+_px_names="docker docker-compose podman nerdctl kubectl k3d helm crictl" # px-allow-docker: traps
+for _px_t in $_px_names; do
+  eval "$_px_t() { px_runtime_blocked $_px_t \"\$@\"; }"
+done
+unset _px_t _px_names
 
 # ---------------------------------------------------------------------------
 # Top-level initialization of the process exit trap upon sourcing.
 # ---------------------------------------------------------------------------
-# The EXIT trap must be installed here at the top level of the calling command when this library is
-# sourced. Installing the trap lazily from inside a helper function would bind it to a command
-# substitution subshell, causing temporary directories to be deleted immediately when the subshell
-# returns their path to the caller.
-px_on_exit_install
+# Install the EXIT trap here at the top level of the calling command when this library is sourced.
+# Because this library owns the process EXIT trap, commands register cleanup work via px_on_exit
+# rather than replacing the trap directly. Installing the trap lazily from inside a helper function
+# could run inside a command substitution subshell, causing the subshell's EXIT trap to delete a
+# newly created temporary directory as soon as the subshell returns its path to the caller.
+trap px_on_exit_run EXIT

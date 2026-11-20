@@ -52,7 +52,7 @@ PHERF_SCOPE=""
 PHERF_CONFIG_FILES=()
 
 ## @description  Prints the command-line usage summary and supported options.
-## @return       Writes the help text to standard output and exits with status 0.
+## @return       Writes the help text to stdout and exits with status 0.
 usage() {
   cat <<'EOF'
 Usage: px-pherf <up|down|status> [option...]
@@ -80,10 +80,10 @@ owns, 6 no such scope.
 EOF
 }
 
-# Inspects the configured backend identifier directly rather than binding the backend so that
-# reporting an unsupported operation never requires a reachable execution substrate.
-## @description  Identifies the implementation round that owns this command for the active backend.
-## @return       Writes the owning round identifier to standard output and exits with status 0.
+# Inspects the configured backend name directly rather than binding the backend so that reporting
+# an unsupported operation never requires a reachable execution substrate.
+## @description  Identifies the implementation round that owns this command on the bound backend.
+## @return       Writes the owning round identifier to stdout and exits with status 0.
 pherf_owner() {
   case "${PX_BACKEND:-compose}" in
   compose) printf 'H3\n' ;;
@@ -97,10 +97,7 @@ while [ "$#" -gt 0 ]; do
     usage
     exit 0
     ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
+  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
   --agents) px_cli_need_value "$@" && PHERF_AGENTS="$2" && shift ;;
   --target) px_cli_need_value "$@" && PHERF_TARGET="$2" && shift ;;
   --endpoint) px_cli_need_value "$@" && PHERF_ENDPOINT="$2" && shift ;;
@@ -108,10 +105,8 @@ while [ "$#" -gt 0 ]; do
   --config) px_cli_need_value "$@" && PHERF_CONFIG_FILES+=("$2") && shift ;;
   -*) px_usage_error "unknown option: $1" ;;
   *)
-    if [ -n "$PHERF_ACTION" ]; then
-      px_usage_error "unexpected argument: $1"
-    fi
-    PHERF_ACTION="$1"
+    [ -z "$PHERF_ACTION" ] || px_usage_error "unexpected argument: $1"
+    PHERF_ACTION=$1
     ;;
   esac
   shift
@@ -125,11 +120,7 @@ up | down | status) ;;
 *) px_usage_error "unknown subcommand: $PHERF_ACTION" ;;
 esac
 
-if [ "${#PHERF_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${PHERF_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
+px_config_load ${PHERF_CONFIG_FILES[@]+"${PHERF_CONFIG_FILES[@]}"}
 
 if [ -z "$PHERF_AGENTS" ]; then
   PHERF_AGENTS=3
@@ -151,17 +142,8 @@ fi
 if [ "$PHERF_TARGET" = harness ] && [ -n "$PHERF_ENDPOINT" ]; then
   px_usage_error "--endpoint belongs to --target external"
 fi
-if [ "$PHERF_TARGET" = harness ] && [ -z "$PHERF_SCOPE" ]; then
-  PHERF_STATUS=0
-  PHERF_SCOPE="$(sb_scope_resolve || exit "$?")" || PHERF_STATUS=$?
-  if [ "$PHERF_STATUS" = "$PX_EXIT_NO_OBJECT" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" \
-      "no scope recorded for cluster ${PX_CLUSTER_ID:-default}." \
-      "Run px-cluster up, or name the scope with --scope or PX_SCOPE_ID."
-  fi
-  if [ "$PHERF_STATUS" != 0 ]; then
-    exit "$PHERF_STATUS"
-  fi
+if [ "$PHERF_TARGET" = harness ]; then
+  PHERF_SCOPE="$(sb_scope_require "$PHERF_SCOPE")" || exit $?
 fi
 
 px_die "$PX_EXIT_UNSUPPORTED" \

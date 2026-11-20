@@ -43,15 +43,15 @@
 # directive or the end of the file.
 #
 # HEADER DIRECTIVES
-#   suite: <name>           Declares the logical identifier of the suite; when omitted, it defaults
-#                           to the base name of the suite file with its extension removed.
-#   description: <text>     Provides a one-line summary of the suite for operators.
-#   class: <name>           Sets the default execution class inherited by any test that does not
-#                           declare its own class.
-#   requires: <name>...     Sets the default role-group requirements inherited by any test that
-#                           does not declare its own requirements.
-#   timeout: <seconds>      Sets the default execution timeout, in seconds, inherited by any test
-#                           that does not declare its own timeout.
+#   suite: <name>           Declares the logical name of the suite, defaulting to the suite file
+#                           name without its extension.
+#   description: <text>     Provides a one-line summary of the suite for an operator.
+#   class: <name>           Sets the default run class for each test that declares none. The
+#                           --class command-line option—or otherwise the class recorded in the
+#                           cluster record—overrides both suite-level and test-level class values.
+#   requires: <name>...     Sets the default role-group requirements for each test that declares
+#                           none.
+#   timeout: <seconds>      Sets the default execution time limit for each test that declares none.
 #
 # TEST DIRECTIVES
 #   test: <id>              Begins a new test block identified by <id>, which must be unique within
@@ -121,9 +121,11 @@
 #     session row  result result exit_code session_dir
 #   The bundle column records the run directory path reported by px-run, or remains empty when a
 #   test did not execute.
-#   A live execution creates a session directory containing plan.tsv, results.tsv, summary.tsv,
-#   groups.tsv, and a dedicated subdirectory for each test holding stdout.txt (the test's data
-#   channel) and stderr.log (its diagnostic log). A dry run creates no files or directories on disk.
+#   The session directory contains plan.tsv, results.tsv, summary.tsv, groups.tsv, and one
+#   subdirectory per test. In addition to session counts, summary.tsv records the active version
+#   set: the HBase profile, the HBase and Hadoop releases, and every configured JDK. Each test
+#   directory holds stdout.txt for the test's structured data channel and stderr.log for its
+#   diagnostic messages. A dry run writes nothing to disk.
 #
 # WHAT A DRIVER TEST BECOMES
 #   For a driver-backed test, px-suite delegates execution to px-run using the command form:
@@ -149,16 +151,8 @@
 #      test is automatically skipped with a result row explaining the unfulfilled dependency.
 #
 # SEVERITY
-#   Test outcomes are evaluated on the severity lattice PASS, SKIP, ADVISORY, FAIL, and ERROR as
-#   defined in suites/lib/common.sh. Process exit statuses map to baseline severities as follows: 0
-#   maps to PASS, 5 maps to SKIP, and 2, 3, and 6 map to ERROR because they indicate harness or
-#   infrastructure faults, while all other non-zero codes map to FAIL. If a test records structured
-#   verdicts, its final severity is elevated to the worst verdict in its stream, allowing a test
-#   that exits 0 to surface an ADVISORY outcome; any verdict containing an unrecognized severity
-#   label is rejected and treated as ERROR. The overall session severity is the maximum severity
-#   observed across all tests, except that a session where every test resolves to SKIP verified
-#   nothing and is reported as INCONCLUSIVE. Finally, px-suite exits with code 0 for PASS, SKIP, or
-#   ADVISORY, code 1 for FAIL or INCONCLUSIVE, and code 3 for ERROR.
+#   The "Verdict severity" section of the README specifies how a test's process exit code and
+#   recorded verdicts map onto the severity lattice defined in suites/lib/common.sh.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
@@ -184,12 +178,10 @@ SUITE_RUN_MARGIN_S=300
 # Regular expression defining the valid syntax for a test identifier.
 SUITE_ID_RE='^[A-Za-z0-9][A-Za-z0-9_-]*$'
 
-# Command-line option state accumulated during argument parsing prior to running the configuration
-# loader.
-OPT_DRY_RUN=0
+# Command-line option values captured during argument parsing before the configuration loader runs.
 OPT_SKIP=""
 OPT_SUITE=""
-OPT_SETS=""
+OPT_CLASS=""
 
 # In-memory representation of the parsed suite definition. Because Bash 3.2 lacks associative
 # arrays, each test is represented by a shared integer index across parallel indexed arrays.
@@ -200,10 +192,11 @@ SUITE_DESCRIPTION=""
 SUITE_CLASS=""
 SUITE_REQUIRES=""
 SUITE_TIMEOUT=""
-# Flattened storage for driver arguments across all tests in file declaration order, storing one
-# argument per array element. Because Bash 3.2 does not support nested arrays, each test records
-# the starting offset and argument count of its slice within this array; since all directives for a
-# given test block are contiguous in the suite file, its arguments form a contiguous slice here.
+SUITE_WORDS=""
+# Flattened storage for the driver arguments of all tests, holding one argument per element in file
+# declaration order. Because Bash 3.2 cannot nest arrays, each test records the starting index of
+# its first argument and its total argument count; since all directives of a test block are adjacent
+# in the suite file, its arguments occupy a contiguous slice here.
 SUITE_ARGV=()
 TEST_ID=()
 TEST_NAME=()
@@ -262,7 +255,7 @@ RUN_REASON=""
 RUN_ELAPSED=0
 
 ## @description  Prints the command-line usage and option reference for px-suite.
-## @return       Writes the usage help text to stdout and exits 0.
+## @return       Writes the usage text to stdout and exits 0.
 usage() {
   cat <<'EOF'
 Usage: px-suite [options] <suite>
@@ -278,7 +271,8 @@ Options:
       --skip ID[,ID...]       do not run these tests
       --continue-on-failure   record a failure and continue, then report the
                               worst severity of the session
-  -c, --class NAME            the run class of a test that declares none
+  -c, --class NAME            the run class of every test, over the class that
+                              the suite declares
   -f, --config FILE           one configuration file, repeatable, read before
                               the defaults
   -e, --set NAME=VALUE        one configuration value, repeatable
@@ -296,13 +290,10 @@ of every test.
 EOF
 }
 
-# Bare suite names are searched under PX_SUITE_DIR with or without the .suite suffix so operators
-# can invoke built-in suites without providing a file path. When no candidate file is readable, the
-# function emits empty output and still returns exit code 0 because callers invoke it inside a
-# command substitution where a non-zero status would trigger the caller's error trap.
-## @description  Resolves a suite name or file path argument to the absolute path of a suite file.
-## @param        name or path identifying the target suite
-## @return       Writes the resolved absolute path to stdout, or nothing if not found; exits 0.
+# When no candidate path is readable, the function writes nothing and still exits 0 so that callers
+# invoking it inside a command substitution do not trigger the failure trap.
+## @description  Resolves a suite name or path argument to an absolute readable file path.
+## @return       Writes the resolved absolute path to stdout (or nothing if absent) and exits 0.
 px_suite_resolve() {
   local name=${1:-} dir candidate
   if [ -f "$name" ]; then
@@ -322,9 +313,8 @@ px_suite_resolve() {
   done
 }
 
-## @description  Looks up the parallel-array index corresponding to a declared test id.
-## @param        id of the test to locate
-## @return       Writes the zero-based array index to stdout and exits 0, or exits 6 if not found.
+## @description  Looks up the parallel-array index of a test by its identifier.
+## @return       Writes the index to stdout and exits 0, or exits 6 when no such test is declared.
 px_suite_index_of() {
   local id=${1:-} index=0 total=${#TEST_ID[@]}
   while [ "$index" -lt "$total" ]; do
@@ -337,38 +327,36 @@ px_suite_index_of() {
   return "$PX_EXIT_NO_OBJECT"
 }
 
-# Validates that a timeout specification is a positive integer number of seconds greater than zero,
-# matching the domain accepted by px_timeout.
-## @description  Validates that a timeout value is a whole number of seconds above zero.
-## @param        value to validate, and location (the file and line for error reporting)
-## @return       Exits 0 when the timeout is valid, or exits 2 on any invalid value.
+## @description  Validates that a timeout value is a whole number of seconds greater than zero,
+##               matching the domain accepted by px_timeout.
+## @return       Exits 0 when valid, or exits 2 on any other value.
 px_suite_check_timeout() {
   if ! [[ ${1:-} =~ $PX_RE_INT ]] || [ "$1" -lt 1 ]; then
     px_die "$PX_EXIT_USAGE" "$2: timeout needs whole seconds above zero, got '${1:-}'"
   fi
 }
 
-# Tokenization is performed with the shell read builtin rather than unquoted expansion so that no
-# token undergoes pathname expansion and glob patterns such as *.sql remain literal words.
-## @description  Splits a whitespace-delimited string into an indexed array in the caller's scope.
-## @param        name of the caller's array variable to populate, and text string to split
-## @return       Populates the named array and exits 0.
+# Uses the shell read builtin to tokenize the string so that words never undergo pathname
+# expansion.
+## @description  Splits a whitespace-delimited text string into a named array in the caller.
+## @return       Populates the caller's array and exits 0.
 px_suite_split() {
   IFS=$' \t\n' read -r -d '' -a "$1" <<<"${2:-}" || true
 }
 
-# Unrecognized requirement names fail closed during parsing so the harness never silently ignores a
-# directive and runs a test without starting the cluster service tier it depends on.
-## @description  Validates all declared requirement tokens against the supported vocabulary.
-## @param        value containing requirement names, and location (file and line for messages)
-## @return       Exits 0 if all requirements are recognized, or exits 2 on an unknown requirement.
+# Validates each requirement token against the supported vocabulary and fails closed on any unknown
+# requirement name.
+## @description  Validates requirement tokens (value, location, list) and appends them to
+##               SUITE_WORDS.
+## @return       Sets SUITE_WORDS and exits 0, or exits 2 on an unknown requirement.
 px_suite_check_requires() {
   local value=${1:-} where=$2 word
   local -a words
+  SUITE_WORDS=${3:-}
   px_suite_split words "${value//,/ }"
   for word in ${words[@]+"${words[@]}"}; do
     case " $SUITE_REQUIREMENTS " in
-    *" $word "*) ;;
+    *" $word "*) SUITE_WORDS="${SUITE_WORDS:+$SUITE_WORDS }$word" ;;
     *)
       px_die "$PX_EXIT_USAGE" "$where: unknown requirement '$word'," \
         "this harness knows: $SUITE_REQUIREMENTS"
@@ -377,9 +365,9 @@ px_suite_check_requires() {
   done
 }
 
-## @description  Records a single-valued directive in a test block and rejects duplicate entries.
-## @param        index of the test block, directive key, and location (file and line for messages)
-## @return       Exits 0 on the first occurrence of the key in the block, or exits 2 if repeated.
+## @description  Records that a test block has declared a single-valued directive and rejects
+##               duplicate declarations of the same directive.
+## @return       Exits 0 on the first declaration, or exits 2 on a repeated directive.
 px_suite_once() {
   local index=$1 key=$2 where=$3
   case "${TEST_SEEN[$index]}" in
@@ -391,14 +379,12 @@ px_suite_once() {
   TEST_SEEN[index]="${TEST_SEEN[$index]}$key "
 }
 
-# Suite header directives establish suite-wide metadata and default values inherited by all tests,
-# allowing attributes such as the execution class or timeout to be declared once per file.
-## @description  Processes a single directive line in the suite header section.
-## @param        key, value, and location (the file and line number for diagnostic messages)
-## @return       Exits 0 on success, or exits 2 on an unknown key or a test directive out of block.
+# Header directives define the default attributes inherited by every test in the suite, allowing a
+# run class or execution time limit to be declared once per file.
+## @description  Parses and applies a single suite header directive.
+## @return       Exits 0 on success, or exits 2 on a test directive outside a block or unknown key.
 px_suite_header() {
-  local key=$1 value=$2 where=$3 word
-  local -a words
+  local key=$1 value=$2 where=$3
   case "$key" in
   suite) SUITE_NAME=$value ;;
   description) SUITE_DESCRIPTION=$value ;;
@@ -408,11 +394,8 @@ px_suite_header() {
     SUITE_TIMEOUT=$value
     ;;
   requires)
-    px_suite_check_requires "$value" "$where"
-    px_suite_split words "${value//,/ }"
-    for word in ${words[@]+"${words[@]}"}; do
-      SUITE_REQUIRES="${SUITE_REQUIRES:+$SUITE_REQUIRES }$word"
-    done
+    px_suite_check_requires "$value" "$where" "$SUITE_REQUIRES"
+    SUITE_REQUIRES=$SUITE_WORDS
     ;;
   name | driver | action | args | arg | overrides | needs)
     px_die "$PX_EXIT_USAGE" "$where: '$key' belongs to a test," \
@@ -422,12 +405,10 @@ px_suite_header() {
   esac
 }
 
-# Every parallel-array slot for the new test is explicitly initialized with empty values or suite
-# header defaults when the block opens, guaranteeing that subsequent reads never encounter an unset
-# array element. The opening line number is stored on the block for later validation diagnostics.
-## @description  Initializes a new test block at the given index with suite header defaults.
-## @param        index, test id, location (file and line for messages), and opening line number
-## @return       Exits 0 when the test block opens, or exits 2 if the id is invalid or duplicated.
+# Explicitly initializes every parallel-array slot for the new test with header defaults so that
+# subsequent reads never encounter an unset array element.
+## @description  Opens a new test block and initializes its attributes from the header defaults.
+## @return       Exits 0 on success, or exits 2 on an invalid or duplicate test identifier.
 px_suite_open() {
   local index=$1 id=$2 where=$3 lineno=$4
   [[ $id =~ $SUITE_ID_RE ]] ||
@@ -451,41 +432,25 @@ px_suite_open() {
   TEST_SEVERITY[index]=""
 }
 
-# Each parsed driver argument is appended as a distinct element in SUITE_ARGV and is never split,
-# expanded, or re-quoted by any later stage. Consequently, the driver receives every argument
-# exactly as written in the suite file, including empty arguments and arguments containing spaces.
-# It exits with code 2 on an unrecognized or duplicate directive or a dependency that is not a valid
-# test id.
 ## @description  Parses and applies a single directive within an open test block.
-## @param        index of the open test, directive key, value, and location (file and line)
-## @return       Exits 0 on success, or exits 2 on an invalid directive or non-id dependency.
+## @return       Exits 0 on success, or exits 2 on an unknown or repeated directive or a dependency
+##               that is not a valid test identifier.
 px_suite_directive() {
   local index=$1 key=$2 value=$3 where=$4 word
   local -a words
   case "$key" in
-  name)
-    px_suite_once "$index" "$key" "$where"
-    TEST_NAME[index]=$value
-    ;;
-  driver)
-    px_suite_once "$index" "$key" "$where"
-    TEST_DRIVER[index]=$value
-    ;;
-  action)
-    px_suite_once "$index" "$key" "$where"
-    TEST_ACTION[index]=$value
-    ;;
-  class)
-    px_suite_once "$index" "$key" "$where"
-    TEST_CLASS[index]=$value
-    ;;
+  name | driver | action | class | timeout | overrides) px_suite_once "$index" "$key" "$where" ;;
+  esac
+  case "$key" in
+  name) TEST_NAME[index]=$value ;;
+  driver) TEST_DRIVER[index]=$value ;;
+  action) TEST_ACTION[index]=$value ;;
+  class) TEST_CLASS[index]=$value ;;
   timeout)
-    px_suite_once "$index" "$key" "$where"
     px_suite_check_timeout "$value" "$where"
     TEST_TIMEOUT[index]=$value
     ;;
   overrides)
-    px_suite_once "$index" "$key" "$where"
     case "$value" in
     /*) ;;
     *) value="$SUITE_DIR/$value" ;;
@@ -514,11 +479,8 @@ px_suite_directive() {
     done
     ;;
   requires)
-    px_suite_check_requires "$value" "$where"
-    px_suite_split words "${value//,/ }"
-    for word in ${words[@]+"${words[@]}"}; do
-      TEST_REQUIRES[index]="${TEST_REQUIRES[$index]:+${TEST_REQUIRES[$index]} }$word"
-    done
+    px_suite_check_requires "$value" "$where" "${TEST_REQUIRES[$index]}"
+    TEST_REQUIRES[index]=$SUITE_WORDS
     ;;
   suite | description)
     px_die "$PX_EXIT_USAGE" "$where: '$key' belongs to the suite header"
@@ -527,12 +489,9 @@ px_suite_directive() {
   esac
 }
 
-# Finalizes an open test definition by enforcing mutual exclusion between driver and action modes
-# (requiring exactly one of the two) and verifying that any declared overrides file already exists
-# on disk before execution begins rather than failing later when the driver attempts to read it.
-## @description  Finalizes and validates an open test block, applying fallback defaults.
-## @param        index (negative when no block is open), and label (suite file name for messages)
-## @return       Exits 0 when valid, exits 2 on an incomplete block, or exits 6 on a missing file.
+## @description  Finalizes an open test block and rejects any incomplete or conflicting definition.
+## @return       Exits 0 when valid, exits 2 on an incomplete block, or exits 6 on an absent
+##               overrides file.
 px_suite_close() {
   local index=$1 label=$2 id where
   [ "$index" -ge 0 ] || return 0
@@ -557,17 +516,17 @@ px_suite_close() {
       "$where: test '$id' names no such overrides file: ${TEST_OVERRIDES[$index]}"
   fi
   [ -n "${TEST_NAME[$index]}" ] || TEST_NAME[index]=$id
+  # A run class resolved from the command line or the cluster record overrides any class declared
+  # in the suite file.
+  [ -z "$OPT_CLASS" ] || TEST_CLASS[index]=$OPT_CLASS
   if [ -z "${TEST_TIMEOUT[$index]}" ]; then
     px_suite_check_timeout "${PX_TIMEOUT_DEFAULT:-600}" PX_TIMEOUT_DEFAULT
     TEST_TIMEOUT[index]=${PX_TIMEOUT_DEFAULT:-600}
   fi
 }
 
-# Prerequisite references are validated prior to topological sorting so that a self-dependency or a
-# reference to an undefined test fails closed immediately with the exact line number of the test.
-## @description  Verifies that every declared dependency references another test in the suite file.
-## @param        label naming the suite file for diagnostic error messages
-## @return       Exits 0 if all dependencies are valid, or exits 2 on a self or unknown dependency.
+## @description  Verifies that every declared dependency references a test defined in this file.
+## @return       Exits 0 when all dependencies exist, or exits 2 on a self-dependency or unknown id.
 px_suite_check_needs() {
   local label=$1 index=0 total=${#TEST_ID[@]} need
   while [ "$index" -lt "$total" ]; do
@@ -584,9 +543,8 @@ px_suite_check_needs() {
   done
 }
 
-## @description  Parses a declarative suite file and populates the in-memory parallel test arrays.
-## @param        file path of the suite definition to parse
-## @return       Exits 0 on valid syntax, or exits 2 on any grammar error with the line number.
+## @description  Parses a declarative suite file and populates the in-memory parallel arrays.
+## @return       Exits 0 on valid syntax, or exits 2 naming the offending line on any grammar error.
 px_suite_parse() {
   local file=$1 label line lineno=0 key value current=-1 count=0 where
   # Diagnostic messages reference the file path through this separate variable so that the input
@@ -629,9 +587,8 @@ px_suite_parse() {
   px_debug "suite $SUITE_NAME holds $count tests"
 }
 
-## @description  Checks whether a test id has already been scheduled by the topological sort.
-## @param        id of the test to check
-## @return       Exits 0 when the test id is already placed in the schedule, or exits 1 otherwise.
+## @description  Checks whether a test identifier has already been placed by the topological sort.
+## @return       Exits 0 when the identifier is already placed, or exits 1 otherwise.
 px_suite_placed() {
   case "$PLACED" in
   *" $1 "*) return 0 ;;
@@ -639,11 +596,10 @@ px_suite_placed() {
   return 1
 }
 
-# Starting from the first test that topological sorting could not schedule, this traversal follows
-# the first unplaced prerequisite at each step until a test id repeats. The repeated id closes the
-# dependency loop, producing an actionable cycle path for the suite author.
-## @description  Traces and formats a dependency cycle among unplaced tests for error reporting.
-## @return       Writes the arrow-separated dependency path to stdout and exits 0.
+# Walks from the first test that topological sorting could not place, following the first unplaced
+# dependency at each step until a test identifier repeats.
+## @description  Traces and formats a dependency cycle among unplaced tests for diagnostic output.
+## @return       Writes the cycle path to stdout and exits 0.
 px_suite_find_cycle() {
   local total=${#TEST_ID[@]} index=0 start=-1 id need next seen=" " path="" guard=0
   while [ "$index" -lt "$total" ]; do
@@ -679,11 +635,9 @@ px_suite_find_cycle() {
   printf '%s\n' "$path"
 }
 
-# Repeatedly scans the declared tests in file order to schedule each test whose prerequisites have
-# all been placed. Preserving declaration order among simultaneously ready tests ensures a stable,
-# reproducible execution plan.
-## @description  Topologically sorts all parsed tests so every test runs after its dependencies.
-## @return       Sets ORDER and ORDER_COUNT and exits 0, or exits 2 naming any dependency cycle.
+## @description  Topologically sorts the tests so that each test follows all of its dependencies.
+## @return       Sets ORDER to the ordered indices and ORDER_COUNT to their count and exits 0, or
+##               exits 2 on a dependency cycle, naming the cycle.
 px_suite_order() {
   local total=${#TEST_ID[@]} index placed=0 progress need ready
   ORDER=""
@@ -719,9 +673,8 @@ px_suite_order() {
   done
 }
 
-## @description  Checks whether a given test id is included in the filtered execution plan.
-## @param        id of the test to look up in PLAN
-## @return       Exits 0 when the execution plan contains the test id, or exits 1 otherwise.
+## @description  Checks whether the filtered execution plan includes a given test identifier.
+## @return       Exits 0 when the plan contains the identifier, or exits 1 otherwise.
 px_suite_in_plan() {
   local id=${1:-} index
   for index in $PLAN; do
@@ -732,10 +685,9 @@ px_suite_in_plan() {
   return 1
 }
 
-# Returns exit status 0 even when the id is absent so callers can invoke it inside a command
-# substitution without triggering the error trap, matching the convention of px_suite_resolve.
-## @description  Finds the zero-based position of a test id within the topologically ordered list.
-## @param        id of the test to locate in ORDER
+# Always exits 0 even when the identifier is absent so callers can invoke it inside a command
+# substitution without triggering the failure trap, for the same reason as px_suite_resolve.
+## @description  Finds the zero-based position of a test identifier in the ordered schedule.
 ## @return       Writes the zero-based position to stdout (or nothing if absent) and exits 0.
 px_suite_position_of() {
   local id=${1:-} index position=0
@@ -748,12 +700,9 @@ px_suite_position_of() {
   done
 }
 
-# Positional range boundaries (--from and --to) are applied to the topologically sorted list before
-# set-membership filters (--only and --skip), because positional slicing and non-positional
-# filtering compose cleanly only in that order. The function exits with code 2 when --from appears
-# after --to, or code 6 when any referenced test id is unknown or the resulting selection is empty.
-## @description  Applies range boundaries and inclusion/exclusion filters to build the final plan.
-## @return       Sets PLAN and PLAN_COUNT and exits 0, exits 2 on crossed bounds, or 6 on no object.
+## @description  Applies the positional range boundaries and selection filters to the ordered list.
+## @return       Sets PLAN to the selected indices and PLAN_COUNT to their count and exits 0; exits
+##               2 when the boundaries cross, or 6 on an unknown test id or an empty selection.
 px_suite_select() {
   local from=${PX_SUITE_FROM:-} to=${PX_SUITE_TO:-} only=${PX_SUITE_FILTER:-}
   local skip=$OPT_SKIP index id word keep position=0 from_at=0 to_at=0
@@ -812,11 +761,10 @@ px_suite_select() {
   done
 }
 
-# Emits each formatted TSV record to stdout as the live data channel while optionally appending a
-# persistent copy to a session artifact file when an active session file path is supplied.
-## @description  Formats and writes a TSV row to stdout and optionally appends it to a session file.
-## @param        file path to append to (or empty for stdout only), followed by row field values
-## @return       Writes the TSV row and exits 0, or exits 1 if a field cannot be formatted or saved.
+# Preserves standard output as the live structured data channel while persisting a copy of each row
+# to the session file whenever an active session exists.
+## @description  Writes a TSV row to stdout and appends it to a session file when present.
+## @return       Writes the row and exits 0, or exits 1 when a field cannot be formatted or written.
 px_suite_row() {
   local dest=$1 row
   shift
@@ -829,9 +777,8 @@ px_suite_row() {
   fi
 }
 
-## @description  Emits the resolved execution plan as one TSV row per selected test in run order.
-## @param        file path to append the plan rows to, or empty to write to stdout alone
-## @return       Writes all plan rows and exits 0.
+## @description  Emits the execution plan as one TSV row per selected test in scheduled run order.
+## @return       Writes the plan rows and exits 0.
 px_suite_plan_emit() {
   local dest=$1 index position=0 mode target
   for index in $PLAN; do
@@ -849,36 +796,21 @@ px_suite_plan_emit() {
   done
 }
 
-# Session directory creation uses atomic mkdir calls so concurrent sessions started within the same
-# second never collide or contaminate one another's results. The function exits with code 1 if no
-# session directory is available or an explicitly named session already exists, or exits with the
-# output-policy status (2 or 1) if the output policy rejects the session log or sessions directory.
-## @description  Allocates an exclusive session directory and initializes session artifact paths.
-## @return       Sets SESSION_DIR and SESSION_ID and exits 0, or exits 1 or 2 on allocation failure.
+## @description  Allocates the session directory exclusively and sets SESSION_DIR and SESSION_ID.
+## @return       Exits 0 on success, exits 1 if no directory is free or a named session already
+##               exists, or exits 2 or 1 when the output policy refuses the session log.
 px_suite_session_create() {
-  local root attempt=0 id status=0
-  root="$(px_out_subdir sessions)" || status=$?
-  if [ "$status" != 0 ]; then
-    exit "$status"
-  fi
+  local root status=0
   if [ -n "${PX_SESSION_ID:-}" ]; then
+    root="$(px_out_subdir sessions)" || exit $?
     SESSION_ID=$PX_SESSION_ID
     SESSION_DIR="$root/$SESSION_ID"
     mkdir "$SESSION_DIR" 2>/dev/null ||
       px_die "$PX_EXIT_FAIL" "session '$SESSION_ID' has a directory already:" \
         "$SESSION_DIR"
   else
-    while [ "$attempt" -lt 16 ]; do
-      id="$(px_run_id)"
-      if mkdir "$root/$id" 2>/dev/null; then
-        SESSION_ID=$id
-        SESSION_DIR="$root/$id"
-        break
-      fi
-      attempt=$((attempt + 1))
-    done
-    [ -n "$SESSION_DIR" ] ||
-      px_die "$PX_EXIT_FAIL" "no free session identifier under $root"
+    SESSION_DIR="$(px_run_dir sessions)" || exit $?
+    SESSION_ID=${SESSION_DIR##*/}
   fi
   # Child processes inherit the active session identifier from the environment, so PX_SESSION_ID is
   # assigned and exported directly here rather than via px_config_set, whose internal origin probe
@@ -902,16 +834,9 @@ px_suite_session_create() {
   px_info "session $SESSION_ID in $SESSION_DIR"
 }
 
-# Before starting each required role group, the harness re-runs the host memory capacity check
-# because activating a group adds its container memory limits to the host footprint. If the active
-# backend lacks the group_switch capability, the test is marked SKIP (status 5) rather than failing,
-# following the general rule for unsupported backend capabilities. On any failure to acquire a
-# group, GROUP_SEVERITY, GROUP_STATUS, and GROUP_REASON record the outcome, where GROUP_STATUS holds
-# 5 when the backend cannot switch groups or the exit status of scope resolution, the memory check,
-# or the group start operation.
-## @description  Starts all cluster role groups required by a test and records them for cleanup.
-## @param        index of the test whose required role groups should be started
-## @return       Exits 0 when all groups are running, or exits 1 with GROUP_* outcome variables set.
+## @description  Starts every role group required by a test and records each started group.
+## @return       Exits 0 when all groups are running, or exits 1 with GROUP_SEVERITY, GROUP_REASON,
+##               and GROUP_STATUS set to the cause status (5 if the backend cannot switch groups).
 px_suite_group_acquire() {
   local index=$1 requirement timeout status=0
   GROUP_REASON=""
@@ -971,15 +896,11 @@ px_suite_group_acquire() {
   return 0
 }
 
-# Invoked by the execution loop after every test (including failed tests) and by the process exit
-# trap at session termination so that timeouts or signals never leave dynamically started role
-# groups running. Teardown is enabled by default; at session end, groups are left running for
-# diagnostic triage only when PX_TEARDOWN is disabled or --keep is set. The held-groups list is
-# cleared before stopping any group to guarantee idempotence if a stop operation fails, and any stop
-# failure logs a warning because cluster teardown will remove the containers regardless.
-## @description  Stops all cluster role groups started for the current test by this process.
-## @param        mode set to "end" when invoked from the session exit trap, or empty otherwise
-## @return       Always exits 0, logging a warning if any role group fails to stop cleanly.
+# If a role group fails to stop cleanly, the failure is logged as a warning rather than aborting
+# the session; the cluster remains running, and a subsequent px-cluster down removes any leftover
+# group resources.
+## @description  Stops every cluster role group started by this process.
+## @return       Always exits 0.
 px_suite_group_release() {
   local mode=${1:-} held=$GROUPS_HELD group timeout
   GROUPS_HELD=""
@@ -1001,12 +922,7 @@ px_suite_group_release() {
   return 0
 }
 
-# Non-zero exit codes from tests, drivers, or backend probes represent normal operational outcomes
-# that belong in result rows rather than unexpected harness crashes. Because Bash fires the ERR trap
-# for failing commands inside a called shell function even when the outer function call is guarded,
-# the ERR trap is temporarily disabled before invoking the command and restored immediately after.
-## @description  Executes a command with the ERR failure trap temporarily disabled.
-## @param        command and arguments to execute without triggering the ERR trap
+## @description  Executes a single command with the ERR failure trap disabled.
 ## @return       Returns the exit status of the executed command.
 px_suite_untrapped() {
   local status=0
@@ -1016,11 +932,8 @@ px_suite_untrapped() {
   return "$status"
 }
 
-# Exit codes 2, 3, and 6 indicate usage, anomaly, or missing-object faults in the harness or
-# cluster infrastructure and therefore map to ERROR, keeping them distinct from workload failures.
 ## @description  Maps a test process exit code onto the harness severity lattice.
-## @param        exit code returned by the test or driver execution
-## @return       Writes the corresponding severity label (PASS, SKIP, ERROR, or FAIL) and exits 0.
+## @return       Writes the corresponding severity label to stdout and exits 0.
 px_suite_severity_of_code() {
   case "${1:-}" in
   "$PX_EXIT_OK") printf 'PASS\n' ;;
@@ -1030,12 +943,9 @@ px_suite_severity_of_code() {
   esac
 }
 
-# Executes a single test within its configured timeout bound. Driver-backed tests are delegated to
-# px-run, which manages the driver lifecycle, whereas action tests run in a fresh bash subshell
-# whose current working directory is the test's artifact directory.
-## @description  Executes one test under its time limit and computes its final severity and reason.
-## @param        index of the test to execute
-## @return       Populates RUN_SEVERITY, RUN_STATUS, RUN_REASON, and RUN_ELAPSED, and exits 0.
+# Driver-backed tests are delegated to px-run, which owns the workload driver lifecycle.
+## @description  Executes a single test within its configured execution time limit.
+## @return       Sets RUN_SEVERITY, RUN_STATUS, RUN_REASON, and RUN_ELAPSED, then exits 0.
 px_suite_run_one() {
   local index=$1 id dir out log timeout limit status=0 started finished worst
   local verdicts reported
@@ -1138,25 +1048,18 @@ px_suite_run_one() {
   return 0
 }
 
-## @description  Increments the per-severity test counter and updates the worst session severity.
-## @param        severity outcome recorded for a test
-## @return       Updates the session counters and SESSION_SEVERITY, and exits 0.
+## @description  Increments the counter for one test severity and updates the worst session
+##               severity.
+## @return       Updates the session counters and SESSION_SEVERITY, then exits 0.
 px_suite_count() {
-  case "${1:-}" in
-  PASS) COUNT_PASS=$((COUNT_PASS + 1)) ;;
-  SKIP) COUNT_SKIP=$((COUNT_SKIP + 1)) ;;
-  ADVISORY) COUNT_ADVISORY=$((COUNT_ADVISORY + 1)) ;;
-  FAIL) COUNT_FAIL=$((COUNT_FAIL + 1)) ;;
-  ERROR) COUNT_ERROR=$((COUNT_ERROR + 1)) ;;
-  esac
+  # The per-severity counter variable names correspond directly to the severity names in the
+  # lattice.
+  local counter="COUNT_${1:-PASS}"
+  printf -v "$counter" '%s' "$((${!counter:-0} + 1))"
   SESSION_SEVERITY="$(sx_severity_worse "$SESSION_SEVERITY" "${1:-PASS}")"
 }
 
-# Checks whether any scheduled prerequisite of the test failed or was skipped. Prerequisites that
-# were excluded from the plan by boundaries or filters do not block execution because the operator
-# explicitly asked to run the selected subset of tests.
-## @description  Checks whether a test is blocked by a scheduled prerequisite that did not pass.
-## @param        index of the candidate test to inspect
+## @description  Determines whether a test is blocked because a prerequisite test did not pass.
 ## @return       Writes the blocking reason to stdout (or an empty line if runnable) and exits 0.
 px_suite_blocked_by() {
   local index=$1 need at severity
@@ -1179,11 +1082,9 @@ px_suite_blocked_by() {
   printf '\n'
 }
 
-# Iterates through the selected plan in topological order, automatically skipping any test whose
-# scheduled prerequisite did not pass and halting at the first FAIL or ERROR outcome unless
-# continue-on-failure mode is enabled.
-## @description  Executes all tests in the plan and streams a result row as each test is decided.
-## @param        keep_going flag: 1 to continue past a failure, or 0 to stop on the first failure
+# Halts at the first failing test unless fault-tolerant continuation mode is enabled, and
+# automatically skips any test whose scheduled dependency did not pass.
+## @description  Executes the scheduled test plan and streams a result row as each test completes.
 ## @return       Writes one TSV result row per decided test and exits 0.
 px_suite_execute() {
   local keep_going=$1 index position=0 blocked rank stop_rank pending
@@ -1199,7 +1100,8 @@ px_suite_execute() {
         "$PX_EXIT_UNSUPPORTED" 0 "$(px_tsv_clean "$blocked")" ""
       continue
     fi
-    px_info "test ${TEST_ID[$index]}: ${TEST_NAME[$index]}"
+    px_info "test ${TEST_ID[$index]}: ${TEST_NAME[$index]}," \
+      "run class ${TEST_CLASS[$index]:-${PX_RUN_CLASS:-none}}"
     px_suite_run_one "$index"
     TEST_SEVERITY[index]=$RUN_SEVERITY
     COUNT_RAN=$((COUNT_RAN + 1))
@@ -1221,11 +1123,9 @@ px_suite_execute() {
   return 0
 }
 
-# Writes summary.tsv as two-column key/value TSV rows so downstream consumers can inspect the final
-# session outcome and aggregate counts in one place without replaying results.tsv.
-## @description  Writes the aggregate session metadata, outcome counts, and verdict to summary.tsv.
-## @param        exit code that px-suite will return for the session
-## @return       Writes the summary.tsv file and exits 0.
+## @description  Writes the session summary record as key-value rows capturing the session verdict,
+##               outcome counts, and the version set selected by the active configuration.
+## @return       Writes summary.tsv and exits 0.
 px_suite_summary() {
   local code=$1 record="$SESSION_DIR/summary.tsv"
   {
@@ -1233,6 +1133,7 @@ px_suite_summary() {
     px_tsv_row description "$(px_tsv_clean "$SUITE_DESCRIPTION")"
     px_tsv_row suite_file "$SUITE_FILE"
     px_tsv_row session "$SESSION_ID"
+    px_versions_rows "$(px_config_dump)"
     px_tsv_row ran "$COUNT_RAN"
     px_tsv_row not_run "$COUNT_NOT_RUN"
     px_tsv_row pass "$COUNT_PASS"
@@ -1249,96 +1150,20 @@ px_suite_summary() {
 # ---------------------------------------------------------------------------
 # Command-line argument parsing
 # ---------------------------------------------------------------------------
-# Command-line flags that map to configuration variables are recorded at the highest-priority
-# "cli" stage so that boundaries and options can originate from the command line, a target
-# environment file, or built-in defaults while allowing px_config_dump to report which source
-# applied. Configuration loading is deferred until after this loop so that --help and usage errors
-# do not depend on loading configuration files.
-#
-# Short flags mirror those used by px-run for shared concepts so operators can move seamlessly
-# between the two commands, whereas options specific to suite orchestration use long flags only.
+# Command-line settings are recorded with the cli origin so that boundaries and options can come
+# from the command line, a target file, or the defaults while px_config_dump reports which source
+# applied during configuration resolution.
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit "$PX_EXIT_OK"
-    ;;
-  -n | --dry-run) OPT_DRY_RUN=1 ;;
-  --continue-on-failure) OPT_SETS="${OPT_SETS}PX_SUITE_CONTINUE=1$PX_NL" ;;
-  -v | --verbose) OPT_SETS="${OPT_SETS}PX_VERBOSE=1$PX_NL" ;;
-  -k | --keep) OPT_SETS="${OPT_SETS}PX_KEEP=1$PX_NL" ;;
-  --from)
-    px_cli_need_value "$@"
-    OPT_SETS="${OPT_SETS}PX_SUITE_FROM=$2$PX_NL"
-    shift
-    ;;
-  --to)
-    px_cli_need_value "$@"
-    OPT_SETS="${OPT_SETS}PX_SUITE_TO=$2$PX_NL"
-    shift
-    ;;
-  --only)
-    px_cli_need_value "$@"
-    OPT_SETS="${OPT_SETS}PX_SUITE_FILTER=$2$PX_NL"
-    shift
-    ;;
-  --skip)
-    px_cli_need_value "$@"
-    OPT_SKIP=$2
-    shift
-    ;;
-  -c | --class)
-    px_cli_need_value "$@"
-    OPT_SETS="${OPT_SETS}PX_RUN_CLASS=$2$PX_NL"
-    shift
-    ;;
-  -f | --config)
-    px_cli_need_value "$@"
-    CONFIG_FILES[${#CONFIG_FILES[@]}]=$2
-    shift
-    ;;
-  -e | --set)
-    px_cli_need_value "$@"
-    case "$2" in
-    *=*) OPT_SETS="${OPT_SETS}$2$PX_NL" ;;
-    *) px_usage_error "--set needs NAME=VALUE, got '$2'" ;;
-    esac
-    shift
-    ;;
-  --)
-    shift
-    break
-    ;;
-  -*) px_usage_error "unknown option $1" ;;
-  *)
-    [ -z "$OPT_SUITE" ] || px_usage_error "px-suite runs one suite at a time"
-    OPT_SUITE=$1
-    ;;
-  esac
-  shift
-done
-if [ $# -gt 0 ]; then
-  [ -z "$OPT_SUITE" ] || px_usage_error "px-suite runs one suite at a time"
-  OPT_SUITE=$1
-  shift
-fi
-[ $# -eq 0 ] || px_usage_error "px-suite takes one suite, not $#"
-[ -n "$OPT_SUITE" ] || px_usage_error "px-suite needs a suite"
+px_cli_parse "$@"
+OPT_SUITE=${PX_CLI_ARGS[0]}
 
 # ---------------------------------------------------------------------------
 # Session initialization and execution
 # ---------------------------------------------------------------------------
 
-# Apply command-line overrides at the highest-priority configuration stage before invoking the
-# configuration loader, because PX_RUN_CLASS determines which class configuration file the loader
-# reads.
-while IFS= read -r SET_LINE; do
-  [ -n "$SET_LINE" ] || continue
-  px_config_set "${SET_LINE%%=*}" "${SET_LINE#*=}" cli
-done <<EOF
-$OPT_SETS
-EOF
+# The argument-parsing loop registers command-line overrides at the highest-precedence stage before
+# the configuration loader runs, because the selected run class determines which class file the
+# loader reads.
 px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 # A run class supplied via --class or -e PX_RUN_CLASS, or otherwise the class persisted in the
 # cluster record file, applies to every test and overrides any class declared by the suite; the
@@ -1366,10 +1191,10 @@ px_suite_parse "$SUITE_FILE"
 px_suite_order
 px_suite_select
 
-# A dry run validates the suite and emits the resolved execution plan without touching the
-# filesystem or backend: it creates no output root, allocates no session directory, and loads no
-# backend, making it safe to run on a host that is currently running a live cluster.
-if [ "$OPT_DRY_RUN" = 1 ]; then
+# A dry run validates the execution plan without modifying host state: it creates no output root,
+# allocates no session directory, and loads no backend, making it safe for an operator to run on a
+# host that already holds a live cluster.
+if px_is_dry_run; then
   px_info "dry run of $SUITE_NAME, $PLAN_COUNT of $ORDER_COUNT tests selected"
   px_suite_plan_emit ""
   exit "$PX_EXIT_OK"

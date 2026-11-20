@@ -70,7 +70,6 @@ COLLECT_INTERVAL=""
 COLLECT_DURATION=""
 COLLECT_TARGETS=""
 COLLECT_STOP=0
-COLLECT_BOUND=0
 COLLECT_AT=""
 
 ## @description  Prints the command-line usage reference and collector registry documentation.
@@ -97,31 +96,11 @@ later round owns, 6 no such collector or scope.
 EOF
 }
 
-# Stores the resolved index in COLLECT_AT rather than writing to stdout so that callers do not run
-# the lookup inside a command-substitution subshell, where the failure trap would report an expected
-# negative lookup as an error.
-## @description  Looks up the array index of a named collector in the collector registry.
-## @param        collector name
-## @return       Sets COLLECT_AT. Exits with 0 on match, or 6 when the name is not a collector.
-collect_find_position() {
-  local i=0
-  COLLECT_AT=""
-  while [ "$i" -lt "${#COLLECT_NAMES[@]}" ]; do
-    if [ "${COLLECT_NAMES[$i]}" = "${1:-}" ]; then
-      COLLECT_AT="$i"
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  return "$PX_EXIT_NO_OBJECT"
-}
-
-# Evaluates collector readiness at the given registry index: reports "ready" when implemented in
-# this round (A1) and its required host tool is available, "absent" when the host tool is missing,
-# and "deferred" when implementation belongs to a later round.
-## @description  Determines the availability state of the collector at a given registry position.
-## @param        registry position
-## @return       Writes the state label to stdout and exits with status 0.
+# Evaluates collector readiness: reports "ready" when implemented in this round and its required
+# host tool is available, "absent" when the tool is missing, and "deferred" when a later round owns
+# the implementation.
+## @description  Reports the availability state of a single collector.
+## @return       Writes the state to stdout and exits with status 0.
 collect_state() {
   local tool="${COLLECT_TOOLS[$1]}"
   if [ "${COLLECT_OWNERS[$1]}" != A1 ]; then
@@ -135,9 +114,9 @@ collect_state() {
   fi
 }
 
-# Emits one tab-separated row per collector containing the collector name, owning implementation
-# round, required tool, current availability state, and summary description.
-## @description  Outputs the full collector registry table.
+# Emits one tab-separated row per collector containing the collector, owning round, required tool,
+# current availability state, and summary description columns.
+## @description  Outputs the collector registry table.
 ## @return       Writes TSV rows to stdout and exits with status 0.
 collect_list() {
   local i=0
@@ -148,65 +127,16 @@ collect_list() {
   done
 }
 
-# Defers sourcing the substrate contract until a collector actually requires backend access, so that
-# listing the registry or reporting command-line usage errors succeeds even when no cluster or
-# backend is present.
-## @description  Lazily loads and binds the substrate backend contract on first use.
-## @return       Exits with status 0.
-collect_backend() {
-  if [ "$COLLECT_BOUND" = 0 ]; then
-    # shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
-    . "$SELF/../lib/backend/contract.sh"
-    COLLECT_BOUND=1
-  fi
-  sb_load
-}
-
-# Must be called after collect_backend because sb_scope_resolve is defined by the substrate
-# contract. Exits with status 6 when no scope is specified or recorded, status 2 on an invalid
-# cluster name or a refused state directory, and status 1 when the state directory cannot be
-# created.
-## @description  Resolves the active sampling scope when --scope was not explicitly provided.
-## @return       Sets COLLECT_SCOPE and exits with 0, or exits with 6, 2, or 1 on resolution error.
-collect_scope() {
-  local status=0
-  if [ -n "$COLLECT_SCOPE" ]; then
-    return 0
-  fi
-  COLLECT_SCOPE="$(sb_scope_resolve || exit "$?")" || status=$?
-  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" \
-      "no scope recorded for cluster ${PX_CLUSTER_ID:-default}." \
-      "Run px-cluster up, or name the scope with --scope or PX_SCOPE_ID."
-  fi
-  if [ "$status" != 0 ]; then
-    exit "$status"
-  fi
-}
-
-# Because the raw schema declaration includes multiline line breaks and indentation, consecutive
-# whitespace runs are collapsed into single spaces before converting the field list into a
-# comma-separated header line.
-## @description  Formats the field names of a substrate schema as a single CSV header line.
-## @param        schema name
-## @return       Writes the CSV header to stdout and exits with 0, or returns 6 on unknown schema.
+## @description  Converts the space-separated field names of a substrate schema into a CSV header.
+## @return       Writes the header to stdout and exits with 0, or returns 6 on an unknown schema.
 collect_csv_header() {
   local fields
   fields="$(sb_schema_fields "$1")" || return "$PX_EXIT_NO_OBJECT"
-  while [ "$fields" != "${fields//  / }" ]; do
-    fields=${fields//  / }
-  done
-  fields=${fields# }
-  fields=${fields% }
   printf '%s\n' "${fields// /,}"
 }
 
-# Extracts fields explicitly by column index rather than splitting through IFS so that empty columns
-# preserve their positional alignment whenever a metrics source omits a sample schema field that has
-# no local equivalent.
-## @description  Converts a tab-separated sample row into a properly quoted CSV row.
-## @param        row, column count
-## @return       Writes the formatted CSV row to stdout and exits with status 0.
+## @description  Converts a single TSV row into a formatted CSV row.
+## @return       Writes the CSV row to stdout and exits with status 0.
 collect_csv_row() {
   local row=$1 count=$2 i=1 field out=""
   while [ "$i" -le "$count" ]; do
@@ -227,18 +157,16 @@ collect_csv_row() {
   printf '%s\n' "$out"
 }
 
-# Records the outcome of a collector execution in the index file consumed by the bundle so that
-# downstream packaging knows whether each selected collector ran, was skipped, or failed.
-## @description  Appends a status entry for a collector to the metrics index file.
-## @param        collector, target, status, artifact, detail
+# Records the outcome of a collector execution in the collector index consumed by the result bundle
+# to determine whether a collector ran, was skipped, or failed.
+## @description  Appends a status row to the collector index.
 ## @return       Exits with status 0.
 collect_record() {
   px_tsv_row "$1" "$2" "$3" "$4" "$(px_tsv_clean "$5")" >>"$COLLECT_INDEX"
 }
 
-## @description  Checks whether a given cluster role is included in the active target filter list.
-## @param        role
-## @return       Returns 0 when the role is selected for collection, or 1 otherwise.
+## @description  Checks whether a given role is included in the target list.
+## @return       Exits with 0 when the role is selected, or 1 otherwise.
 collect_wanted() {
   local want
   case "$COLLECT_TARGETS" in
@@ -252,12 +180,8 @@ collect_wanted() {
   return 1
 }
 
-# Formats the delay as fractional seconds, which both supported host platforms accept, so the
-# sampling loop remains anchored to an absolute wall-clock schedule rather than drifting by adding
-# the sample execution time to every interval.
-## @description  Sleeps for the requested duration in milliseconds.
-## @param        milliseconds
-## @return       Exits with status 0, setting COLLECT_STOP when a signal interrupts the sleep.
+## @description  Sleeps for the specified duration in milliseconds.
+## @return       Exits with status 0 and sets COLLECT_STOP when interrupted by a signal.
 collect_sleep_ms() {
   local ms=$1
   if [ "$ms" -le 0 ]; then
@@ -266,17 +190,13 @@ collect_sleep_ms() {
   sleep "$((ms / 1000)).$(printf '%03d' "$((ms % 1000))")" || COLLECT_STOP=1
 }
 
-# Because the backend returns one row per instance in a single call, each sampling pass costs only
-# one substrate invocation regardless of how many instances are running. Returns 0 when collection
-# completes or is skipped, returns 1 on a sampling failure, exits with 6 when the target scope is
-# absent, and exits with 1 when the runtime fails to respond.
-## @description  Periodically samples resource metrics for all instances in the scope into a CSV.
-## @param        csv path
+# Exits with status 0 when collection completes or is skipped, status 1 on a sampling failure or
+# when the runtime does not respond, and status 6 when the target scope is absent.
+## @description  Samples every instance in the scope on a fixed cadence and writes the CSV output.
 ## @return       Exits with 0 when run or skipped, 1 on sampling or runtime failure, or 6 if absent.
 collect_container() {
   local csv=$1 columns role_col header rows row role tick=0 samples=0
   local start_ms due_ms now_ms status=0
-  collect_backend
   if ! sb_supports sb_sample_resources ||
     ! sb_capability resource_sampling >/dev/null; then
     collect_record container "$COLLECT_TARGETS" skip "" \
@@ -284,13 +204,7 @@ collect_container() {
     px_warn "container: the backend has no metrics source, skipped"
     return 0
   fi
-  sb_scope_exists "$COLLECT_SCOPE" || status=$?
-  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" "no such scope: $COLLECT_SCOPE"
-  fi
-  if [ "$status" != 0 ]; then
-    px_die "$status" "cannot tell whether the scope $COLLECT_SCOPE exists"
-  fi
+  sb_scope_check "$COLLECT_SCOPE"
   header="$(collect_csv_header sample)"
   columns="$(sb_schema_count sample)"
   # Resolve the role column index once before entering the sampling loop so that filtering rows by
@@ -337,40 +251,14 @@ EOF
   px_info "container: $samples sample rows in $tick passes"
 }
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
-  --list) COLLECT_LIST=1 ;;
-  --collector) px_cli_need_value "$@" && COLLECT_SELECTED+=("$2") && shift ;;
-  --interval) px_cli_need_value "$@" && COLLECT_INTERVAL="$2" && shift ;;
-  --duration) px_cli_need_value "$@" && COLLECT_DURATION="$2" && shift ;;
-  --targets) px_cli_need_value "$@" && COLLECT_TARGETS="$2" && shift ;;
-  --scope) px_cli_need_value "$@" && COLLECT_SCOPE="$2" && shift ;;
-  --out) px_cli_need_value "$@" && COLLECT_OUT="$2" && shift ;;
-  --config) px_cli_need_value "$@" && COLLECT_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *) px_usage_error "unexpected argument: $1" ;;
-  esac
-  shift
-done
+px_cli_parse "$@"
 
 if [ "$COLLECT_LIST" = 1 ]; then
   collect_list
   exit 0
 fi
 
-if [ "${#COLLECT_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${COLLECT_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 
 if [ "${#COLLECT_SELECTED[@]}" = 0 ]; then
   COLLECT_SELECTED=(container)
@@ -395,20 +283,29 @@ fi
 # about an unknown or deferred collector immediately rather than after a long collection period.
 COLLECT_POSITIONS=()
 for COLLECT_NAME in "${COLLECT_SELECTED[@]}"; do
-  if ! collect_find_position "$COLLECT_NAME"; then
+  px_word_at "$COLLECT_NAME" "${COLLECT_NAMES[@]}" ||
     px_die "$PX_EXIT_NO_OBJECT" "no such collector: $COLLECT_NAME"
-  fi
-  if [ "${COLLECT_OWNERS[$COLLECT_AT]}" != A1 ]; then
+  if [ "${COLLECT_OWNERS[$PX_AT]}" != A1 ]; then
     px_die "$PX_EXIT_UNSUPPORTED" \
-      "the $COLLECT_NAME collector arrives with round ${COLLECT_OWNERS[$COLLECT_AT]}"
+      "the $COLLECT_NAME collector arrives with round ${COLLECT_OWNERS[$PX_AT]}"
   fi
-  COLLECT_POSITIONS+=("$COLLECT_AT")
+  COLLECT_POSITIONS+=("$PX_AT")
 done
 
-# Resolve the target scope before creating any output directories or files so that a missing cluster
-# never leaves an empty metrics index behind.
-collect_backend
-collect_scope
+# Bind the substrate contract here rather than at the top of the script because listing the registry
+# or reporting a usage error does not require a backend. Resolve the active scope before creating
+# any output files so that a missing cluster never leaves an empty index behind.
+# shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
+. "$SELF/../lib/backend/contract.sh"
+sb_load
+sb_scope_require >/dev/null
+if px_is_dry_run; then
+  for COLLECT_NAME in "${COLLECT_SELECTED[@]}"; do
+    px_plan collect "$COLLECT_NAME" "$COLLECT_DURATION" \
+      "${COLLECT_OUT:-${PX_RUN_DIR:-a new run directory}}"
+  done
+  exit "$PX_EXIT_OK"
+fi
 
 # Execute each step of the output directory policy at the top level of the script so that any path
 # refusal terminates the main process directly rather than exiting only a subshell.

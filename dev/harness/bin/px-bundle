@@ -31,8 +31,6 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 px_trap_enable
 
-BUNDLE_OWNER="A5"
-
 BUNDLE_ACTION=""
 BUNDLE_RUN=""
 BUNDLE_PATH=""
@@ -62,37 +60,21 @@ owns, 6 no such run or bundle.
 EOF
 }
 
-# The diagnostic output identifies the implementation round responsible for the subcommand and
-# references the format specification document so that users can locate the format definition before
-# the implementation code exists.
-## @description  Terminates the process with the unsupported exit code and names the owning round.
-## @param        subcommand  The subcommand whose implementation is deferred to the owning round.
-## @return       Terminates execution with exit code 5.
-bundle_deferred() {
-  px_die "$PX_EXIT_UNSUPPORTED" \
-    "px-bundle $1 arrives with round $BUNDLE_OWNER, which also writes docs/bundle-format.md"
-}
-
 while [ "$#" -gt 0 ]; do
   case "$1" in
   -h | --help)
     usage
     exit 0
     ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
+  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
   --run) px_cli_need_value "$@" && BUNDLE_RUN="$2" && shift ;;
   --bundle) px_cli_need_value "$@" && BUNDLE_PATH="$2" && shift ;;
   --out) px_cli_need_value "$@" && BUNDLE_OUT="$2" && shift ;;
   --config) px_cli_need_value "$@" && BUNDLE_CONFIG_FILES+=("$2") && shift ;;
   -*) px_usage_error "unknown option: $1" ;;
   *)
-    if [ -n "$BUNDLE_ACTION" ]; then
-      px_usage_error "unexpected argument: $1"
-    fi
-    BUNDLE_ACTION="$1"
+    [ -z "$BUNDLE_ACTION" ] || px_usage_error "unexpected argument: $1"
+    BUNDLE_ACTION=$1
     ;;
   esac
   shift
@@ -106,11 +88,7 @@ write | verify) ;;
 *) px_usage_error "unknown subcommand: $BUNDLE_ACTION" ;;
 esac
 
-if [ "${#BUNDLE_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${BUNDLE_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
+px_config_load ${BUNDLE_CONFIG_FILES[@]+"${BUNDLE_CONFIG_FILES[@]}"}
 
 # Argument validation runs in the current round because these checks do not depend on the bundle
 # format. Validating paths upfront ensures that an operator discovers an invalid path immediately
@@ -141,4 +119,5 @@ else
   fi
 fi
 
-bundle_deferred "$BUNDLE_ACTION"
+px_die "$PX_EXIT_UNSUPPORTED" \
+  "px-bundle $BUNDLE_ACTION arrives with round A5, which also writes docs/bundle-format.md"

@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+  The YARN configuration of the YARN roles, and of a client role when the
+  deployment renders YARN.
+
+  The NodeManager resources are pinned. The upstream default of -1 resolves
+  to 8 GiB and 8 virtual cores, which a NodeManager container of a few GiB
+  cannot hold: the task JVMs run inside the same container and count against
+  its memory limit, so an unpinned value ends in an out-of-memory kill.
+  Each NodeManager binds the ports of its own index; the container manager
+  port is pinned too, because its upstream default is an ephemeral port that
+  no port map can publish.
+-->
+<configuration>
+  <property>
+    <name>yarn.resourcemanager.hostname</name>
+    <value>resourcemanager-0</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.address</name>
+    <value>resourcemanager-0:${PX_PORT_RESOURCEMANAGER_RPC}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.scheduler.address</name>
+    <value>resourcemanager-0:${PX_PORT_RESOURCEMANAGER_SCHEDULER}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.resource-tracker.address</name>
+    <value>resourcemanager-0:${PX_PORT_RESOURCEMANAGER_TRACKER}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.admin.address</name>
+    <value>resourcemanager-0:${PX_PORT_RESOURCEMANAGER_ADMIN}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.webapp.address</name>
+    <value>resourcemanager-0:${PX_PORT_RESOURCEMANAGER_HTTP}</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.bind-host</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <!-- A NodeManager reports its own hostname and binds every interface. -->
+    <name>yarn.nodemanager.hostname</name>
+    <value>${PX_HOSTNAME}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.bind-host</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.address</name>
+    <value>${PX_HOSTNAME}:${PX_RENDER_NODEMANAGER_RPC_PORT}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.localizer.address</name>
+    <value>${PX_HOSTNAME}:${PX_RENDER_NODEMANAGER_LOCALIZER_PORT}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.webapp.address</name>
+    <value>${PX_HOSTNAME}:${PX_RENDER_NODEMANAGER_HTTP_PORT}</value>
+  </property>
+  <property>
+    <!-- The shuffle handler runs inside the NodeManager, reads its port from
+         this file and binds every interface. The application master of each
+         MapReduce job runs in a NodeManager container and binds three sockets
+         on ephemeral ports: the client RPC of MRClientService, the task
+         umbilical of TaskAttemptListenerImpl and the AM webapp. They are on
+         the harness network only, and the host publishes none of them.
+         "The port map" in docs/backends.md lists them. -->
+    <name>mapreduce.shuffle.port</name>
+    <value>${PX_RENDER_NODEMANAGER_SHUFFLE_PORT}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.aux-services</name>
+    <value>mapreduce_shuffle</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.aux-services.mapreduce_shuffle.class</name>
+    <value>org.apache.hadoop.mapred.ShuffleHandler</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.resource.memory-mb</name>
+    <value>${PX_NM_RESOURCE_MIB}</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.resource.cpu-vcores</name>
+    <value>${PX_NM_VCORES}</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.minimum-allocation-mb</name>
+    <value>${PX_YARN_MIN_ALLOC_MIB}</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.maximum-allocation-mb</name>
+    <value>${PX_YARN_MAX_ALLOC_MIB}</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.maximum-allocation-vcores</name>
+    <value>${PX_NM_VCORES}</value>
+  </property>
+  <property>
+    <!-- The virtual memory check refuses JVMs that only reserve address
+         space. The physical memory check stays on, and the container limit
+         backs it. -->
+    <name>yarn.nodemanager.vmem-check-enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.pmem-check-enabled</name>
+    <value>true</value>
+  </property>
+  <property>
+    <!-- A desktop engine keeps its disk image nearly full. The default limit
+         of 90 percent would mark every NodeManager unhealthy. -->
+    <name>yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage</name>
+    <value>99</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.local-dirs</name>
+    <value>${PX_DATA_DIR}/nm-local</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.log-dirs</name>
+    <value>${PX_LOG_DIR}/nm-containers</value>
+  </property>
+  <property>
+    <name>yarn.log-aggregation-enable</name>
+    <value>false</value>
+  </property>
+</configuration>

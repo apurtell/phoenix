@@ -67,11 +67,10 @@ SX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SX_SEVERITIES="PASS SKIP ADVISORY FAIL ERROR"
 
-# Callers compare severities through their numeric ranks so that no caller duplicates the lattice
+# Callers compare severities through their numeric rank so that no caller duplicates the lattice
 # ordering.
-## @description  Resolves a severity name to its numeric rank in the severity lattice.
-## @param        severity The severity name to evaluate.
-## @return       Writes the rank (0 to 4) to stdout and exits 0, or exits 6 if not a severity.
+## @description  Resolves a single severity to its rank in the severity lattice.
+## @return       Writes the rank (0 to 4) to stdout and exits 0, or exits 6 on an unknown word.
 sx_severity_rank() {
   case "${1:-}" in
   PASS) printf '0\n' ;;
@@ -83,12 +82,10 @@ sx_severity_rank() {
   esac
 }
 
-# Implements the entirety of the highest-severity aggregation policy. When an argument is not a
-# recognized severity, the function terminates with exit code 2, which aborts an enclosing command
-# substitution and returns status 2 to the caller.
+# Selecting the stronger of two severities implements the entire severity resolution policy.
 ## @description  Compares two severities and reports the stronger one.
-## @param        left, right The two severity names to compare.
-## @return       Writes the stronger severity to stdout and exits 0, or exits 2 on an invalid name.
+## @return       Writes the stronger word to stdout and exits 0, or exits 2 on a word that is not a
+##               valid severity.
 sx_severity_worse() {
   local left=${1:-} right=${2:-} left_rank right_rank
   left_rank="$(sx_severity_rank "$left")" ||
@@ -102,13 +99,10 @@ sx_severity_worse() {
   fi
 }
 
-# Evaluates the aggregate outcome across a collection of severities, such as the tests within a
-# session. Resolves to the worst severity in the set, or to INCONCLUSIVE when the set is empty or
-# contains only SKIP outcomes. Exits 2 if the worst word is not a valid severity or if either count
-# is not a whole number.
-## @description  Computes the aggregate result for a set of recorded severities.
-## @param        worst, total, skipped The worst severity, total count, and SKIP count of the set.
-## @return       Writes the result word to stdout and exits 0, or exits 2 on invalid arguments.
+# Evaluates the aggregate result of a set from its worst severity, total count, and SKIP count,
+# resolving to the worst severity or to INCONCLUSIVE when the set is empty or holds only SKIP.
+## @description  Computes the aggregate result for a set of severities.
+## @return       Writes the result to stdout and exits 0, or exits 2 on an invalid argument.
 sx_result() {
   local worst=${1:-} total=${2:-} skipped=${3:-}
   sx_severity_rank "$worst" >/dev/null ||
@@ -123,21 +117,6 @@ sx_result() {
   fi
 }
 
-# Non-blocking outcomes (PASS, SKIP, and ADVISORY) map to 0, whereas FAIL and INCONCLUSIVE map to
-# the failure exit code. ERROR maps to the anomaly exit code, which represents a harness or
-# infrastructure fault everywhere in this harness.
-## @description  Translates a severity level or INCONCLUSIVE result into a process exit code.
-## @param        outcome The severity name or INCONCLUSIVE result to translate.
-## @return       Writes the exit code to stdout and exits 0, or exits 6 on an unrecognized word.
-sx_severity_code() {
-  case "${1:-}" in
-  PASS | SKIP | ADVISORY) printf '%s\n' "$PX_EXIT_OK" ;;
-  FAIL | INCONCLUSIVE) printf '%s\n' "$PX_EXIT_FAIL" ;;
-  ERROR) printf '%s\n' "$PX_EXIT_ANOMALY" ;;
-  *) return "$PX_EXIT_NO_OBJECT" ;;
-  esac
-}
-
 # ---------------------------------------------------------------------------
 # Run directory resolution and output isolation enforcement.
 # ---------------------------------------------------------------------------
@@ -145,10 +124,11 @@ sx_severity_code() {
 # px-run via PX_RUN_DIR. Resolving this location through the shared output policy guarantees that
 # an action cannot write inside the working tree, even if supplied with a path that points there.
 
-# Exits 2 when PX_RUN_DIR is unset, escapes the output root, or points inside the working tree, and
-# exits 1 when the path cannot be resolved.
-## @description  Resolves and validates the run directory for the current action.
-## @return       Writes the absolute run directory to stdout and exits 0, or exits 2 or 1 on error.
+# Validates that PX_RUN_DIR is set, resides within the output root, and lies outside the working
+# tree before reporting its resolved path.
+## @description  Resolves and reports the PX_RUN_DIR run directory for the current action.
+## @return       Writes the directory to stdout and exits 0; exits 2 if unset, outside the output
+##               root, or inside the tree, or exits 1 if it cannot be resolved.
 sx_run_dir() {
   if [ -z "${PX_RUN_DIR:-}" ]; then
     px_die "$PX_EXIT_USAGE" \
@@ -157,18 +137,12 @@ sx_run_dir() {
   px_out_resolve "$PX_RUN_DIR"
 }
 
-# Ensures the enclosing run directory exists before returning the stream path. Because the verdict
-# stream is append-only, multiple checks executed within the same action never overwrite each other.
-# Exits 1 when the run directory cannot be resolved or created, and exits 2 when the run directory
-# violates the output policy.
-## @description  Resolves the verdict stream file for the current action and creates its directory.
-## @return       Writes the verdict file path to stdout and exits 0, or exits 1 or 2 on failure.
+## @description  Resolves the append-only verdict stream path and creates its run directory.
+## @return       Writes the path to stdout and exits 0; returns exit code 2 or 1 from sx_run_dir,
+##               or exits 1 if the directory cannot be created.
 sx_verdict_file() {
-  local dir status=0
-  dir="$(sx_run_dir)" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  local dir
+  dir="$(sx_run_dir)" || return $?
   mkdir -p "$dir" || px_die "$PX_EXIT_FAIL" "cannot create the run directory $dir"
   printf '%s/verdicts.tsv\n' "$dir"
 }
@@ -180,32 +154,21 @@ sx_verdict_file() {
 # Field values are sanitized with px_tsv_clean before writing because an embedded tab character in
 # a detail message would corrupt column alignment for every downstream reader.
 
-# Appends the sanitized TSV row to the action's verdict stream and logs the verdict to stderr at a
-# diagnostic level corresponding to its severity weight. Exits 2 when the check name is empty or the
-# severity is not in the lattice, exits 1 when the row cannot be formatted or written, and
-# propagates the status of sx_verdict_file (2 or 1) when the stream cannot be opened.
-## @description  Records a check verdict to the verdict stream and logs it to stderr.
-## @param        check, severity, detail... The check name, severity level, and detail tokens.
-## @return       Exits 0 on success, or exits 2 or 1 on invalid input or write failure.
+# Appends a single verdict record (check, severity, detail...) to the verdict stream and logs the
+# outcome to stderr.
+## @description  Records a check verdict and reports it on stderr.
+## @return       Exits 0, or returns exit code 2 or 1 from sx_verdict_file; exits 2 on an empty
+##               check or unknown severity, and exits 1 if the row cannot be written.
 sx_verdict() {
-  local check=${1:-} severity=${2:-} detail="" file row status=0
-  if [ $# -gt 2 ]; then
-    shift 2
-    detail="$*"
-  fi
+  local check=${1:-} severity=${2:-} detail="${*:3}" file
   [ -n "$check" ] || px_die "$PX_EXIT_USAGE" "a verdict needs a check name"
   sx_severity_rank "$severity" >/dev/null ||
     px_die "$PX_EXIT_USAGE" \
       "check '$check' carries unknown severity '$severity', expected one of $SX_SEVERITIES"
-  file="$(sx_verdict_file)" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  file="$(sx_verdict_file)" || return $?
   check="$(px_tsv_clean "$check")"
   detail="$(px_tsv_clean "$detail")"
-  row="$(px_tsv_row "$check" "$severity" "$detail")" ||
-    px_die "$PX_EXIT_FAIL" "cannot write the verdict of check '$check'"
-  printf '%s\n' "$row" >>"$file" ||
+  px_tsv_row "$check" "$severity" "$detail" >>"$file" ||
     px_die "$PX_EXIT_FAIL" "cannot append to the verdict stream $file"
   case "$severity" in
   PASS) px_debug "$check: PASS $detail" ;;
@@ -216,16 +179,13 @@ sx_verdict() {
   return 0
 }
 
-# Invoked by px-suite after each test completes so that a test exiting 0 after recording an
-# ADVISORY verdict still surfaces that advisory outcome. Any row carrying an unrecognized severity
-# is rejected and promoted to ERROR so that a misspelled FAIL cannot be mistaken for a pass. When
-# the file is missing or contains no verdicts, absence is signaled by empty output rather than a
-# non-zero exit status because callers invoke this function inside a command substitution, where
-# Bash treats a non-zero return status as a failure in the caller.
-## @description  Determines the highest-ranking severity recorded in a verdict stream file.
-## @param        file The path to the verdict TSV file to inspect.
-## @return       Writes the worst severity to stdout (or nothing if absent or empty) and exits 0.
+# Any row carrying an unknown severity is promoted to ERROR so that a misspelled FAIL cannot pass.
+## @description  Reports the worst severity recorded in a verdict stream.
+## @return       Writes the worst severity to stdout, or nothing for an absent or empty file, and
+##               exits 0.
 sx_verdict_worst() {
+  # Signal absence through empty output rather than a non-zero exit status, because callers read
+  # this function via command substitution where Bash treats a non-zero status as a caller failure.
   local file=${1:-} row rest severity worst="" lineno=0
   [ -f "$file" ] || return 0
   while IFS= read -r row || [ -n "$row" ]; do

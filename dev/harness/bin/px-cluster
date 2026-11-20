@@ -38,9 +38,22 @@
 # group transition discovers its affected member roles only from the backend response, so it records
 # its planned-action rows immediately after the backend call returns.
 #
-# A failed up operation tears the cluster down by default so that an unusable deployment does not
-# continue consuming host memory needed by the operator. Setting PX_TEARDOWN=0 or passing --keep
-# preserves the failed deployment in place for diagnostic inspection.
+# Each command tears down only the resources that it provisioned. A failed up operation tears its
+# cluster down automatically so that a cluster that outlives its purpose does not continue holding
+# host memory needed by the operator, whereas passing --keep leaves the deployment in place for
+# diagnostic inspection. Once up brings a cluster up, the cluster remains running until it is
+# explicitly removed by px-cluster down, which is idempotent.
+#
+# The up subcommand persists a cluster record capturing the bring-up configuration, and every
+# subsequent command targeting that cluster loads the record as a configuration stage. The scale
+# subcommand updates the recorded instance count in place, and down removes the record.
+#
+# The matrix subcommand executes a single test suite across multiple version sets. Each version set
+# is defined by a configuration file, and every lifecycle phase for that set (build, bring-up,
+# suite execution, and teardown) executes as a child command that loads that file. Because each
+# child inherits only the operator-supplied configuration, settings resolved by this parent process
+# cannot mask the child's version set. The matrix tears down each set's cluster upon completion or
+# when interrupted by a signal.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
@@ -72,25 +85,27 @@ set -euo pipefail
 # validated separately against SB_CLUSTER_RE from the substrate contract.
 PC_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 
-# Authoritative list of supported subcommands. A single list drives both membership validation and
-# command dispatch so no subcommand can be routed unless it is registered here.
-PC_SUBCOMMANDS="up down status ready config validate logs exec cp-in cp-out
-scale group kill signal restart endpoint version"
+# Authoritative set of supported subcommands. A single list drives both membership validation and
+# command dispatch, ensuring that no new subcommand can be routed without being registered here.
+PC_SUBCOMMANDS="render up down status ready config validate logs exec cp-in cp-out
+scale group kill signal restart endpoint version matrix"
 
 # Timeout and interval variable names inspected by the validate subcommand: integer whole-second
 # timeouts in the first list, and potentially fractional second intervals in the second.
 PC_TIMEOUT_NAMES="PX_TIMEOUT_DEFAULT PX_TIMEOUT_PROVISION PX_TIMEOUT_READY
 PX_TIMEOUT_EXEC PX_TIMEOUT_TEARDOWN PX_TIMEOUT_DRAIN PX_TIMEOUT_SCALE
-PX_TIMEOUT_GROUP PX_TIMEOUT_STOP PX_RETRY_ATTEMPTS"
-PC_SECONDS_NAMES="PX_POLL_INTERVAL_S PX_RETRY_SLEEP_S"
+PX_TIMEOUT_GROUP PX_TIMEOUT_STOP"
+PC_SECONDS_NAMES="PX_POLL_INTERVAL_S"
 
 PC_CHECKS=""
 PC_FAILS=0
-PC_ROW_FIELDS=()
+PC_ARGS=()
+# Additional configuration files supplied via --config, which each version set in a matrix run reads
+# after its own version set file.
+PC_FILES=()
 
-# Prints top-level command usage text, which px_usage_error displays when a global usage error
-# occurs.
-## @description  Prints how to invoke this command.
+## @description  Prints top-level invocation usage text, which px_usage_error displays on a global
+##               usage error.
 ## @return       Writes the usage text to stdout and exits with 0.
 usage() {
   cat <<'EOF'
@@ -107,12 +122,16 @@ Global options. They come before the subcommand.
       --strict           refuse a name that lib/varnames.txt does not declare
       --backend NAME     backend to bind, default compose
       --cluster ID       cluster name, default from the configuration
+      --class NAME       run class, validation or measurement: it selects the
+                         defaults of env/class-NAME.env
       --config FILE      extra configuration file, strongest file stage,
                          repeatable
   -e, --set NAME=VALUE   set one configuration value, repeatable
 
 Subcommands.
-  up [DIR]               provision a rendered deployment, then wait for ready
+  render [OPTION...]     render the deployment directory of the run class
+  up [DIR]               preflight and provision a deployment, then wait for
+                         ready. With no DIR it renders the run class first
   down                   tear the cluster down and remove its scope
   status                 report the instance inventory and role group state
   ready                  wait for readiness
@@ -129,6 +148,8 @@ Subcommands.
   restart ROLE INDEX     drain, restart and rebalance one instance
   endpoint ROLE INDEX P  report the host address of one named port
   version                report the backend and contract versions
+  matrix SUITE FILE...   run SUITE against each version set FILE: build, stage,
+                         up, run and down for each one
 
 Run 'px-cluster <subcommand> --help' for the options of that subcommand.
 
@@ -138,14 +159,32 @@ its command through.
 EOF
 }
 
-## @description  Prints the invocation syntax and option summary for a single subcommand.
-## @param        subcommand
+## @description  Prints the invocation syntax and option reference for a single subcommand.
 ## @return       Writes the usage text to stdout and exits with 0.
 pc_sub_usage() {
   case "${1:-}" in
+  render) cat <<'EOF'
+Usage: px-cluster [--class NAME] [--config FILE] render [OPTION...]
+  Renders the deployment directory of the cluster from the run class and
+  the configuration, by default into $PX_OUT/deploy/<cluster>, and writes
+  its path. It calls the generator of the backend and passes each OPTION
+  on: -e NAME=VALUE (for example -e PX_RS_COUNT=3), --out DIR, --check and
+  the others that the generator lists. It makes no backend call. It refuses
+  to replace the deployment directory of a cluster that is up, exit 2.
+EOF
+    ;;
   up) cat <<'EOF'
 Usage: px-cluster up [--timeout S] [--ready-timeout S] [--no-wait] [DIR]
-  DIR is the rendered deployment directory, default PX_DEPLOYMENT_DIR.
+  DIR is the rendered deployment directory, default PX_DEPLOYMENT_DIR. With
+  neither, a run class (--class or PX_RUN_CLASS) renders the deployment
+  first, so a class and a topology file (--config FILE) are enough. A
+  cluster of the same name that is up refuses that render, exit 2.
+  The host preflight runs before the cluster is created: a deployment that
+  the engine cannot hold is refused with the arithmetic, exit 3.
+  The image PX_IMAGE_TAG must exist first: scripts/build-phoenix.sh builds
+  the Phoenix jars, then scripts/stage-artifacts.sh builds the image. An
+  image that the host does not hold refuses the bring-up before the
+  preflight, exit 2, with those two commands.
   --timeout S        provision timeout, default PX_TIMEOUT_PROVISION
   --ready-timeout S  readiness timeout, default PX_TIMEOUT_READY
   --no-wait          create the instances and do not wait for readiness
@@ -259,12 +298,29 @@ Usage: px-cluster version
   the backend's tooling reports.
 EOF
     ;;
+  matrix) cat <<'EOF'
+Usage: px-cluster [--class NAME] [--config FILE] matrix SUITE FILE...
+  Runs the suite SUITE against each version set in order. A version set is a
+  configuration FILE that selects the HBase profile, the HBase and the Hadoop
+  release and the JDKs, for example PX_PHOENIX_HBASE_PROFILE,
+  PX_DIST_HBASE_VERSION, PX_DIST_HADOOP_VERSION and PX_<ROLE>_JDK. For each
+  set it runs scripts/build-phoenix.sh and scripts/stage-artifacts.sh,
+  brings the cluster up, runs px-suite and brings the cluster down. A set
+  reads its FILE before each --config FILE of this command. A set that fails
+  does not stop the next one.
+  Writes one row per set: set, file, profile, HBase, Hadoop, JDKs, session,
+  last step and exit code. The rows are also in $PX_OUT/matrix/<id>/matrix.tsv,
+  and the session record of each set names its version set.
+  Exit 0 when every set passed, else the exit code of the first set that did
+  not, 2 usage, 6 no such FILE.
+EOF
+    ;;
   *) usage ;;
   esac
 }
 
-## @description  Logs a subcommand usage error, displays that subcommand's help text, and exits.
-## @param        subcommand, message...
+## @description  Reports a usage error for a specific subcommand, prints its usage text, and
+##               terminates the process.
 ## @return       Writes the error and usage text to stderr and exits with 2.
 pc_sub_usage_error() {
   local sub=$1
@@ -274,9 +330,8 @@ pc_sub_usage_error() {
   exit "$PX_EXIT_USAGE"
 }
 
-## @description  Checks whether a given token is a recognized subcommand of this utility.
-## @param        word
-## @return       Returns 0 if the word is a valid subcommand, or 1 otherwise.
+## @description  Checks whether a given word is a recognized subcommand of this utility.
+## @return       Exits with 0 when the word is a valid subcommand, or 1 otherwise.
 pc_is_subcommand() {
   local name
   for name in $PC_SUBCOMMANDS; do
@@ -287,23 +342,52 @@ pc_is_subcommand() {
   return 1
 }
 
-# Consumes all remaining tokens after a -- delimiter, where no further options are parsed, and
-# appends them as positional arguments to the caller's args array.
-## @description  Collects all remaining words after -- as positional arguments for the caller.
-## @param        word...
-## @return       Appends the arguments to the caller's args array and returns 0.
-pc_rest() {
+# Parses subcommand options (name, spec, argument...) into local variables in the caller's scope and
+# collects remaining positional arguments into PC_ARGS. Each specification token takes the form
+# --opt=var for value options or --flag=var=value for boolean flags.
+## @description  Parses subcommand options into caller local variables and positional words into
+##               PC_ARGS.
+## @return       Exits with 0, or exits with 2 on an unknown option or a missing option value.
+pc_opts() {
+  local _sub=$1 _spec=$2 _word _rest _found
+  shift 2
+  PC_ARGS=()
   while [ $# -gt 0 ]; do
-    args+=("$1")
+    case "$1" in
+    --)
+      shift
+      PC_ARGS+=("$@")
+      break
+      ;;
+    -*)
+      _found=0
+      for _word in $_spec; do
+        [ "${_word%%=*}" = "$1" ] || continue
+        _found=1
+        _rest=${_word#*=}
+        case "$_rest" in
+        *=*) printf -v "${_rest%%=*}" '%s' "${_rest#*=}" ;;
+        *)
+          [ $# -ge 2 ] || pc_sub_usage_error "$_sub" "$1 needs a value"
+          printf -v "$_rest" '%s' "$2"
+          shift
+          ;;
+        esac
+        break
+      done
+      [ "$_found" = 1 ] || pc_sub_usage_error "$_sub" "unknown option $1"
+      ;;
+    *) PC_ARGS+=("$1") ;;
+    esac
     shift
   done
 }
 
 # Validates that an operator-supplied role, group, port, or signal name is a plain token. Enforcing
 # a narrow grammar keeps any identifier that reaches a label or a file path predictable.
-## @description  Verifies that an operator-supplied identifier is a well-formed plain token.
-## @param        label, value
-## @return       Returns 0 when valid, or exits with 2 on an empty or malformed value.
+## @description  Verifies that an operator-supplied role, group, port, or signal name is a plain
+##               token.
+## @return       Exits with 0 when valid, or exits with 2 on an empty or malformed value.
 pc_require_name() {
   local label=$1 value=${2:-}
   if [ -z "$value" ]; then
@@ -314,23 +398,26 @@ pc_require_name() {
   fi
 }
 
-# Verifies that an instance index is a non-negative integer; the backend itself determines whether
-# the indexed instance exists and returns exit code 6 if it does not.
+# Verifies that an instance index is a whole number; the backend determines whether the instance
+# actually exists and returns exit code 6 when it does not.
 ## @description  Validates that an instance index is a whole number.
-## @param        value
-## @return       Returns 0 if the value is a whole number, or exits with 2 on any other input.
+## @return       Exits with 0 if valid, or exits with 2 on any other value.
 pc_require_index() {
   if ! [[ ${1:-} =~ $PX_RE_INT ]]; then
     px_die "$PX_EXIT_USAGE" "an instance index is a whole number, got '${1:-}'"
   fi
 }
 
-# Resolves a timeout duration in whole seconds by selecting a command-line override first, then the
-# named configuration variable, and finally PX_TIMEOUT_DEFAULT so the command remains usable even
-# when no environment file is loaded.
-## @description  Resolves a timeout value in whole seconds from CLI, config, or PX_TIMEOUT_DEFAULT.
-## @param        configuration name; command line value (may be empty)
-## @return       Writes the seconds to stdout and returns 0, or exits with 2 if not a whole number.
+## @description  Validates both the role name and the numeric index identifying a single instance.
+## @return       Exits with 0 when valid, or exits with 2 on a malformed role name or index.
+pc_require_instance() {
+  pc_require_name role "$1"
+  pc_require_index "$2"
+}
+
+## @description  Resolves a timeout duration in whole seconds.
+## @return       Writes the resolved seconds to stdout and exits with 0, or exits with 2 when the
+##               value is not a whole number.
 pc_timeout() {
   local name=$1 value=${2:-}
   if [ -z "$value" ]; then
@@ -345,118 +432,34 @@ pc_timeout() {
   printf '%s\n' "$value"
 }
 
-# Parses a single tab-separated row into the PC_ROW_FIELDS array using explicit delimiter matching
-# rather than shell word splitting, which would collapse consecutive tabs and lose empty columns.
-## @description  Splits one TSV row into PC_ROW_FIELDS while preserving empty column positions.
-## @param        row
-## @return       Populates PC_ROW_FIELDS and returns 0.
-pc_row_split() {
-  local row=${1:-} field
-  PC_ROW_FIELDS=()
-  while :; do
-    case "$row" in
-    *"$PX_TAB"*)
-      field=${row%%"$PX_TAB"*}
-      row=${row#*"$PX_TAB"}
-      ;;
-    *)
-      PC_ROW_FIELDS+=("$row")
-      return 0
-      ;;
-    esac
-    PC_ROW_FIELDS+=("$field")
-  done
-}
-
-# Formats tab-separated rows as a column-aligned table using the field names defined by a contract
-# schema as the header, avoiding any hardcoded column names or column indices in this command.
-## @description  Formats TSV input rows as a column-aligned table under a contract schema header.
-## @param        schema name; rows on stdin
-## @return       Writes the table to stdout and returns 0, or exits with 1 on an unknown schema.
+# Formats tab-separated rows from stdin as a column-aligned table headed by the field names of a
+# contract schema so that this file never hardcodes column names or column numbers.
+## @description  Formats TSV rows from stdin as a column-aligned table under a contract schema.
+## @return       Writes the formatted table to stdout and exits with 0, or exits with 1 on an
+##               unknown schema.
 pc_table() {
-  local schema=${1:-} fields field rows row count=0 index value out
-  local widths=()
-  fields="$(sb_schema_fields "$schema")" ||
-    px_die "$PX_EXIT_FAIL" "no such contract schema: $schema"
-  rows="$(cat)"
-  for field in $fields; do
-    count=$((count + 1))
-    widths[count]=${#field}
-  done
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    pc_row_split "$row"
-    index=0
-    while [ "$index" -lt "${#PC_ROW_FIELDS[@]}" ] && [ "$index" -lt "$count" ]; do
-      value=${PC_ROW_FIELDS[index]}
-      if [ "${#value}" -gt "${widths[index + 1]}" ]; then
-        widths[index + 1]=${#value}
-      fi
-      index=$((index + 1))
-    done
-  done <<EOF
-$rows
-EOF
-  # Omit right-padding on the final column so rendered lines never contain trailing spaces.
-  out=""
-  index=0
-  for field in $fields; do
-    index=$((index + 1))
-    if [ "$index" = "$count" ]; then
-      out="$out$field"
-    else
-      out="$out$(printf '%-*s  ' "${widths[index]}" "$field")"
-    fi
-  done
-  printf '%s\n' "$out"
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    pc_row_split "$row"
-    out=""
-    index=1
-    while [ "$index" -le "$count" ]; do
-      value=""
-      if [ "$index" -le "${#PC_ROW_FIELDS[@]}" ]; then
-        value=${PC_ROW_FIELDS[index - 1]}
-      fi
-      if [ "$index" = "$count" ]; then
-        out="$out$value"
-      else
-        out="$out$(printf '%-*s  ' "${widths[index]}" "$value")"
-      fi
-      index=$((index + 1))
-    done
-    printf '%s\n' "$out"
-  done <<EOF
-$rows
-EOF
+  local fields
+  fields="$(sb_schema_fields "${1:-}")" ||
+    px_die "$PX_EXIT_FAIL" "no such contract schema: ${1:-}"
+  # Explicit tab splitting via split preserves empty columns in their positional slots, and omitting
+  # right-padding on the final column ensures that no rendered line ends with trailing whitespace.
+  awk -F '\t' -v head="$fields" '
+    function row(a, i, s) {
+      for (i = 1; i < n; i++) s = s sprintf("%-" w[i] "s  ", a[i])
+      print s a[n]
+    }
+    BEGIN { n = split(head, h, " "); for (i = 1; i <= n; i++) w[i] = length(h[i]) }
+    $0 != "" {
+      r[++m] = $0
+      for (i = 1; i <= n && i <= NF; i++) if (length($i) > w[i]) w[i] = length($i)
+    }
+    END { row(h); for (j = 1; j <= m; j++) { split(r[j], f, "\t"); row(f) } }
+  '
 }
 
-# Resolves the active scope identifier for the target cluster, terminating the process when the
-# cluster is not running. Every subcommand that acts on cluster instances relies on this lookup.
-## @description  Outputs the active scope id, or terminates when the cluster has no recorded scope.
-## @return       Writes the scope id to stdout and exits 0; exits 6 if unrecorded, or with the
-##               sb_scope_resolve status (2 on a refused state directory, 1 if creation fails).
-pc_scope_require() {
-  local id status=0
-  id="$(sb_scope_resolve)" || status=$?
-  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" \
-      "no scope recorded for cluster $PX_CLUSTER_ID." \
-      "Run px-cluster up, or name the scope in PX_SCOPE_ID."
-  fi
-  if [ "$status" != 0 ]; then
-    px_die "$status" "cannot read the scope record of cluster $PX_CLUSTER_ID"
-  fi
-  printf '%s\n' "$id"
-}
-
-# Persists the backend-assigned scope identifier for a newly provisioned cluster to the contract's
-# scope record file, propagating the sb_scope_record status (2 on a refused state directory, or 1
-# when the directory or record file cannot be created or written).
-## @description  Persists the scope identifier of a newly created cluster to the state record.
-## @param        scope id
-## @return       Returns 0, or exits with 1 on write failure or the sb_scope_record status (2 or 1).
+## @description  Persists the scope identifier of the cluster created by this command.
+## @return       Exits with 0, or exits with 1 when the record cannot be written, or with the
+##               sb_scope_record status (2 on a refused state directory, 1 when it cannot be made).
 pc_scope_save() {
   local file status=0
   file="$(sb_scope_record)" || status=$?
@@ -468,10 +471,10 @@ pc_scope_save() {
   px_debug "recorded scope $1 in $file"
 }
 
-# Deletes the persisted scope record file once the underlying backend scope has been destroyed,
-# ensuring subsequent subcommands report no such object rather than targeting a stale identifier.
-## @description  Removes the recorded scope file after the cluster scope has been deleted.
-## @return       Returns 0.
+# Deletes the persisted scope record once the underlying scope has been removed so subsequent
+# subcommands report no such object rather than acting on an identifier that no longer exists.
+## @description  Removes the persisted scope record after the cluster scope has been destroyed.
+## @return       Exits with 0.
 pc_scope_forget() {
   local file status=0
   file="$(sb_scope_record)" || status=$?
@@ -479,14 +482,207 @@ pc_scope_forget() {
     return 0
   fi
   rm -f "$file" || px_debug "cannot remove $file"
+  pc_record_forget
+  file="$(sb_deployment_record)" || return 0
+  rm -f "$file" || px_debug "cannot remove $file"
 }
 
-# Appends an intended fault-injection or lifecycle mutation to the planned-action log before the
-# operation executes. If the record cannot be written, the action is aborted immediately so that
-# px-run never misinterprets its side effects as an unplanned cluster anomaly.
-## @description  Records an operator action in the planned-action log before execution or aborts.
-## @param        scope id, action, role (optional), index (optional), detail (optional)
-## @return       Returns 0, or exits with the failure status of sb_planned_record (2 or 1).
+# Emits every setting taken from the command line, a --config file, or the target file as a
+# flattened NAME='VALUE' entry that the configuration loader reads back byte for byte. PX_BACKEND
+# and PX_RUN_CLASS are always included so that subsequent commands resolve the same backend and run
+# class.
+## @description  Emits the flattened settings for this command as one NAME='VALUE' row per variable.
+## @return       Writes the rows to stdout and exits with 0, or exits with 1 if any value contains
+##               a newline.
+pc_record_rows() {
+  local name origin value rows=""
+  while IFS="$PX_TAB" read -r name origin; do
+    [ -n "$name" ] || continue
+    case " $PX_CONFIG_RECORD_SKIP " in
+    *" $name "*) continue ;;
+    esac
+    value=${!name:-}
+    case "$name" in
+    PX_BACKEND | PX_RUN_CLASS) [ -n "$value" ] || continue ;;
+    *)
+      if [ "$origin" != cli ] && [ "$origin" != target ] &&
+        ! px_word_at "$origin" ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; then
+        continue
+      fi
+      ;;
+    esac
+    case "$value" in
+    *"$PX_NL"*) px_die "$PX_EXIT_FAIL" "$name holds a newline, which the record cannot hold" ;;
+    esac
+    rows="$rows$name='$value'$PX_NL"
+  done <<EOF
+$PX_CONFIG_ORIGINS
+EOF
+  printf '%s' "$rows"
+}
+
+## @description  Deduplicates NAME='VALUE' rows from stdin so that the last entry for each name
+##               wins while filtering out any variable listed in PX_CONFIG_RECORD_SKIP.
+## @return       Writes the merged rows sorted by variable name to stdout and exits with 0.
+pc_rows_merge() {
+  awk -v skip=" $PX_CONFIG_RECORD_SKIP " 'NF { n = substr($0, 1, index($0, "=") - 1) }
+    NF && index(skip, " " n " ") == 0 { row[n] = $0 } END { for (n in row) print row[n] }' |
+    LC_ALL=C sort
+}
+
+# When bringing up a cluster from a pre-rendered directory, the render settings from render.env in
+# that directory are merged into the cluster record, with the bring-up command's settings taking
+# precedence.
+## @description  Persists the cluster record for a bring-up from a deployment directory (dir).
+## @return       Exits with 0, or exits with 1 if a value contains a newline or the record cannot
+##               be written.
+pc_record_save() {
+  local file=$PX_CONFIG_RECORD rows
+  [ -n "$file" ] || px_die "$PX_EXIT_FAIL" "cluster $PX_CLUSTER_ID has no place for its record"
+  rows="$(pc_record_rows)" || exit $?
+  if ! {
+    printf '# cluster %s, brought up by px-cluster up at %s\n' "$PX_CLUSTER_ID" "$(px_timestamp)"
+    { grep -v '^#' "$1/render.env" 2>/dev/null || true; printf '%s\n' "$rows"; } | pc_rows_merge
+  } >"$file.tmp" || ! mv -f "$file.tmp" "$file"; then
+    px_die "$PX_EXIT_FAIL" "cannot write the cluster record $file"
+  fi
+  px_debug "recorded the configuration of cluster $PX_CLUSTER_ID in $file"
+}
+
+# Records the effective render settings in render.env inside the deployment directory (dir), with
+# each positional NAME=VALUE argument overriding the value of NAME. A subsequent bring-up from that
+# directory merges render.env into the cluster record so that later scale operations re-render with
+# the original render settings.
+## @description  Writes the effective render settings (dir, NAME=VALUE...) to render.env.
+## @return       Exits with 0, or exits with 1 if a value contains a newline or the file cannot be
+##               written.
+pc_render_record() {
+  local dir=$1 rows pair
+  shift
+  rows="$(pc_record_rows)" || exit $?
+  rows="$rows$PX_NL"
+  for pair in "$@"; do
+    rows="$rows${pair%%=*}='${pair#*=}'$PX_NL"
+  done
+  if ! {
+    printf '# the settings of the render at %s\n' "$(px_timestamp)"
+    printf '%s' "$rows" | pc_rows_merge
+  } >"$dir/render.env"; then
+    px_die "$PX_EXIT_FAIL" "cannot write $dir/render.env"
+  fi
+}
+
+## @description  Deletes the cluster record file, logging an INFO line prefixed with the supplied
+##               message (message) or a DEBUG line when no message is provided.
+## @return       Exits with 0.
+pc_record_forget() {
+  [ -n "$PX_CONFIG_RECORD" ] && [ -f "$PX_CONFIG_RECORD" ] || return 0
+  rm -f "$PX_CONFIG_RECORD" || px_debug "cannot remove $PX_CONFIG_RECORD"
+  if [ -n "${1:-}" ]; then
+    px_info "$1 $PX_CONFIG_RECORD"
+  else
+    px_debug "removed the cluster record $PX_CONFIG_RECORD"
+  fi
+}
+
+## @description  Updates the value of a single variable (file, name, value) in a cluster record or
+##               render.env file.
+## @return       Exits with 0, returns 6 if the file does not exist, or returns 1 on a write error.
+pc_record_set() {
+  local file=$1
+  [ -n "$file" ] && [ -f "$file" ] || return "$PX_EXIT_NO_OBJECT"
+  if ! {
+    sed -n 1p "$file"
+    {
+      awk -v n="$2=" 'NR > 1 && index($0, n) != 1' "$file"
+      printf "%s='%s'\n" "$2" "$3"
+    } | LC_ALL=C sort
+  } >"$file.tmp" || ! mv -f "$file.tmp" "$file"; then
+    return "$PX_EXIT_FAIL"
+  fi
+}
+
+## @description  Persists the deployment directory of the newly created cluster so the memory check
+##               can sum its resource requirements before a subsequent group start.
+## @return       Exits with 0, or exits with 1 on a write failure or 2 on a refused state directory.
+pc_deployment_save() {
+  local file status=0
+  file="$(sb_deployment_record)" || status=$?
+  if [ "$status" != 0 ]; then
+    px_die "$status" "cannot place the deployment record of cluster $PX_CLUSTER_ID"
+  fi
+  printf '%s\n' "$1" >"$file" ||
+    px_die "$PX_EXIT_FAIL" "cannot write the deployment record $file"
+}
+
+## @description  Renders the deployment directory for the run class through the backend generator.
+## @return       Writes the directory path to stdout; exits 0, 1 if the directory cannot be written,
+##               2 on usage or an invalid value, or 6 on an absent --config file.
+pc_render() { "$PX_HOME/$PX_DEPLOY_SUBDIR/compose.gen.sh" "$@"; }
+
+# Prevents rendering (generator option...) into the recorded deployment directory of a running
+# cluster because rendering overwrites the files in that directory.
+## @description  Refuses a render targeting the recorded deployment directory of an active cluster.
+## @return       Exits with 0, or exits with 2 on a refusal, or 2 or 1 when the state directory is
+##               refused.
+pc_render_guard() {
+  local out="deploy/$PX_CLUSTER_ID" file dir="" target
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --check) return 0 ;;
+    --out) [ $# -lt 2 ] || out=$2 ;;
+    esac
+    shift
+  done
+  ! px_is_dry_run || return 0
+  file="$(sb_deployment_record)" || exit $?
+  [ -f "$file" ] || return 0
+  IFS= read -r dir <"$file" || true
+  target="$(px_out_resolve "$out" 2>/dev/null)" || return 0
+  if [ -n "$dir" ] && [ "$target" = "$dir" ]; then
+    px_die "$PX_EXIT_USAGE" "cluster $PX_CLUSTER_ID is up from $dir, and a render replaces" \
+      "its files: run px-cluster down first, or render into another directory with --out"
+  fi
+}
+
+# Executes the host preflight check (verifying container engine health, port availability, and total
+# memory capacity) against a rendered deployment directory.
+## @description  Runs the host preflight checks (engine, ports, memory sum) against a deployment.
+## @return       Exits 0 when the host can hold the deployment, or exits with the preflight status:
+##               1 when a figure cannot be measured, 2 on usage, 3 when refused, or 4 on expiration.
+pc_preflight() {
+  local status=0
+  # Export private configuration variables so the child process sees the container engine bound by
+  # this process.
+  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$PX_HOME/scripts/preflight.sh" \
+    --deployment "$1" >&2 || status=$?
+  case "$status" in
+  0) return 0 ;;
+  124 | 137) px_die "$PX_EXIT_TIMEOUT" "the preflight expired after ${PX_TIMEOUT_DEFAULT:-300}s" ;;
+  esac
+  px_die "$status" "the preflight refused the deployment $1, so no instance is created"
+}
+
+## @description  Halts cluster bring-up when the host lacks an image required by the deployment dir.
+## @return       Exits with 0, or exits with 2 reporting the commands that build the image, or with
+##               the sb_image_present status when the container engine does not respond.
+pc_image_check() {
+  local rows status=0 missing
+  rows="$(sb_call sb_image_present "$1")" || status=$?
+  case "$status" in
+  0) return 0 ;;
+  6) ;;
+  *) px_die "$status" "cannot ask the engine for the images that $1 names" ;;
+  esac
+  missing="$(printf '%s\n' "$rows" | awk -F '\t' '$2 == "" { print $1; exit }')"
+  px_die "$PX_EXIT_USAGE" "the host holds no image $missing, which $1 names, so no" \
+    "instance is created. Build it with the configuration of the render:" \
+    "$PX_HOME/scripts/build-phoenix.sh, then" \
+    "$PX_HOME/scripts/stage-artifacts.sh --tag $missing"
+}
+
+## @description  Records an operator action in the planned-action log or terminates the process.
+## @return       Exits with 0, or exits with the failure status of sb_planned_record (2 or 1).
 pc_planned() {
   local status=0
   sb_planned_record "$@" || status=$?
@@ -495,23 +691,10 @@ pc_planned() {
   fi
 }
 
-# Logs a substrate contract call that would be executed during a mutating subcommand without
-# performing any state change, serving as the stopping point for dry-run execution.
-## @description  Logs a planned contract invocation during a dry run without modifying state.
-## @param        message...
-## @return       Writes the dry-run notice to stderr and returns 0.
-pc_plan() { px_info "dry run, not called: $*"; }
-
 ## @description  Appends a validation check row for the validate subcommand and tallies failures.
-## @param        check name, status (ok, fail, or warn), detail
-## @return       Returns 0.
+## @return       Exits with 0.
 pc_check() {
   local row
-  # Reject any status outside the contract vocabulary immediately so downstream consumers that
-  # branch on check status values never encounter an unrecognized token.
-  if ! sb_valid_value check_status "${2:-}"; then
-    px_die "$PX_EXIT_FAIL" "check status '${2:-}' is not ok, fail or warn"
-  fi
   row="$(px_tsv_row "$1" "$2" "$(px_tsv_clean "${3:-}")")" || return 0
   PC_CHECKS="$PC_CHECKS$row$PX_NL"
   if [ "$2" = fail ]; then
@@ -519,12 +702,9 @@ pc_check() {
   fi
 }
 
-# Tears down all instances within a cluster scope by first releasing any active discovered
-# endpoints, then stopping and removing the instances, and finally deleting both the backend scope
-# and its local record file unless keep is set to 1.
-## @description  Tears down all instances in a scope and deletes the scope unless keep is 1.
-## @param        scope id, keep (1 retains data and the scope)
-## @return       Returns 0, or the backend status if instance teardown or scope removal fails.
+## @description  Tears down and removes every instance belonging to a single cluster scope.
+## @return       Exits with 0, or returns the backend status when instance teardown or scope removal
+##               fails.
 pc_teardown() {
   local scope=$1 keep=$2 status=0
   # Discovered endpoints may hold background port-forwarding processes; release them before
@@ -551,13 +731,9 @@ pc_teardown() {
   fi
 }
 
-# Enforces the cleanup policy after an unsuccessful cluster startup. By default, the partially
-# provisioned cluster is torn down immediately; setting PX_TEARDOWN=0 or PX_KEEP preserves the
-# cluster in place for diagnostic inspection. Any teardown failure is logged as a warning so the
-# caller can still return the original startup failure status.
-## @description  Applies the failure teardown policy when cluster provisioning or readiness fails.
-## @param        scope id
-## @return       Returns 0, logging a warning if teardown fails so the start status is preserved.
+## @description  Applies the failure teardown policy when cluster bring-up does not succeed.
+## @return       Exits with 0, emitting a warning if teardown fails so the caller still reports the
+##               status of the failed start.
 pc_up_failed() {
   local scope=$1 status=0
   if px_is_keep || ! px_is_true "${PX_TEARDOWN:-1}"; then
@@ -571,41 +747,51 @@ pc_up_failed() {
   fi
 }
 
-# Provisions a cluster from a rendered deployment directory and optionally waits for all instances
-# to reach readiness. Because the deployment directory is the sole interface between configuration
-# generators and the substrate backend, this subcommand accepts any rendered directory. If startup
-# or readiness fails, the cluster is torn down unless the teardown policy retains it.
-## @description  Provisions a rendered deployment directory and waits for cluster readiness.
-## @param        argument...
-## @return       Exits 0, 1 provision fail, 2 usage/no dir, 3 instance terminated, or 4 timeout.
+## @description  Emits the dry-run execution plan rows for bringing up a deployment directory (dir,
+##               provision bound, readiness bound).
+## @return       Writes the plan rows to stdout and exits with 0.
+pc_up_plan() {
+  local script
+  script="$(px_preflight_script 2>/dev/null)" || script=none
+  px_plan image sb_image_present "$1"
+  px_plan preflight "$script" --deployment "$1"
+  px_plan scope sb_scope_create "$PX_CLUSTER_ID"
+  px_plan provision sb_provision "<scope>" "$1" "$2"
+  [ "$PC_WAIT" = 0 ] || px_plan ready sb_wait_ready "<scope>" "$3"
+}
+
+## @description  Provisions a cluster from a rendered deployment directory and waits for readiness.
+## @return       Exits 0, 1 if provisioning fails, 2 on usage or a missing deployment directory, 3
+##               if an instance terminates, or 4 on a timeout.
 pc_up() {
-  local dir="" timeout="" ready="" wait=1 scope rows status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error up "--timeout needs a value"
-      timeout=$2
-      shift
-      ;;
-    --ready-timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error up "--ready-timeout needs a value"
-      ready=$2
-      shift
-      ;;
-    --no-wait) wait=0 ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error up "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -le 1 ] || pc_sub_usage_error up "one deployment directory, got: $*"
+  local dir timeout ready scope rows file status=0
   dir=${1:-${PX_DEPLOYMENT_DIR:-}}
-  if [ -z "$dir" ]; then
-    pc_sub_usage_error up \
-      "name a rendered deployment directory, or set PX_DEPLOYMENT_DIR"
+  if [ -z "$dir" ] && [ -z "${PX_RUN_CLASS:-}" ]; then
+    px_die "$PX_EXIT_USAGE" "name a rendered deployment directory, set PX_DEPLOYMENT_DIR, or" \
+      "name a run class to render one"
+  fi
+  timeout="$(pc_timeout PX_TIMEOUT_PROVISION "")" || exit $?
+  ready="$(pc_timeout PX_TIMEOUT_READY "$PC_TIMEOUT")" || exit $?
+  # Reject the bring-up before rendering whenever the cluster is already recorded, because rendering
+  # overwrites the files in its target directory. When PX_FORCE=1 authorizes replacing a stale
+  # record, remove it first so that none of its persisted values leak into the new render.
+  if ! px_is_dry_run; then
+    pc_up_gate pc_check_record
+    pc_record_forget "PX_FORCE=1 removes the stale record"
+  fi
+  # When a run class is specified without a deployment directory, render the deployment first to
+  # support one-command bring-up where a run class and a topology file select every configuration
+  # value. In dry-run mode, the deployment is rendered into a temporary scratch directory that the
+  # exit hook removes upon termination.
+  if [ -z "$dir" ] && px_is_dry_run; then
+    px_plan render "$(pc_generator)" --class "$PX_RUN_CLASS" --cluster "$PX_CLUSTER_ID"
+    PC_PLAN_DIR="$(px_run_dir plan)" || exit $?
+    dir="$(pc_render -e PX_DRY_RUN=0 --out "$PC_PLAN_DIR")" ||
+      px_die "$?" "the render of the $PX_RUN_CLASS deployment failed"
+  elif [ -z "$dir" ]; then
+    dir="$(pc_render)" || exit $?
+    pc_render_record "$dir"
+    px_info "rendered the $PX_RUN_CLASS deployment of cluster $PX_CLUSTER_ID into $dir"
   fi
   [ -d "$dir" ] || px_die "$PX_EXIT_USAGE" "no such deployment directory: $dir"
   dir="$(px_realpath "$dir")" ||
@@ -613,23 +799,23 @@ pc_up() {
   # The configuration loader only reads the port map from PX_DEPLOYMENT_DIR automatically; when a
   # deployment directory is supplied as a positional argument, load its port map explicitly here.
   px_config_load_ports "$dir"
-  timeout="$(pc_timeout PX_TIMEOUT_PROVISION "$timeout")" || exit $?
-  ready="$(pc_timeout PX_TIMEOUT_READY "$ready")" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
   if px_is_dry_run; then
-    pc_plan "sb_scope_create $PX_CLUSTER_ID"
-    pc_plan "sb_provision <scope> $dir $timeout"
-    if [ "$wait" = 1 ]; then
-      pc_plan "sb_wait_ready <scope> $ready"
-    fi
+    pc_up_plan "$dir" "$timeout" "$ready"
     return 0
   fi
+  # Verify required container images before running host preflight checks: no preflight check can
+  # compensate for a missing image, and rejecting a deployment that exceeds host capacity before
+  # creating any instances is far cheaper than letting the container engine thrash.
+  pc_image_check "$dir"
+  pc_preflight "$dir"
   scope="$(sb_call sb_scope_create "$PX_CLUSTER_ID")" || status=$?
   if [ "$status" != 0 ]; then
     px_die "$status" "cannot create a scope for cluster $PX_CLUSTER_ID." \
       "A cluster of that name may be up already: run px-cluster down."
   fi
   pc_scope_save "$scope"
+  pc_deployment_save "$dir"
+  pc_record_save "$dir"
   px_info "provisioning cluster $PX_CLUSTER_ID in scope $scope from $dir"
   rows="$(sb_call sb_provision "$scope" "$dir" "$timeout")" || status=$?
   pc_table instance <<EOF
@@ -681,38 +867,35 @@ pc_collect_stop() {
   px_is_dry_run || rm -f "$record"
 }
 
-# Destroys all instances belonging to the cluster and deletes the enclosing scope so no orphaned
-# resources survive a test run. Passing --keep retains the data and scope for diagnostic analysis;
-# because the operator explicitly requested teardown, PX_TEARDOWN is ignored here.
-## @description  Tears down all cluster instances and removes the scope unless --keep is specified.
-## @param        argument...
-## @return       Exits 0 on success, 1 if leftovers remain, 2 on usage, or 6 if no scope exists.
+# Teardown is idempotent: if no scope is recorded for the cluster, down exits with 0, and any stale
+# cluster record left behind without a corresponding scope record is cleaned up as well.
+## @description  Removes all cluster instances and deletes the enclosing scope so no orphaned state
+##               survives a run, or retains the data and scope for diagnostic inspection on --keep.
+## @return       Exits 0 (including when nothing is recorded), 1 if resources remain, or 2 on usage.
 pc_down() {
-  local keep=0 scope
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --keep) keep=1 ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error down "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -eq 0 ] || pc_sub_usage_error down "unexpected argument: $*"
+  local keep=0 scope status=0
   if px_is_keep; then
     keep=1
   fi
   pc_label_check "$keep"
   pc_collect_stop
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
-  if px_is_dry_run; then
-    pc_plan "sb_teardown $scope $keep"
-    if [ "$keep" = 0 ]; then
-      pc_plan "sb_scope_delete $scope"
+  scope="$(sb_scope_resolve || exit "$?")" || status=$?
+  case "$status" in
+  0) ;;
+  "$PX_EXIT_NO_OBJECT")
+    if [ "$keep" = 0 ] && ! px_is_dry_run; then
+      pc_record_forget "removed the record of a cluster that has no scope,"
     fi
+    px_info "no cluster $PX_CLUSTER_ID is recorded"
+    pc_down_label
+    return 0
+    ;;
+  *) px_die "$status" "cannot read the scope record of cluster $PX_CLUSTER_ID" ;;
+  esac
+  if px_is_dry_run; then
+    px_plan teardown sb_teardown "$scope" "$keep"
+    [ "$keep" = 1 ] || px_plan delete sb_scope_delete "$scope"
+    pc_down_label
     return 0
   fi
   pc_teardown "$scope" "$keep" || exit $?
@@ -721,31 +904,17 @@ pc_down() {
   fi
 }
 
-# Displays the current instance inventory and the status of any explicitly requested role groups.
-# Because group definitions originate in the rendered deployment rather than the substrate contract,
-# the operator specifies which group names to query.
-## @description  Reports the cluster instance inventory and the state of any requested role groups.
-## @param        argument...
-## @return       Exits 0, 2 on usage, or 6 when the role, index, group, or scope does not exist.
+# Displays the cluster instance inventory along with the state of any requested role groups. Because
+# group names are defined by the rendered deployment, the operator explicitly names each group to
+# inspect.
+## @description  Reports the instance inventory and the state of each named role group.
+## @return       Exits 0, 2 on usage, or 6 when the specified role, index, group, or scope does not
+##               exist.
 pc_status() {
-  local groups="" group role="" index="" scope rows grows="" row status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --group)
-      [ $# -ge 2 ] || pc_sub_usage_error status "--group needs a name"
-      pc_require_name "group" "$2"
-      groups="$groups$2$PX_NL"
-      shift
-      ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error status "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
+  local group role="" index="" scope rows grows="" row status=0
+  for group in ${PC_GROUPS[@]+"${PC_GROUPS[@]}"}; do
+    pc_require_name "group" "$group"
   done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -le 2 ] || pc_sub_usage_error status "unexpected argument: $*"
   role=${1:-}
   index=${2:-}
   if [ -n "$role" ]; then
@@ -754,8 +923,7 @@ pc_status() {
   if [ -n "$index" ]; then
     pc_require_index "$index"
   fi
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
+  scope="$(sb_scope_require)" || exit $?
   if [ -n "$index" ]; then
     rows="$(sb_call sb_list "$scope" "$role" "$index")" || status=$?
   elif [ -n "$role" ]; then
@@ -785,36 +953,16 @@ EOF
   exit "$status"
 }
 
-# Blocks under a finite timeout until every instance in the scope or in the named roles reports
-# ready. Exits 0 when all selected instances are ready, 1 if the container runtime does not respond,
-# 2 on usage errors, 3 if an instance terminates, 4 on timeout, or 6 if the scope is missing or no
-# instance matches the role selection.
 ## @description  Waits for readiness across the entire cluster scope or the specified roles.
-## @param        argument...
-## @return       Exits 0 ready, 1 runtime fail, 2 usage, 3 terminated, 4 timeout, 6 no scope/match.
+## @return       Exits 0 when all are ready, 1 if the runtime did not answer, 2 on usage, 3 if an
+##               instance terminated, 4 on a timeout, or 6 on a missing scope or empty role match.
 pc_ready() {
-  local timeout="" scope rows role status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error ready "--timeout needs a value"
-      timeout=$2
-      shift
-      ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error ready "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  local timeout scope rows role status=0
   for role in "$@"; do
     pc_require_name "role" "$role"
   done
-  timeout="$(pc_timeout PX_TIMEOUT_READY "$timeout")" || exit $?
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
+  timeout="$(pc_timeout PX_TIMEOUT_READY "$PC_TIMEOUT")" || exit $?
+  scope="$(sb_scope_require)" || exit $?
   rows="$(sb_call sb_wait_ready "$scope" "$timeout" "$@")" || status=$?
   pc_table ready <<EOF
 $rows
@@ -825,38 +973,34 @@ EOF
   exit "$status"
 }
 
-# Emits every resolved configuration variable alongside the precedence stage that defined it so
-# operators can diagnose override surprises. This subcommand neither loads a backend nor invokes
-# any external runtime, allowing the self-test suite to verify the runtime boundary by asserting an
-# empty runtime invocation log.
-## @description  Dumps all resolved configuration values and their originating precedence stages.
-## @param        argument...
-## @return       Writes TSV rows to stdout and exits 0, or exits 2 on a usage error.
+# Each PATTERN is a shell glob supporting * and ? wildcards on the variable name, which the filter
+# translates into an anchored regular expression. Supplying multiple patterns selects the union of
+# all matching variable names.
+## @description  Reports every resolved configuration value, or those matching any supplied glob
+##               pattern (pattern...), alongside the precedence stage that defined it.
+## @return       Writes the resolved TSV rows to stdout and exits 0, or exits 6 if no name matches.
 pc_config() {
-  [ $# -eq 0 ] || pc_sub_usage_error config "unexpected argument: $*"
-  px_config_dump
+  local rows status=0
+  if [ $# -eq 0 ]; then
+    px_config_dump
+    return 0
+  fi
+  rows="$(px_config_dump | PC_PATTERNS="$*" awk -F '\t' "$(px_awk_glob)"'
+    BEGIN { n = split(ENVIRON["PC_PATTERNS"], w, " "); for (i = 1; i <= n; i++) re[i] = glob(w[i]) }
+    { for (i = 1; i <= n; i++) if ($1 ~ re[i]) { print; m = 1; next } }
+    END { exit !m }')" || status=$?
+  [ "$status" = 0 ] || px_die "$PX_EXIT_NO_OBJECT" "no configuration value matches $*"
+  printf '%s\n' "$rows"
 }
 
-# Validates configuration settings, output directory policy, and substrate backend readiness prior
-# to provisioning. When invoked with --no-backend, it skips all backend calls so configuration
-# validation can run on hosts without an installed container engine.
-## @description  Validates configuration, output policy, and optional backend preflight checks.
-## @param        argument...
-## @return       Writes check rows to stdout; exits 0 if all pass, 1 if any fails, or 2 on usage.
+## @description  Validates the configuration, output policy, and backend before provisioning.
+## @return       Writes check rows to stdout; exits 0 when no check fails, 1 when any check fails,
+##               or 2 on a usage error.
 pc_validate() {
   local no_backend=0 dir="" name root undeclared="" scope="" rows bad=0
   local backend file status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --no-backend) no_backend=1 ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error validate "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  pc_opts validate "--no-backend=no_backend=1" "$@"
+  set -- ${PC_ARGS[@]+"${PC_ARGS[@]}"}
   [ $# -le 1 ] || pc_sub_usage_error validate "one directory, got: $*"
   dir=${1:-${PX_DEPLOYMENT_DIR:-}}
   root="$(px_out_root)" || status=$?
@@ -931,13 +1075,9 @@ EOF
   return 0
 }
 
-# Executes the backend portion of validation by loading the backend module, verifying that it
-# defines every required contract function, and invoking its preflight checks. If no active scope
-# record exists, a temporary scope is created for the preflight and scheduled for removal on exit,
-# because preflight validates the container engine and host ports rather than a running cluster.
-## @description  Verifies backend contract completeness and runs backend preflight checks.
-## @param        backend name
-## @return       Appends check rows, increments failure counts, and returns 0.
+## @description  Executes the backend half of validation by binding the backend, reporting any
+##               missing required contract functions, and running the backend preflight checks.
+## @return       Appends check rows, increments the failure count, and exits with 0.
 pc_validate_backend() {
   local backend=$1 missing rows row value column counted=0 scope="" status=0
   sb_load "$backend"
@@ -987,40 +1127,22 @@ EOF
   fi
 }
 
-# Streams the raw log output of a single cluster instance without modification, ensuring that
-# interactive operators and automated cluster health checks inspect the exact same byte stream.
-## @description  Streams unmodified log output for a single role instance.
-## @param        argument...
-## @return       Exits with 0, 2 on usage, 5 if previous is unsupported, or 6 if no such instance.
+# Streams the raw log bytes of a single instance without modification so that operators and cluster
+# health checks inspect the exact same byte stream.
+## @description  Streams the unmodified log bytes of a single cluster instance.
+## @return       Exits with the backend status: 0, 2 on usage, 5 if previous logs are unsupported,
+##               or 6 if no such instance exists.
 pc_logs() {
   local since="-" previous=0 follow=0 role index scope detail status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --since)
-      [ $# -ge 2 ] || pc_sub_usage_error logs "--since needs seconds"
-      since=$2
-      shift
-      ;;
-    --previous) previous=1 ;;
-    -f | --follow) follow=1 ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error logs "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  pc_opts logs "--since=since --previous=previous=1 -f=follow=1 --follow=follow=1" "$@"
+  set -- ${PC_ARGS[@]+"${PC_ARGS[@]}"}
   [ $# -eq 2 ] || pc_sub_usage_error logs "name a role and an index"
-  role=$1
-  index=$2
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
+  role=$1 index=$2
+  pc_require_instance "$role" "$index"
   if [ "$since" != "-" ] && ! [[ $since =~ $PX_RE_INT ]]; then
     pc_sub_usage_error logs "--since takes whole seconds, got '$since'"
   fi
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
+  scope="$(sb_scope_require "" "in PX_SCOPE_ID")" || exit $?
   if [ "$previous" = 1 ] && ! sb_capability logs_previous >/dev/null; then
     detail="$(sb_capability_detail logs_previous)" || detail=""
     px_die "$PX_EXIT_UNSUPPORTED" \
@@ -1032,80 +1154,37 @@ pc_logs() {
   exit "$status"
 }
 
-# Executes an arbitrary command inside a target role instance. Routing all in-container execution
-# for workload drivers, health checks, and operators through this single entry point isolates
-# layers above the backend from direct container runtime dependencies. Exits with the command's
-# exit status, or 2 on usage errors, 6 if the instance does not exist, 124 if the execution timeout
-# expires, 125 if the command cannot start, 126 if it is not executable, or 127 if it is not found.
-## @description  Executes a command inside one cluster instance and forwards its exit status.
-## @param        argument...
-## @return       Status; 2 usage, 6 no target, 124 timeout, 125 start, 126 not exec, 127 not found.
+## @description  Executes a single command inside a target cluster instance.
+## @return       Exits with the command status, 2 on usage, 6 on no such instance, 124 on an expired
+##               timeout, 125 if it could not start, 126 if not executable, or 127 if not found.
 pc_exec() {
-  local timeout="" role="" index="" scope positional=0 status=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error exec "--timeout needs a value"
-      timeout=$2
-      shift
-      ;;
-    --) shift; break ;;
-    -*) pc_sub_usage_error exec "unknown option $1" ;;
-    *)
-      positional=$((positional + 1))
-      case "$positional" in
-      1) role=$1 ;;
-      2) index=$1 ;;
-      *) pc_sub_usage_error exec "unexpected argument $1, a command follows --" ;;
-      esac
-      ;;
-    esac
-    shift
-  done
-  [ "$positional" -eq 2 ] || pc_sub_usage_error exec "name a role and an index"
-  [ $# -gt 0 ] || pc_sub_usage_error exec "name a command after --"
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
-  timeout="$(pc_timeout PX_TIMEOUT_EXEC "$timeout")" || exit $?
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
-  if px_is_dry_run; then
-    pc_plan "sb_exec $scope $role $index $timeout -- $*"
-    return 0
-  fi
+  local role=$1 index=$2 timeout scope status=0
+  shift 2
+  pc_require_instance "$role" "$index"
+  timeout="$(pc_timeout PX_TIMEOUT_EXEC "$PC_TIMEOUT")" || exit $?
+  scope="$(sb_scope_require)" || exit $?
+  px_plan exec sb_exec "$scope" "$role" "$index" "$timeout" -- "$@" && return 0
   sb_call sb_exec "$scope" "$role" "$index" "$timeout" -- "$@" || status=$?
+  # Mark the exit status as already handled because it belongs to the executed remote command,
+  # suppressing the exit hook's diagnostic summary line.
+  px_exit_noted "$status"
   exit "$status"
 }
 
-# Copies files or directories into or out of a target instance. For outbound retrievals, the local
-# destination path is validated against PX_OUT before loading the backend so that any path escape
-# is rejected immediately without making a backend call (the backend enforces the same boundary).
-## @description  Copies a path into an instance or retrieves an instance path under PX_OUT.
-## @param        direction (in or out), argument...
-## @return       Exits 0, 1 on copy failure, 2 on usage or path outside PX_OUT, or 6 if no instance.
+## @description  Stages a local path into an instance or retrieves a remote path from an instance.
+## @return       Exits 0, 1 if the copy failed, 2 on usage or a destination outside PX_OUT, or 6 if
+##               no such instance exists.
 pc_cp() {
   local direction=$1 role index source target scope sub status=0
-  local args=()
   shift
   sub="cp-$direction"
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error "$sub" "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  pc_opts "$sub" "" "$@"
+  set -- ${PC_ARGS[@]+"${PC_ARGS[@]}"}
   [ $# -eq 4 ] ||
     pc_sub_usage_error "$sub" "name a role, an index, a source and a target"
-  role=$1
-  index=$2
-  source=$3
-  target=$4
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
-  scope="$(pc_scope_require)" || exit $?
+  role=$1 index=$2 source=$3 target=$4
+  pc_require_instance "$role" "$index"
+  scope="$(sb_scope_require "" "in PX_SCOPE_ID")" || exit $?
   if [ "$direction" = in ]; then
     [ -e "$source" ] ||
       px_die "$PX_EXIT_USAGE" "no such local path: $source"
@@ -1114,11 +1193,7 @@ pc_cp() {
   else
     target="$(px_out_resolve "$target")" || exit $?
   fi
-  sb_load "${PX_BACKEND:-compose}"
-  if px_is_dry_run; then
-    pc_plan "sb_copy_$direction $scope $role $index $source $target"
-    return 0
-  fi
+  pc_plan "sb_copy_$direction $scope $role $index $source $target" && return 0
   sb_call "sb_copy_$direction" "$scope" "$role" "$index" "$source" "$target" ||
     status=$?
   if [ "$status" != 0 ]; then
@@ -1126,29 +1201,13 @@ pc_cp() {
   fi
 }
 
-# Adjusts the replica count of a scalable role within the 1-to-9 instance parity range supported by
-# both backends. The scaling operation is recorded in the planned-action log beforehand because
-# scaling down terminates running instances.
-## @description  Changes the instance count of a scalable role within the 1-to-9 parity limit.
-## @param        argument...
-## @return       Exits 0, 1 if scaling fails, 2 on usage or count out of range, or 4 on a timeout.
+## @description  Adjusts the replica count of a scalable role within the one-to-nine instance parity
+##               limit enforced across both backends.
+## @return       Exits 0, 1 if scaling failed, 2 on usage or an out-of-range count, or 4 on timeout.
 pc_scale() {
   local timeout="" role count scope rows status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error scale "--timeout needs a value"
-      timeout=$2
-      shift
-      ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error scale "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  pc_opts scale "--timeout=timeout" "$@"
+  set -- ${PC_ARGS[@]+"${PC_ARGS[@]}"}
   [ $# -eq 2 ] || pc_sub_usage_error scale "name a role and a count"
   role=$1
   count=$2
@@ -1159,12 +1218,8 @@ pc_scale() {
       "got '$count'"
   fi
   timeout="$(pc_timeout PX_TIMEOUT_SCALE "$timeout")" || exit $?
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
-  if px_is_dry_run; then
-    pc_plan "sb_scale $scope $role $count $timeout"
-    return 0
-  fi
+  scope="$(sb_scope_require "" "in PX_SCOPE_ID")" || exit $?
+  pc_plan "sb_scale $scope $role $count $timeout" && return 0
   pc_planned "$scope" scale "$role" "" "count $count"
   rows="$(sb_call sb_scale "$scope" "$role" "$count" "$timeout")" || status=$?
   pc_table instance <<EOF
@@ -1175,14 +1230,9 @@ EOF
   fi
 }
 
-# Records a role-group start or stop transition in the planned-action log by writing one entry per
-# distinct role present in the backend's response rows (ignoring rows without a role). Because the
-# substrate contract reveals the member roles of a group only in the operation response, these
-# records are written after the backend returns; any write failure emits a warning so the caller can
-# still report the status of the group transition itself.
-## @description  Records planned-action entries for each role in a group start or stop response.
-## @param        scope id, action (start or stop), group, answer schema (ready or stopped), rows
-## @return       Returns 0.
+## @description  Records a role-group transition as planned by writing one entry for each distinct
+##               role in the backend response; rows without a role cover no instances.
+## @return       Exits with 0.
 pc_group_planned() {
   local scope=$1 action=$2 group=$3 schema=$4 rows=$5 column row role seen=""
   column="$(sb_schema_index "$schema" role)" || return 0
@@ -1204,44 +1254,16 @@ EOF
   fi
 }
 
-# Starts, stops, or queries the status of a named role group. Stopping a group halts its instances
-# while preserving their state, allowing memory-constrained hosts that cannot run every service tier
-# simultaneously to activate a tier only during test steps that require it. Starting a group
-# re-runs the host memory preflight check first because starting the group adds its container memory
-# limits back to the active host footprint. Exits 0 on success, 1 if the action fails or the memory
-# check is not executable, 2 on usage errors or an unknown group, 3 if an instance terminates or the
-# memory check refuses the start, 4 on timeout, or any other status returned by the memory check.
-## @description  Starts, stops, or reports the state of a role group.
-## @param        argument...
-## @return       Exits 0, 1 fail, 2 usage/no group, 3 terminated/refused, 4 timeout, or check code.
+# Starts, stops, or queries the state of a named role group, re-running the host memory check before
+# starting a group.
+## @description  Starts, stops, or reports the state of a single role group.
+## @return       Exits 0, 1 if the action or memory check failed, 2 on usage or an unknown group, 3
+##               if an instance terminated or the memory check refused the start, or 4 on a timeout.
 pc_group() {
-  local timeout="" action group scope rows schema status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error group "--timeout needs a value"
-      timeout=$2
-      shift
-      ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error group "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -eq 2 ] || pc_sub_usage_error group "name an action and a group"
-  action=$1
-  group=$2
-  case "$action" in
-  start | stop | status) ;;
-  *) pc_sub_usage_error group "unknown action $action" ;;
-  esac
+  local action=$1 group=$2 timeout scope rows schema status=0
   pc_require_name "group" "$group"
-  timeout="$(pc_timeout PX_TIMEOUT_GROUP "$timeout")" || exit $?
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
+  timeout="$(pc_timeout PX_TIMEOUT_GROUP "$PC_TIMEOUT")" || exit $?
+  scope="$(sb_scope_require)" || exit $?
   if [ "$action" = status ]; then
     rows="$(sb_call sb_group_status "$scope" "$group")" || status=$?
     pc_table group <<EOF
@@ -1249,10 +1271,7 @@ $rows
 EOF
     exit "$status"
   fi
-  if px_is_dry_run; then
-    pc_plan "sb_group_$action $scope $group $timeout"
-    return 0
-  fi
+  px_plan group "sb_group_$action" "$scope" "$group" "$timeout" && return 0
   schema=stopped
   if [ "$action" = start ]; then
     schema=ready
@@ -1269,44 +1288,18 @@ EOF
   fi
 }
 
-# Abruptly terminates a single cluster instance to inject a fault at a test milestone. The kill is
-# recorded in the planned-action log before execution so px-run does not classify the resulting
-# termination as an unplanned cluster anomaly.
-## @description  Abruptly terminates one role instance for fault injection after logging the plan.
-## @param        argument...
-## @return       Exits 0 on success, 1 on failure, 2 on usage or unknown mode, or 6 if no instance.
+## @description  Terminates a single instance abruptly to inject a fault at a test milestone.
+## @return       Exits 0, 1 if termination failed, 2 on usage or an unknown mode, or 6 if no such
+##               instance exists.
 pc_kill() {
-  local mode=hard role index scope status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --mode)
-      [ $# -ge 2 ] || pc_sub_usage_error kill "--mode needs a value"
-      mode=$2
-      shift
-      ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error kill "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -eq 2 ] || pc_sub_usage_error kill "name a role and an index"
-  role=$1
-  index=$2
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
+  local mode=$PC_MODE role=$1 index=$2 scope status=0
+  pc_require_instance "$role" "$index"
   if ! sb_valid_value kill_mode "$mode"; then
     px_die "$PX_EXIT_USAGE" \
       "unknown kill mode '$mode', one of: $(sb_vocabulary kill_mode)"
   fi
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
-  if px_is_dry_run; then
-    pc_plan "sb_kill $scope $role $index $mode"
-    return 0
-  fi
+  scope="$(sb_scope_require)" || exit $?
+  px_plan kill sb_kill "$scope" "$role" "$index" "$mode" && return 0
   pc_planned "$scope" kill "$role" "$index" "mode $mode"
   sb_call sb_kill "$scope" "$role" "$index" "$mode" || status=$?
   if [ "$status" != 0 ]; then
@@ -1314,41 +1307,24 @@ pc_kill() {
   fi
 }
 
-# Delivers a named POSIX signal to a target instance to support non-destructive fault injection and
-# on-demand JVM thread dumps. The signal delivery is recorded in the planned-action log beforehand.
-## @description  Delivers a named signal to a cluster instance after recording the planned action.
-## @param        argument...
-## @return       Exit 0, 1 if delivery fails, 2 on usage, 5 if backend lacks signals, 6 if missing.
+## @description  Delivers a named signal to a single instance, such as QUIT for a JVM thread dump.
+## @return       Exits 0, 1 if delivery failed, 2 on usage, 5 if the backend does not support signal
+##               delivery, or 6 if no such instance exists.
 pc_signal() {
   local role index signal scope detail status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error signal "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  pc_opts signal "" "$@"
+  set -- ${PC_ARGS[@]+"${PC_ARGS[@]}"}
   [ $# -eq 3 ] || pc_sub_usage_error signal "name a role, an index and a signal"
-  role=$1
-  index=$2
-  signal=$3
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
+  role=$1 index=$2 signal=$3
+  pc_require_instance "$role" "$index"
   pc_require_name "signal name" "$signal"
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
+  scope="$(sb_scope_require "" "in PX_SCOPE_ID")" || exit $?
   if ! sb_supports sb_signal; then
     detail="$(sb_capability_detail signal_delivery)" || detail=""
     px_die "$PX_EXIT_UNSUPPORTED" \
       "this backend delivers no signal: $detail"
   fi
-  if px_is_dry_run; then
-    pc_plan "sb_signal $scope $role $index $signal"
-    return 0
-  fi
+  pc_plan "sb_signal $scope $role $index $signal" && return 0
   pc_planned "$scope" signal "$role" "$index" "signal $signal"
   sb_call sb_signal "$scope" "$role" "$index" "$signal" || status=$?
   if [ "$status" != 0 ]; then
@@ -1356,55 +1332,28 @@ pc_signal() {
   fi
 }
 
-# Performs a graceful rolling restart of a single instance by draining hosted regions, restarting
-# the container, waiting for readiness, and rebalancing regions. The substrate backend orchestrates
-# and reports these phases because backends differ in how a replacement instance is materialized.
-# Exits 0 when every phase succeeds, 1 if a phase fails, 2 on usage errors or when the role has no
-# drain semantics, 4 if a phase times out, 5 if the backend lacks drain-aware restart, or 6 if no
-# such instance exists.
-## @description  Gracefully drains, restarts, waits for readiness, and rebalances one instance.
-## @param        argument...
-## @return       Exits 0, 1 phase fail, 2 usage/no drain, 4 timeout, 5 unsupported, 6 no instance.
+# Drains hosted regions, restarts the instance, waits for readiness, and rebalances. Exits 0 when
+# every phase succeeds, 1 if a phase fails, 2 on usage or when the role has no drain semantics, 4 if
+# a phase times out, 5 if the backend has no drain-aware restart, or 6 if no such instance exists.
+## @description  Drains, restarts, waits for readiness on, and rebalances a single instance.
+## @return       Exits 0 if all phases succeed, 1 on phase failure, 2 on usage or no drain
+##               semantics, 4 on timeout, 5 if drain-aware restart is unsupported, or 6 if missing.
 pc_restart() {
   local drain="" ready="" role index scope rows detail status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --drain-timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error restart "--drain-timeout needs a value"
-      drain=$2
-      shift
-      ;;
-    --ready-timeout)
-      [ $# -ge 2 ] || pc_sub_usage_error restart "--ready-timeout needs a value"
-      ready=$2
-      shift
-      ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error restart "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
+  pc_opts restart "--drain-timeout=drain --ready-timeout=ready" "$@"
+  set -- ${PC_ARGS[@]+"${PC_ARGS[@]}"}
   [ $# -eq 2 ] || pc_sub_usage_error restart "name a role and an index"
-  role=$1
-  index=$2
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
+  role=$1 index=$2
+  pc_require_instance "$role" "$index"
   drain="$(pc_timeout PX_TIMEOUT_DRAIN "$drain")" || exit $?
   ready="$(pc_timeout PX_TIMEOUT_READY "$ready")" || exit $?
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
+  scope="$(sb_scope_require "" "in PX_SCOPE_ID")" || exit $?
   if ! sb_supports sb_restart_drain; then
     detail="$(sb_capability_detail drain_restart)" || detail=""
     px_die "$PX_EXIT_UNSUPPORTED" \
       "this backend has no drain-aware restart: $detail"
   fi
-  if px_is_dry_run; then
-    pc_plan "sb_restart_drain $scope $role $index $drain $ready"
-    return 0
-  fi
+  pc_plan "sb_restart_drain $scope $role $index $drain $ready" && return 0
   pc_planned "$scope" restart "$role" "$index" "drain ${drain}s"
   rows="$(sb_call sb_restart_drain "$scope" "$role" "$index" "$drain" \
     "$ready")" || status=$?
@@ -1416,39 +1365,18 @@ EOF
   fi
 }
 
-# Resolves the host-accessible loopback address and port for a named service port on an instance, or
-# releases an endpoint acquired by a long-running session. Because layers above the substrate
-# backend have no hard-coded port knowledge, client tools, JDBC URL builders, and operators all
-# query this subcommand for endpoint discovery. Exits 0 on success, 1 if no address can be
-# established, 2 on usage errors, 5 if endpoint release is unsupported by the backend, or 6 on an
-# unknown port name or instance.
-## @description  Discovers or releases the host address and port for a named instance service port.
-## @param        argument...
-## @return       Writes host/port row; exits 0, 1 fail, 2 usage, 5 no release, 6 no port/instance.
+# Dry-run mode emits a plan row for endpoint resolution as well as endpoint release, because a
+# backend may establish a live port-forwarding tunnel to satisfy the query.
+## @description  Reports the host address of a named port or releases one held by a long session.
+## @return       Writes a host-and-port row; exits 0, 1 if no address is established, 2 on usage, 5
+##               if the backend does not support release, or 6 on an unknown port name or instance.
 pc_endpoint() {
-  local release=0 role index port scope row status=0
-  local args=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --release) release=1 ;;
-    --) shift; pc_rest "$@"; break ;;
-    -*) pc_sub_usage_error endpoint "unknown option $1" ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -eq 3 ] ||
-    pc_sub_usage_error endpoint "name a role, an index and a port name"
-  role=$1
-  index=$2
-  port=$3
-  pc_require_name "role" "$role"
-  pc_require_index "$index"
+  local role=$1 index=$2 port=$3 scope row status=0
+  pc_require_instance "$role" "$index"
   pc_require_name "port name" "$port"
-  scope="$(pc_scope_require)" || exit $?
-  sb_load "${PX_BACKEND:-compose}"
-  if [ "$release" = 1 ]; then
+  scope="$(sb_scope_require)" || exit $?
+  if [ "$PC_RELEASE" = 1 ]; then
+    px_plan release sb_endpoint_release "$scope" "$role" "$index" "$port" && return 0
     if ! sb_supports sb_endpoint_release; then
       px_die "$PX_EXIT_UNSUPPORTED" \
         "this backend releases no endpoint: its address is part of the" \
@@ -1457,6 +1385,7 @@ pc_endpoint() {
     sb_call sb_endpoint_release "$scope" "$role" "$index" "$port" || status=$?
     exit "$status"
   fi
+  px_plan endpoint sb_endpoint "$scope" "$role" "$index" "$port" && return 0
   row="$(sb_call sb_endpoint "$scope" "$role" "$index" "$port")" || status=$?
   if [ "$status" != 0 ]; then
     px_die "$status" "no address for $role/$index port $port"
@@ -1464,16 +1393,12 @@ pc_endpoint() {
   printf '%s\n' "$row"
 }
 
-# Reports the substrate contract revision supported by the harness, the active backend identifier
-# and contract revision, and the version strings reported by the backend's runtime tooling. The
-# diagnostic bundle manifest records this identical set of version metadata.
-## @description  Reports the harness contract revision, bound backend, and backend tooling versions.
-## @param        argument...
-## @return       Writes a table to stdout and exits 0, or 1 if backend tooling cannot be reached.
+## @description  Reports the substrate contract revision supported by the harness, the bound
+##               backend, and the version strings reported by the backend's runtime tooling.
+## @return       Writes a table to stdout and exits 0, or 1 if the backend cannot reach its tooling.
 pc_version() {
   local rows row status=0
   [ $# -eq 0 ] || pc_sub_usage_error version "unexpected argument: $*"
-  sb_load "${PX_BACKEND:-compose}"
   rows=""
   row="$(px_tsv_row harness_contract "$PX_CONTRACT_VERSION")"
   rows="$rows$row$PX_NL"
@@ -1489,11 +1414,9 @@ EOF
   exit "$status"
 }
 
-# Populates fallback defaults for PX_CLUSTER_ID and PX_BACKEND after configuration files have been
-# loaded, and validates that the cluster identifier conforms to the grammar required by backend
-# scopes, runtime labels, and state record files.
-## @description  Applies post-load configuration defaults and validates the cluster identifier.
-## @return       Returns 0, or exits with 2 on an invalid cluster name.
+## @description  Applies fallback configuration defaults after the loader runs and rejects any
+##               cluster name that backend scopes, runtime labels, or state record files cannot use.
+## @return       Exits with 0, or exits with 2 on an invalid cluster name.
 pc_config_init() {
   if [ -z "${PX_CLUSTER_ID:-}" ]; then
     px_config_set PX_CLUSTER_ID default derived
@@ -1508,22 +1431,137 @@ pc_config_init() {
   fi
 }
 
-# Parses global command-line flags, loads the layered configuration, and dispatches the requested
-# subcommand. Help requests and unknown subcommand names are handled before running the
-# configuration loader so that both succeed even in a workspace without an environment file.
-## @description  Parses global options, loads configuration, and dispatches the target subcommand.
-## @param        argument...
-## @return       Returns or exits with the subcommand status, or exits with 2 on a usage error.
+## @description  Executes a harness command (command...) with only the operator's environment and
+##               command-line configuration, stripping any values loaded from files by this process.
+## @return       Exits with the status of the executed command.
+pc_matrix_child() {
+  local line names=""
+  while IFS= read -r line; do
+    case "${line#*"$PX_TAB"}" in
+    '' | environment | cli) ;;
+    *) names="$names ${line%%"$PX_TAB"*}" ;;
+    esac
+  done <<EOF
+$PX_CONFIG_ORIGINS
+EOF
+  # Because configuration values loaded from files are exported into the environment, they would
+  # otherwise reach the child process at the highest file-precedence stage and mask the child's own
+  # version set configuration.
+  (
+    for line in $names; do
+      unset "$line"
+    done
+    px_with_private "$@"
+  )
+}
+
+# Keeps the current matrix version set flagged as active until its teardown completes so that the
+# exit hook retries any teardown interrupted by a signal or an earlier failure.
+## @description  Tears down the cluster belonging to the currently active matrix version set.
+## @return       Returns the px-cluster down exit status: 0, or 1 when leftover resources remain.
+pc_matrix_down() {
+  px_config_child "$SELF/px-cluster" ${PC_MATRIX_FILES[@]+"${PC_MATRIX_FILES[@]}"} down >&2 ||
+    return $?
+  PC_MATRIX_UP=0
+}
+
+## @description  Tears down the cluster of the active matrix version set when matrix execution
+##               terminates early due to a failure or a signal.
+## @return       Exits with 0, emitting a warning if teardown fails.
+pc_matrix_abandon() {
+  [ "$PC_MATRIX_UP" = 1 ] || return 0
+  px_warn "the matrix ends with the cluster of a set up, so it comes down"
+  pc_matrix_down || px_warn "the down of the set failed: run px-cluster down"
+}
+
+# Each version set takes the recorded session severity when its suite executed, defaults to ERROR if
+# execution halted during the build or cluster bring-up, and is promoted to at least FAIL if cluster
+# teardown failed. The trailing summary row reports the worst severity across all version sets.
+## @description  Executes a suite (suite, file...) across each version set: build, up, run, down.
+## @return       Writes one row per set and a result row; exits 0, or with the exit code of the
+##               first failed set, 2 on usage, or 6 if a version set file is missing.
+pc_matrix() {
+  local suite=${1:-} file line dir record n=0 first=0 status down step session dump rows
+  local worst=PASS severity
+  local files=() class=()
+  shift
+  for file in "$@"; do
+    [ -f "$file" ] || px_die "$PX_EXIT_NO_OBJECT" "no such version set file: $file"
+  done
+  if [ -n "${PX_RUN_CLASS:-}" ]; then
+    class=(--class "$PX_RUN_CLASS")
+  fi
+  if px_is_dry_run; then
+    for file in "$@"; do
+      files=(--config "$file")
+      for line in ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; do
+        files+=(--config "$line")
+      done
+      px_plan build px-cluster build "${files[@]}"
+      px_plan up px-cluster up "${files[@]}"
+      px_plan run px-suite "${files[@]}" ${class[@]+"${class[@]}"} "$suite"
+      px_plan down px-cluster down "${files[@]}"
+    done
+    return 0
+  fi
+  dir="$(px_run_dir matrix)" || exit $?
+  record="$dir/matrix.tsv"
+  : >"$record" || px_die "$PX_EXIT_FAIL" "cannot write $record"
+  for file in "$@"; do
+    n=$((n + 1))
+    file="$(px_realpath "$file")"
+    files=(--config "$file")
+    for line in ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; do
+      files+=(--config "$line")
+    done
+    session="${dir##*/}-$n"
+    status=0
+    px_info "version set $n: $file"
+    step=build
+    pc_matrix_child "$PX_HOME/scripts/build-phoenix.sh" "${files[@]}" >&2 || status=$?
+    if [ "$status" = 0 ]; then
+      step=stage
+      pc_matrix_child "$PX_HOME/scripts/stage-artifacts.sh" "${files[@]}" >&2 || status=$?
+    fi
+    if [ "$status" = 0 ]; then
+      step=up
+      pc_matrix_child "$SELF/px-cluster" "${files[@]}" up >&2 || status=$?
+    fi
+    if [ "$status" = 0 ]; then
+      step=run
+      PX_SESSION_ID=$session pc_matrix_child "$SELF/px-suite" "${files[@]}" \
+        ${class[@]+"${class[@]}"} "$suite" >&2 || status=$?
+      # Always tear the cluster down after its version set completes, even when the test suite
+      # fails.
+      down=0
+      pc_matrix_child "$SELF/px-cluster" "${files[@]}" down >&2 || down=$?
+      if [ "$status" = 0 ]; then
+        step=down
+        status=$down
+      fi
+    fi
+    case "$step" in
+    run | down) ;;
+    *) session="" ;;
+    esac
+    dump="$(pc_matrix_child "$SELF/px-cluster" "${files[@]}" config)" || dump=""
+    rows="$(px_versions_rows "$dump")"
+    px_tsv_row "$n" "$file" "$(px_tsv_get hbase_profile "$rows")" \
+      "$(px_tsv_get hbase_version "$rows")" "$(px_tsv_get hadoop_version "$rows")" \
+      "$(px_tsv_get jdks "$rows")" "$session" "$step" "$status" | tee -a "$record"
+    [ "$first" != 0 ] || first=$status
+  done
+  px_info "matrix record $record"
+  exit "$first"
+}
+
+## @description  Parses global command-line options, loads the layered configuration, and dispatches
+##               the requested subcommand.
+## @return       Exits with the status of the subcommand, or exits with 2 on a usage error.
 pc_main() {
-  local sub arg name value strict="" files=() sets=()
+  local sub arg strict="" files=() sets=()
   while [ $# -gt 0 ]; do
-    case "$1" in
-    -h | --help)
-      usage
-      return 0
-      ;;
-    -v | --verbose) sets+=("PX_VERBOSE=1") ;;
-    -n | --dry-run) sets+=("PX_DRY_RUN=1") ;;
+    px_cli_common "$1" || case "$1" in
     --keep) sets+=("PX_KEEP=1") ;;
     --strict)
       strict="--strict"
@@ -1539,9 +1577,15 @@ pc_main() {
       sets+=("PX_CLUSTER_ID=$2")
       shift
       ;;
+    --class)
+      px_cli_need_value "$@"
+      sets+=("PX_RUN_CLASS=$2")
+      shift
+      ;;
     --config)
       px_cli_need_value "$@"
       files+=("$2")
+      PC_FILES+=("$2")
       shift
       ;;
     -e | --set)
@@ -1579,29 +1623,25 @@ pc_main() {
       ;;
     esac
   done
-  # Apply command-line variable overrides before running the file loader because the CLI holds the
-  # highest configuration precedence. When strict mode is active, validate declared variable names
-  # here as well because the file loader does not inspect variables set prior to its execution.
-  for arg in ${sets[@]+"${sets[@]}"}; do
-    name=${arg%%=*}
-    value=${arg#*=}
-    if [ "$name" = "$arg" ]; then
-      px_usage_error "--set takes NAME=VALUE, got '$arg'"
-    fi
-    if [ -n "$strict" ] && ! px_config_known "$name"; then
-      px_die "$PX_EXIT_USAGE" \
-        "undeclared name '$name' on the command line." \
-        "Add it to lib/varnames.txt."
-    fi
-    px_config_set "$name" "$value" cli
-  done
-  if [ -n "$strict" ]; then
-    px_config_load "$strict" ${files[@]+"${files[@]}"}
-  else
-    px_config_load ${files[@]+"${files[@]}"}
-  fi
+  # Command-line overrides hold the highest precedence stage and are applied before the file loader
+  # runs. Under strict mode, undeclared variable names are rejected here as well because the loader
+  # does not inspect variables that were already set before its execution.
+  px_config_set_cli ${strict:+"$strict"} -- ${sets[@]+"${sets[@]}"}
+  px_config_load ${strict:+"$strict"} ${files[@]+"${files[@]}"}
   pc_config_init
+  # Every subcommand that operates on a live cluster binds the substrate backend here. The render,
+  # config, and validate subcommands bind no backend, as verified by an empty runtime invocation
+  # log, and matrix binds none either because each of its steps runs as a child process that binds
+  # its own backend.
   case "$sub" in
+  render | config | validate | matrix) ;;
+  *) sb_load ;;
+  esac
+  case "$sub" in
+  render)
+    pc_render_guard "$@"
+    pc_render "$@" || exit $?
+    ;;
   up) pc_up "$@" ;;
   down) pc_down "$@" ;;
   status) pc_status "$@" ;;
@@ -1619,6 +1659,7 @@ pc_main() {
   restart) pc_restart "$@" ;;
   endpoint) pc_endpoint "$@" ;;
   version) pc_version "$@" ;;
+  matrix) pc_matrix "$@" ;;
   esac
 }
 

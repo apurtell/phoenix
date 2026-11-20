@@ -66,16 +66,18 @@ TOOL_SHELL_COMMAND="/bin/bash"
 # that a forgotten session cannot hold a cluster open for a full day.
 TOOL_SHELL_TIMEOUT_S=3600
 
-# These lists separate essential host utilities that the harness cannot function without from
-# optional utilities that only specific code paths require. The doctor subcommand reports missing
-# utilities from the first group as a failure and those from the second group as a warning.
-TOOL_CORE_COMMANDS="sed grep sort sleep mkdir rm cp"
-TOOL_EXTRA_COMMANDS="awk stat base64 tar"
+# Separate the essential host commands required for core harness operation from optional commands
+# used only by specific code paths. The doctor subcommand reports missing commands from the first
+# group as failures and those from the second group as warnings; awk belongs to the core group
+# because px-cluster formats its output tables with awk.
+TOOL_CORE_COMMANDS="sed grep sort sleep mkdir rm cp awk"
+TOOL_EXTRA_COMMANDS="stat base64 tar"
 
 TOOL_FAILURES=0
 
-## @description  Writes the command usage summary, including the owning round for every subcommand.
-## @return       Writes the help text to stdout and exits with status 0.
+## @description  Prints the command-line usage summary, including the owning round of each
+##               subcommand.
+## @return       Writes the usage text to stdout and exits 0.
 usage() {
   local i=0
   printf 'Usage: %s <subcommand> [option...] [-- command...]\n\n' "$PX_PROG"
@@ -109,30 +111,9 @@ Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
 EOF
 }
 
-# The result is written to the TOOL_ROUND global variable rather than stdout because running a
-# lookup probe inside a command substitution spawns a subshell, causing the failure trap to report
-# an expected lookup miss as an unexpected error.
-## @description  Finds the implementation round that owns the specified subcommand.
-## @param        The subcommand name to look up.
-## @return       Sets TOOL_ROUND and returns 0, or returns 6 when the name is not a subcommand.
-tool_find_owner() {
-  local i=0
-  TOOL_ROUND=""
-  while [ "$i" -lt "${#TOOL_NAMES[@]}" ]; do
-    if [ "${TOOL_NAMES[$i]}" = "${1:-}" ]; then
-      TOOL_ROUND="${TOOL_OWNERS[$i]}"
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  return "$PX_EXIT_NO_OBJECT"
-}
-
-# The target role intentionally has no default value because this round ships no cluster topology,
-# and guessing a role name could execute operations against the wrong instance.
 ## @description  Validates and completes the target coordinates for an in-instance operation.
-## @return       Sets TOOL_INDEX when it is empty, or exits with status 2 when the role is missing
-##               or the instance index is malformed.
+## @return       Sets TOOL_INDEX when empty and exits 0, or exits 2 on a missing role or a
+##               malformed index.
 tool_require_target() {
   if [ -z "$TOOL_ROLE" ]; then
     px_usage_error "name the role with --role"
@@ -145,41 +126,19 @@ tool_require_target() {
   fi
 }
 
-# Verifying scope existence upfront informs the operator immediately when a cluster is absent,
-# avoiding a less clear error during command execution. An explicit --scope option takes precedence
-# over the scope reported by sb_scope_resolve. If validation fails, this function exits with status
-# 6 when no scope is named or recorded or when the scope is absent, status 2 on an invalid cluster
-# name or a refused state directory, and status 1 when the state directory cannot be created or the
-# runtime does not answer.
-## @description  Binds the backend, resolves the active scope, and verifies that the scope is up.
-## @return       Sets TOOL_SCOPE and returns 0; exits with 6 if the scope is unnamed, unrecorded,
-##               or absent, 2 on an invalid cluster or state path, or 1 on state or runtime errors.
+# Verifies that the target scope is active immediately after resolving it so that an absent cluster
+# is reported before attempting an in-instance exec call.
+## @description  Binds the backend, resolves TOOL_SCOPE from --scope or state, and checks it is up.
+## @return       Exits 0 when up, exits 6 if no scope is recorded or it is absent, or exits 2 or 1.
 tool_require_scope() {
-  local status=0
   sb_load
-  if [ -z "$TOOL_SCOPE" ]; then
-    TOOL_SCOPE="$(sb_scope_resolve || exit "$?")" || status=$?
-    if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
-      px_die "$PX_EXIT_NO_OBJECT" \
-        "no scope recorded for cluster ${PX_CLUSTER_ID:-default}." \
-        "Run px-cluster up, or name the scope with --scope or PX_SCOPE_ID."
-    fi
-    if [ "$status" != 0 ]; then
-      exit "$status"
-    fi
-  fi
-  sb_scope_exists "$TOOL_SCOPE" || status=$?
-  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" "no such scope: $TOOL_SCOPE"
-  fi
-  if [ "$status" != 0 ]; then
-    px_die "$status" "cannot tell whether the scope $TOOL_SCOPE exists"
-  fi
+  TOOL_SCOPE="$(sb_scope_require "$TOOL_SCOPE")" || exit $?
+  sb_scope_check "$TOOL_SCOPE"
 }
 
 ## @description  Resolves the execution timeout cap for a single in-instance command.
-## @param        The fallback timeout duration in seconds.
-## @return       Writes the seconds to stdout and exits 0, or exits 2 on an invalid seconds value.
+## @return       Writes the timeout in seconds to stdout and exits 0, or exits 2 when the value is
+##               not a valid number of seconds.
 tool_timeout() {
   local value="${TOOL_TIMEOUT:-}"
   if [ -z "$value" ]; then
@@ -191,12 +150,8 @@ tool_timeout() {
   printf '%s\n' "$value"
 }
 
-# The substrate contract reserves four distinct exit codes for execution framing failures. Because
-# each code reflects a different root cause and remediation path, each is translated into its own
-# diagnostic message and harness exit status.
 ## @description  Translates the exit status of an in-instance command into the harness vocabulary.
-## @param        The raw exit status ($1) and the command that was executed ($2).
-## @return       Returns the command status, or exits with a mapped code on a framing failure.
+## @return       Returns the command exit status, or exits with a mapped code on a framing failure.
 tool_exec_status() {
   local status=$1 target=$2
   case "$status" in
@@ -218,38 +173,25 @@ tool_exec_status() {
 }
 
 # Operators access every in-cluster utility through this entry point, ensuring that no component
-# above the backend layer depends directly on a container runtime.
+# above the backend layer requires direct knowledge of a container runtime.
 ## @description  Opens an interactive shell or runs a command inside a single role instance.
-## @param        Optional command arguments to execute in place of the default shell.
-## @return       Returns the exit status of the shell session or the executed command.
+## @return       Returns the exit status of the shell or executed command.
 tool_shell() {
   local timeout target status=0
   tool_require_target
   tool_require_scope
   timeout="$(tool_timeout "$TOOL_SHELL_TIMEOUT_S")"
-  if [ "$#" -gt 0 ]; then
-    target="$1"
-    px_debug "running $target in $TOOL_ROLE/$TOOL_INDEX of $TOOL_SCOPE"
-    sb_exec "$TOOL_SCOPE" "$TOOL_ROLE" "$TOOL_INDEX" "$timeout" -- "$@" || status=$?
-  else
-    target="$TOOL_SHELL_COMMAND"
-    px_info "shell in $TOOL_ROLE/$TOOL_INDEX of $TOOL_SCOPE, cap $timeout s"
-    sb_exec "$TOOL_SCOPE" "$TOOL_ROLE" "$TOOL_INDEX" "$timeout" \
-      -- "$target" -l || status=$?
-  fi
+  [ "$#" -gt 0 ] || set -- "$TOOL_SHELL_COMMAND" -l
+  target=$1
+  px_info "$target in $TOOL_ROLE/$TOOL_INDEX of $TOOL_SCOPE, cap $timeout s"
+  sb_exec "$TOOL_SCOPE" "$TOOL_ROLE" "$TOOL_INDEX" "$timeout" -- "$@" || status=$?
   tool_exec_status "$status" "$target"
 }
 
-# Output rows follow the check schema defined by the substrate contract so that downstream readers
-# can parse a doctor report and a backend preflight report with the same logic.
-## @description  Emits one diagnostic check row and increments the failure count on failed checks.
-## @param        The check name ($1), check vocabulary status ($2), and diagnostic detail ($3).
-## @return       Writes a TSV row to stdout and returns 0.
+## @description  Formats and writes a single diagnostic check row and increments the failure count.
+## @return       Writes a TSV row to stdout and exits 0.
 tool_check() {
   local name=$1 state=$2 detail=$3
-  if ! sb_valid_value check_status "$state"; then
-    px_die "$PX_EXIT_FAIL" "doctor wrote an undeclared check status: $state"
-  fi
   if [ "$state" = fail ]; then
     TOOL_FAILURES=$((TOOL_FAILURES + 1))
   fi
@@ -257,7 +199,7 @@ tool_check() {
 }
 
 ## @description  Audits and reports the host environment and the harness directory layout.
-## @return       Writes diagnostic check rows to stdout and returns 0.
+## @return       Writes diagnostic check rows to stdout and exits 0.
 tool_doctor_host() {
   local name root value status=0
   tool_check harness_home ok "$PX_HOME"
@@ -274,23 +216,19 @@ tool_doctor_host() {
   else
     tool_check working_tree warn "this harness sits outside a working tree"
   fi
-  for name in $TOOL_CORE_COMMANDS; do
+  for name in $TOOL_CORE_COMMANDS $TOOL_EXTRA_COMMANDS; do
     if command -v "$name" >/dev/null 2>&1; then
       tool_check "command:$name" ok present
     else
-      tool_check "command:$name" fail "not on PATH"
-    fi
-  done
-  for name in $TOOL_EXTRA_COMMANDS; do
-    if command -v "$name" >/dev/null 2>&1; then
-      tool_check "command:$name" ok present
-    else
-      tool_check "command:$name" warn "not on PATH, some paths degrade"
+      case " $TOOL_CORE_COMMANDS " in
+      *" $name "*) tool_check "command:$name" fail "not on PATH" ;;
+      *) tool_check "command:$name" warn "not on PATH, some paths degrade" ;;
+      esac
     fi
   done
   tool_check processors ok "$(px_nproc)"
   status=0
-  value="$(px_mem_total_bytes)" || status=$?
+  value="$(px_mem_total_bytes || exit "$?")" || status=$?
   if [ "$status" = 0 ]; then
     tool_check host_memory_bytes ok "$value"
   else
@@ -298,11 +236,9 @@ tool_doctor_host() {
   fi
 }
 
-# Investigating a configuration precedence surprise starts with this summary of where configuration
-# stages originated and how many variables carry values, while px-cluster config prints the
-# individual values themselves.
-## @description  Reports the active configuration sources and the count of populated variables.
-## @return       Writes diagnostic check rows to stdout and returns 0.
+## @description  Reports the active configuration state, including where the stages originated and
+##               how many variable names carry a value.
+## @return       Writes diagnostic check rows to stdout and exits 0.
 tool_doctor_config() {
   local count origin status=0
   count="$(px_config_dump | grep -c .)" || count=0
@@ -320,10 +256,10 @@ tool_doctor_config() {
   fi
 }
 
-# Surfacing the capability degradation table here lets an operator see which optional operations
-# the current host supports before a test suite records a skip.
-## @description  Reports the bound backend identity, component versions, and degradation table.
-## @return       Writes diagnostic check rows to stdout and returns 0.
+# Surfacing the backend capability degradation table here allows an operator to see which optional
+# operations the current host supports before a test suite records a skip.
+## @description  Reports the bound backend identity, tool versions, and capability degradation.
+## @return       Writes diagnostic check rows to stdout and exits 0.
 tool_doctor_backend() {
   local row name detail
   sb_load
@@ -347,10 +283,10 @@ $(sb_capability_names)
 EOF
 }
 
-# Passing --config-only omits backend binding and keeps the diagnostic run free of any cluster
-# call, providing a safe inspection path when the underlying runtime itself is the suspect.
+# Passing --config-only keeps the diagnostic report free of any cluster or backend calls, providing
+# a safe inspection mode when the underlying container runtime itself is the suspect.
 ## @description  Generates the diagnostic report covering the host, configuration, and backend.
-## @return       Writes check rows to stdout and returns 0 if all checks pass, or 1 on any failure.
+## @return       Writes check rows to stdout and exits 0 when no check fails, or exits 1 otherwise.
 tool_doctor() {
   tool_doctor_host
   tool_doctor_config
@@ -383,10 +319,7 @@ while [ "$#" -gt 0 ]; do
     usage
     exit 0
     ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
+  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
   --role) px_cli_need_value "$@" && TOOL_ROLE="$2" && shift ;;
   --index) px_cli_need_value "$@" && TOOL_INDEX="$2" && shift ;;
   --scope) px_cli_need_value "$@" && TOOL_SCOPE="$2" && shift ;;
@@ -399,10 +332,8 @@ while [ "$#" -gt 0 ]; do
     ;;
   -*) px_usage_error "unknown option: $1" ;;
   *)
-    if [ -n "$TOOL_SUBCOMMAND" ]; then
-      px_usage_error "unexpected argument: $1"
-    fi
-    TOOL_SUBCOMMAND="$1"
+    [ -z "$TOOL_SUBCOMMAND" ] || px_usage_error "unexpected argument: $1"
+    TOOL_SUBCOMMAND=$1
     ;;
   esac
   shift
@@ -411,15 +342,11 @@ done
 if [ -z "$TOOL_SUBCOMMAND" ]; then
   px_usage_error "name a subcommand"
 fi
-if ! tool_find_owner "$TOOL_SUBCOMMAND"; then
+px_word_at "$TOOL_SUBCOMMAND" "${TOOL_NAMES[@]}" ||
   px_usage_error "unknown subcommand: $TOOL_SUBCOMMAND"
-fi
+TOOL_ROUND=${TOOL_OWNERS[$PX_AT]}
 
-if [ "${#TOOL_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${TOOL_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
+px_config_load ${TOOL_CONFIG_FILES[@]+"${TOOL_CONFIG_FILES[@]}"}
 
 TOOL_STATUS=0
 case "$TOOL_SUBCOMMAND" in

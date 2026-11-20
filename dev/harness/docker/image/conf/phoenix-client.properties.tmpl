@@ -1,0 +1,25 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The Phoenix client properties of the client, tooling and probe roles. A
+# driver reads the JDBC URL from this file, so no driver composes a host or a
+# port. The HBase client settings repeat hbase-site.xml for a client program
+# that reads a properties file and not a class path resource. The URL names
+# a host of the harness network, so a client runs inside a container of it.
+
+phoenix.jdbc.url=jdbc:phoenix:zookeeper-0:${PX_PORT_ZOOKEEPER_CLIENT}:/hbase
+hbase.zookeeper.quorum=zookeeper-0
+hbase.zookeeper.property.clientPort=${PX_PORT_ZOOKEEPER_CLIENT}
+zookeeper.znode.parent=/hbase

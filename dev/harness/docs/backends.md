@@ -20,7 +20,7 @@ limitations under the License.
 The substrate contract serves as the sole interface between the test harness and the underlying
 container execution environment. This contract is declared in `lib/backend/contract.sh` and
 implemented in `lib/backend/<name>.sh`, with one implementation file dedicated to each backend.
-Because every layer above the contract interacts exclusively through the 32 `sb_*` functions
+Because every layer above the contract interacts exclusively through the 35 `sb_*` functions
 defined below, drivers, checks, suite actions, health monitors, collectors, and operator commands
 execute without modification across all backends, and no component above the contract requires
 direct access to a container runtime.
@@ -34,9 +34,8 @@ sole reference required to implement an additional backend.
   shared across all commands: the scope record and the planned-action record.
 * `compose.sh` implements the Docker Compose backend and is the only file in the repository
   permitted to invoke a container runtime directly.
-* The Kubernetes backend has not yet been implemented. The section at the end of this document
-  establishes its structural headings and planned architectural mapping, which milestones K1 and
-  K2 will complete.
+* The Kubernetes backend has not yet been implemented. Its section at the end of this document
+  presents the planned architectural mapping, which milestones K1 and K2 will complete.
 
 ## Binding a backend
 
@@ -164,7 +163,8 @@ kv          key value
 endpoint    host port
             sb_endpoint
 image       image_ref image_id
-            sb_image_ref
+            sb_image_ref, sb_image_build, sb_image_present,
+            sb_image_base_digest
 ```
 
 `sb_schema_fields <schema>` outputs the schema's field names in order,
@@ -203,7 +203,7 @@ call, where it denotes an instance belonging to a role group that is intentional
 
 ## Capabilities
 
-The substrate contract comprises 27 required functions and 5 optional functions. When a function or
+The substrate contract comprises 30 required functions and 5 optional functions. When a function or
 feature is optional, callers must query support beforehand and record an unsupported operation as a
 skip rather than a failure. Backends advertise their actual feature support through
 `sb_capabilities` using a fixed set of capability identifiers that callers can query by name.
@@ -213,19 +213,19 @@ skip rather than a failure. Backends advertise their actual feature support thro
 | `logs_previous` | Logs of a previous container. | no, as Compose retains no previous record. |
 | `previous_termination` | Exit evidence of a previous container. | no, for the same reason. |
 | `resource_sampling` | `sb_sample_resources` | probed: yes when a no-stream stats pass responds. |
-| `signal_delivery` | `sb_signal` | probed: yes when the container runtime provides a kill verb. |
+| `signal_delivery` | `sb_signal` | yes, via the container runtime kill verb. |
 | `events` | `sb_events` | yes, read from the container runtime event stream. |
 | `drain_restart` | `sb_restart_drain` | yes, for any role whose drain label is `regionmover`. |
 | `port_forward` | A port forward freed by `sb_endpoint_release`. | no, the port is published. |
 | `scale` | `sb_scale` | yes, within the replica limit of 1 to 9. |
 | `group_switch` | `sb_group_stop` and `sb_group_start` | yes, selected via the group label. |
-| `oom_evidence` | `sb_oom_killed` | yes, as the container runtime reports out-of-memory kills. |
+| `oom_evidence` | `sb_oom_killed` | yes, as the container runtime reports the kill. |
 | `image_digest` | Reporting a digest in the `image` row. | no, reports a local image id instead. |
 | `node_placement` | Reporting a real `node` column. | no, as the node is always `localhost`. |
 
 Any declared capability omitted from a backend's table is treated as absent so that callers degrade
-gracefully rather than failing. The contract layer caches the capability table in memory once per
-process. Furthermore, the Compose backend evaluates its two dynamically probed capabilities once
+gracefully rather than failing. The contract layer reads and caches the capability table once per
+process. Furthermore, the Compose backend evaluates its single dynamically probed capability once
 and persists the complete table to `$(px_state_dir)/compose/capabilities.tsv` for subsequent
 processes on the same host to reuse, unless `PX_FORCE=1` is set to force a fresh probe.
 
@@ -271,6 +271,38 @@ The function returns exit code 2 if `PX_CLUSTER_ID` is invalid or the state dire
 and 1 if the state directory cannot be created. Higher-level commands never construct scope
 identifiers manually.
 
+`sb_deployment_record [cluster]` outputs the path to a second per-cluster state record,
+`$(px_state_dir)/deployment-<backend>-<cluster>`, whose first line stores the deployment directory
+provisioned by `px-cluster up`. `px-cluster down` removes this file alongside the scope record.
+Host preflight reads this record so that the memory check performed before starting a role group
+sums the resource limits of the active deployment, regardless of where it was rendered. Its exit
+codes match those of `sb_scope_record`.
+
+### The cluster record
+
+Immediately after writing the scope record, `px-cluster up` writes a third per-cluster state file:
+`$PX_OUT/$PX_STATE_DIR/cluster-<cluster>.env`. Because the filename encodes no backend identifier,
+subsequent commands discover the active backend directly from this file, and cluster names are
+unique across all backends within a given `PX_OUT` directory. The record persists the bring-up
+configuration as flattened `NAME='VALUE'` assignments covering every setting supplied on the
+command line, in `--config` files, and in the cluster target file, together with `PX_BACKEND` and
+`PX_RUN_CLASS`. Every command's configuration loader evaluates this file at stage 2b under the
+`cluster` origin—immediately after the target file and prior to `local.env` (see "Configuration
+precedence" in the README)—allowing the scope record for the recorded backend to resolve without
+requiring `--backend`. If an explicitly supplied `PX_BACKEND` conflicts with the recorded backend,
+the loader terminates with exit code 2 and reports the precedence stage that defined the
+conflicting value. Running `px-cluster scale` updates the replica count in the record,
+`px-cluster down` removes the record alongside the scope record, and `px-cluster down --keep`
+preserves it. Invoking `px-cluster up` when the target cluster's scope already exists fails with
+exit code 2 even if `PX_FORCE=1` is set; if the scope no longer exists, the cluster record is
+treated as stale, so `up` accepts it only when `PX_FORCE=1` is set and `px-cluster down` removes
+it. Both `px-cluster render` and `px-cluster push` write their render-time settings to `render.env`
+in the deployment directory as `NAME='VALUE'` assignments, and `px-cluster up DIR` merges those
+entries into the cluster record at a lower precedence than its own settings. When no cluster is
+recorded, `sb_scope_require` exits with code 6 and the diagnostic hint
+`no cluster ID is recorded: run px-cluster up, or name another with --cluster`, whereas
+`px-cluster down` exits with code 0.
+
 ### Planned actions
 
 Intentional lifecycle operations deliberately alter instance states and restart counts. To prevent
@@ -301,12 +333,17 @@ disruption. Each entry is stored as a TSV row with fields `ts_ms action role ind
 ## The deployment directory
 
 The rendered deployment directory forms the sole integration boundary between a manifest generator
-and the Compose backend. `sb_provision` accepts the path to this directory and records both the
-directory path and the compose file path inside the backend's scope record so that subsequent
-processes can locate the active deployment. Because the backend consumes only the artifacts
-specified in this section, a hand-written test deployment provisions identically to a generated
-one. Treated as run output, the deployment directory is rendered beneath `$PX_OUT` by the
-generator. This specification is normative for the generator implemented in milestone A2.
+and the Compose backend. `sb_provision` accepts the path to this directory, and the backend records
+both the directory path and the compose file path inside its own scope record so that subsequent
+processes can reach the same deployment. Because the backend reads exclusively the artifacts listed
+in this section and nothing else, a hand-written test deployment provisions identically to a
+generated one when it conforms to these rules, including the memory limit requirement described
+below. Treated as run output, the deployment directory is rendered beneath `$PX_OUT` by the
+generator. This section is normative for the generator.
+
+The generator for the Compose backend is `docker/compose.gen.sh`, invoked by `px-cluster render`.
+It exclusively writes files to the deployment directory, and the backend reads no file that is not
+specified in this section.
 
 ### compose.yaml
 
@@ -320,6 +357,49 @@ accurate failure evidence; the backend neither restarts failed instances automat
 the restart policy. Services that define a container healthcheck derive their readiness state from
 that probe, whereas services without a healthcheck are considered ready while running, and one-shot
 services are considered ready once they exit with status 0.
+
+Every service must declare a memory limit via `mem_limit` or `deploy.resources.limits.memory`,
+formatted in YAML block style with one key per line. `px-cluster up` runs the host preflight check
+against the deployment directory first and rejects any deployment containing a service whose memory
+limit cannot be parsed, exiting with code 1.
+
+### The network
+
+The harness manages the deployment network. `compose.yaml` declares a single network—the project's
+default network—configured with the `bridge` driver and the cluster label, and attaches every
+service to it. Compose names this network `<project>_default`, matching the identifier stored in
+the scope record so that teardown removes it cleanly. No service uses host networking.
+
+Every service, including the setup and client roles, is assigned a stable hostname `<role>-<index>`
+that matches its service name, such as `regionserver-2` or `client-0`. Because the container engine
+resolves these names across the network, instances address one another by hostname: the ZooKeeper
+quorum at `zookeeper-0`, `fs.defaultFS` on `namenode-0`, the ResourceManager on `resourcemanager-0`,
+the JobHistoryServer on `jobhistory-0`, the master at `hbase-master-0`, and each RegionServer,
+DataNode, and NodeManager under its own hostname. The container image receives the instance hostname
+in `PX_HOSTNAME` and the bind address in `PX_BIND_HOST`, which is `0.0.0.0`. Every daemon binds its
+service ports on all interfaces inside its container through the bind-host and bind-address
+properties of HDFS, YARN, MapReduce, and HBase, along with ZooKeeper's `clientPortAddress`, allowing
+peers on the network to connect. A self-targeted health probe connects to `127.0.0.1` inside the
+container, whereas a probe targeting another instance—such as the setup role's bootstrap probe—uses
+that target instance's hostname. All health probes ignore environment proxy settings. Because
+commands invoked via `sb_exec` (such as the region mover or `px-tool shell`) do not inherit the
+environment exported by the container entrypoint, the image defines `HADOOP_CONF_DIR`,
+`YARN_CONF_DIR`, and `HBASE_CONF_DIR` pointing to the rendered configuration so that executed
+commands also address each peer by hostname.
+
+Every port in the port map is published exclusively on the host's loopback address as
+`"127.0.0.1:<port>:<port>"`. Keeping the container port identical to the host port ensures that the
+base-plus-step port map remains the single source of truth for containers, the host, and every
+client. No port is published on any other host interface, preventing access to cluster services
+from outside the host. A role's debug port is included in the port map—and therefore published—only
+when `PX_JVM_DEBUG=1` is set at render time.
+
+From the host, the operator accesses every published port at `127.0.0.1:<port>`, which matches the
+address returned by `sb_endpoint`: the web interfaces for HDFS, YARN, the JobHistoryServer, and
+HBase, the JMX servlets, and any requested debug port. Running a JDBC or HBase client directly on
+the host is not supported. Because HBase returns the internal hostnames of the master and
+RegionServers—which resolve only on the harness network—clients must run inside the `client` or
+`tooling` container, where the rendered `phoenix-client.properties` file contains the JDBC URL.
 
 ### Service labels
 
@@ -337,14 +417,16 @@ inherit them.
 | `px.harness.drain` | `regionmover` | no | `sb_restart_drain`, which drains the target role. |
 
 * `cluster`. If a provisioned deployment produces no containers carrying the scope's cluster label,
-  `sb_provision` fails with exit code 2. Declared volumes also carry this cluster label so that
-  teardown and `sb_scope_delete` can identify and remove them.
+  `sb_provision` fails with exit code 2. Declared volumes and the project network also carry this
+  cluster label so that teardown and `sb_scope_delete` can identify and remove them.
 * `role`. When this label is omitted, the backend defaults to the Compose service name, mapping one
   service directly to one role.
 * `index`. When omitted, the instance index is derived by subtracting one from the Compose
   container replica number. Any role managed by `sb_scale` must omit this explicit label because
   all replicas of a scaled Compose service share identical service labels and would otherwise
-  receive colliding indices.
+  receive colliding indices. Conversely, a role whose services carry an explicit index label
+  defines a separate Compose service per instance, and its instance count changes only by rendering
+  a new deployment.
 * `group`. Services sharing a group label are started and stopped as a unit. A group is considered
   intentionally stopped when none of its member instances are running or restarting and either
   `sb_group_stop` stopped the group or the group is an on-demand group that no test step has
@@ -359,33 +441,59 @@ inherit them.
 
 ### The port map
 
-The deployment generator writes host port mappings to `ports.generated.env` at the root of the
-deployment directory. This file follows the standard configuration grammar consisting of
-`KEY=VALUE` assignments, comments, and blank lines. Variable names follow the pattern
+The deployment generator writes all published port mappings to `ports.generated.env` at the root of
+the deployment directory. The file contains `KEY=VALUE` assignments, comments, and blank lines
+following the standard configuration file grammar. Each variable is named
 `PX_PORT_<ROLE>_<PORT>_<INDEX>` for an individual instance or `PX_PORT_<ROLE>_<PORT>` for a
-single-instance role, where `<ROLE>` and `<PORT>` are uppercase identifiers with `.` and `-`
-converted to `_`. When both forms are present, the indexed variable takes precedence over the
-unindexed variable. Each value specifies the host port published on the loopback interface,
-127.0.0.1. Port allocation is computed entirely by the generator; the backend never calculates
-port numbers.
+single-instance role, where `<ROLE>` and `<PORT>` are the uppercase role and port identifiers with
+`.` and `-` converted to `_`. When both forms are present, the indexed variable takes precedence
+over the unindexed one. The assigned value specifies both the internal container port of the
+instance and the host port published on 127.0.0.1. Port numbers are calculated exclusively by the
+generator; the backend never computes a port. The port map defines the exact set of published
+ports: `compose.yaml` publishes every port listed in the map and no others.
 
-The configuration loader ingests this file at stage 8—the lowest-precedence configuration stage—so
-any port variable overridden by an earlier configuration stage retains its higher-precedence value.
-Setting `PX_PORT_MAP_ENV` redirects loading to an alternate port-map file. The configuration loader
-reads the port map automatically when `PX_DEPLOYMENT_DIR` or `PX_PORT_MAP_ENV` is present at load
-time, `px-cluster up DIR` loads it from the target deployment directory, and the backend loads it
-from the deployment directory recorded in its scope record. Any malformed line rejected by the
-loader terminates the process with exit code 2. A missing port-map file is not fatal: in its
-absence, `sb_endpoint` returns exit code 6 and `sb_preflight` emits a warning row. Additionally,
-`sb_restart_drain` looks up the instance's `rpc` port via `PX_PORT_<ROLE>_RPC_<INDEX>` whenever the
-region-mover command template includes the `{port}` placeholder.
+Certain internal container bindings are intentionally absent from the port map. The application
+master of each MapReduce job executes inside a NodeManager container and binds three sockets on
+ephemeral ports: the client RPC port of `MRClientService`, the task umbilical port of
+`TaskAttemptListenerImpl`, and the AM web application port. Hadoop provides no configuration
+setting to pin these ports. Because they bind across all interfaces of the NodeManager container,
+they remain isolated to the private harness network, and none of them are published on the host.
+The MapReduce shuffle handler likewise binds all container interfaces on the `shuffle` port defined
+in the port map.
 
-## The 32 functions
+No HTTPS endpoints are bound because no configuration template sets an HTTPS policy, leaving all
+policies at `HTTP_ONLY`. The self-test suite verifies that every published port conforms to
+`127.0.0.1:<port>:<port>`, that all rendered configurations address peers by hostname and bind
+`0.0.0.0`, and that no template configures an HTTPS policy.
 
-Of the 32 contract functions, 27 are required—and `sb_load` rejects any backend that omits even one
+The configuration loader ingests this file at stage 8 (see "Configuration precedence" in the
+README), and the backend reads it from the deployment directory named in its scope record. Any line
+rejected by the loader terminates the process with exit code 2. A missing port-map file is not an
+error: in its absence, `sb_endpoint` returns exit code 6 and `sb_preflight` reports a warning.
+Additionally, `sb_restart_drain` looks up the instance's `rpc` port via `PX_PORT_<ROLE>_RPC_<INDEX>`
+whenever the region-mover command template uses `{port}`.
+
+### The topology record
+
+The deployment generator writes `topology.env` at the root of the deployment directory. While
+`compose.yaml` attaches it as the environment file for every service, the backend itself does not
+read its contents. The file supplies every service with the bind address `PX_BIND_HOST` and the
+debug flag `PX_JVM_DEBUG`. Alongside the topology parameters, it records the deployment's version
+set for preservation in diagnostic bundles: `PX_PHOENIX_HBASE_PROFILE`, the HBase profile of the
+Phoenix build; `PX_DIST_HBASE_VERSION` and `PX_DIST_HADOOP_VERSION`, the daemon release versions for
+HBase, HDFS, and YARN; and `PX_ZOOKEEPER_VERSION` and `PX_HBASE_HADOOP_VERSION`, the ZooKeeper and
+Hadoop client JAR versions shipped within the HBase distribution. The latter two values are read
+from the image staging record, `$PX_OUT/images/<context>.staged.tsv`, and default to `unstaged`
+prior to image staging. If a staging record corresponds to a different profile or release, rendering
+fails with exit code 2 so that the topology record never declares a version absent from the image.
+Section "Versions and the HBase profile" in the README defines this version set.
+
+## The 35 functions
+
+Of the 35 contract functions, 30 are required—and `sb_load` rejects any backend that omits even one
 of them—while 5 are optional: `sb_signal`, `sb_restart_drain`, `sb_events`, `sb_sample_resources`,
 and `sb_endpoint_release`. Before invoking an optional function, callers must check `sb_supports`
-or `sb_capability`, or else invoke it via `sb_call`, which translates an unimplemented function
+or `sb_capability`, or else invoke it through `sb_call`, which translates an unimplemented function
 into exit code 5. Callers must always record exit code 5 as a skipped operation rather than a
 failure.
 
@@ -409,8 +517,9 @@ invoked without running the configuration loader:
 | `PX_TIMEOUT_GROUP` | 600 | `sb_group_stop`, `sb_group_start` |
 | `PX_TIMEOUT_DRAIN` | 600 | The drain and rebalance phases of `sb_restart_drain` |
 | `PX_TIMEOUT_TEARDOWN` | 300 | `sb_teardown`, `sb_scope_delete` |
-| `PX_TIMEOUT_STOP` | 120 | The stop grace period for teardown, group stop, kill, and signal. |
+| `PX_TIMEOUT_STOP` | 120 | The stop grace period for teardown, group stop, kill, and signal |
 | `PX_TIMEOUT_DEFAULT` | 300 | Non-following `sb_logs`, `sb_copy_in`, `sb_copy_out` |
+| `PX_TIMEOUT_BUILD` | 3600 | `sb_image_build` |
 
 When `PX_DRY_RUN=1` is active, any function that creates, removes, stops, starts, signals, or
 copies artifacts logs the intended operation and returns exit code 0 without emitting data rows,
@@ -448,12 +557,10 @@ diagnostic bug reports.
 
 * **stdout** Emits `kv` rows pairing each component name with its version string.
 * **exit** Returns exit code 0 on success, or 1 when the container runtime cannot be reached.
-* **Compose** Emits rows for `engine_client`, `engine_server`, `compose_flavour`, and
-  `compose_version`. The flavour is reported as `plugin` when using the Docker CLI compose
-  subcommand, or `standalone` when falling back to the standalone `docker-compose` binary in the
-  absence of the subcommand. If the engine client does not respond, the function returns exit code
-  1 without emitting rows; if the server daemon does not respond, it emits the rows with an empty
-  `engine_server` value and returns exit code 1.
+* **Compose** Emits rows for `engine_client`, `engine_server`, and `compose_version`, obtaining the
+  last from the compose subcommand of the Docker CLI. If the engine client does not respond, the
+  function returns exit code 1 without emitting rows; if the server daemon does not respond, it
+  emits the rows with an empty `engine_server` value and returns exit code 1.
 
 #### `sb_capabilities`
 
@@ -472,25 +579,27 @@ rather than failing on unsupported operations.
 #### `sb_preflight scope_id`
 
 Executes the backend-specific portion of host preflight validation, verifying whether the runtime
-engine is installed and reachable, whether the current user is authorized, whether tool versions
-meet minimum floors, whether mapped loopback ports are free, and how much memory is available to
-the engine. The host-level preflight check—which compares aggregate container resource limits
-against host memory, disk space, and CPU count—resides in `scripts/preflight.sh` from milestone A2
-(see the README). Because `sb_preflight` verifies that mapped ports are unoccupied, it fails if run
-against an already-active cluster and is therefore never invoked prior to starting a role group.
+engine is installed and reachable, whether the caller is authorized, whether tool versions meet
+their minimum floors, whether the mapped ports are free, and how much memory is available to the
+engine. The host-level portion—which sums configured resource limits against available memory, disk
+space, and processors—resides in `scripts/preflight.sh` (see the README). Because `sb_preflight`
+verifies that mapped ports are free, a full check fails against a cluster that is already running.
+The memory check executed prior to starting a role group also invokes `sb_preflight`, but inspects
+only the `engine_memory` row and ignores the port availability result.
 
-* **stdout** Emits `check` rows containing the check identifier, a status of `ok`, `fail`, or
-  `warn`, and an explanatory detail string.
+* **stdout** Emits `check` rows containing the check name, a status of `ok`, `fail`, or `warn`, and
+  an explanatory detail string.
 * **exit** Returns exit code 0 when no check fails, 3 when at least one check fails, and 2 on
-  invalid usage or when the configuration loader rejects a malformed port-map line. Presence of a
-  `warn` row does not alter the exit code.
+  invalid usage or when the configuration loader rejects a malformed port-map line. A `warn` row
+  does not alter the exit code.
 * **Compose** Evaluates the checks `engine_binary`, `engine_responsive`, `engine_version` (minimum
   floor 20.10), `engine_credentials`, `compose_version` (minimum floor 2), `engine_memory`, and
-  `port_availability`. If no engine binary is found, the check terminates early after emitting two
-  `fail` rows. `engine_memory` reports the total memory allocated to the engine—which on desktop
-  hosts runs inside a virtual machine with its own memory ceiling—and reports `warn` if the engine
-  does not report a memory total. `port_availability` reports `fail` if any port in the loaded port
-  map already accepts a loopback connection, and reports `warn` when no port map is loaded.
+  `port_availability`. When no engine binary is found, the function terminates early after emitting
+  two `fail` rows. `engine_memory` reports the total memory available to the engine—which on
+  desktop hosts runs inside a virtual machine with its own memory ceiling—and reports `warn` when
+  the engine reports no memory total. `port_availability` fails when any port in the loaded port
+  map (the set of ports published by the deployment) already accepts a connection on 127.0.0.1 of
+  the host, and reports `warn` when no port map is loaded.
 
 ### Scope
 
@@ -688,8 +797,12 @@ and refer to the same underlying instances.
   role has no instances in the scope; and 4 if the operation exceeds its timeout (defaulting to
   `PX_TIMEOUT_SCALE`).
 * **Compose** Runs `up -d --no-recreate --no-build --no-deps --scale <service>=<count> <service>`
-  so that no unrelated services are started or modified, and then invokes `sb_wait_ready` scoped
-  exclusively to that role.
+  so that no unrelated services are started or modified, and then invokes `sb_wait_ready` restricted
+  to that role. Because a role whose instances carry an explicit index label defines a dedicated
+  service per instance with its own published ports, adding a service replica would duplicate both
+  the index and the ports. Consequently, such a role cannot be scaled in place: the call fails with
+  exit code 2 and instructs the caller to re-render the deployment with the updated count and bring
+  the cluster up again.
 
 #### `sb_group_stop scope_id group [timeout_s]`
 
@@ -891,14 +1004,15 @@ milestone A3 uses it to determine whether resource exhaustion requires tearing d
 
 #### `sb_endpoint scope_id role index port_name`
 
-Performs service port discovery, returning a host-reachable loopback address for a named service
-port so that test clients, JDBC connection URLs, and operators never hardcode port numbers.
+Performs service port discovery, returning a host-reachable address for a named service port—always
+on the loopback interface—so that host-side tools and operators never hardcode port numbers.
 
 * **stdout** Emits a single `endpoint` row.
 * **exit** Returns exit code 0 on success, 1 if the runtime fails to respond, 6 if the instance is
-  unknown or the port map contains no entry for the requested port name, and 2 on invalid usage.
-* **Compose** Verifies that the target instance exists, looks up the host port in the loaded port
-  map, and returns `127.0.0.1` paired with that port.
+  unknown or the port map contains no entry for the requested port, and 2 on invalid usage.
+* **Compose** Verifies that the target instance exists, reads the port from the loaded port map,
+  and returns `127.0.0.1` paired with that port. Because the deployment publishes that port on
+  127.0.0.1 of the host, the returned address is directly reachable from the host.
 
 #### `sb_endpoint_release scope_id role index port_name` (optional)
 
@@ -924,24 +1038,78 @@ manifest and later read back by the image promotion workflow from a passing test
   from container inspection. Because the `image_digest` capability is `no` on Compose, callers that
   require an immutable registry digest must check that capability first.
 
+#### `sb_image_build context_dir tag [NAME=VALUE...]`
+
+Builds the single multi-role container image from a staged build context so that the build
+pipeline's image construction invokes the container engine exclusively through the substrate
+contract like every other operation. Because this function and the two image functions that follow
+operate at the host level rather than on a cluster scope, they take no scope identifier argument.
+`scripts/stage-artifacts.sh` stages the build context under `$PX_OUT/images/` and invokes this
+function; no other component builds an image.
+
+* **stdout** Emits a single `image` row containing the tag as `image_ref` and the local image
+  identifier.
+* **exit** Returns exit code 0 when built; 1 if the build fails, the resulting image lacks an
+  identifier, or the runtime fails to respond; 2 on invalid usage, a context directory without a
+  `Dockerfile`, a tag that is not a local `repository:tag`, or a build argument not formatted as
+  `NAME=VALUE`; and 4 if the build exceeds its timeout (defaulting to `PX_TIMEOUT_BUILD`).
+* **Compose** Invokes the engine's `build` command with `--tag`, one `--build-arg` flag for each
+  build argument, and `--file <context>/Dockerfile`, followed by an image inspection to retrieve the
+  image identifier. All build output is directed to stderr. The image remains strictly local: any
+  tag specifying a registry host or a digest is rejected, and nothing is pushed. The build fetches
+  the base images pinned by digest in the `Dockerfile`, while its runtime stage installs four
+  operating-system packages from the base distribution archive without version pins. The engine
+  builds for the host architecture; arm64 is the primary supported architecture and amd64 is best
+  effort, which the staging step notes in its output when running on an amd64 host.
+
+#### `sb_image_present deployment_dir`
+
+Reports each container image referenced by a deployment before cluster bring-up creates any
+resources. `px-cluster up` calls this function prior to running preflight checks and rejects any
+deployment whose required image is absent on the host, reporting the two commands that build it.
+
+* **stdout** Emits one `image` row per referenced image, containing the image reference and the
+  local image identifier (which is empty for any image not held by the engine).
+* **exit** Returns exit code 0 when every referenced image is present; 1 if the runtime fails to
+  respond; 2 on invalid usage or a directory lacking the deployment manifest file; and 6 when one or
+  more images are absent.
+* **Compose** Inspects each of the `image:` values declared in `compose.yaml` via the engine's
+  `image ls` command. A deployment that declares no image references—such as one written by
+  hand—emits no rows and returns exit code 0.
+
+#### `sb_image_base_digest ref arch`
+
+Resolves the manifest digest for a specific architecture of a base image from its upstream registry.
+`scripts/stage-artifacts.sh` calls this function for any base image lacking a declared digest,
+records the resolved digest in `$PX_OUT/images/pins.env`, and verifies against that record on
+subsequent invocations—applying the same trust-on-first-use policy that `scripts/fetch-dist.sh`
+uses for binary distributions.
+
+* **stdout** Emits a single `image` row containing the image reference and `sha256:<hex>` as
+  `image_id`.
+* **exit** Returns exit code 0 on success; 1 if the registry or container runtime fails to return a
+  digest for the requested architecture; and 2 on invalid usage, an architecture other than `arm64`
+  or `amd64`, or an image reference that already includes a digest.
+* **Compose** Invokes `buildx imagetools inspect` with a format string that lists the platform and
+  digest of each manifest in the image index, and selects the `linux/<arch>` entry.
+
 ## The runtime boundary
 
 **Only a backend implementation may invoke a container runtime or a Kubernetes tool.** In the
 current repository, `lib/backend/compose.sh` is the sole file permitted to reference any of the
-eight tool binaries (`docker`, `docker-compose`, `podman`, `nerdctl`, `kubectl`, `k3d`, `helm`, and
-`crictl`) or any of the three internal engine variables (`PX_DOCKER_BIN`, `_PXC_ENGINE`, and
-`_PXC_COMPOSE`).
+eight tool binaries `docker`, `docker-compose`, `podman`, `nerdctl`, `kubectl`, `k3d`, `helm`, and
+`crictl`, or either of the engine variables `PX_DOCKER_BIN` and `_PXC_ENGINE`.
 
 The Compose backend resolves the container engine binary once per process and stores its absolute
-filesystem path in `_PXC_ENGINE`, a shell-private variable that is never exported. Only Docker is
-accepted by this resolution search. If the operator sets `PX_DOCKER_BIN` (conventionally in
-`env/local.env`), that path takes precedence; otherwise, the backend searches `PATH` followed by
-`~/.docker/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and `/usr/bin`. Compose operations prefer
-the compose subcommand of that resolved engine binary, falling back to the standalone
-`docker-compose` executable only when the subcommand is unavailable. Because `PX_DOCKER_BIN` is
-classified as `private` in `lib/varnames.txt`, the configuration loader populates it as an
-unexported shell variable, and `compose.sh` scrubs it from the environment upon loading so that
-child processes cannot discover the engine binary through it.
+filesystem path in `_PXC_ENGINE`, a private shell variable that is never exported. Only Docker is
+accepted by this resolution search. If the operator sets `PX_DOCKER_BIN`—conventionally in
+`env/local.env`—that setting takes precedence; otherwise, the backend searches `PATH` followed by
+`~/.docker/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and `/usr/bin`. Compose operations always
+use the compose subcommand of that resolved engine binary, and the backend never invokes the
+standalone `docker-compose` program. Because `PX_DOCKER_BIN` is declared `private` in
+`lib/varnames.txt`, the configuration loader populates it as an unexported variable in the current
+process, and `compose.sh` scrubs it from the environment upon loading so that child processes cannot
+discover the engine binary through it.
 
 Every runtime invocation inside the backend funnels through a single function, `px_compose_call`,
 which executes the resolved absolute path either via the `command` shell builtin or under
@@ -985,9 +1153,11 @@ all three:
    backend call and asserts that the audit log is **not** empty and contains the expected scope
    label selector, proving that the shim and `PATH` interception are functioning properly.
 
-Any new file that genuinely requires direct runtime access represents an architectural design
-decision rather than a routine allowlist addition. The container image build scripts are the only
-anticipated future additions, and each will carry its own explicit justification.
+Any requirement for a new file to access the container runtime directly is an architectural design
+question rather than a routine allowlist addition. The image build pipeline illustrates this
+principle: `scripts/stage-artifacts.sh` stages the build context and invokes `sb_image_build`, so
+the build pipeline never references a container runtime directly and the allowlist remains
+unchanged.
 
 ## Rules a backend author must honour
 
@@ -1029,11 +1199,14 @@ Compose.
 
 ## Kubernetes backend
 
-**Status: not yet implemented. Milestone K1 implements the core Kubernetes backend, and milestone
-K2 implements its preflight checks, safety controls, and image promotion workflows.** The section
-headings below outline the structure of that upcoming implementation. Every specification earlier in
-this document is normative for Kubernetes: the backend will implement the exact same 32 contract
-functions, output schemas, and exit codes without introducing any custom substrate verbs.
+**Status: not yet implemented. Milestone K1 implements the core backend, and milestone K2
+implements its preflight checks, safety controls, and image promotion workflows.** Milestone K1 adds
+the specification sections covering binding, scope management, manifest generation, readiness
+probes, command execution and file copy, scaling, and capabilities; milestone K2 adds the sections
+covering fault injection, failure evidence, endpoints, images, preflight checks, and k3d proofing.
+Everything earlier in this document is normative for the Kubernetes backend: it implements the exact
+same 35 contract functions, output schemas, and exit codes without introducing any custom substrate
+verbs.
 
 The planned architectural mapping from the design document serves as the baseline design rather than
 an immutable commitment:
@@ -1054,68 +1227,3 @@ evidence         restart counts, terminated reason and exit code, pod events; th
 endpoint         a loopback-bound port-forward whose pid is recorded in the state dir
 image_ref        the spec reference plus the resolved digest, which promotion reads
 ```
-
-### Binding and prerequisites
-
-*K1. Defines the minimum client version floor, Kubernetes context resolution, and the metadata
-reported by `sb_version_info`.*
-
-### Scope: context and namespace
-
-*K1. Specifies the scope identifier format, namespace labeling, and the concurrency check that
-refuses to overwrite an existing deployment.*
-
-### Manifest generation and provisioning
-
-*K1. Covers manifest generation, fail-closed validation rules, client-side dry-run verification,
-and how `sb_provision` applies manifests.*
-
-### Readiness and probes
-
-*K1. Details the pod readiness probe configuration that delegates to the shared healthcheck
-script.*
-
-### Exec, logs and copy
-
-*K1. Describes targeting the named pod container, retrieving previous container logs, and
-enforcing destination path validation during copy-out operations.*
-
-### Scaling and role groups
-
-*K1. Covers StatefulSet replica scaling, aligning pod ordinals with zero-based instance indices,
-and implementing role group stop and start transitions.*
-
-### Faults: kill, signal and drain restart
-
-*K2. Specifies the kill modes, signal delivery when the container image includes a shell, and the
-graceful drain-restart workflow.*
-
-### Evidence: restarts, termination, out of memory, events
-
-*K2. Details pod restart count tracking, termination reason normalization, pod event collection,
-and cluster anomaly detection.*
-
-### Endpoints and port forwarding
-
-*K2. Covers loopback-bound port-forward management, PID tracking in the state directory, and
-automatic endpoint release during teardown.*
-
-### Images, digests and promotion
-
-*K2. Specifies immutable image digest resolution, registry pull secret handling, and promoting
-verified images from passing run bundles.*
-
-### The capability table on Kubernetes
-
-*K1. Lists which optional capabilities report `yes` on Kubernetes and describes the runtime probes
-backing them.*
-
-### Preflight on Kubernetes
-
-*K2. Covers cluster allocatable capacity checks, namespace resource quota summation, storage class
-verification, and k3s resource allowances.*
-
-### k3d proofing
-
-*K2. Details the two supported k3d cluster topologies, version pins, and host-level concurrency
-controls.*

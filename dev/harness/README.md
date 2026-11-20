@@ -37,43 +37,62 @@ export PATH="$PWD/dev/harness/bin:$PATH"   # or call the commands by path
 px-cluster --help                          # every command answers --help
 px-cluster config                          # every resolved value with its origin
 px-cluster validate --no-backend           # check the configuration and the contract only
-px-suite --dry-run my.suite                # print the execution order, change nothing
+px-cluster render --class validation       # render a deployment, change nothing else
+px-suite my.suite --dry-run                # print the execution order, change nothing
+px-run psql --class validation -- --prepare schema.sql query.sql   # one test, one bundle
 dev/harness/test/run-tests.sh              # the self-test: no runtime, no network, no Maven
 ```
 
-Because `px-cluster config` and `px-cluster validate --no-backend` do not contact a container
-runtime, both commands function even before a runtime is installed on the host. Bringing up a live
-cluster requires two additional prerequisites: a built container image and a rendered deployment
-directory. The deployment directory serves as the sole architectural boundary between the topology
-generator and the substrate backend; consequently, `px-cluster up DIR` provisions whatever
-directory it receives without needing any built-in knowledge of roles, sizing, port assignments, or
-component versions. Supply the target directory as a positional argument or configure it via
-`PX_DEPLOYMENT_DIR`; invoking `px-cluster up` without either constitutes a usage error and exits
-with code 2. Refer to the "The deployment directory" section of `docs/backends.md` for the exact
-layout and contents of that directory.
+Because `px-cluster config`, `px-cluster validate --no-backend`, and `px-cluster render` do not
+contact a container runtime, they function even before a runtime is installed on the host. Bringing
+up a cluster requires two additional prerequisites: the container image and a rendered deployment
+directory. That deployment directory serves as the sole architectural boundary between the generator
+and the backend, allowing `px-cluster up DIR` to provision whatever directory it receives without
+any knowledge of roles, sizing, ports, or versions. See the "The deployment directory" section of
+`docs/backends.md` for the specification of what that directory contains.
 
-When `px-cluster up` completes, it persists the active cluster scope so that subsequent commands
-invoked from any shell session can discover it automatically, as detailed under "Scope resolution"
-below. All generated artifacts are written beneath `$PX_OUT`, which defaults to
-`$HOME/phoenix-harness`. Operators should inspect the run directory path printed by the command, as
-no runtime artifacts are ever left inside the source tree.
+Once the image is built, a single command brings up a cluster from a run class and a topology file.
+During staging, `stage-artifacts.sh` pins each base image by digest through
+`PX_IMAGE_BASE_JDK<N>_SHA256_<ARCH>`. Any digest not already declared in
+`docker/versions.local.env` is resolved and recorded on first use in `$PX_OUT/images/pins.env`, and
+every subsequent build uses that record:
+
+```sh
+dev/harness/scripts/build-phoenix.sh       # the Phoenix jars of this tree
+dev/harness/scripts/stage-artifacts.sh     # the staging checks, then the image build
+px-cluster --class measurement --config dev/harness/docker/env/override-24gib.env up
+```
+
+When invoked without a directory argument, `px-cluster up` first renders the deployment for the
+active run class into `$PX_OUT/deploy/<cluster>`. Calling it without a directory,
+`PX_DEPLOYMENT_DIR`, or a run class constitutes a usage error and exits with code 2. Prior to
+creating any resources, the command executes the host preflight check, `scripts/preflight.sh`,
+against the deployment directory to verify the container engine, its credentials, and the required
+loopback ports, and then compares the sum of the container memory limits against total engine memory
+less 4 GiB. Any deployment that exceeds this budget is refused with exit code 3 and a diagnostic
+message showing the arithmetic.
+
+Upon completion, `px-cluster up` records the cluster scope so that subsequent commands in any shell
+session can discover it automatically; see "Scope resolution" below. All generated output is placed
+under `$PX_OUT`, which defaults to `$HOME/phoenix-harness`. Operators should inspect the run
+directory printed by the command, as nothing useful is left inside the repository tree.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `px-cluster` | Manages lifecycle: provision, wait, inspect, log, exec, scale, faults, teardown. |
-| `px-suite` | Executes a declarative suite: dependencies, boundaries, filters, and dry-run plans. |
+| `px-cluster` | Manages lifecycle: provision, wait, inspect, faults, teardown, version matrix. |
+| `px-suite` | Executes a declarative suite file: dependencies, boundaries, filters, and dry run. |
 | `px-run` | Executes one test: one run directory, one driver, snapshots, disruptions, exit code. |
 | `px-tool` | Runs administration and diagnosis tasks: an instance shell and the doctor report. |
 | `px-collect` | Samples host and container resource utilization and writes the telemetry to CSV. |
 | `px-profile` | Orchestrates sampling profiler sessions against selected cluster roles. |
 | `px-jfr` | Captures Java Flight Recorder profiling sessions against selected cluster roles. |
 | `px-trace-count` | Runs exact invocation-count tracing, the count-based evidence a run prefers. |
-| `px-bundle` | Packages and validates the structured result bundle produced by a test run. |
-| `px-report` | Aggregates verdict streams into a consolidated run verdict and final exit code. |
-| `px-pherf` | Deploys and coordinates the Pherf workload controller and agents on any backend. |
-| `px-k3d` | Creates and tears down the local k3d cluster that validates the Kubernetes backend. |
+| `px-bundle` | Packages and validates the result bundle produced by a test run. |
+| `px-report` | Merges verdict streams into a single consolidated run verdict and exit code. |
+| `px-pherf` | Deploys and coordinates the Pherf controller and its agents on either backend. |
+| `px-k3d` | Creates and removes the local k3d cluster used to validate the Kubernetes backend. |
 
 Every command responds to `--help` with exit code 0 and rejects any unrecognized flag with exit
 code 2.
@@ -94,13 +113,16 @@ publishes the specific image digests recorded by a passing result bundle.
 
 ### Pinned downloads
 
-Every external artifact required during image construction is fetched through a cryptographically
-pinned download mechanism. A declared pin specifies an architecture-specific cryptographic digest
-that the fetcher validates over HTTPS after resolving an appropriate Apache mirror. When an
-artifact lacks a predeclared pin, the fetcher applies a trust-on-first-use policy: the initial
-download records the observed digest into the local version override file, and all subsequent
-downloads verify the artifact against that recorded hash. Any digest mismatch immediately aborts
-the retrieval.
+Every third-party distribution required by the container image is retrieved through a pinned
+download mechanism. A declared pin specifies an architecture-specific cryptographic hash that the
+fetcher verifies over HTTPS after resolving an Apache mirror. When an artifact has no declared pin,
+retrieval follows a trust-on-first-use policy: the first download logs the observed hash and records
+it in `$PX_OUT/dist/pins.env` outside the source tree, and all subsequent downloads verify against
+that recorded value. Because each pin is bound to a specific release version, a re-pinned release
+never inherits the pin of another release. Any hash mismatch immediately aborts the download. Base
+container images are similarly pinned by digest, whereas the four OS packages installed from the
+base distribution's package archive remain unpinned. Phoenix itself is never downloaded remotely;
+the image packages only the jars produced by the local Maven build.
 
 ### Output outside the tree
 
@@ -155,12 +177,21 @@ $PX_OUT/
     planned-<scope>.tsv         the planned actions of one scope
     collect-<cluster>.tsv       the collections of the cluster that may hold a
                                 live collector, one directory per line
+    deployment-<backend>-<cluster>  the deployment directory that up provisioned
     compose/                    the Compose backend: its scope records, its
                                 capability table and its host lock
+  deploy/<cluster>/    the rendered deployment directory: compose.yaml,
+                       ports.generated.env, topology.env, services.tsv
+  dist/                the verified distributions, and pins.env, the pins that trust on
+                       first use recorded
+  build/phoenix/       the record and the log of the local Phoenix build: build.tsv holds
+                       the jars, the bson jar, pherf_classpath (the pherf jar and the
+                       class path of phoenix-pherf without its test jars) and java_home
+                       (the JDK of the build)
+  images/<context>/    the staged build context of the image: the tag, each : and / as _
+  images/<context>.staged.tsv  the version set of that context
+  matrix/<run-id>/     one directory per px-cluster matrix: matrix.tsv
 ```
-
-Subsequent implementation rounds will place downloaded binary distributions, container image build
-contexts, and rendered deployment directories beneath this same root directory.
 
 Each run identifier combines a chronologically sortable UTC timestamp with a compact disambiguating
 suffix in the format `<YYYYMMDDTHHMMSSZ>-<4 characters>`. The timestamp prefix ensures that run
@@ -170,14 +201,14 @@ exclusively so that two runs initiated within the same second cannot collide or 
 
 ## Scope resolution
 
-Every command that targets a running cluster resolves the active scope identifier through a single
-function, `sb_scope_resolve`. Resolution checks `PX_SCOPE_ID` first when explicitly set in the
-environment; otherwise, it reads the scope record persisted by `px-cluster up` for the selected
-backend and `PX_CLUSTER_ID` (which defaults to `default`), or exits with code 6 and an error
-message identifying the missing cluster. This resolution path is shared across `px-cluster`,
-`px-run`, `px-suite`, `px-tool`, `px-collect`, and `px-pherf`, while `px-cluster down` removes the
-persisted scope record upon teardown. A valid cluster name must begin with a lowercase letter or
-digit and may contain only lowercase letters, digits, `-`, and `_`.
+Every command that operates on a cluster resolves the active scope identifier through
+`sb_scope_resolve`, which checks `PX_SCOPE_ID` first, falls back to the scope record written by
+`px-cluster up`, and otherwise terminates with exit code 6 and the diagnostic hint
+`no cluster ID is recorded: run px-cluster up, or name another with --cluster`. Because the target
+backend for the scope record is determined from the stored cluster record, `--backend` only needs
+to be specified during initial cluster bring-up. The sole exception is `px-cluster down`, which
+exits with code 0 when no cluster is recorded. The complete resolution contract is detailed in
+`docs/backends.md`.
 
 ## The PX_* namespace
 
@@ -222,15 +253,17 @@ following order, and **the first stage that defines a variable takes precedence*
 | 7 | Local version overrides | `versions-local` | `docker/versions.local.env` |
 | 8 | Generated port map | `ports` | `<deployment directory>/ports.generated.env` |
 
-Because a later stage never overwrites a value established by an earlier stage, explicit overrides
-reliably supersede lower-priority defaults. This precedence model also underpins trust-on-first-use
-artifact pinning: local version overrides supply a digest only when the tracked version definitions
-do not already declare one, whereas an operator who wishes to override a committed pin places the
-replacement in `local.env`, which outranks both version files. Similarly, because run class
-defaults are evaluated prior to the baseline defaults, specifying a run class only inside a later
-stage would occur too late to take effect; the loader actively rejects such late declarations
-rather than silently ignoring them, requiring the class to be specified on the command line or in
-the environment.
+Because a later stage never overwrites a value set by an earlier one, an explicit override always
+supersedes lower-priority defaults. The local version overrides file holds operator-declared pins,
+such as base image digests, together with version selections that re-pin a release; `versions.env`
+specifies only the fallback default for each selection, which the loader applies after the final
+stage under the `derived` origin. Trust-on-first-use pins live outside the configuration loader:
+distribution digests are stored in `$PX_OUT/dist/pins.env` and read directly by
+`scripts/fetch-dist.sh`, while base image digests are stored in `$PX_OUT/images/pins.env` and read
+directly by `scripts/stage-artifacts.sh`. An operator who wants to replace a declared pin sets the
+override in `local.env`, which outranks both version files. Because the run class is evaluated prior
+to the baseline defaults, it must be specified on the command line, in the environment, in a
+`--config` file, or in `local.env`; declaring it in a later stage is too late to take effect.
 
 Operators also use `local.env` to configure `PX_DOCKER_BIN` when the Docker CLI resides outside the
 standard search paths inspected by the backend. Every `px-*` command reads this file directly, while
@@ -250,6 +283,120 @@ text rather than sourcing them in a shell, ensuring that files cannot execute ar
 and that all assigned values are treated as uninterpreted literals without variable expansion.
 Running `px-cluster config` displays every resolved variable alongside its origin stage, providing
 the primary starting point for diagnosing configuration precedence issues.
+
+## Versions and the HBase profile
+
+A version set comprises the Phoenix HBase build profile, the cluster's HBase and Hadoop runtime
+releases, and the target JDK assigned to each role. By default, these selections track the latest
+patch releases so that test runs include upstream bug fixes that an older static pin would miss:
+Hadoop 3.4.3 across every profile, and the latest HBase 2.6 release (2.6.7) for the default `2.6`
+profile.
+
+The `PX_PHOENIX_HBASE_PROFILE` setting determines the `-Dhbase.profile` argument passed to the
+Phoenix build. Each profile selects an HBase compatibility module and compiles Phoenix against the
+HBase and Hadoop versions declared for that profile in the root `pom.xml`. The deployed cluster
+executes its own HBase runtime release, which must fall within the version range supported by that
+compatibility module. The lower bound of each range is governed by the `check-hbase-compatibility`
+enforcer rule in `phoenix-core-client/pom.xml`, while the upper bound is the final patch release
+prior to the next compatibility module in the same minor series, since Phoenix introduces a new
+module whenever HBase modifies an interface that the module consumes. This compatibility matrix is
+codified in `PX_HBASE_PROFILES` within `lib/common.sh`, and the build script rejects any root pom
+that maps a profile to a different module.
+
+| Profile | Module | Phoenix compiles against | Admitted runtime | Default runtime |
+|---|---|---|---|---|
+| `2.5.0` | 2.5.0 | HBase 2.5.3-hadoop3, Hadoop 3.2.4 | 2.5.0 to 2.5.3 | 2.5.3 |
+| `2.5.4` | 2.5.4 | HBase 2.5.10-hadoop3, Hadoop 3.3.6 | 2.5.4 and later 2.5 | 2.5.10 |
+| `2.5` | 2.5.4 | HBase 2.5.14-hadoop3, Hadoop 3.4.2 | 2.5.4 and later 2.5 | 2.5.16 |
+| `2.6.0` | 2.6.0 | HBase 2.6.1-hadoop3, Hadoop 3.3.6 | 2.6.0 to 2.6.3 | 2.6.1 |
+| `2.6.3` | 2.6.0 | HBase 2.6.3-hadoop3, Hadoop 3.4.2 | 2.6.0 to 2.6.3 | 2.6.3 |
+| `2.6` (default) | 2.6.4 | HBase 2.6.5-hadoop3, Hadoop 3.4.2 | 2.6.4 and later 2.6 | 2.6.7 |
+
+Because the floating `2.5` and `2.6` profiles track their respective minor release lines, each
+defaults to the latest patch release in that series, whereas every other profile defaults to the
+exact release declared for it in the pom. Both the artifact staging step and the host preflight
+check reject any HBase release outside the admitted range with exit code 2, reporting the active
+profile, its permitted version range, and the offending release.
+
+The ZooKeeper and Hadoop client libraries used by the HBase daemons are the bundled jars shipped
+inside the HBase distribution's `lib/` directory. During staging, the harness inspects the archive
+to extract the exact version of each jar (requiring precisely one match for each), passes those
+versions to the container image build for secondary verification, and records them in the staging
+manifest. Any deployment rendered from that image propagates those versions into `topology.env`
+alongside the rest of the version set, and `px-suite` records the complete version set in the
+`summary.tsv` artifact of every suite session.
+
+Predeclared cryptographic pins, taken from the official `.sha512` checksum files published by
+Apache, cover the default distributions: Hadoop 3.4.3 for both CPU architectures, HBase 2.6.7, and
+HBase 2.5.16. All other releases are verified under trust on first use. Because Apache Hadoop uses
+different arm64 archive filenames across releases, each Hadoop release entry explicitly declares its
+arm64 archive path: release 3.4.3 uses `hadoop-3.4.3-aarch64.tar.gz`, whereas release 3.4.2 used
+`hadoop-3.4.2-aarch64-lean.tar.gz`.
+
+### Re-pinning
+
+Operators can re-pin component versions for a single host without modifying any tracked repository
+file by writing the desired version selections into `docker/versions.local.env`, which is ignored by
+git:
+
+```sh
+cat >dev/harness/docker/versions.local.env <<'EOF'
+PX_DIST_HBASE_VERSION=2.6.8
+PX_DIST_HADOOP_VERSION=3.4.4
+PX_DIST_HADOOP_3_4_4_PATH_ARM64=hadoop/common/hadoop-3.4.4/hadoop-3.4.4-aarch64.tar.gz
+EOF
+dev/harness/scripts/build-phoenix.sh && dev/harness/scripts/stage-artifacts.sh
+```
+
+Adding `PX_PHOENIX_HBASE_PROFILE=2.5` to that file selects an alternate build profile along with
+that profile's default runtime release unless an explicit release version is also specified. Passing
+a `--config FILE` containing the same assignments applies those overrides to a single command
+invocation. Because a newly re-pinned release lacks a predeclared checksum pin, its initial download
+uses trust on first use and records the observed hash in `$PX_OUT/dist/pins.env`. To promote that
+hash to a declared pin, copy the digest into `versions.local.env` under a variable such as
+`PX_DIST_HBASE_2_6_8_SHA512_ARM64`, splitting values that exceed a single line across `_2` and
+subsequent continuation suffixes. Running `px-cluster config` displays the provenance of each active
+version selection.
+
+### The version matrix
+
+The `px-cluster matrix SUITE FILE...` command executes a single test suite across multiple version
+sets sequentially. Each `FILE` argument is a configuration file that re-pins the HBase profile, the
+runtime distribution releases, or the role JDK versions. For each file in turn, the command builds
+Phoenix, stages the container image, provisions the cluster, runs the suite, and tears the cluster
+down, evaluating the matrix configuration file ahead of any `--config FILE` options supplied on the
+command line. The command emits one summary row per version set, persists the table to
+`$PX_OUT/matrix/<run-id>/matrix.tsv`, and records each set's resolved versions within its own suite
+session directory.
+
+```sh
+px-cluster matrix smoke set-2.6.env set-2.5.env --class validation \
+  --config dev/harness/docker/env/override-24gib.env
+```
+
+## The cluster network
+
+All cluster instances execute on a dedicated bridge network managed by the harness and never use
+host networking. Every instance is assigned a deterministic hostname of the form `<role>-<index>`,
+such as `namenode-0`, `regionserver-2`, or `client-0`, and cluster nodes communicate with one
+another using these hostnames. Inside its container, each daemon binds its listening ports across
+all network interfaces so that peer instances on the bridge network can establish connections.
+
+Every port defined in the port map is published exclusively on the host's `127.0.0.1` loopback
+address using the identical port number assigned inside the container. Consequently, a single port
+map governs inter-container, host, and client access while ensuring that no cluster service is
+exposed outside the host machine. JVM debug ports are published only when the deployment is rendered
+with `PX_JVM_DEBUG=1`. During bring-up, the host preflight check aborts provisioning if any
+published port is already bound on `127.0.0.1`.
+
+Operators on the host can access all published endpoints at `127.0.0.1:<port>`, including daemon web
+interfaces, JMX servlets, and JVM debug ports, and can query `px-cluster endpoint` to resolve the
+port assigned to a specific instance. Running a JDBC or HBase client directly on the host is not
+supported because HBase returns internal container hostnames that do not resolve on the host system.
+Instead, execute client workloads inside the `client` or `tooling` container, for example via
+`px-tool shell`, where the rendered `phoenix-client.properties` file provides the configured JDBC
+URL. The complete networking contract is specified in the "The network" section of
+`docs/backends.md`.
 
 ## Exit codes
 
@@ -302,41 +449,18 @@ prior to executing the change. Only entries recorded within the time bounds of t
 honored, ensuring that disruptions from earlier runs never mask new failures. The schema and
 semantics of this ledger are detailed in `docs/backends.md`.
 
-The `sb_exec` contract function is the sole exception that propagates a foreign exit status,
-returning the exact exit code produced by the command executed inside the target instance. Four
-status codes are reserved to distinguish substrate framing failures from in-container command
-failures: 124 indicates that the execution wait expired, 125 indicates that the substrate could not
-launch the command, 126 indicates that the target binary is not executable, and 127 indicates that
-the target binary does not exist. Programs running inside a cluster role must never exit with any
-of these four reserved codes.
+The `sb_exec` function returns the exit status of the command it executes and reserves status codes
+124 through 127 for substrate framing errors, as detailed in `docs/backends.md`.
 
 ## The host memory check
 
-Starting an additional role group commits its container memory limits against host capacity;
-accordingly, both `px-cluster group start` and the `requires` directive processing in `px-suite`
-execute the host memory check prior to starting each role group. This check corresponds to the
-memory validation phase of the host preflight subsystem, invoked via the command-line contract
-implemented in round A2:
-
-```sh
-"$PX_HOME/scripts/preflight.sh" --phase memory
-```
-
-* The invoking command executes the preflight script under the `PX_TIMEOUT_DEFAULT` bound and
-  redirects both its standard output and standard error streams to the caller's standard error,
-  preventing diagnostic output from corrupting structured data on standard output.
-* An exit code of 0 authorizes the role group to start. Any non-zero exit status blocks the
-  start and is propagated by the caller: `px-cluster` terminates with that status code, while
-  `px-suite` marks the affected test as `ERROR`. The preflight script exits with code 3 when the
-  configured container limits exceed available host capacity, code 2 when given an invalid
-  argument, and code 1 when host memory cannot be measured. It never returns code 4, which is
-  reserved by the caller to report that the preflight check itself timed out.
-* If the preflight script file is absent, execution is not blocked: the caller emits a warning
-  noting that the memory check is not yet installed and proceeds to start the role group.
-  Conversely, if the script file exists on disk but lacks execute permissions, the check fails with
-  exit code 1.
-* The substrate backend preflight function, `sb_preflight`, cannot be used as a substitute for this
-  check because its host port availability assertions fail whenever a cluster is already running.
+Starting an additional role group commits its container memory limits against the container engine;
+accordingly, both `px-cluster group start` and the `requires` directive handling in `px-suite`
+execute `scripts/preflight.sh --phase memory` prior to starting each group via `px_memory_recheck`
+in `lib/common.sh`, which defines the invocation contract and its exit codes. Any exit status other
+than 0 blocks the group from starting. This check evaluates only the `engine_memory` row reported by
+the backend preflight, since the full preflight's host port assertions would fail while a cluster is
+already running.
 
 ## Verdict severity
 
@@ -372,33 +496,13 @@ single test run.
 ## Self-test
 
 The self-test suite in `test/run-tests.sh` executes without a container runtime, network access, or
-a prior Maven build, allowing it to run both on a developer laptop and inside the pre-commit CI
+a prior Maven build, allowing it to run both on a developer laptop and inside the pre-commit
 container. It emits TAP-formatted test output and exits with code 1 if any assertion fails. Among
 its architectural guarantees, the suite verifies through three independent enforcement layers that
-no component outside the active backend directly invokes a container runtime or Kubernetes CLI
-tool: a static source scanner paired with a documented allowlist that also fails on stale allowlist
-entries, a runtime shell trap that forces any unauthorized invocation to exit with code 2, and a
-mock runtime shim exercised against a negative control, a deliberately hostile driver, and a
-positive control. The design of these three isolation layers is documented in `docs/backends.md`.
-Using the same mock runtime environment, the suite exercises every substrate contract function and
-every `px-cluster` subcommand, and its final test group verifies that the entire run left no new
-files or directories beneath the working tree root.
-
-## What is here, and what is not yet
-
-This initial delivery establishes the foundational architecture: the substrate contract and its
-Docker Compose backend, the twelve CLI commands with their complete command-line interfaces, the
-declarative suite grammar and single-run wrapper, the shared shell library, this overview, and
-`docs/backends.md`. By design, this layer contains no hardcoded cluster topology knowledge.
-
-| Round | Adds |
-|---|---|
-| A2 | Adds the image, deployment generator, port map, versions and pins, sizing, and preflight. |
-| A3 | Adds host safety controls: sleep inhibition, the health monitor, and quiet-host checks. |
-| A5 | Adds the driver contract, bundle format, cluster checks, plug-in contract, and suites. |
-| A6 | Wires the measurement toolkit: profiler, flight recorder, tracing, jHiccup, and samplers. |
-| K1, K2 | Adds the Kubernetes backend, its preflight and safety checks, and the `px-k3d` tool. |
-
-Any command or subcommand whose functional implementation belongs to a subsequent round exits
-cleanly with code 5 and identifies the owning round, giving operators an explicit status message
-rather than a cascade of runtime errors.
+no component outside the active backend directly invokes a container runtime or a Kubernetes tool: a
+static source scan paired with a reasoned allowlist that also fails on stale entries, a runtime
+trap that forces any stray invocation to exit with code 2, and a fake runtime shim exercised against
+a negative control, a hostile driver, and a positive control. The design of these three layers is
+documented in `docs/backends.md`. Against the same fake runtime, the suite exercises every substrate
+contract function and every `px-cluster` subcommand, and its final test group proves that no command
+created any new path beneath the root of the working tree.

@@ -17,14 +17,8 @@
 # This command performs the verdict merge by reading the verdict records from every driver and
 # every cluster component of a single run to produce one consolidated result.
 #
-# The merge policy is fixed by the system design and is documented here so that driver authors and
-# check authors can write conforming verdict records immediately:
-#   PASS < SKIP < ADVISORY < FAIL < ERROR
-# The merge selects the highest severity encountered, and only FAIL and ERROR cause a run to fail.
-# ERROR is reserved for a harness or infrastructure fault, which separates a cluster anomaly from
-# a workload failure. SKIP and ADVISORY never block a run, a run that produces only SKIP verdicts
-# is treated as inconclusive rather than a pass, and any record carrying a severity outside this
-# defined set is rejected.
+# The severity lattice and its governing rules are documented in the "Verdict severity" section of
+# the README, and suites/lib/common.sh provides the canonical lattice definition.
 #
 # Round A5 implements the core behavior, encompassing the merge logic, the severity check, and the
 # report packaged into the result bundle. The current round establishes the command name, the
@@ -38,7 +32,6 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 px_trap_enable
 
-REPORT_OWNER="A5"
 REPORT_FORMATS="tsv json"
 
 REPORT_RUN=""
@@ -46,8 +39,8 @@ REPORT_BUNDLES=()
 REPORT_FORMAT="tsv"
 REPORT_VERDICTS=()
 
-## @description  Prints the command usage and option reference to standard output.
-## @return       Writes the usage message to stdout and exits with status 0.
+## @description  Prints the command-line usage and option reference for the report generator.
+## @return       Writes the usage message to stdout and exits 0.
 usage() {
   cat <<'EOF'
 Usage: px-report [option...]
@@ -76,10 +69,7 @@ while [ "$#" -gt 0 ]; do
     usage
     exit 0
     ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
+  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
   --run) px_cli_need_value "$@" && REPORT_RUN="$2" && shift ;;
   --format) px_cli_need_value "$@" && REPORT_FORMAT="$2" && shift ;;
   --out) px_cli_need_value "$@" && REPORT_OUT="$2" && shift ;;
@@ -91,11 +81,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ "${#REPORT_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${REPORT_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
+px_config_load ${REPORT_CONFIG_FILES[@]+"${REPORT_CONFIG_FILES[@]}"}
 
 case " $REPORT_FORMATS " in
 *" $REPORT_FORMAT "*) ;;
@@ -114,19 +100,17 @@ fi
 if [ -n "$REPORT_RUN" ] && [ ! -d "$REPORT_RUN" ]; then
   px_die "$PX_EXIT_NO_OBJECT" "no such run directory: $REPORT_RUN"
 fi
-if [ "${#REPORT_VERDICTS[@]}" -gt 0 ]; then
-  for REPORT_FILE in "${REPORT_VERDICTS[@]}"; do
-    if [ ! -f "$REPORT_FILE" ]; then
-      px_die "$PX_EXIT_NO_OBJECT" "no such verdict record: $REPORT_FILE"
-    fi
-  done
-fi
-# Output path resolution executes at the top level rather than inside a command argument so that a
-# policy refusal terminates the main process instead of only exiting a subshell.
+for REPORT_FILE in ${REPORT_VERDICTS[@]+"${REPORT_VERDICTS[@]}"}; do
+  if [ ! -f "$REPORT_FILE" ]; then
+    px_die "$PX_EXIT_NO_OBJECT" "no such verdict record: $REPORT_FILE"
+  fi
+done
+# Evaluate the output policy at the top level rather than inside a command argument so that a
+# policy refusal terminates the main process instead of exiting only a subshell.
 if [ -n "$REPORT_OUT" ]; then
   REPORT_DEST="$(px_out_resolve "$REPORT_OUT")" || exit $?
   px_debug "the report would go to $REPORT_DEST"
 fi
 
 px_die "$PX_EXIT_UNSUPPORTED" \
-  "the verdict merge arrives with round $REPORT_OWNER, which fixes the verdict record"
+  "the verdict merge arrives with round A5, which fixes the verdict record"

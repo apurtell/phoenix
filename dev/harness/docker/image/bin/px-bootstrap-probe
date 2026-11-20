@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The bootstrap probe orchestrates cluster initialization, executes workload setup hooks, and
+# verifies every readiness subject before the harness hands the cluster over to a test suite. The
+# setup role invokes it once during initial bring-up, and a subsequent step may run it again from a
+# client role through the substrate contract, for instance by passing --yarn after the YARN service
+# group has started.
+#
+# Subjects are evaluated in a fixed sequence, and the probe logs the execution plan up front so
+# that the diagnostic stream records both the intended order and the first subject to fail:
+#   zookeeper       ZooKeeper responds to the ruok health query.
+#   hdfs            The NameNode has left safe mode and every DataNode is live.
+#   hdfs-namespace  The shared directories (/tmp and the user home directory) exist.
+#   hbase-master    The master is active and initialized, and every RegionServer has checked in.
+#   regionservers   Every configured RegionServer has joined the cluster.
+#   yarn            When --yarn is passed, the ResourceManager, every NodeManager, and the
+#                   JobHistoryServer are verified; because YARN starts on demand, standard bring-up
+#                   skips this subject.
+#   workload-setup  Every executable file in PX_BOOTSTRAP_SETUP_DIR runs in name order.
+#   monitors        Every heartbeat file listed in PX_MONITOR_HEARTBEATS is fresh.
+#
+# All readiness waits are bounded by a single shared deadline of PX_TIMEOUT_READY seconds spanning
+# the entire probe run. Log output is written both to stderr, which serves as the instance log, and
+# to bootstrap-probe.log under PX_LOG_DIR.
+
+PROBE_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/image.sh
+. "$PROBE_HOME/lib/image.sh"
+
+set -euo pipefail
+
+PROBE_YARN=0
+PROBE_SUBJECTS="zookeeper hdfs hdfs-namespace hbase-master regionservers yarn"
+PROBE_SUBJECTS="$PROBE_SUBJECTS workload-setup monitors"
+PROBE_LOG=""
+PROBE_DEADLINE=0
+
+## @description  Prints the command-line usage documentation and exit code summary.
+## @return       Writes the help text to stdout and exits with status 0.
+usage() {
+  cat <<'EOF'
+Usage: px-bootstrap-probe [--yarn]
+
+Initializes and verifies the cluster in a fixed order: zookeeper, hdfs,
+hdfs-namespace, hbase-master, regionservers, yarn, workload-setup, monitors.
+
+Options:
+  --yarn       verify the YARN group too; without it the yarn subject is
+               skipped, because YARN starts on demand
+  -h, --help   show this text
+
+Exit codes: 0 every subject verified, 1 a subject failed, 2 usage or an
+incomplete environment, 4 a subject was not ready before PX_TIMEOUT_READY.
+EOF
+}
+
+## @description  Emits a single probe log entry (at level INFO or ERROR, with message text) to both
+##               stderr and the persistent probe log file.
+## @return       Always returns exit status 0.
+probe_say() {
+  local level=$1
+  shift
+  img_log "$level" "$*"
+  if [ -n "$PROBE_LOG" ]; then
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$PROBE_LOG" 2>/dev/null ||
+      true
+  fi
+}
+
+# Provisions /tmp in HDFS with permissions open to every user and the sticky bit enabled, as
+# expected by MapReduce staging, and creates the probe user's HDFS home directory for job output.
+## @description  Initializes the shared staging and user home directories in the HDFS namespace.
+## @return       Sets IMG_REASON and returns exit status 0, or 1 if an hdfs command fails.
+probe_hdfs_namespace() {
+  local hdfs="${PX_HADOOP_HOME:-}/bin/hdfs" user
+  user="$(id -un)"
+  if ! "$hdfs" dfs -mkdir -p /tmp "/user/$user" >&2 ||
+    ! "$hdfs" dfs -chmod 1777 /tmp >&2; then
+    IMG_REASON="the hdfs command could not create /tmp and /user/$user"
+    return "$IMG_EXIT_FAIL"
+  fi
+  IMG_REASON="/tmp and /user/$user exist"
+  return 0
+}
+
+# The plug-in contract deposits its workload initialization scripts into the hook directory, and
+# this routine runs each executable file found there in lexicographical name order.
+## @description  Executes all executable setup hooks in the configured directory in name order.
+## @return       Sets IMG_REASON and returns 0 if all hooks pass, 1 if a hook fails, or 2 if the
+##               directory does not exist.
+probe_workload_setup() {
+  local dir=$1 hook ran=0
+  if [ ! -d "$dir" ]; then
+    IMG_REASON="PX_BOOTSTRAP_SETUP_DIR=$dir is not a directory"
+    return "$IMG_EXIT_USAGE"
+  fi
+  for hook in "$dir"/*; do
+    if [ ! -f "$hook" ] || [ ! -x "$hook" ]; then
+      continue
+    fi
+    probe_say INFO "run  workload-setup: ${hook##*/}"
+    if ! "$hook" >&2; then
+      IMG_REASON="the setup hook ${hook##*/} failed"
+      return "$IMG_EXIT_FAIL"
+    fi
+    ran=$((ran + 1))
+  done
+  IMG_REASON="$ran setup hooks passed"
+  return 0
+}
+
+## @description  Evaluates a single subject from the probe plan and logs its verification outcome.
+## @return       Returns 0 when verified or skipped, 1 on failure, 2 for an incomplete environment,
+##               or 4 if the subject is not ready before the deadline.
+probe_subject() {
+  local subject=$1 status=0
+  case "$subject" in
+  hdfs-namespace) probe_hdfs_namespace || status=$? ;;
+  yarn)
+    if [ "$PROBE_YARN" -eq 0 ]; then
+      probe_say INFO "skip yarn: the YARN group starts on demand; --yarn verifies it"
+      return 0
+    fi
+    img_wait_for yarn "$PROBE_DEADLINE" || status=$?
+    ;;
+  workload-setup)
+    if [ -z "${PX_BOOTSTRAP_SETUP_DIR:-}" ]; then
+      probe_say INFO "skip workload-setup: PX_BOOTSTRAP_SETUP_DIR names no hook directory"
+      return 0
+    fi
+    probe_workload_setup "$PX_BOOTSTRAP_SETUP_DIR" || status=$?
+    ;;
+  *) img_wait_for "$subject" "$PROBE_DEADLINE" || status=$? ;;
+  esac
+  if [ "$status" -eq 0 ]; then
+    probe_say INFO "ok   $subject: $IMG_REASON"
+  else
+    probe_say ERROR "fail $subject: $IMG_REASON"
+  fi
+  return "$status"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --yarn) PROBE_YARN=1 ;;
+  *) img_die "$IMG_EXIT_USAGE" "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+PROBE_DEADLINE="$(img_deadline)" || exit "$IMG_EXIT_USAGE"
+if [ -n "${PX_LOG_DIR:-}" ] && mkdir -p "$PX_LOG_DIR" 2>/dev/null; then
+  PROBE_LOG="$PX_LOG_DIR/bootstrap-probe.log"
+fi
+
+probe_say INFO "plan $PROBE_SUBJECTS"
+for subject in $PROBE_SUBJECTS; do
+  status=0
+  probe_subject "$subject" || status=$?
+  if [ "$status" -ne 0 ]; then
+    probe_say ERROR "stop at $subject: the cluster is not handed to a suite"
+    exit "$status"
+  fi
+done
+
+if PROBE_MARKER="$(img_marker 2>/dev/null)"; then
+  : >"$PROBE_MARKER" 2>/dev/null || img_warn "cannot write the marker $PROBE_MARKER"
+fi
+probe_say INFO "done every subject is verified"
+exit 0

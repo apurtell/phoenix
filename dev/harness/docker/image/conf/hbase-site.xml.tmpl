@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+  The HBase and Phoenix configuration of the master, the RegionServers and
+  every client role. A Phoenix client reads it from its class path.
+
+  Each instance is on the harness network with the hostname <role>-<index>.
+  A peer is named by its hostname, and a daemon binds every interface of its
+  own container. A RegionServer reports PX_HOSTNAME as its identity, and the
+  master reports hbase-master-0. Each RegionServer binds the ports of its own
+  index, so the host publishes them at the same numbers; another role renders
+  the ports of RegionServer 0, which it never binds.
+-->
+<configuration>
+  <property>
+    <name>hbase.cluster.distributed</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>hbase.rootdir</name>
+    <value>hdfs://namenode-0:${PX_PORT_NAMENODE_RPC}/hbase</value>
+  </property>
+  <property>
+    <name>hbase.tmp.dir</name>
+    <value>${PX_DATA_DIR}/hbase-tmp</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.quorum</name>
+    <value>zookeeper-0</value>
+  </property>
+  <property>
+    <name>hbase.zookeeper.property.clientPort</name>
+    <value>${PX_PORT_ZOOKEEPER_CLIENT}</value>
+  </property>
+  <property>
+    <name>zookeeper.znode.parent</name>
+    <value>/hbase</value>
+  </property>
+  <property>
+    <name>hbase.master.hostname</name>
+    <value>hbase-master-0</value>
+  </property>
+  <property>
+    <name>hbase.master.ipc.address</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <name>hbase.master.port</name>
+    <value>${PX_PORT_HBASE_MASTER_RPC}</value>
+  </property>
+  <property>
+    <name>hbase.master.info.bindAddress</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <name>hbase.master.info.port</name>
+    <value>${PX_PORT_HBASE_MASTER_HTTP}</value>
+  </property>
+  <property>
+    <!-- The master assigns no region until every configured RegionServer
+         has checked in. The master healthcheck reads the same count. -->
+    <name>hbase.master.wait.on.regionservers.mintostart</name>
+    <value>${PX_RS_COUNT}</value>
+  </property>
+  <property>
+    <name>hbase.unsafe.regionserver.hostname</name>
+    <value>${PX_HOSTNAME}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.ipc.address</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.port</name>
+    <value>${PX_RENDER_REGIONSERVER_RPC_PORT}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.info.bindAddress</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <!-- The upstream info port 16030 is the RPC port of RegionServer 1 in a
+         port map with a step of 10, so the port map moves the info family. -->
+    <name>hbase.regionserver.info.port</name>
+    <value>${PX_RENDER_REGIONSERVER_HTTP_PORT}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.handler.count</name>
+    <value>30</value>
+  </property>
+  <property>
+    <!-- The run class lowers the block cache and the global memstore from
+         0.4 each. With the Phoenix global memory pool of 15 percent, the
+         defaults commit almost the whole heap before the first request. -->
+    <name>hfile.block.cache.size</name>
+    <value>${PX_HBASE_BLOCKCACHE_SIZE}</value>
+  </property>
+  <property>
+    <name>hbase.regionserver.global.memstore.size</name>
+    <value>${PX_HBASE_MEMSTORE_SIZE}</value>
+  </property>
+  <property>
+    <!-- Phoenix secondary indexes need this write-ahead log codec. -->
+    <name>hbase.regionserver.wal.codec</name>
+    <value>org.apache.hadoop.hbase.regionserver.wal.IndexedWALEditCodec</value>
+  </property>
+</configuration>

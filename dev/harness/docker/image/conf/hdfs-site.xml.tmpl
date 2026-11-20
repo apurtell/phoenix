@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+  The HDFS configuration of the HDFS roles and of every HDFS client, which
+  includes HBase. The replication factor is a client setting, so every role
+  renders the same clamped value.
+
+  Each instance is on the harness network with the hostname <role>-<index>.
+  A peer is named by its hostname, and a daemon binds every interface of its
+  own container. Each DataNode binds the ports of its own index, so the host
+  publishes them at the same numbers. A role that is not a DataNode renders
+  the ports of DataNode 0, which it never binds.
+-->
+<configuration>
+  <property>
+    <!-- The configured factor clamped to the DataNode count. The image
+         derives it in img_derive_for. -->
+    <name>dfs.replication</name>
+    <value>${PX_RENDER_HDFS_REPLICATION}</value>
+  </property>
+  <property>
+    <name>dfs.namenode.rpc-address</name>
+    <value>namenode-0:${PX_PORT_NAMENODE_RPC}</value>
+  </property>
+  <property>
+    <name>dfs.namenode.http-address</name>
+    <value>namenode-0:${PX_PORT_NAMENODE_HTTP}</value>
+  </property>
+  <property>
+    <name>dfs.namenode.rpc-bind-host</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <name>dfs.namenode.http-bind-host</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <!-- The Secondary NameNode binds this address, because Hadoop has no
+         bind-host setting for it, and no peer connects to it. Port 0 when the
+         deployment has no Secondary NameNode. -->
+    <name>dfs.namenode.secondary.http-address</name>
+    <value>${PX_BIND_HOST}:${PX_RENDER_SECONDARYNAMENODE_HTTP_PORT}</value>
+  </property>
+  <property>
+    <name>dfs.namenode.name.dir</name>
+    <value>file://${PX_DATA_DIR}/namenode</value>
+  </property>
+  <property>
+    <name>dfs.namenode.checkpoint.dir</name>
+    <value>file://${PX_DATA_DIR}/namesecondary</value>
+  </property>
+  <property>
+    <name>dfs.datanode.data.dir</name>
+    <value>file://${PX_DATA_DIR}/datanode</value>
+  </property>
+  <property>
+    <name>dfs.datanode.address</name>
+    <value>${PX_BIND_HOST}:${PX_RENDER_DATANODE_DATA_PORT}</value>
+  </property>
+  <property>
+    <name>dfs.datanode.ipc.address</name>
+    <value>${PX_BIND_HOST}:${PX_RENDER_DATANODE_IPC_PORT}</value>
+  </property>
+  <property>
+    <name>dfs.datanode.http.address</name>
+    <value>${PX_BIND_HOST}:${PX_RENDER_DATANODE_HTTP_PORT}</value>
+  </property>
+  <property>
+    <!-- A DataNode binds every interface and reports its own hostname. -->
+    <name>dfs.datanode.hostname</name>
+    <value>${PX_HOSTNAME}</value>
+  </property>
+  <property>
+    <!-- A reverse name lookup of a container address can give another name
+         than the hostname, so the NameNode must not require a match. -->
+    <name>dfs.namenode.datanode.registration.ip-hostname-check</name>
+    <value>false</value>
+  </property>
+  <property>
+    <!-- One operating system user runs every role, so permission checks add
+         nothing and only cost a bring-up its first failure. -->
+    <name>dfs.permissions.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <!-- A short extension, so a fresh namespace leaves safe mode quickly and
+         the bootstrap probe does not wait for the 30 second default. -->
+    <name>dfs.namenode.safemode.extension</name>
+    <value>5000</value>
+  </property>
+</configuration>

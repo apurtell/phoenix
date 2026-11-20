@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+  The MapReduce configuration of the YARN roles and of a client role that
+  submits jobs. The job submitter's copy of this file sets the task sizes,
+  so every role renders the same values.
+
+  The container sizes are pinned. The generator holds each one at or below
+  PX_YARN_MAX_ALLOC_MIB, which is at or below PX_NM_RESOURCE_MIB, so each
+  container fits one NodeManager. An application master and a task share one
+  NodeManager only where their sum fits PX_NM_RESOURCE_MIB. A task heap is four
+  fifths of its container. The task JVMs receive the module options that the
+  project build uses on JDK 11, because a task JVM loads Phoenix and HBase
+  classes too. Only options that JDK 11, 17 and 21 all accept appear, because
+  the submitter and the NodeManager can run on different JDK releases. The
+  image derives the heaps, the options and the class path in img_derive_for.
+-->
+<configuration>
+  <property>
+    <name>mapreduce.framework.name</name>
+    <value>yarn</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.address</name>
+    <value>jobhistory-0:${PX_PORT_JOBHISTORY_RPC}</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.webapp.address</name>
+    <value>jobhistory-0:${PX_PORT_JOBHISTORY_HTTP}</value>
+  </property>
+  <property>
+    <name>mapreduce.jobhistory.admin.address</name>
+    <value>jobhistory-0:${PX_PORT_JOBHISTORY_ADMIN}</value>
+  </property>
+  <property>
+    <!-- The JobHistoryServer binds its three services on every interface. -->
+    <name>mapreduce.jobhistory.bind-host</name>
+    <value>${PX_BIND_HOST}</value>
+  </property>
+  <property>
+    <name>mapreduce.shuffle.port</name>
+    <value>${PX_RENDER_NODEMANAGER_SHUFFLE_PORT}</value>
+  </property>
+  <property>
+    <name>yarn.app.mapreduce.am.staging-dir</name>
+    <value>/tmp/hadoop-yarn/staging</value>
+  </property>
+  <property>
+    <name>yarn.app.mapreduce.am.env</name>
+    <value>HADOOP_MAPRED_HOME=${PX_HADOOP_HOME}</value>
+  </property>
+  <property>
+    <name>mapreduce.map.env</name>
+    <value>HADOOP_MAPRED_HOME=${PX_HADOOP_HOME}</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.env</name>
+    <value>HADOOP_MAPRED_HOME=${PX_HADOOP_HOME}</value>
+  </property>
+  <property>
+    <name>mapreduce.application.classpath</name>
+    <value>${PX_RENDER_MR_CLASSPATH}</value>
+  </property>
+  <property>
+    <name>yarn.app.mapreduce.am.resource.mb</name>
+    <value>${PX_MR_AM_MIB}</value>
+  </property>
+  <property>
+    <name>yarn.app.mapreduce.am.command-opts</name>
+    <value>-Xmx${PX_RENDER_MR_AM_HEAP_MIB}m ${PX_RENDER_MR_JAVA_OPTS}</value>
+  </property>
+  <property>
+    <name>mapreduce.map.memory.mb</name>
+    <value>${PX_MR_TASK_MIB}</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.memory.mb</name>
+    <value>${PX_MR_TASK_MIB}</value>
+  </property>
+  <property>
+    <name>mapreduce.map.java.opts</name>
+    <value>-Xmx${PX_RENDER_MR_TASK_HEAP_MIB}m ${PX_RENDER_MR_JAVA_OPTS}</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.java.opts</name>
+    <value>-Xmx${PX_RENDER_MR_TASK_HEAP_MIB}m ${PX_RENDER_MR_JAVA_OPTS}</value>
+  </property>
+</configuration>

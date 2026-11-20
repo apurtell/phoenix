@@ -37,7 +37,6 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 px_trap_enable
 
-K3D_OWNER="K2"
 K3D_CLASSES="validation measurement"
 K3D_AGENTS_MAX=9
 
@@ -48,7 +47,7 @@ K3D_NAME=""
 K3D_CONFIG_FILES=()
 
 ## @description  Prints the command-line usage summary and supported options.
-## @return       Writes the help text to standard output and exits with status 0.
+## @return       Writes the help text to stdout and exits with status 0.
 usage() {
   cat <<'EOF'
 Usage: px-k3d <create|delete|status> [option...]
@@ -78,20 +77,15 @@ while [ "$#" -gt 0 ]; do
     usage
     exit 0
     ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
+  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
   --class) px_cli_need_value "$@" && K3D_CLASS="$2" && shift ;;
   --agents) px_cli_need_value "$@" && K3D_AGENTS="$2" && shift ;;
   --name) px_cli_need_value "$@" && K3D_NAME="$2" && shift ;;
   --config) px_cli_need_value "$@" && K3D_CONFIG_FILES+=("$2") && shift ;;
   -*) px_usage_error "unknown option: $1" ;;
   *)
-    if [ -n "$K3D_ACTION" ]; then
-      px_usage_error "unexpected argument: $1"
-    fi
-    K3D_ACTION="$1"
+    [ -z "$K3D_ACTION" ] || px_usage_error "unexpected argument: $1"
+    K3D_ACTION=$1
     ;;
   esac
   shift
@@ -105,11 +99,7 @@ create | delete | status) ;;
 *) px_usage_error "unknown subcommand: $K3D_ACTION" ;;
 esac
 
-if [ "${#K3D_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${K3D_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
+px_config_load ${K3D_CONFIG_FILES[@]+"${K3D_CONFIG_FILES[@]}"}
 
 if [ -z "$K3D_CLASS" ]; then
   K3D_CLASS="${PX_RUN_CLASS:-}"
@@ -147,4 +137,4 @@ if [ -z "$K3D_NAME" ]; then
 fi
 
 px_die "$PX_EXIT_UNSUPPORTED" \
-  "px-k3d $K3D_ACTION arrives with round $K3D_OWNER, which brings the second backend"
+  "px-k3d $K3D_ACTION arrives with round K2, which brings the second backend"

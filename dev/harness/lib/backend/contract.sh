@@ -17,7 +17,7 @@
 # Defines the substrate contract by declaring what a backend must provide, binding a single
 # backend, and verifying that the binding is complete.
 #
-# Every layer above this file interacts with the substrate exclusively through these 32 sb_*
+# Every layer above this file interacts with the substrate exclusively through these 35 sb_*
 # functions. Consequently, a driver, a check, a suite action, a health monitor, a collector, and
 # the operator commands execute unchanged across every backend, and no component above this layer
 # depends on a container runtime. This file itself does not reference any specific runtime.
@@ -59,17 +59,8 @@ readonly PX_CONTRACT_VERSION=1
 # exclusively on the numeric exit code, while the underlying cause is reported in the diagnostic
 # message, the cluster-check verdict, and the bundle manifest.
 #
-#   0 ok              The operation completed what its name states.
-#   1 failure         The operation failed.
-#   2 usage           The arguments are invalid, or a named mode is unknown.
-#   3 anomaly         An instance terminated or restarted without an explicit request.
-#   4 timeout         A finite wait expired before completion.
-#   5 unsupported     This backend cannot perform the operation, as declared by sb_capabilities.
-#   6 no such object  The specified scope, role, index, port, or value does not exist.
-#
-# When a runtime cannot respond at all, the function returns failure code 1. Returning code 6
-# requires an affirmative response from the runtime confirming that the target object does not
-# exist.
+# When a runtime cannot respond, the function returns failure code 1. Returning code 6 requires an
+# explicit response from the runtime confirming that the target object does not exist.
 #
 # The sb_exec function is the sole entry point that returns a foreign exit status by forwarding
 # the exit code of the command it executed. Four codes remain reserved so that callers can
@@ -92,133 +83,56 @@ SB_EXEC_NOTFOUND=127 # The target is not present.
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
-# Every function that reports multiple values emits tab-separated (TSV) rows whose field order is
-# normative. Callers resolve column positions dynamically through sb_schema_index instead of
-# hard-coding column numbers, ensuring that adding a new column does not break existing readers.
-#
-#   instance    role index instance_id state ready image_ref node
-#               Represents an inventory row emitted by sb_list, sb_provision, and sb_scale. The
-#               instance_id field is an opaque backend-specific identifier, node names the host
-#               running the instance, and image_ref is the image reference recorded in the
-#               manifest.
-#   ready       role index ready elapsed_ms
-#               Represents a single readiness outcome emitted by sb_wait_ready and sb_group_start.
-#               The elapsed_ms field measures the wait duration rather than the instance age.
-#   stopped     role index stopped
-#               Represents a single stop outcome emitted by sb_group_stop.
-#   group       group running desired state
-#               Represents the aggregate state of a role group emitted by sb_group_status.
-#   phase       phase status elapsed_ms
-#               Represents one phase of a compound operation. The sb_restart_drain function emits
-#               drain, stop, start, ready, and rebalance in that order.
-#   term        reason exit_code signal finished_at
-#               Represents normalized exit evidence emitted by sb_termination_reason. Because
-#               every backend maps onto the same reason vocabulary, anomaly detection decisions
-#               remain identical across substrates.
-#   oom         oom evidence
-#               Represents the out-of-memory determination emitted by sb_oom_killed.
-#   event       ts_ms role index type reason message
-#               Represents a single lifecycle event emitted oldest-first by sb_events, with the
-#               message text sanitized through px_tsv_clean.
-#   sample      ts_ms role index cpu_pct mem_bytes mem_limit_bytes rx_bytes
-#               tx_bytes blk_read_bytes blk_write_bytes
-#               Represents a per-instance resource snapshot emitted by sb_sample_resources. Any
-#               column without an equivalent in the underlying metrics source is left empty.
-#   capability  capability supported detail
-#               Represents the capability degradation table emitted by sb_capabilities.
-#   check       check status detail
-#               Represents a single preflight check result emitted by sb_preflight.
-#   kv          key value
-#               Represents a descriptive key-value pair emitted by sb_scope_args and
-#               sb_version_info.
-#   endpoint    host port
-#               Represents a host-reachable address emitted by sb_endpoint, where the host is
-#               always on the loopback interface.
-#   image       image_ref image_id
-#               Represents the image an instance runs, as emitted by sb_image_ref, where image_id
-#               is either a local identifier or a registry digest.
+# Every function that reports multiple values emits tab-separated (TSV) rows, and callers query
+# sb_schema_index to resolve column positions. The field lists defined in sb_schema_fields are
+# normative. The reference in docs/backends.md documents the writer and meaning of each column and
+# maps the design verbs to these functions.
 
-SB_SCHEMA_INSTANCE="role index instance_id state ready image_ref node"
-SB_SCHEMA_READY="role index ready elapsed_ms"
-SB_SCHEMA_STOPPED="role index stopped"
-SB_SCHEMA_GROUP="group running desired state"
-SB_SCHEMA_PHASE="phase status elapsed_ms"
-SB_SCHEMA_TERM="reason exit_code signal finished_at"
-SB_SCHEMA_OOM="oom evidence"
-SB_SCHEMA_EVENT="ts_ms role index type reason message"
-SB_SCHEMA_SAMPLE="ts_ms role index cpu_pct mem_bytes mem_limit_bytes rx_bytes tx_bytes
-blk_read_bytes blk_write_bytes"
-SB_SCHEMA_CAPABILITY="capability supported detail"
-SB_SCHEMA_CHECK="check status detail"
-SB_SCHEMA_KV="key value"
-SB_SCHEMA_ENDPOINT="host port"
-SB_SCHEMA_IMAGE="image_ref image_id"
-
-# Defines the canonical value vocabularies. Each backend normalizes its native representations
-# onto these terms so that checks receive identical values across all backends.
-SB_STATES="pending running stopped exited unknown"
-SB_READY_VALUES="ready unready stopped"
-SB_STOPPED_VALUES="stopped already_stopped"
-SB_GROUP_STATES="up down partial"
-SB_PHASE_STATUSES="ok fail skip"
-SB_CHECK_STATUSES="ok fail warn"
-SB_TERM_REASONS="running completed error oom killed evicted unknown"
-SB_KILL_MODES="hard delete"
-SB_TERM_WHICH="current previous"
-SB_YES_NO="yes no"
-
-# Translates a contract exit code, including the four framing codes reserved by sb_exec, into its
-# human-readable name. Any other code is reported as the status of the command that sb_exec ran.
-## @description  Resolves the human-readable name for a contract or sb_exec exit code.
-## @param        code Exit code to translate.
-## @return       Writes the exit code name to stdout and always exits 0.
+# Translates a contract exit code, including the four codes reserved by sb_exec, into its
+# human-readable name. Any exit status outside the contract is reported as "command status".
+## @description  Resolves the human-readable name of a contract or sb_exec exit code.
+## @param        code: The exit status to translate.
+## @return       Writes the exit code name to stdout and exits 0.
 sb_exit_name() {
   case "${1:-}" in
-  "$SB_EXIT_OK") printf 'ok\n' ;;
-  "$SB_EXIT_FAIL") printf 'failure\n' ;;
-  "$SB_EXIT_USAGE") printf 'usage\n' ;;
-  "$SB_EXIT_ANOMALY") printf 'cluster anomaly\n' ;;
-  "$SB_EXIT_TIMEOUT") printf 'timeout\n' ;;
-  "$SB_EXIT_UNSUPPORTED") printf 'unsupported\n' ;;
-  "$SB_EXIT_NO_OBJECT") printf 'no such object\n' ;;
   "$SB_EXEC_TIMEOUT") printf 'exec timed out\n' ;;
   "$SB_EXEC_NOSTART") printf 'exec could not start\n' ;;
   "$SB_EXEC_NOEXEC") printf 'exec target not executable\n' ;;
   "$SB_EXEC_NOTFOUND") printf 'exec target not found\n' ;;
+  "$SB_EXIT_OK" | "$SB_EXIT_FAIL" | "$SB_EXIT_USAGE" | "$SB_EXIT_ANOMALY" | \
+    "$SB_EXIT_TIMEOUT" | "$SB_EXIT_UNSUPPORTED" | "$SB_EXIT_NO_OBJECT") px_exit_name "$1" ;;
   *) printf 'command status\n' ;;
   esac
 }
 
-# Reports the space-separated set of canonical words accepted for a given value kind so that
-# backends can query the contract rather than duplicating the vocabulary. Supported kinds are
-# state, ready, stopped, group_state, phase_status, check_status, term_reason, kill_mode,
-# term_which, and yes_no.
+# Reports the canonical words accepted for a value kind so that backends can normalize native
+# representations onto the contract vocabulary. The supported kinds are state, ready, stopped,
+# group_state, phase_status, check_status, term_reason, kill_mode, term_which, and yes_no.
 ## @description  Outputs the space-separated list of valid words for a contract value kind.
-## @param        kind Vocabulary kind to look up.
-## @return       Writes the space-separated words to stdout; exits 0, or 6 if the kind is unknown.
+## @param        kind: The value kind to look up.
+## @return       Writes the space-separated words to stdout; exits 0, or 6 for an unknown kind.
 sb_vocabulary() {
   case "${1:-}" in
-  state) printf '%s\n' "$SB_STATES" ;;
-  ready) printf '%s\n' "$SB_READY_VALUES" ;;
-  stopped) printf '%s\n' "$SB_STOPPED_VALUES" ;;
-  group_state) printf '%s\n' "$SB_GROUP_STATES" ;;
-  phase_status) printf '%s\n' "$SB_PHASE_STATUSES" ;;
-  check_status) printf '%s\n' "$SB_CHECK_STATUSES" ;;
-  term_reason) printf '%s\n' "$SB_TERM_REASONS" ;;
-  kill_mode) printf '%s\n' "$SB_KILL_MODES" ;;
-  term_which) printf '%s\n' "$SB_TERM_WHICH" ;;
-  yes_no) printf '%s\n' "$SB_YES_NO" ;;
+  state) printf '%s\n' 'pending running stopped exited unknown' ;;
+  ready) printf '%s\n' 'ready unready stopped' ;;
+  stopped) printf '%s\n' 'stopped already_stopped' ;;
+  group_state) printf '%s\n' 'up down partial' ;;
+  phase_status) printf '%s\n' 'ok fail skip' ;;
+  check_status) printf '%s\n' 'ok fail warn' ;;
+  term_reason) printf '%s\n' 'running completed error oom killed evicted unknown' ;;
+  kill_mode) printf '%s\n' 'hard delete' ;;
+  term_which) printf '%s\n' 'current previous' ;;
+  yes_no) printf '%s\n' 'yes no' ;;
   *) return "$SB_EXIT_NO_OBJECT" ;;
   esac
 }
 
-# Validates a candidate value against the canonical vocabulary for its kind. Backends use this
-# check to validate arguments so that an unknown mode fails closed with the usage exit code before
-# reaching the underlying substrate.
-## @description  Checks whether a value belongs to the specified contract vocabulary kind.
-## @param        kind Vocabulary kind to validate against.
-## @param        value Candidate word to test.
-## @return       Exits 0 if valid, 1 if not in the vocabulary, or 6 if the kind is unknown.
+# Validates a candidate word against the vocabulary for its value kind so that an unknown mode
+# fails closed.
+## @description  Checks whether a word belongs to the specified contract value vocabulary.
+## @param        kind: A value kind supported by sb_vocabulary.
+## @param        value: The candidate word to test.
+## @return       Exits 0 when the value is in the vocabulary, 1 when not, or 6 for an unknown kind.
 sb_valid_value() {
   local words word
   words="$(sb_vocabulary "${1:-}")" || return "$SB_EXIT_NO_OBJECT"
@@ -230,37 +144,40 @@ sb_valid_value() {
   return 1
 }
 
-# Reports the ordered field names for a named contract schema, such as instance, separated by
-# spaces on stdout.
-## @description  Outputs the ordered field names for a given contract schema.
-## @param        schema Schema name, for example instance.
-## @return       Writes space-separated field names to stdout; exits 0, or 6 if schema is unknown.
+# Reports the ordered field names for a contract schema. The supported schemas are instance, ready,
+# stopped, group, phase, term, oom, event, sample, capability, check, kv, endpoint, and image.
+## @description  Outputs the ordered field names for a contract schema.
+## @param        schema: The schema name to inspect.
+## @return       Writes the space-separated names to stdout; exits 0, or 6 for an unknown schema.
 sb_schema_fields() {
   case "${1:-}" in
-  instance) printf '%s\n' "$SB_SCHEMA_INSTANCE" ;;
-  ready) printf '%s\n' "$SB_SCHEMA_READY" ;;
-  stopped) printf '%s\n' "$SB_SCHEMA_STOPPED" ;;
-  group) printf '%s\n' "$SB_SCHEMA_GROUP" ;;
-  phase) printf '%s\n' "$SB_SCHEMA_PHASE" ;;
-  term) printf '%s\n' "$SB_SCHEMA_TERM" ;;
-  oom) printf '%s\n' "$SB_SCHEMA_OOM" ;;
-  event) printf '%s\n' "$SB_SCHEMA_EVENT" ;;
-  sample) printf '%s\n' "$(printf '%s' "$SB_SCHEMA_SAMPLE" | tr '\n' ' ')" ;;
-  capability) printf '%s\n' "$SB_SCHEMA_CAPABILITY" ;;
-  check) printf '%s\n' "$SB_SCHEMA_CHECK" ;;
-  kv) printf '%s\n' "$SB_SCHEMA_KV" ;;
-  endpoint) printf '%s\n' "$SB_SCHEMA_ENDPOINT" ;;
-  image) printf '%s\n' "$SB_SCHEMA_IMAGE" ;;
+  instance) printf '%s\n' 'role index instance_id state ready image_ref node' ;;
+  ready) printf '%s\n' 'role index ready elapsed_ms' ;;
+  stopped) printf '%s\n' 'role index stopped' ;;
+  group) printf '%s\n' 'group running desired state' ;;
+  phase) printf '%s\n' 'phase status elapsed_ms' ;;
+  term) printf '%s\n' 'reason exit_code signal finished_at' ;;
+  oom) printf '%s\n' 'oom evidence' ;;
+  event) printf '%s\n' 'ts_ms role index type reason message' ;;
+  sample)
+    printf '%s %s\n' 'ts_ms role index cpu_pct mem_bytes mem_limit_bytes rx_bytes' \
+      'tx_bytes blk_read_bytes blk_write_bytes'
+    ;;
+  capability) printf '%s\n' 'capability supported detail' ;;
+  check) printf '%s\n' 'check status detail' ;;
+  kv) printf '%s\n' 'key value' ;;
+  endpoint) printf '%s\n' 'host port' ;;
+  image) printf '%s\n' 'image_ref image_id' ;;
   *) return "$SB_EXIT_NO_OBJECT" ;;
   esac
 }
 
-# Resolves the 1-based column position of a field within a contract schema. Callers pair this
-# lookup with px_tsv_field to avoid hard-coding numeric column indices.
-## @description  Reports the 1-based column position of a field within a named schema.
-## @param        schema Schema name to query.
-## @param        field Field name whose column position is requested.
-## @return       Writes the position to stdout; exits 0, or 6 if the schema or field is unknown.
+# Resolves the 1-based column position of a field within a contract schema for use with
+# px_tsv_field, so that callers never hard-code column numbers.
+## @description  Reports the 1-based column position of a field within a contract schema.
+## @param        schema: A schema name defined by sb_schema_fields.
+## @param        field: A field name belonging to that schema.
+## @return       Writes the position to stdout; exits 0, or 6 for an unknown schema or field.
 sb_schema_index() {
   local fields field position=0
   fields="$(sb_schema_fields "${1:-}")" || return "$SB_EXIT_NO_OBJECT"
@@ -275,8 +192,8 @@ sb_schema_index() {
 }
 
 ## @description  Reports the total number of columns defined by a contract schema.
-## @param        schema Schema name to inspect.
-## @return       Writes the column count to stdout; exits 0, or 6 when the schema is unknown.
+## @param        schema: A schema name defined by sb_schema_fields.
+## @return       Writes the column count to stdout; exits 0, or 6 for an unknown schema.
 sb_schema_count() {
   local fields field count=0
   fields="$(sb_schema_fields "${1:-}")" || return "$SB_EXIT_NO_OBJECT"
@@ -286,27 +203,38 @@ sb_schema_count() {
   printf '%s\n' "$count"
 }
 
+## @description  Reads the value from the first row in rows whose first field exactly matches key.
+## @param        key: The first field to match exactly.
+## @param        rows: Lines formatted as a key, a tab, and a value.
+## @return       Writes the text after the first tab; exits 0, or 6 when no row has the key.
+sb_row_get() {
+  local key=${1:-} rows=${2:-} line
+  while IFS= read -r line; do
+    case "$line" in
+    "$key$PX_TAB"*)
+      printf '%s\n' "${line#*"$PX_TAB"}"
+      return 0
+      ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  return "$SB_EXIT_NO_OBJECT"
+}
+
 # ---------------------------------------------------------------------------
 # The function set
 # ---------------------------------------------------------------------------
-# The substrate contract consists of 32 functions. Every function that operates on a cluster
-# accepts the scope id returned by sb_scope_create as its first argument.
+# The substrate contract consists of 35 functions. Every function that operates on a cluster takes
+# the scope id returned by sb_scope_create as its first argument. The three image functions
+# sb_image_build, sb_image_present, and sb_image_base_digest operate on the host rather than on a
+# cluster, so they take no scope id.
 #
-# Required functions must be defined by every backend implementation, and sb_load rejects any
-# backend that omits one. Optional functions require callers to check sb_supports or sb_capability
-# beforehand and record a skip rather than failing when support is absent. The five optional
-# functions correspond to features that a substrate may genuinely lack: signal delivery, a
-# drain-aware restart, a lifecycle event stream, a metrics source, and a port-forward release.
-#
-# The design document describes the substrate verb set in prose, mapping to contract functions as
-# follows:
-#   provision -> sb_provision          teardown  -> sb_teardown
-#   wait_ready -> sb_wait_ready        exec      -> sb_exec
-#   logs -> sb_logs                    cp        -> sb_copy_in, sb_copy_out
-#   scale -> sb_scale                  kill_role -> sb_kill
-#   restart_role -> sb_restart_drain   inspect   -> sb_list
-#   sample_resources -> sb_sample_resources
-#   restart_count -> sb_restart_count  oom_detect -> sb_oom_killed
+# Required functions must be defined by every backend implementation, and sb_load refuses to bind a
+# backend that omits any of them. Optional functions require callers to check sb_supports or
+# sb_capability first and record a skip rather than fail when support is absent. The five optional
+# functions correspond to capabilities that a substrate can genuinely lack: signal delivery, a
+# drain-aware restart, a lifecycle event stream, a metrics source, and a forward to release.
 
 SB_REQUIRED_FUNCTIONS="sb_backend_id
 sb_contract_version
@@ -334,7 +262,10 @@ sb_restart_count
 sb_termination_reason
 sb_oom_killed
 sb_endpoint
-sb_image_ref"
+sb_image_ref
+sb_image_build
+sb_image_present
+sb_image_base_digest"
 
 SB_OPTIONAL_FUNCTIONS="sb_signal
 sb_restart_drain
@@ -365,9 +296,7 @@ sb_contract_required() { printf '%s\n' "$SB_REQUIRED_FUNCTIONS"; }
 ## @return       Writes one function name per line to stdout and exits 0.
 sb_contract_optional() { printf '%s\n' "$SB_OPTIONAL_FUNCTIONS"; }
 
-# Outputs the complete set of substrate contract function names with required functions listed
-# first, allowing the self-test to compare the contract against the functions a backend defines.
-## @description  Lists every required and optional contract function name in order.
+## @description  Outputs every substrate contract function name, with required functions first.
 ## @return       Writes one function name per line to stdout and exits 0.
 sb_contract_functions() {
   printf '%s\n%s\n' "$SB_REQUIRED_FUNCTIONS" "$SB_OPTIONAL_FUNCTIONS"
@@ -386,27 +315,19 @@ PX_SB_CAPS=""
 PX_SB_CAPS_READY=""
 
 ## @description  Checks whether a function name belongs to the substrate contract.
-## @param        name Function name to test.
+## @param        name: The function name to test.
 ## @return       Exits 0 when the name is a contract function, or 1 otherwise.
 sb_is_contract_name() {
-  local all
-  all="
-$SB_REQUIRED_FUNCTIONS
-$SB_OPTIONAL_FUNCTIONS
-"
-  case "$all" in
-  *"
-$1
-"*) return 0 ;;
+  case "$PX_NL$SB_REQUIRED_FUNCTIONS$PX_NL$SB_OPTIONAL_FUNCTIONS$PX_NL" in
+  *"$PX_NL${1:-}$PX_NL"*) return 0 ;;
   esac
   return 1
 }
 
-# Verifies that the currently loaded backend defines every required contract function and outputs
-# any missing function names. Both sb_load and validation commands invoke this check so that an
-# incomplete backend can be diagnosed without interacting with a cluster.
-## @description  Verifies that all required contract functions are defined by the backend.
-## @return       Writes any missing names to stdout; exits 0 if complete, or 1 if any are missing.
+# Verifies that the currently bound backend defines every required contract function and reports
+# any missing function names.
+## @description  Reports every required contract function that the bound backend does not define.
+## @return       Writes any missing names to stdout; exits 0 when complete, or 1 if any is missing.
 sb_verify_backend() {
   local name missing=0
   while IFS= read -r name; do
@@ -424,15 +345,13 @@ EOF
   return 0
 }
 
-# Binds a single backend implementation for the process by sourcing lib/backend/<name>.sh. It
-# rejects any backend whose contract version does not match, refuses to bind a second backend over
-# an already bound one, and rejects any incomplete backend missing required functions. A repeated
-# call naming the currently bound backend returns immediately as a no-op so that any command can
-# call sb_load without a guard. Exits with code 2 on an invalid or unknown backend name, and exits
-# with code 1 on a contract version mismatch, a second backend, or a missing required function.
-## @description  Loads, validates, and binds the specified substrate backend.
-## @param        backend Backend name, defaulting to PX_BACKEND and then compose.
-## @return       Exits 0 when bound, 2 on invalid/unknown name, or 1 on version or binding errors.
+# Binds a single backend for the process by sourcing lib/backend/<name>.sh, while treating a repeat
+# call for the same backend as a no-op. Ends the process with code 2 on an invalid or unknown
+# backend name, and with code 1 on a contract version mismatch, an attempt to bind a second
+# backend, or a missing required function.
+## @description  Loads, validates, and binds one backend from lib/backend/<name>.sh.
+## @param        backend: Name matching ^[a-z][a-z0-9_]*$; defaults to PX_BACKEND, else compose.
+## @return       Exits 0 when bound, or ends the process with 2 on a bad name or 1 on bind failure.
 sb_load() {
   local backend file version missing
   backend="${1:-${PX_BACKEND:-compose}}"
@@ -479,11 +398,9 @@ sb_bound_backend() {
   printf '%s\n' "$PX_BACKEND_BOUND"
 }
 
-# Determines whether the currently bound backend implements a given contract function. Callers
-# must query this predicate before invoking any optional contract function.
-## @description  Tests whether the bound backend defines a specified contract function.
-## @param        name Contract function name to check.
-## @return       Exits 0 if implemented, 1 if unimplemented, or 2 if not a contract function.
+## @description  Tests whether the bound backend implements a specified contract function.
+## @param        name: A contract function name to check.
+## @return       Exits 0 when available, 1 when not implemented, or 2 if not a contract function.
 sb_supports() {
   local name=${1:-}
   if ! sb_is_contract_name "$name"; then
@@ -494,11 +411,11 @@ sb_supports() {
 }
 
 # Invokes a contract function on the bound backend and translates an unimplemented optional
-# function into the unsupported exit code (5), which callers record as a skipped operation.
-## @description  Dispatches a contract function call, returning code 5 if unimplemented.
-## @param        name Contract function name to invoke.
-## @param        argument... Arguments forwarded to the contract function.
-## @return       Returns the function status, 5 if not implemented, or 2 if not a contract name.
+# function into exit code 5 (unsupported).
+## @description  Dispatches a contract function call, returning code 5 if it is not implemented.
+## @param        name: The contract function name to invoke.
+## @param        argument...: Zero or more arguments forwarded to the contract function.
+## @return       Returns the function status, 5 if not implemented, or 2 if not a contract function.
 sb_call() {
   local name=${1:-} status
   shift || true
@@ -515,11 +432,8 @@ sb_call() {
   return "$status"
 }
 
-# Queries the capability table of the bound backend once and caches the result for the lifetime of
-# the current process. Because the table is small whereas probing the runtime can be expensive,
-# caching ensures that repeated capability lookups incur the probe cost only once.
-## @description  Populates the per-process capability table cache from the bound backend.
-## @return       Exits 0 on success, or 1 when no backend is bound or the table cannot be read.
+## @description  Reads and caches the capability table of the bound backend once per process.
+## @return       Exits 0, or 1 when no backend is bound or the backend cannot report its table.
 sb_capabilities_cache() {
   [ -z "$PX_SB_CAPS_READY" ] || return 0
   if ! declare -F sb_capabilities >/dev/null 2>&1; then
@@ -530,64 +444,41 @@ sb_capabilities_cache() {
   PX_SB_CAPS_READY=1
 }
 
-# Checks whether the bound backend supports a declared capability. Any declared capability name
-# omitted from the backend capability table is treated as unsupported so that callers degrade
-# gracefully instead of failing.
-## @description  Reports whether the bound backend supports a named capability.
-## @param        name Declared capability name to query.
-## @return       Writes yes or no to stdout; exits 0 for yes, 1 for no, or 6 if undeclared.
+# Checks whether the bound backend declares a capability from SB_CAPABILITY_NAMES, treating any
+# omitted row as no. Exits 1 with no stdout output when the capability table cannot be read, and
+# exits 6 when the queried name is not a declared capability.
+## @description  Reports whether the bound backend declares support for a named capability.
+## @param        name: A capability name from SB_CAPABILITY_NAMES.
+## @return       Writes yes or no to stdout; exits 0 for yes, 1 for no or error, or 6 if undeclared.
 sb_capability() {
-  local name=${1:-} row value
-  case "
-$SB_CAPABILITY_NAMES
-" in
-  *"
-$name
-"*) ;;
+  local name=${1:-} row
+  case "$PX_NL$SB_CAPABILITY_NAMES$PX_NL" in
+  *"$PX_NL$name$PX_NL"*) ;;
   *)
     px_error "'$name' is not a declared capability"
     return "$SB_EXIT_NO_OBJECT"
     ;;
   esac
   sb_capabilities_cache || return "$SB_EXIT_FAIL"
-  while IFS= read -r row; do
-    case "$row" in
-    "$name$PX_TAB"*)
-      value="$(px_tsv_field 2 "$row")" || value=no
-      if [ "$value" = yes ]; then
-        printf 'yes\n'
-        return 0
-      fi
-      printf 'no\n'
-      return 1
-      ;;
-    esac
-  done <<EOF
-$PX_SB_CAPS
-EOF
+  row="$(sb_row_get "$name" "$PX_SB_CAPS")" || row=no
+  if [ "${row%%"$PX_TAB"*}" = yes ]; then
+    printf 'yes\n'
+    return 0
+  fi
   printf 'no\n'
   return 1
 }
 
-# Extracts the detail column for a capability row from the backend capability table, explaining
-# either why a capability is unavailable or how the backend satisfies it.
-## @description  Outputs the diagnostic detail field for a row in the capability table.
-## @param        name Capability name to look up.
-## @return       Writes the detail text to stdout; exits 0, or 6 when the row is not present.
+# Extracts the detail column for a capability row from the backend capability table, explaining why
+# the capability is absent or how the backend satisfies it.
+## @description  Reports the diagnostic detail column for one capability row.
+## @param        name: A capability name from SB_CAPABILITY_NAMES.
+## @return       Writes the detail to stdout; exits 0, 1 if the table is unreadable, or 6 if absent.
 sb_capability_detail() {
-  local name=${1:-} row
+  local row
   sb_capabilities_cache || return "$SB_EXIT_FAIL"
-  while IFS= read -r row; do
-    case "$row" in
-    "$name$PX_TAB"*)
-      px_tsv_field 3 "$row" || printf '\n'
-      return 0
-      ;;
-    esac
-  done <<EOF
-$PX_SB_CAPS
-EOF
-  return "$SB_EXIT_NO_OBJECT"
+  row="$(sb_row_get "${1:-}" "$PX_SB_CAPS")" || return "$SB_EXIT_NO_OBJECT"
+  px_tsv_field 2 "$row" || printf '\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -602,46 +493,52 @@ EOF
 # scope identifiers, label values, and state file names, its allowed syntax remains narrow.
 SB_CLUSTER_RE='^[a-z0-9][a-z0-9_-]*$'
 
-# Computes the path to the state file that stores the scope id for a cluster on the bound backend.
-# Embedding the backend name in the file name allows the same cluster name to exist simultaneously
-# on two backends without either record shadowing the other. The file stores the scope id on its
-# first line; px-cluster writes it after sb_scope_create and removes it after sb_scope_delete.
-# Exits 2 if the cluster name is invalid or the output policy refuses the state directory, and 1 if
-# the state directory cannot be created.
-## @description  Reports the state file path recording the scope id for a cluster.
-## @param        cluster Cluster name; defaults to PX_CLUSTER_ID, or "default" when unset.
-## @return       Writes the path to stdout; exits 0, 2 on invalid name or policy refusal, or 1.
-sb_scope_record() {
-  local cluster=${1:-${PX_CLUSTER_ID:-default}} dir status=0
+# Computes the state file path <kind>-<backend>-<cluster> for a cluster. Exits 2 when the cluster
+# name does not match SB_CLUSTER_RE or the output policy refuses the state directory, and exits 1
+# when the state directory cannot be created.
+## @description  Reports the <kind>-<backend>-<cluster> state file path for a cluster.
+## @param        kind: The record kind, either scope or deployment.
+## @param        cluster: Name matching SB_CLUSTER_RE; defaults to PX_CLUSTER_ID, else "default".
+## @return       Writes the path to stdout; exits 0, 2 on bad name or policy refusal, or 1 on error.
+sb_cluster_file() {
+  local cluster=${2:-${PX_CLUSTER_ID:-default}} dir
   if ! [[ $cluster =~ $SB_CLUSTER_RE ]]; then
     px_error "invalid cluster name '$cluster'"
     return "$SB_EXIT_USAGE"
   fi
-  dir="$(px_state_dir)" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
-  printf '%s/scope-%s-%s\n' "$dir" "${PX_BACKEND_BOUND:-${PX_BACKEND:-compose}}" "$cluster"
+  dir="$(px_state_dir)" || return $?
+  printf '%s/%s-%s-%s\n' "$dir" "$1" "${PX_BACKEND_BOUND:-${PX_BACKEND:-compose}}" "$cluster"
 }
 
-# Resolves the target scope id for a cluster command. An explicit PX_SCOPE_ID environment variable
-# takes precedence so that an operator can target a scope that was never recorded on the local
-# host; otherwise, the scope id is read from the record written by px-cluster for the bound backend
-# and PX_CLUSTER_ID. When PX_SCOPE_ID is unset, propagates any sb_scope_record failure (2 on an
-# invalid cluster name or refused state directory, or 1 when the state directory cannot be created)
-# and exits 6 if no scope record exists.
-## @description  Resolves the active scope id from PX_SCOPE_ID or the local cluster record.
-## @return       Writes the scope id to stdout; exits 0, 6 if unrecorded, or 1 or 2 on error.
+# Reports the state file whose first line stores the scope id for a cluster on the active backend.
+# Exits 2 on an invalid cluster name or a refused state directory, and exits 1 when the state
+# directory cannot be created.
+## @description  Reports the state file path that records the scope id for a cluster.
+## @param        cluster: Name matching SB_CLUSTER_RE; defaults to PX_CLUSTER_ID, else "default".
+## @return       Writes the path to stdout; exits 0, 2 on bad name or policy refusal, or 1 on error.
+sb_scope_record() { sb_cluster_file scope "${1:-}"; }
+
+# Reports the state file whose first line stores the deployment directory created by px-cluster up.
+# Exits 2 on an invalid cluster name or a refused state directory, and exits 1 when the state
+# directory cannot be created.
+## @description  Reports the state file path recording the deployment directory from px-cluster up.
+## @param        cluster: Name matching SB_CLUSTER_RE; defaults to PX_CLUSTER_ID, else "default".
+## @return       Writes the path to stdout; exits 0, 2 on bad name or policy refusal, or 1 on error.
+sb_deployment_record() { sb_cluster_file deployment "${1:-}"; }
+
+# Resolves the target scope id for a cluster command, preferring PX_SCOPE_ID when set and falling
+# back to the recorded scope for PX_CLUSTER_ID. Exits 6 when no scope is named or recorded, 2 on an
+# invalid cluster name or a refused state directory, and 1 when the state directory cannot be
+# created.
+## @description  Resolves the active scope id from PX_SCOPE_ID or the recorded cluster scope.
+## @return       Writes the scope id to stdout; exits 0, 6 if none, 2 on bad name/policy, or 1.
 sb_scope_resolve() {
-  local file id="" status=0
+  local file id=""
   if [ -n "${PX_SCOPE_ID:-}" ]; then
     printf '%s\n' "$PX_SCOPE_ID"
     return 0
   fi
-  file="$(sb_scope_record)" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  file="$(sb_scope_record)" || return $?
   if [ -f "$file" ]; then
     IFS= read -r id <"$file" || true
   fi
@@ -650,6 +547,82 @@ sb_scope_resolve() {
     return "$SB_EXIT_NO_OBJECT"
   fi
   printf '%s\n' "$id"
+}
+
+# Defines the operator remedy for a cluster with no recorded scope so that every diagnostic message
+# reporting that condition presents the same guidance.
+PX_HINT_NO_CLUSTER="run px-cluster up, or name another with --cluster"
+
+# Determines the scope of the selected cluster via sb_scope_resolve, terminating the process if
+# no scope can be determined. When resolution fails, ends the process with code 6 if no scope is
+# recorded, or with the status of sb_scope_resolve (2 for a refused state directory, or 1 on
+# failure).
+## @description  Emits the resolved scope id for the selected cluster, or terminates the process.
+## @return       Writes the scope id and exits 0, or ends the process with 6, 2, or 1.
+sb_scope_require() {
+  local id status=0
+  id="$(sb_scope_resolve || exit "$?")" || status=$?
+  if [ "$status" = "$SB_EXIT_NO_OBJECT" ]; then
+    px_die "$SB_EXIT_NO_OBJECT" "no cluster ${PX_CLUSTER_ID:-default} is recorded:" \
+      "$PX_HINT_NO_CLUSTER"
+  fi
+  if [ "$status" != 0 ]; then
+    px_die "$status" "cannot read the scope record of cluster ${PX_CLUSTER_ID:-default}"
+  fi
+  printf '%s\n' "$id"
+}
+
+# Verifies through sb_scope_exists that the target scope exists on the bound backend, terminating
+# the process otherwise. Ends the process with code 6 when the scope is absent, or propagates the
+# failure status of sb_scope_exists (2 on usage errors, or 1 when the runtime did not respond).
+## @description  Terminates the process unless the bound backend confirms that a scope exists.
+## @param        scope_id: The required scope id to verify.
+## @return       Exits 0 if the scope exists, or ends the process with 6 if absent, 2, or 1.
+sb_scope_check() {
+  local status=0
+  sb_scope_exists "${1:-}" || status=$?
+  if [ "$status" = "$SB_EXIT_NO_OBJECT" ]; then
+    px_die "$SB_EXIT_NO_OBJECT" "no such scope: ${1:-}"
+  fi
+  if [ "$status" != 0 ]; then
+    px_die "$status" "cannot tell whether the scope ${1:-} exists"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+# An image tag must reference a local image only. Because a digest or a registry host would allow
+# the container engine to pull the image from a remote registry, the tag grammar rejects both.
+
+## @description  Tests that a tag is a local repository:tag without a digest or registry host.
+## @param        tag: The image tag to validate, for example px-harness:dev.
+## @return       Exits 0 for a valid local tag, or 1 otherwise.
+sb_image_tag_local() {
+  local tag=${1:-} re='^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*$' first
+  [[ $tag =~ $re ]] || return 1
+  first=${tag%%/*}
+  [ "$first" != "$tag" ] || return 0
+  case "$first" in
+  *.* | *:* | localhost) return 1 ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Port map
+# ---------------------------------------------------------------------------
+# The deployment generator writes each published port under a PX_PORT_* variable name, and the
+# backend reads that variable back. A single helper constructs the variable name for both sides.
+
+## @description  Names the port-map variable PX_PORT_<ROLE>_<NAME>[_<INDEX>], mapping . and - to _.
+## @param        role: The role name.
+## @param        port_name: The logical port name, for example rpc.
+## @param        index: The zero-based instance index, or empty to omit the index suffix.
+## @return       Writes the variable name to stdout and exits 0.
+sb_port_var() {
+  printf 'PX_PORT_%s%s\n' "$(printf '%s_%s' "${1:-}" "${2:-}" | tr '[:lower:].-' '[:upper:]__')" \
+    "${3:+_$3}"
 }
 
 # ---------------------------------------------------------------------------
@@ -668,84 +641,65 @@ sb_scope_resolve() {
 # rows left over from an earlier run or a previous cluster sharing the same scope id never excuse
 # new unexpected restarts.
 
-# Computes the state file path that stores planned actions for a given scope. Because a scope id
-# may contain characters that are unsafe in file names, such as the separator between a cluster
-# context and a namespace, characters outside [A-Za-z0-9._-] are normalized to underscores.
-# Propagates the output policy status (2 if the state directory is refused, or 1 if the directory
-# cannot be created).
-## @description  Reports the sanitized state file path for a scope's planned-action log.
-## @param        scope Target scope id.
-## @return       Writes the file path to stdout; exits 0, or 2 or 1 on state directory failure.
+# Computes the state file path for a scope's planned-action log, replacing any character outside
+# A-Za-z0-9._- with an underscore so that the scope id is safe for use in a file name. Exits 2 when
+# the output policy refuses the state directory, and exits 1 when the directory cannot be created.
+## @description  Reports the planned-action log file path for a scope, sanitizing unsafe characters.
+## @param        scope_id: The scope id, where each character outside A-Za-z0-9._- becomes _.
+## @return       Writes the path to stdout; exits 0, 2 if policy refuses the dir, or 1 on dir error.
 sb_planned_file() {
-  local dir status=0
-  dir="$(px_state_dir)" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  local dir
+  dir="$(px_state_dir)" || return $?
   printf '%s/planned-%s.tsv\n' "$dir" "${1//[^A-Za-z0-9._-]/_}"
 }
 
-# Appends a planned disruption entry to the scope's planned-action log. Callers must record the
-# action before initiating it because an anomaly reader may inspect the log while the action is
-# still in flight. Exits 2 when the scope id or action is empty or when the output policy refuses
-# the state directory, and exits 1 when a field contains a tab or newline, when the state directory
-# cannot be created, or when the record file cannot be written.
-## @description  Records an intentional disruption in the scope's planned-action log.
-## @param        scope Target scope id.
-## @param        action Disruption verb, such as kill, signal, restart, or scale.
-## @param        role Target role name, which may be empty.
-## @param        index Target instance index, or empty to cover all instances of the role.
-## @param        detail Optional free-form detail string, which may be empty.
-## @return       Exits 0 on success, 2 on usage or policy refusal, or 1 on formatting or I/O error.
+# Appends an intentional action to the scope's planned-action log before execution begins so that a
+# concurrent anomaly reader observes the record while the operation is in flight. Exits 2 when the
+# scope id or action is empty or the output policy refuses the state directory, and exits 1 when a
+# field contains a tab or newline, the state directory cannot be created, or the row cannot be
+# written.
+## @description  Records an action as planned before it starts so concurrent readers observe it.
+## @param        scope_id: The target scope id, required.
+## @param        action: The required action name, such as kill, signal, restart, or scale.
+## @param        role: The target role name; an empty value matches no instance.
+## @param        index: The target instance index; an empty value covers every instance of the role.
+## @param        detail: Optional free-form detail text, which may be empty.
+## @return       Exits 0, 2 on missing arguments or refused directory, or 1 on format or I/O error.
 sb_planned_record() {
   local scope=${1:-} action=${2:-} role=${3:-} index=${4:-} detail=${5:-}
-  local file row target status=0
+  local file row
   if [ -z "$scope" ] || [ -z "$action" ]; then
     px_error "sb_planned_record needs a scope id and an action"
     return "$SB_EXIT_USAGE"
   fi
-  file="$(sb_planned_file "$scope")" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  file="$(sb_planned_file "$scope")" || return $?
   row="$(px_tsv_row "$(px_epoch_ms)" "$action" "$role" "$index" \
     "$(px_tsv_clean "$detail")")" || return "$SB_EXIT_FAIL"
   if ! printf '%s\n' "$row" >>"$file"; then
     px_error "cannot write the planned-action record $file"
     return "$SB_EXIT_FAIL"
   fi
-  target=$action
-  if [ -n "$role" ]; then
-    target="$target $role"
-  fi
-  if [ -n "$index" ]; then
-    target="$target/$index"
-  fi
-  px_info "recorded planned $target in $file"
+  px_info "recorded planned $action${role:+ $role}${index:+/$index} in $file"
 }
 
-# Determines whether a logged planned action covers the specified role and instance index. Only
-# rows recorded at or after the start of the caller's observation window are considered. Exits 0
-# when a matching row covers the instance and 1 when no row matches or the state directory cannot
-# be created; exits 2 when the scope id or role is empty, when the window start is not a whole
-# number, or when the output policy refuses the state directory.
-## @description  Tests whether a planned action recorded within the window covers an instance.
-## @param        scope Target scope id.
-## @param        role Target role name.
-## @param        index Target instance index.
-## @param        since Observation window start in epoch milliseconds, defaulting to 0.
-## @return       Exits 0 if covered, 1 if not covered or on state dir creation failure, or 2.
+# Determines whether a planned-action row recorded at or after the observation window start covers
+# the specified role and instance index. Exits 0 when a matching row covers the instance, 1 when no
+# row matches or the state directory cannot be created, and 2 when the scope id or role is empty,
+# the window start is not a whole number of epoch milliseconds, or the state directory is refused.
+## @description  Tests whether a planned row recorded since the window start covers an instance.
+## @param        scope_id: The target scope id, required.
+## @param        role: The target role name, required.
+## @param        index: The target instance index; also matched by a row with an empty index.
+## @param        since: The observation window start in whole epoch milliseconds; defaults to 0.
+## @return       Exits 0 if covered, 1 if uncovered or on directory error, or 2 on bad args/policy.
 sb_planned_contains() {
   local scope=${1:-} role=${2:-} index=${3:-} since=${4:-0}
-  local file row ts rest row_role row_index status=0
+  local file row ts rest row_role row_index
   if [ -z "$scope" ] || [ -z "$role" ] || ! [[ $since =~ $PX_RE_INT ]]; then
     px_error "sb_planned_contains needs a scope id, a role and a whole window start"
     return "$SB_EXIT_USAGE"
   fi
-  file="$(sb_planned_file "$scope")" || status=$?
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  file="$(sb_planned_file "$scope")" || return $?
   [ -f "$file" ] || return 1
   while IFS= read -r row || [ -n "$row" ]; do
     # Fields are split explicitly by parameter expansion because consecutive tabs would collapse

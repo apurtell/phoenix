@@ -33,26 +33,21 @@
 # The positive control validates that an empty log during negative controls is genuine evidence of
 # non-invocation rather than an artifact of a broken fixture.
 #
-# Beyond boundary enforcement, this file validates the remainder of the harness: documentation
-# policies, substrate contract compliance against the backend, the twelve CLI entry points, a full
-# sweep of every contract function and px-cluster subcommand against the fake runtime, the suite
-# runner, the run wrapper, the configuration loader, the output policy, and the JSON and TSV
-# emitters. Dedicated regression cases cover defects identified during design review wherever the
-# fake runtime can reproduce them.
+# Every defect identified during the review of this round retains its own dedicated test case
+# wherever the fake runtime can reproduce it.
 #
 # All test fixtures are materialized from heredocs into a single temporary directory that is
 # removed by the exit hook, ensuring no fixture files are committed to the repository. Commands
 # execute with the working tree root as their working directory, and the final test group verifies
 # that no test execution created any new paths under that root.
 #
-# Test case identifiers referenced as acceptance criteria by requirements retain those exact names
-# to preserve requirement traceability: readme_states_policies (R-002), no_direct_docker (R-004),
-# no_direct_kubectl (R-281), bins_source_common (R-006), and no_user_paths (R-011).
+# Test case identifiers referenced as acceptance criteria by requirements of this round retain
+# those exact names so traceability from a requirement locates its test case:
+# readme_states_policies (R-002), no_direct_docker (R-004), no_direct_kubectl (R-281),
+# bins_source_common (R-006), no_user_paths (R-011), and loader_precedence (R-027).
 #
-# Output follows TAP conventions: one "ok N - name" or "not ok N - name" line per assertion,
-# diagnostic output formatted as comment lines, a trailing plan line, and a final summary. The
-# shell runs with set -uo pipefail and omits set -e so failed assertions are recorded without
-# terminating the test suite early.
+# The shell runs with set -uo pipefail and omits set -e so that a failed assertion is recorded
+# rather than terminating the test run early.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -99,7 +94,7 @@ T_K8S_NAMES='kubectl|k3d|helm|crictl'
 # and bypass shell function traps, so only the backend itself may reference them.
 T_RUNTIME_RE='(^|[^[:alnum:]_./-])('"$T_RUNTIME_NAMES"')([^[:alnum:]_-]|$)'
 T_K8S_RE='(^|[^[:alnum:]_./-])('"$T_K8S_NAMES"')([^[:alnum:]_-]|$)'
-T_ENGINE_RE='(^|[^[:alnum:]_])(PX_DOCKER_BIN|_PXC_ENGINE|_PXC_COMPOSE)([^[:alnum:]_]|$)'
+T_ENGINE_RE='(^|[^[:alnum:]_])(PX_DOCKER_BIN|_PXC_ENGINE)([^[:alnum:]_]|$)'
 T_SCAN_RE="$T_RUNTIME_RE|$T_ENGINE_RE"
 
 # Inline waiver marker honored by the Layer 1 static scan. Any source line carrying this directive
@@ -132,8 +127,7 @@ teardown by default"
 T_NUMBER=0
 T_FAILED=0
 T_FAILED_NAMES=""
-T_VERBOSE=0
-T_KEEP=0
+T_SKIPPED=""
 T_WORK=""
 T_OUT=""
 T_ERR=""
@@ -146,18 +140,29 @@ T_SHIM_STATE=""
 T_SWEEP_STATE=""
 T_SWEEP_OUT=""
 T_DEPLOY=""
+T_A2=""
+T_A2_BIN=""
+T_A2_OUT=""
+T_A2_STATE=""
+T_A2_CURL_DIR=""
+T_A2_CURL_LOG=""
+T_A2_MVN_LOG=""
+T_GEN=""
+T_IMG=""
+T_ENVD=""
+T_ZK_PORT=""
+T_ZK_PID=""
 
-## @description  Prints command-line usage instructions and options for this test runner.
+## @description  Prints command-line usage instructions for invoking this test runner.
 ## @return       Writes the usage text to stdout. Exit 0.
 usage() {
   cat <<'EOF'
-Usage: run-tests.sh [-v] [-k] [-h]
+Usage: run-tests.sh [-k] [-h]
 
 Runs the harness self-test. It needs no container runtime, no network and no
 Maven build.
 
 Options:
-  -v  report the detail of a passing assertion as well as a failing one
   -k  keep the temporary fixture directory for a diagnosis
   -h  show this text
 
@@ -170,11 +175,8 @@ EOF
 # Test runner assertion and execution primitives
 # ---------------------------------------------------------------------------
 
-# Formats multi-line diagnostic messages as individual TAP comment lines so that test output
-# remains readable.
-## @description  Emits diagnostic text as TAP comment lines on standard output.
-## @param        text...  Diagnostic text to format line by line.
-## @return       Writes TAP comment lines to stdout. Exit 0.
+## @description  Emits diagnostic text as TAP comment lines, one line per input line.
+## @return       Writes formatted TAP comment lines to stdout. Exit 0.
 t_diag() {
   local line
   while IFS= read -r line; do
@@ -184,22 +186,23 @@ $*
 EOF
 }
 
-## @description  Records a passing test assertion and emits its TAP result line.
-## @param        name, detail...  Assertion name and optional detail reported only in verbose mode.
-## @return       Writes one passing TAP line to stdout. Exit 0.
+## @description  Records a passing test assertion for the given assertion name (name).
+## @return       Writes one passing TAP result line to stdout. Exit 0.
 t_pass() {
-  local name=$1
-  shift
   T_NUMBER=$((T_NUMBER + 1))
-  printf 'ok %s - %s\n' "$T_NUMBER" "$name"
-  if [ "$T_VERBOSE" = 1 ] && [ $# -gt 0 ]; then
-    t_diag "$@"
-  fi
+  printf 'ok %s - %s\n' "$T_NUMBER" "$1"
 }
 
-## @description  Records a failing test assertion along with its supporting diagnostic evidence.
-## @param        name, detail...  Assertion name and diagnostic detail lines for the failure.
-## @return       Writes one failing TAP line and its diagnostics to stdout. Exit 0.
+## @description  Records a case (name, reason) that cannot run on this host as a counted TAP skip.
+## @return       Writes one skipped TAP result line to stdout. Exit 0.
+t_skip() {
+  T_NUMBER=$((T_NUMBER + 1))
+  T_SKIPPED="$T_SKIPPED  $T_NUMBER $1: $2$PX_NL"
+  printf 'ok %s - %s # SKIP %s\n' "$T_NUMBER" "$1" "$2"
+}
+
+## @description  Records a failing test assertion (name, detail...) along with diagnostic evidence.
+## @return       Writes one failing TAP result line and its diagnostics to stdout. Exit 0.
 t_fail() {
   local name=$1
   shift
@@ -210,8 +213,7 @@ t_fail() {
   [ $# -eq 0 ] || t_diag "$@"
 }
 
-## @description  Verifies that an actual value equals the expected value.
-## @param        name, expected, actual  Assertion name, expected value, and actual value.
+## @description  Verifies that two values are equal (name, expected, actual).
 ## @return       Records one equality assertion. Exit 0.
 t_equals() {
   if [ "$2" = "$3" ]; then
@@ -221,8 +223,7 @@ t_equals() {
   fi
 }
 
-## @description  Verifies that a text string contains a specified substring.
-## @param        name, needle, text  Assertion name, required substring, and searched text.
+## @description  Verifies that a text string contains a required substring (name, needle, text).
 ## @return       Records one substring presence assertion. Exit 0.
 t_contains() {
   case "$3" in
@@ -231,8 +232,7 @@ t_contains() {
   esac
 }
 
-## @description  Verifies that a text string does not contain a forbidden substring.
-## @param        name, needle, text  Assertion name, forbidden substring, and searched text.
+## @description  Verifies that a text string does not contain a substring (name, needle, text).
 ## @return       Records one substring absence assertion. Exit 0.
 t_absent() {
   case "$3" in
@@ -241,8 +241,7 @@ t_absent() {
   esac
 }
 
-## @description  Verifies that a given text string is empty.
-## @param        name, text  Assertion name and text string expected to be empty.
+## @description  Verifies that a text string is empty (name, text).
 ## @return       Records one emptiness assertion. Exit 0.
 t_empty() {
   if [ -z "$2" ]; then
@@ -252,8 +251,7 @@ t_empty() {
   fi
 }
 
-## @description  Verifies that a given text string is non-empty.
-## @param        name, text  Assertion name and text string expected to be non-empty.
+## @description  Verifies that a text string is non-empty (name, text).
 ## @return       Records one non-emptiness assertion. Exit 0.
 t_nonempty() {
   if [ -n "$2" ]; then
@@ -263,67 +261,42 @@ t_nonempty() {
   fi
 }
 
-# Combines the exit status and full standard output of the preceding command into a single
-# comparison value so that any failure diagnostic displays both together.
-## @description  Verifies both the exit status and complete standard output of the last command.
-## @param        name, expected status, expected stdout  Assertion name, status, and stdout text.
+## @description  Verifies the last command's exit status and full stdout (name, status, stdout).
 ## @return       Records one combined outcome assertion. Exit 0.
 t_outcome() {
   t_equals "$1" "exit $2$PX_NL$3" "exit $T_STATUS$PX_NL$T_STDOUT"
 }
 
-# Compares the exit status and only the leading columns of standard output from the last command so
-# test cases can ignore trailing timing columns that vary from run to run.
-## @description  Verifies the exit status and leading TSV columns of the last command's output.
-## @param        name, expected status, column count, expected rows  Assertion target and columns.
+# Compares the exit status and leading TSV columns of standard output from the last command.
+## @description  Verifies the exit status and leading stdout columns (name, status, count, rows).
 ## @return       Records one column-sliced outcome assertion. Exit 0.
 t_outcome_columns() {
-  t_equals "$1" "exit $2$PX_NL$4" "exit $T_STATUS$PX_NL$(t_columns "$3" "$T_STDOUT")"
+  t_equals "$1" "exit $2$PX_NL$4" "exit $T_STATUS$PX_NL$(printf '%s\n' "$T_STDOUT" | cut -f "1-$3")"
 }
 
-## @description  Extracts the leading columns from tab-separated rows.
-## @param        column count, rows  Number of leading columns to keep and input TSV rows.
-## @return       Writes the selected leading columns to stdout. Exit 0.
-t_columns() {
-  [ -n "$2" ] || return 0
-  printf '%s\n' "$2" | cut -f "1-$1"
-}
-
-# Formats a flat list of argument fields into tab-separated rows of a fixed column count so
-# expected test values stay readable without embedding literal tab characters.
-## @description  Constructs tab-separated rows of a specified width from a flat list of fields.
-## @param        column count, field...  Columns per row followed by the individual field values.
+## @description  Formats a flat list of fields into tab-separated rows of a given column count.
 ## @return       Writes the formatted TSV rows to stdout. Exit 0.
-t_rows() {
-  local count=$1 column=0 row="" field
-  shift
-  for field in "$@"; do
-    column=$((column + 1))
-    if [ "$column" = 1 ]; then
-      row=$field
-    else
-      row="$row$PX_TAB$field"
-    fi
-    if [ "$column" = "$count" ]; then
-      printf '%s\n' "$row"
-      column=0
-    fi
-  done
-}
+t_rows() { printf '%s\n' "${@:2}" | awk -v n="$1" '{ printf "%s%s", $0, (NR % n ? "\t" : "\n") }'; }
 
-# Collapses consecutive spaces into a single space so test cases can inspect aligned table rows
-# without depending on column padding.
-## @description  Collapses runs of multiple spaces in a text string into single spaces.
-## @param        text  Input text string to normalize.
-## @return       Writes the space-collapsed text to stdout. Exit 0.
+# Collapses consecutive spaces into a single space so test cases can inspect aligned tables.
+## @description  Collapses every run of spaces in a text string into a single space.
+## @return       Writes the normalized text to stdout. Exit 0.
 t_squeeze() { printf '%s\n' "$1" | tr -s ' '; }
 
-# Executes a command inside a target working directory and captures its exit status, stdout, and
-# stderr via temporary files rather than command substitution so variables set by the command are
-# not lost in a subshell pipeline and output streams stay separate. Standard input is connected to
-# /dev/null so commands cannot consume enclosing loop input or observe a terminal during exec.
-## @description  Executes a command in a specified directory and captures its status and outputs.
-## @param        directory, command...  Target working directory followed by the command and args.
+## @description  Reports whether a text string contains a given substring (needle, text).
+## @return       Writes yes or no to stdout. Exit 0.
+t_flag() {
+  case "$2" in
+  *"$1"*) printf yes ;;
+  *) printf no ;;
+  esac
+}
+
+## @description  Reports whether a filesystem path exists as a yes or no flag.
+## @return       Writes yes or no to stdout. Exit 0.
+t_exists() { if [ -e "$1" ]; then printf yes; else printf no; fi; }
+
+## @description  Executes a command in a target directory (directory, command...) with empty stdin.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_run_in() {
   local dir=$1
@@ -334,50 +307,45 @@ t_run_in() {
   T_STDERR="$(cat "$T_ERR")"
 }
 
-## @description  Executes a command in the current test working directory and captures its outcome.
-## @param        command...  Command and arguments to execute.
+## @description  Executes a command in the current working directory of the test.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_run() { t_run_in "$PWD" "$@"; }
 
-# Runs a command with the fake runtime directory prepended to PATH and referenced by PX_DOCKER_BIN
-# so any invocation reaching a runtime is logged rather than executed against the host system.
-## @description  Executes a command with the fake runtime shims active on PATH and PX_DOCKER_BIN.
-## @param        command...  Command and arguments to execute under the shim environment.
+## @description  Executes a command with the fake runtime first on PATH and set in PX_DOCKER_BIN.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_with_shim() {
   t_run env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
     "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" "$@"
 }
 
-# Runs a command configured against the sweep test cluster, pointing the fake runtime at the sweep
-# state directory, setting the output root to the sweep output directory, and targeting cluster ID
-# sweep. Any leading NAME=VALUE arguments inject additional environment variables for the call.
-## @description  Executes a command in the verb sweep environment against the sweep cluster.
-## @param        command...  Optional leading NAME=VALUE overrides followed by the command to run.
+## @description  Executes a command (NAME=VALUE..., command...) against the fake sweep cluster.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_sweep() {
-  t_run env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
-    "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SWEEP_STATE" \
-    "PX_OUT=$T_SWEEP_OUT" "PX_CLUSTER_ID=sweep" "PX_POLL_INTERVAL_S=0.2" \
-    "PX_REGION_MOVER_CMD=$T_MOVER_CMD" "$@"
+  t_with_shim "PX_FAKE_STATE_DIR=$T_SWEEP_STATE" "PX_OUT=$T_SWEEP_OUT" PX_CLUSTER_ID=sweep \
+    PX_POLL_INTERVAL_S=0.2 "PX_REGION_MOVER_CMD=$T_MOVER_CMD" "$@"
 }
 
-## @description  Invokes a substrate contract function in a backend-bound process against sweep.
-## @param        function, argument...  Contract function name and its arguments.
+## @description  Invokes a contract function (function, argument...) against the sweep cluster.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_sb() { t_sweep "$T_BASH" "$T_WORK/probe/sb.sh" "$@"; }
 
-## @description  Executes a px-cluster subcommand against the sweep cluster under the fake runtime.
-## @param        argument...  Subcommand and arguments passed to px-cluster --cluster sweep.
+## @description  Executes a px-cluster subcommand against the sweep cluster.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_pc() { t_sweep "$T_BASH" "$T_BIN/px-cluster" --cluster sweep "$@"; }
 
-# Evaluates multiple substrate contract calls within a single assertion. Each input line specifies
-# the expected exit code followed by the contract function name and its space-separated arguments,
-# and any call whose actual exit code differs is reported in the failure diagnostic.
-## @description  Verifies the exit codes of a batch of substrate contract function calls.
-## @param        name, lines  Assertion name and newline-delimited expected-code call specs.
-## @return       Records one assertion covering all listed contract calls. Exit 0.
+## @description  Executes px-suite (session id, argument...) inside an isolated session.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_suite() { t_run env "PX_SESSION_ID=$1" "$T_BASH" "$T_BIN/px-suite" "${@:2}"; }
+
+## @description  Executes px-run under the fake runtime with a stub driver (name, argument...).
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_px_run() {
+  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 --scope px-selftest \
+    --driver "$T_WORK/drivers/$1.sh" "${@:2}"
+}
+
+## @description  Verifies exit codes for contract calls (name, lines of code, function, arguments).
+## @return       Records one batch assertion. Exit 0.
 t_sb_codes() {
   local name=$1 line bad=""
   local words=()
@@ -394,11 +362,7 @@ EOF
   t_empty "$name" "$bad"
 }
 
-# Verifies that the fake runtime log contains a specific invocation line. Because compose calls
-# include the compose file path and project directory after the project name, those two flags are
-# stripped before matching unless the caller passes raw to compare the unmodified log line.
-## @description  Verifies that the fake runtime recorded a specific invocation line.
-## @param        name, the whole call line, raw  Assertion name, expected call, and optional raw.
+## @description  Verifies that the fake runtime recorded an expected invocation (name, call, raw).
 ## @return       Records one runtime invocation assertion. Exit 0.
 t_called() {
   local name=$1 want=$2 raw=${3:-} calls line
@@ -418,14 +382,12 @@ EOF
   t_fail "$name" "no call: $want" "calls:" "$calls"
 }
 
-## @description  Truncates the fake runtime call log so subsequent assertions inspect one command.
-## @return       Empties the log file at T_SHIM_LOG. Exit 0.
+## @description  Clears the invocation log of the fake runtime.
+## @return       Truncates the fake runtime call log. Exit 0.
 t_shim_log_reset() { : >"$T_SHIM_LOG"; }
 
-# Restores the fake runtime state for the selftest cluster to a single running RegionServer
-# instance with a restart count of zero so test cases never observe state left by earlier runs.
-## @description  Resets the selftest cluster fake runtime state to one healthy RegionServer.
-## @return       Reinitializes instances.txt and restart-count in T_SHIM_STATE. Exit 0.
+## @description  Resets the fake runtime to a single running RegionServer with restart count 0.
+## @return       Reinitializes the fake runtime state files. Exit 0.
 t_shim_state_reset() {
   rm -f "$T_SHIM_STATE"/*
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee000001 regionserver \
@@ -434,63 +396,26 @@ t_shim_state_reset() {
   printf '0\n' >"$T_SHIM_STATE/restart-count"
 }
 
-## @description  Reads the planned-action ledger for the sweep cluster if present.
-## @return       Writes the contents of planned-px-sweep.tsv to stdout. Exit 0.
+## @description  Reads the planned-action ledger for the sweep cluster.
+## @return       Writes the ledger records to stdout. Exit 0.
 t_sweep_planned() { cat "$T_SWEEP_OUT/state/planned-px-sweep.tsv" 2>/dev/null || true; }
 
-# Enumerates all filesystem paths under a root directory while pruning .git repository metadata and
-# target build output directories that concurrent builds in other shells might modify.
-## @description  Lists all sorted paths under a root directory excluding .git and target trees.
-## @param        root directory  Root directory path to traverse.
-## @return       Writes sorted paths to stdout. Exit 0.
+## @description  Lists all filesystem paths under a root directory excluding .git and target.
+## @return       Writes the sorted paths to stdout. Exit 0.
 t_tree_paths() {
   find "$1" \( -name .git -o -name target \) -prune -o -print 2>/dev/null | LC_ALL=C sort
 }
 
-## @description  Reports paths present in a second directory listing that were absent in the first.
-## @param        first listing file, second listing file  Baseline and post-run path listing files.
-## @return       Writes newly added paths to stdout. Exit 0.
+## @description  Reports paths in a second listing file that are absent from the first listing.
+## @return       Writes the newly added paths to stdout. Exit 0.
 t_tree_added() { LC_ALL=C comm -13 "$1" "$2"; }
-
-## @description  Extracts a specific column from a named variable row in the last config dump.
-## @param        name, column  Configuration variable name and 1-based column index.
-## @return       Writes the field value to stdout, or an empty line when no row matches. Exit 0.
-t_dump_field() {
-  local name=$1 column=$2 line
-  while IFS= read -r line; do
-    case "$line" in
-    "$name$PX_TAB"*)
-      px_tsv_field "$column" "$line" || printf '\n'
-      return 0
-      ;;
-    esac
-  done <<EOF
-$T_STDOUT
-EOF
-  printf '\n'
-}
-
-# shellcheck disable=SC2329 # the exit hook of lib/common.sh calls it by name
-## @description  Removes the temporary fixture directory via the exit hook on pass or fail.
-## @return       Deletes T_WORK unless T_KEEP is set. Exit 0.
-t_cleanup() {
-  [ -n "$T_WORK" ] || return 0
-  if [ "$T_KEEP" = 1 ]; then
-    printf '# fixtures kept in %s\n' "$T_WORK"
-    return 0
-  fi
-  rm -rf "$T_WORK"
-}
 
 # ---------------------------------------------------------------------------
 # Dynamic test fixture generators
 # ---------------------------------------------------------------------------
 
-# Generates the suite definition fixtures exercised by the suite runner tests. The order.suite
-# fixture intentionally declares tests out of topological dependency order so the printed execution
-# plan demonstrates that dependency sorting occurred.
-## @description  Materializes test suite fixture files under the temporary workspace.
-## @return       Writes suite fixture files into T_WORK/suites. Exit 0.
+## @description  Writes the test suite fixture files, with the order suite out of dependency order.
+## @return       Populates the suite fixture directory. Exit 0.
 t_fixtures_suites() {
   mkdir -p "$T_WORK/suites"
   cat >"$T_WORK/suites/order.suite" <<'SUITE_EOF'
@@ -603,19 +528,22 @@ test: literal
   arg: a b
   args: ~/data x=~
 SUITE_EOF
-  # Create two matching files in the execution directory to detect unintended glob expansion.
+  cat >"$T_WORK/suites/class.suite" <<SUITE_EOF
+suite: selftest-class
+class: measurement
+timeout: 60
+
+test: classed
+  driver: $T_WORK/drivers/exit-code.sh
+SUITE_EOF
+  # Create two files that a glob pattern would match inside the suite execution directory.
   mkdir -p "$T_WORK/globdir"
   : >"$T_WORK/globdir/alpha.sql"
   : >"$T_WORK/globdir/beta.sql"
 }
 
-# Generates stub driver scripts for px-run and px-suite tests: one exits with its argument status
-# to verify exit code propagation, four deterministically mutate fake runtime state without timing
-# assumptions (staging a container restart, an unexpected exit, a vanished instance, and an
-# unresponsive runtime), one prints its received arguments, and one hostile driver attempts to read
-# the backend engine variable.
-## @description  Materializes stub and fault-injection driver scripts under T_WORK/drivers.
-## @return       Writes executable driver scripts. Exit 0.
+## @description  Materializes the stub driver scripts invoked by the run and suite test cases.
+## @return       Populates the stub driver fixture directory. Exit 0.
 t_fixtures_drivers() {
   mkdir -p "$T_WORK/drivers"
   cat >"$T_WORK/drivers/exit-code.sh" <<'DRIVER_EOF'
@@ -674,12 +602,8 @@ DRIVER_EOF
   chmod +x "$T_WORK/drivers"/*.sh
 }
 
-# Generates the fake container runtime shim, its backing state directory, and fake shims for each
-# Kubernetes CLI tool. Each Kubernetes shim appends its binary name and arguments to the shared
-# runtime call log and exits without output. Generating these executables at runtime avoids
-# committing files named after restricted tools into the source tree where Layer 1 would scan them.
-## @description  Creates fake container runtime and Kubernetes tool shims and initializes state.
-## @return       Populates T_SHIM_DIR, T_SHIM_STATE, and T_SHIM_LOG. Exit 0.
+## @description  Materializes the fake container runtime, its state, and fake Kubernetes tool shims.
+## @return       Populates the fake runtime and Kubernetes tool shims. Exit 0.
 t_fixtures_shim() {
   local name
   T_SHIM_DIR="$T_WORK/shim"
@@ -714,19 +638,23 @@ if [ -f "$fake_state/cluster" ]; then
   read -r fake_cluster <"$fake_state/cluster"
 fi
 
+## @description  Splits one inventory line into the f_ fields.
+## @return       Sets the f_ fields. Exit 0.
 fake_split() {
   IFS='|' read -r f_id f_role f_name f_state f_status f_image f_service \
     f_number f_index f_group f_start f_drain <<<"$1"
 }
 
+## @description  Joins the f_ fields into one inventory line.
+## @return       Writes the line to stdout. Exit 0.
 fake_join() {
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$f_id" "$f_role" "$f_name" \
     "$f_state" "$f_status" "$f_image" "$f_service" "$f_number" "$f_index" \
     "$f_group" "$f_start" "$f_drain"
 }
 
-# Rewrites the state and the status of the instances whose id or service is
-# the key. An empty state removes them.
+## @description  Sets the state and status (field, key, state, status) of matching instances.
+## @return       Exit 0.
 fake_rewrite() {
   local field=$1 key=$2 state=$3 status=$4 line value out=""
   [ -f "$fake_inv" ] || return 0
@@ -747,6 +675,8 @@ fake_rewrite() {
   printf '%s' "$out" >"$fake_inv"
 }
 
+## @description  Finds one instance by its id.
+## @return       Exit 0 when the instance exists; 1, with an error on stderr, otherwise.
 fake_find() {
   local line
   if [ -f "$fake_inv" ]; then
@@ -760,8 +690,8 @@ fake_find() {
   return 1
 }
 
-# Scales one service: it keeps the numbers up to the count and adds the
-# missing ones as copies of the first instance of the service.
+## @description  Scales the service of a --scale service=count argument, copying its first instance.
+## @return       Exit 0.
 fake_scale() {
   local spec="" service count line out="" top=0 template="" number
   while [ $# -gt 0 ]; do
@@ -807,7 +737,7 @@ version)
   ;;
 info)
   case "$*" in
-  *MemTotal*) printf '25165824000\n' ;;
+  *MemTotal*) cat "$fake_state/mem-total" 2>/dev/null || printf '25165824000\n' ;;
   *) printf 'fake-engine\n' ;;
   esac
   ;;
@@ -909,11 +839,6 @@ stats)
   done
   ;;
 kill)
-  if [ "${1:-}" = --help ]; then
-    [ ! -e "$fake_state/no-kill" ] || exit 1
-    printf 'Usage: fake kill [-s SIGNAL] CONTAINER\n'
-    exit 0
-  fi
   fake_find "${3:-}" || exit 1
   if [ "${2:-}" = KILL ]; then
     fake_rewrite id "$3" exited 'Exited (137) 1 second ago'
@@ -935,6 +860,29 @@ logs)
   fake_id=${!#}
   printf 'fake log out %s\n' "$fake_id"
   printf 'fake log err %s\n' "$fake_id" >&2
+  ;;
+build)
+  if [ -e "$fake_state/build-fails" ]; then
+    printf 'fake: the build failed\n' >&2
+    exit 1
+  fi
+  printf 'fake: built\n'
+  ;;
+image)
+  if [ "${1:-}" = inspect ]; then
+    printf 'sha256:f00dfeed0001\n'
+  elif [ "${1:-}" = ls ] && [ ! -e "$fake_state/no-image" ]; then
+    printf 'sha256:f00dfeed0001\n'
+  fi
+  ;;
+buildx)
+  # The image index of a base image: one manifest per platform, and an
+  # attestation manifest without a platform.
+  if [ ! -e "$fake_state/no-manifest" ]; then
+    printf 'linux/amd64 sha256:%s\n' "$(printf 'a%.0s' $(seq 1 64))"
+    printf 'linux/arm64 sha256:%s\n' "$(printf 'b%.0s' $(seq 1 64))"
+    printf ' sha256:%s\n' "$(printf 'c%.0s' $(seq 1 64))"
+  fi
   ;;
 events)
   if [ -e "$fake_state/no-events" ]; then
@@ -967,7 +915,6 @@ compose)
   shift || true
   case "$fake_cverb" in
   version)
-    [ ! -e "$fake_state/no-compose" ] || exit 1
     printf 'v2.40.0\n'
     ;;
   up)
@@ -1051,13 +998,8 @@ SHIM_EOF
   t_shim_state_reset
 }
 
-# Initializes the fixture state for the verb sweep cluster, including a rendered deployment
-# directory, fake runtime instance records, and simulated events, networks, and volumes. The
-# topology comprises one master, two RegionServers carrying the drain label, and an on-demand
-# NodeManager in the yarn group. The generated port map binds ports 1 and 2, which remain unused by
-# host services so preflight port availability checks behave deterministically.
-## @description  Creates the deployment directory and fake runtime state for the sweep cluster.
-## @return       Populates T_SWEEP_STATE, T_SWEEP_OUT, and T_DEPLOY. Exit 0.
+## @description  Materializes the sweep cluster deployment directory, instances, and event records.
+## @return       Populates the sweep cluster deployment and runtime state. Exit 0.
 t_fixtures_sweep() {
   T_SWEEP_STATE="$T_WORK/sweep-state"
   T_SWEEP_OUT="$T_WORK/sweep-out"
@@ -1072,26 +1014,54 @@ rs01|regionserver|px-sweep-regionserver-1|created|Created|px:selftest|regionserv
 rs02|regionserver|px-sweep-regionserver-2|created|Created|px:selftest|regionserver|2||||regionmover
 nm01|nodemanager|px-sweep-nodemanager-1|created|Created|px:selftest|nodemanager|1||yarn|on-demand|
 SWEEP_EOF
-  # Event records test index derivation fallback: explicit label first, container number second,
-  # and container name suffix third.
+  # Instance indices are derived from the explicit index label first, falling back to the
+  # container number.
   cat >"$T_SWEEP_STATE/events.txt" <<'SWEEP_EOF'
 1700000000000000000|regionserver||2|container|die|px-sweep-regionserver-2
 1700000000500000000|master|0||container|start|px-sweep-master-1
-1700000000750000000|regionserver|||container|kill|px-sweep-regionserver-2
+1700000000750000000|regionserver||2|container|kill|px-sweep-regionserver-2
 1700000001000000000||||network|connect|px-sweep_default
 SWEEP_EOF
-  printf 'services: {}\n' >"$T_DEPLOY/compose.yaml"
+  cat >"$T_DEPLOY/compose.yaml" <<'SWEEP_EOF'
+services:
+  master:
+    mem_limit: 512m
+    labels:
+      px.harness.cluster: "sweep"
+      px.harness.role: "master"
+  regionserver:
+    scale: 2
+    mem_limit: 768m
+    labels:
+      px.harness.cluster: "sweep"
+      px.harness.drain: "regionmover"
+      px.harness.role: "regionserver"
+  nodemanager:
+    mem_limit: 512m
+    labels:
+      px.harness.cluster: "sweep"
+      px.harness.group: "yarn"
+      px.harness.role: "nodemanager"
+      px.harness.start: "on-demand"
+SWEEP_EOF
   printf 'PX_PORT_MASTER_UI=1\nPX_PORT_REGIONSERVER_RPC_0=2\n' \
     >"$T_DEPLOY/ports.generated.env"
 }
 
-# Generates environment configuration fixtures for testing five-stage precedence resolution. Each
-# successive precedence layer overrides one fewer variable than the layer below it so a single
-# configuration dump reveals the winning origin for every stage.
-## @description  Writes environment files for configuration precedence and validation tests.
-## @return       Populates T_WORK/env with valid and malformed environment files. Exit 0.
+## @description  Materializes the environment files for each stage of the precedence test case.
+## @return       Populates the configuration environment fixture directory. Exit 0.
 t_fixtures_config() {
+  local stage name count
   mkdir -p "$T_WORK/env"
+  # Generate the three precedence stages below defaults: version pins, local version pins, and the
+  # port map. Each stage N assigns the value N to the first N timeout variables.
+  for stage in 6:versions 7:versions-local 8:ports; do
+    count=0
+    for name in DEFAULT READY EXEC SCALE GROUP DRAIN FETCH PROVISION; do
+      count=$((count + 1))
+      [ "$count" -gt "${stage%%:*}" ] || printf 'PX_TIMEOUT_%s=%s\n' "$name" "${stage%%:*}"
+    done >"$T_WORK/env/${stage#*:}.env"
+  done
   cat >"$T_WORK/env/defaults.env" <<'ENV_EOF'
 PX_TIMEOUT_DEFAULT=5
 PX_TIMEOUT_READY=5
@@ -1121,12 +1091,8 @@ ENV_EOF
   printf 'PX_CONTRACT_VERSION=2\n' >"$T_WORK/env/contract.env"
 }
 
-# Builds two synthetic directory trees for testing the Layer 1 static scanner. The first tree
-# contains one violation of each category on line 3 of its respective file alongside three benign
-# files (allowlisted backend, comment-only token, and inline waiver) that the scanner must ignore.
-# The second tree simulates a workspace where both allowlist entries have become stale.
-## @description  Creates synthetic source trees for Layer 1 static scan and allowlist tests.
-## @return       Populates T_WORK/scan and T_WORK/stale. Exit 0.
+## @description  Writes the two Layer 1 fixture trees for violations and stale allowlist entries.
+## @return       Populates the Layer 1 static scan fixture trees. Exit 0.
 t_fixtures_scan() {
   mkdir -p "$T_WORK/scan/bin" "$T_WORK/scan/lib/backend" "$T_WORK/scan/lib" \
     "$T_WORK/scan/drivers/psql" "$T_WORK/scan/drivers/evil" \
@@ -1180,11 +1146,8 @@ noop() { :; }
 SCAN_EOF
 }
 
-# Generates small standalone probe scripts that source harness libraries and invoke internal
-# functions in an isolated process, enabling direct behavioral assertions on runtime traps,
-# configuration loading, timeouts, and JSON/TSV emitters.
-## @description  Writes helper probe scripts used to test library functions in child processes.
-## @return       Populates T_WORK/probe and T_WORK/nap with probe scripts. Exit 0.
+## @description  Writes probe scripts that exercise individual library functions in child processes.
+## @return       Populates the library probe script directory. Exit 0.
 t_fixtures_probes() {
   mkdir -p "$T_WORK/probe"
   cat >"$T_WORK/probe/term-when.sh" <<'PROBE_EOF'
@@ -1238,11 +1201,6 @@ for probe_name in "$@"; do
   printf '%s %s\n' "$probe_name" "$probe_status"
 done
 PROBE_EOF
-  cat >"$T_WORK/probe/shim-direct.sh" <<'PROBE_EOF'
-#!/usr/bin/env bash
-# This probe sources no library, so the name resolves through PATH alone.
-docker version
-PROBE_EOF
   cat >"$T_WORK/probe/shim-names.sh" <<'PROBE_EOF'
 #!/usr/bin/env bash
 # This probe sources no library, so each name resolves through PATH alone.
@@ -1250,20 +1208,9 @@ for probe_name in "$@"; do
   "$probe_name" version
 done
 PROBE_EOF
-  cat >"$T_WORK/probe/sb-load.sh" <<'PROBE_EOF'
-#!/usr/bin/env bash
-. "$PX_HOME/lib/backend/contract.sh"
-sb_load
-sb_bound_backend
-PROBE_EOF
-  cat >"$T_WORK/probe/sb-list.sh" <<'PROBE_EOF'
-#!/usr/bin/env bash
-. "$PX_HOME/lib/backend/contract.sh"
-sb_load
-sb_list px-selftest
-PROBE_EOF
-  # Forward the exit status and standard output of a single contract function directly as the
-  # probe outcome, running under set -u to match production CLI execution.
+  # The exit status of the contract function becomes the exit status of the probe so test cases can
+  # inspect both the exit code and standard output of a single contract call. The shell runs under
+  # set -u because every command executes the substrate contract under that option.
   cat >"$T_WORK/probe/sb.sh" <<'PROBE_EOF'
 #!/usr/bin/env bash
 . "$PX_HOME/lib/backend/contract.sh"
@@ -1312,6 +1259,23 @@ PROBE_EOF
 . "$PX_HOME/lib/common.sh"
 px_config_load "$@"
 px_config_dump
+PROBE_EOF
+  # Executes the memory recheck for a group start against a copy of the harness passed as the
+  # first argument.
+  cat >"$T_WORK/probe/memory-recheck.sh" <<'PROBE_EOF'
+#!/usr/bin/env bash
+. "$1/lib/common.sh"
+px_memory_recheck
+printf 'status %s\n' "$?"
+PROBE_EOF
+  # Runs the compatibility range check for a version set and prints the resolved profile and
+  # HBase release version.
+  cat >"$T_WORK/probe/versions-check.sh" <<'PROBE_EOF'
+#!/usr/bin/env bash
+. "$PX_HOME/lib/common.sh"
+px_config_load
+px_versions_check
+printf '%s %s\n' "$PX_PHOENIX_HBASE_PROFILE" "$PX_DIST_HBASE_VERSION"
 PROBE_EOF
   cat >"$T_WORK/probe/config-strict.sh" <<'PROBE_EOF'
 #!/usr/bin/env bash
@@ -1380,21 +1344,365 @@ printf 'clean [%s]\n' "$(px_tsv_clean "$(printf 'x\ty\nz\r')")"
 PROBE_EOF
 }
 
-# Creates the temporary workspace directory, registers the cleanup exit hook, and populates all
-# test fixtures. The PX_OUT output root is also placed inside this directory so commands under test
-# never write artifacts outside the temporary workspace.
-## @description  Allocates the temporary workspace, exports PX_OUT, and generates all fixtures.
-## @return       Sets T_WORK and exports PX_OUT. Exit 0, or exits 1 when creation fails.
+## @description  Materializes deployment-layer fakes for tools, JDKs, archives, and a source tree.
+## @return       Populates the deployment-layer fixture workspace. Exit 0.
+t_fixtures_a2() {
+  local real_uname name line zk client jar
+  T_A2="$T_WORK/a2"
+  T_A2_BIN="$T_A2/bin"
+  T_A2_STATE="$T_A2/state"
+  T_A2_CURL_DIR="$T_A2/curl"
+  T_A2_CURL_LOG="$T_A2/curl.log"
+  T_A2_MVN_LOG="$T_A2/mvn.log"
+  T_GEN="$PX_HOME/$PX_DEPLOY_SUBDIR/compose.gen.sh"
+  T_IMG="$PX_HOME/$PX_DEPLOY_SUBDIR/image"
+  T_ENVD="$PX_HOME/$PX_DEPLOY_SUBDIR/env"
+  mkdir -p "$T_A2_BIN" "$T_A2_STATE" "$T_A2_CURL_DIR" "$T_A2/out" "$T_A2/jdk/11/bin" \
+    "$T_A2/jdk/17/bin" "$T_A2/jdk/21/bin" "$T_A2/hadoop/bin" "$T_A2/hbase/bin" \
+    "$T_A2/phoenix/server" "$T_A2/tree" "$T_A2/dist-src" "$T_A2/decoy"
+  T_A2_OUT="$(px_realpath "$T_A2/out")"
+  : >"$T_A2_CURL_LOG"
+  : >"$T_A2_MVN_LOG"
+  printf 'a2\n' >"$T_A2_STATE/cluster"
+  # Create a decoy runtime binary discoverable only via PATH; any process that ignores
+  # PX_DOCKER_BIN invokes this decoy, which logs the call and fails.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 1\n' "$T_A2/decoy.log" \
+    >"$T_A2/decoy/docker"
+
+  cat >"$T_A2_BIN/curl" <<'A2_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for curl. It records every argument list, and it
+# answers from a directory where a file named after the address holds the
+# body. An address with no file fails the way curl --fail fails.
+[ -z "${PX_FAKE_CURL_LOG:-}" ] || printf '%s\n' "$*" >>"$PX_FAKE_CURL_LOG"
+out="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -o) out=$2; shift ;;
+  --max-time | --connect-timeout | --retry | --proto | --proto-redir | --noproxy) shift ;;
+  http://* | https://*) url=$1 ;;
+  esac
+  shift
+done
+key="$(printf '%s' "$url" | LC_ALL=C tr -c 'A-Za-z0-9' '_')"
+body="${PX_FAKE_CURL_DIR:-/nonexistent}/$key"
+if [ ! -f "$body" ]; then
+  printf 'curl: (22) The requested URL returned error: 404\n' >&2
+  exit 22
+fi
+if [ -n "$out" ]; then
+  cp "$body" "$out"
+else
+  cat "$body"
+fi
+A2_EOF
+
+  cat >"$T_A2_BIN/mvn" <<'A2_EOF'
+#!/usr/bin/env bash
+# A fixture that stands in for Maven. It records the JDK and the argument
+# list, and it writes one jar for each module of -pl, so a build record names
+# files that exist. Without -pl it writes the product that the case names.
+[ -z "${PX_FAKE_MVN_LOG:-}" ] || printf 'JAVA_HOME=%s %s\n' "${JAVA_HOME:-}" "$*" \
+  >>"$PX_FAKE_MVN_LOG"
+printf '[INFO] fake build\n'
+[ "${PX_FAKE_MVN_STATUS:-0}" = 0 ] || exit "$PX_FAKE_MVN_STATUS"
+pom="" list="" profile=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -f) pom=$2; shift ;;
+  -pl) list=$2; shift ;;
+  -Dhbase.profile=*) profile=${1#*=} ;;
+  esac
+  shift
+done
+tree=${pom%/pom.xml}
+for module in ${list//,/ }; do
+  case "$module" in
+  phoenix-server) jar="phoenix-server-hbase-$profile.jar" ;;
+  */phoenix-client-embedded) jar="phoenix-client-embedded-hbase-$profile.jar" ;;
+  *) jar="${module##*/}-5.4.0-SNAPSHOT.jar" ;;
+  esac
+  mkdir -p "$tree/$module/target"
+  printf 'fake jar %s\n' "$module" >"$tree/$module/target/$jar"
+done
+if [ -z "$list" ] && [ -n "${PX_FAKE_MVN_PRODUCT:-}" ]; then
+  mkdir -p "$tree/${PX_FAKE_MVN_PRODUCT%/*}"
+  printf 'fake product\n' >"$tree/$PX_FAKE_MVN_PRODUCT"
+fi
+A2_EOF
+
+  real_uname="$(command -v uname)"
+  cat >"$T_A2_BIN/uname" <<'A2_EOF'
+#!/usr/bin/env bash
+# A fixture that names the machine architecture and passes every other
+# question to the real uname.
+if [ "${1:-}" = -m ]; then
+  printf '%s\n' "${PX_FAKE_UNAME_M:-arm64}"
+  exit 0
+fi
+A2_EOF
+  printf 'exec %q "$@"\n' "$real_uname" >>"$T_A2_BIN/uname"
+
+  for name in 11 17 21; do
+    cat >"$T_A2/jdk/$name/bin/java" <<A2_EOF
+#!/usr/bin/env bash
+# A fixture JDK. It answers a version request the way a JDK does.
+printf 'openjdk version "$name.0.1" 2021-10-19\n' >&2
+A2_EOF
+  done
+
+  cat >"$T_A2/hadoop/bin/hdfs" <<'A2_EOF'
+#!/usr/bin/env bash
+# A fixture Hadoop launcher. A format writes the namespace marker, and every
+# other call exits with the status the case asks for.
+case "$*" in
+'namenode -format'*)
+  mkdir -p "$PX_DATA_DIR/namenode/current"
+  : >"$PX_DATA_DIR/namenode/current/VERSION"
+  ;;
+esac
+exit "${PX_FAKE_HDFS_STATUS:-0}"
+A2_EOF
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$T_A2/hbase/bin/hbase"
+  chmod +x "$T_A2_BIN"/* "$T_A2"/jdk/*/bin/java "$T_A2/hadoop/bin/hdfs" "$T_A2/hbase/bin/hbase" \
+    "$T_A2/decoy/docker"
+
+  cat >"$T_A2/sha-probe.sh" <<'A2_EOF'
+#!/usr/bin/env bash
+# A probe of the SHA-512 helper with one PATH: the first argument.
+. "$PX_HOME/lib/common.sh"
+PATH=$1
+px_sha512 "$2"
+A2_EOF
+  cat >"$T_A2/platform-probe.sh" <<'A2_EOF'
+#!/usr/bin/env bash
+# A probe of the other platform helpers with one PATH: the first argument.
+. "$PX_HOME/lib/common.sh"
+PATH=$1
+probe_ms="$(px_epoch_ms)"
+[[ $probe_ms =~ ^[0-9]{13}$ ]] && probe_ms=milliseconds
+printf '%s %s %s\n' "$(px_nproc)" "$probe_ms" "$(px_realpath "$2")"
+A2_EOF
+
+  # Construct a synthetic Maven source tree containing a root POM with the version properties and
+  # profiles inspected by the build, along with a module POM for each component. Profile 2.6.3
+  # intentionally maps to a module that the harness compatibility table does not list for it.
+  cat >"$T_A2/tree/pom.xml" <<'A2_EOF'
+<project>
+  <parent>
+    <version>99</version>
+  </parent>
+  <version>5.4.0-SNAPSHOT</version>
+  <properties>
+    <hadoop.version>3.4.2</hadoop.version>
+    <hbase-2.5.runtime.version>2.5.14-hadoop3</hbase-2.5.runtime.version>
+    <hbase-2.6.3.runtime.version>2.6.3-hadoop3</hbase-2.6.3.runtime.version>
+    <hbase-2.6.runtime.version>2.6.5-hadoop3</hbase-2.6.runtime.version>
+  </properties>
+  <profiles>
+    <profile>
+      <activation>
+        <property>
+          <name>hbase.profile</name>
+          <value>2.5</value>
+        </property>
+      </activation>
+      <properties>
+        <hbase.compat.version>2.5.4</hbase.compat.version>
+        <hadoop.version>3.3.6</hadoop.version>
+        <hbase.version>${hbase-2.5.runtime.version}</hbase.version>
+      </properties>
+    </profile>
+    <profile>
+      <activation>
+        <property>
+          <name>hbase.profile</name>
+          <value>2.6.3</value>
+        </property>
+      </activation>
+      <properties>
+        <hbase.compat.version>2.6.4</hbase.compat.version>
+        <hbase.version>${hbase-2.6.3.runtime.version}</hbase.version>
+      </properties>
+    </profile>
+    <profile>
+      <activation>
+        <property>
+          <name>hbase.profile</name>
+          <value>2.6</value>
+        </property>
+      </activation>
+      <properties>
+        <hbase.compat.version>2.6.4</hbase.compat.version>
+        <hbase.version>${hbase-2.6.runtime.version}</hbase.version>
+      </properties>
+    </profile>
+  </profiles>
+</project>
+A2_EOF
+  for name in phoenix-server phoenix-client-parent/phoenix-client-embedded phoenix-pherf; do
+    mkdir -p "$T_A2/tree/$name/src/main"
+    printf '<project/>\n' >"$T_A2/tree/$name/pom.xml"
+  done
+  touch -t 202001010000 "$T_A2"/tree/pom.xml "$T_A2"/tree/*/pom.xml \
+    "$T_A2"/tree/*/*/pom.xml 2>/dev/null || true
+
+  # Build the release archives served by the fake fetch layer, each containing a single top-level
+  # directory. The jHiccup source archive includes its POM. Each valid HBase archive contains its
+  # bundled ZooKeeper and Hadoop client JARs alongside look-alike JARs that must not match, while
+  # HBase 2.6.5 intentionally omits ZooKeeper and bundles two conflicting Hadoop client JARs.
+  mkdir -p "$T_A2/dist-src/jHiccup-2.0.10"
+  printf '<project/>\n' >"$T_A2/dist-src/jHiccup-2.0.10/pom.xml"
+  (cd "$T_A2/dist-src" && tar -czf jHiccup-2.0.10.tar.gz jHiccup-2.0.10)
+  for line in hbase-2.6.7:3.8.6:3.4.1 hbase-2.6.6:3.8.5:3.4.0 hbase-2.5.15:3.8.4:3.3.6; do
+    IFS=: read -r name zk client <<<"$line"
+    mkdir -p "$T_A2/dist-src/$name/lib"
+    for jar in "zookeeper-$zk" "zookeeper-jute-$zk" "hadoop-common-$client" \
+      "hadoop-common-$client-tests"; do
+      : >"$T_A2/dist-src/$name/lib/$jar.jar"
+    done
+  done
+  mkdir -p "$T_A2/dist-src/hbase-2.6.5/lib"
+  : >"$T_A2/dist-src/hbase-2.6.5/lib/hadoop-common-3.4.1.jar"
+  : >"$T_A2/dist-src/hbase-2.6.5/lib/hadoop-common-3.4.2.jar"
+  for name in hbase-2.6.7 hbase-2.6.6 hbase-2.6.5 hbase-2.5.15 hadoop-3.4.3 hadoop-3.4.2 \
+    async-profiler-4.1; do
+    mkdir -p "$T_A2/dist-src/$name/bin"
+    printf 'fixture %s\n' "$name" >"$T_A2/dist-src/$name/bin/tool"
+    (cd "$T_A2/dist-src" && tar -czf "$name.tar.gz" "$name")
+  done
+}
+
+## @description  Executes a command with the deployment-layer tool fakes and fake container runtime.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a2() {
+  t_with_shim "PATH=$T_A2_BIN:$T_SHIM_DIR:$PATH" "PX_FAKE_STATE_DIR=$T_A2_STATE" \
+    "PX_FAKE_CURL_DIR=$T_A2_CURL_DIR" "PX_FAKE_CURL_LOG=$T_A2_CURL_LOG" \
+    "PX_FAKE_MVN_LOG=$T_A2_MVN_LOG" "PX_OUT=$T_A2_OUT" PX_POLL_INTERVAL_S=0.2 "$@"
+}
+
+## @description  Executes the deployment generator under the deployment-layer fixture environment.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_gen() { t_a2 "$T_BASH" "$T_GEN" "$@"; }
+
+## @description  Registers a literal response body (address, text) to be served by the fake curl.
+## @return       Writes the staged response file for the fake curl shim. Exit 0.
+t_curl_body() { printf '%s' "$2" | t_curl_file "$1" /dev/stdin; }
+
+## @description  Registers a file payload (address, file) to be served by the fake curl.
+## @return       Copies the payload file into the fake curl response directory. Exit 0.
+t_curl_file() { cat "$2" >"$T_A2_CURL_DIR/$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '_')"; }
+
+## @description  Extracts the effective environment of a rendered service (directory, service).
+## @return       Writes one NAME=VALUE line per variable to stdout. Exit 0.
+t_service_env() {
+  local dir=$1 service=$2
+  printf 'PX_DATA_DIR=%s\nPX_LOG_DIR=%s\nPX_HADOOP_HOME=%s\n' "$T_A2/data" \
+    "$T_A2/logs" "$T_A2/hadoop"
+  grep -v '^#' "$dir/ports.generated.env"
+  grep -v '^#' "$dir/topology.env"
+  awk -v s="  $service:" '
+    $0 == s { f = 1; next }
+    f && /^  [a-z]/ { f = 0 }
+    f && /^    environment:/ { e = 1; next }
+    f && e && /^    [a-z]/ { e = 0 }
+    f && e { sub(/^ +/, ""); sub(/: /, "="); gsub(/"/, ""); print }
+  ' "$dir/compose.yaml"
+}
+
+# Runs an image script under the rendered environment of a service (directory, service,
+# NAME=VALUE..., --, command).
+## @description  Executes an image script within a rendered service environment.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_in_service() {
+  local dir=$1 service=$2 line
+  local words=()
+  shift 2
+  while IFS= read -r line; do
+    [ -n "$line" ] && words+=("$line")
+  done <<EOF
+$(t_service_env "$dir" "$service")
+EOF
+  t_image "${words[@]}" "$@"
+}
+
+## @description  Renders a service (directory, service, NAME=VALUE...) into an empty $T_A2/render.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_render() {
+  local dir=$1 service=$2
+  shift 2
+  rm -rf "$T_A2/render"
+  t_in_service "$dir" "$service" "$@" -- "$T_BASH" "$T_IMG/entrypoint.sh" --render-only \
+    "$T_A2/render"
+}
+
+## @description  Executes an image script in a minimal environment (NAME=VALUE..., --, command...).
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_image() {
+  local words=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    words+=("$1")
+    shift
+  done
+  shift
+  t_run env -i "PATH=$T_A2_BIN:$PATH" "HOME=$T_A2" "TMPDIR=$T_A2" \
+    "PX_FAKE_CURL_DIR=$T_A2_CURL_DIR" "PX_FAKE_CURL_LOG=$T_A2_CURL_LOG" \
+    ${words[@]+"${words[@]}"} "$@"
+}
+
+## @description  Sums the memory limit column across the service table emitted by --check.
+## @return       Writes the total memory sum to stdout. Exit 0.
+t_mem_sum() { printf '%s\n' "$1" | awk -F '\t' 'NF { s += $6 } END { print s + 0 }'; }
+
+## @description  Extracts space-joined variable values (file, name...) from an environment file.
+## @return       Writes the resolved values to stdout. Exit 0.
+t_env_value() {
+  local file=$1 name out=""
+  shift
+  for name; do
+    out="$out $(sed -n "s/^$name=//p" "$file" 2>/dev/null | sed -n 1p)"
+  done
+  printf '%s\n' "${out# }"
+}
+
+## @description  Extracts joined values for the specified keys (file, key...) from a key-value TSV.
+## @return       Writes the resolved values to stdout. Exit 0.
+t_tsv_values() {
+  local file=$1 key out=""
+  shift
+  for key; do
+    out="$out $(awk -F '\t' -v k="$key" '$1 == k { print $2; exit }' "$file" 2>/dev/null)"
+  done
+  printf '%s\n' "${out# }"
+}
+
+## @description  Extracts space-joined values for keys (key...) from the Phoenix build record.
+## @return       Writes the resolved values to stdout. Exit 0.
+t_build_record() { t_tsv_values "$T_A2_OUT/build/phoenix/build.tsv" "$@"; }
+
+## @description  Writes the instance inventory produced by provisioning a deployment (directory).
+## @return       Writes the provisioned container inventory file. Exit 0.
+t_a2_provision() {
+  local service role index group start drain n=0
+  : >"$T_A2_STATE/provision.txt"
+  while IFS="$PX_TAB" read -r service role index group start _; do
+    case "$service" in '#'* | '') continue ;; esac
+    n=$((n + 1))
+    drain=""
+    [ "$role" != regionserver ] || drain=regionmover
+    printf 'a2%04d|%s|px-a2-%s-1|created|Created|px-harness:hbase-2.6.5|%s|1|%s|%s|%s|%s\n' \
+      "$n" "$role" "$service" "$service" "$index" "$group" "$start" "$drain" \
+      >>"$T_A2_STATE/provision.txt"
+  done <"$1/services.tsv"
+}
+
+## @description  Creates the temporary workspace holding every output root and builds all fixtures.
+## @return       Sets T_WORK and exports PX_OUT. Exit 0, or exits 1 if directory creation fails.
 t_setup() {
-  local root=${TMPDIR:-/tmp}
-  T_WORK="$(mktemp -d "${root%/}/px-selftest.XXXXXXXX")" || {
-    printf 'Bail out! cannot create a fixture directory\n'
-    exit 1
-  }
-  px_on_exit t_cleanup
-  # Resolve the physical path of T_WORK up front because the output policy canonicalizes PX_OUT,
-  # and temporary directories on platforms such as macOS often traverse symbolic links that would
-  # otherwise cause string comparisons between paths to fail.
+  T_WORK="$(px_mktemp_dir px-selftest)" || exit "$PX_EXIT_FAIL"
+  # Resolve the physical path of the fixture root up front because the output policy writes the
+  # canonical physical path back to PX_OUT; temporary directories often traverse symbolic links,
+  # and the two paths would otherwise fail string equality checks.
   T_WORK="$(px_realpath "$T_WORK")"
   T_OUT="$T_WORK/stdout.txt"
   T_ERR="$T_WORK/stderr.txt"
@@ -1410,25 +1718,22 @@ t_setup() {
   t_fixtures_config
   t_fixtures_scan
   t_fixtures_probes
+  t_fixtures_a2
 }
 
 # ---------------------------------------------------------------------------
 # Layer 1: Static source scan and allowlist enforcement
 # ---------------------------------------------------------------------------
 
-# Emits the Layer 1 static scan allowlist mapping relative file paths that may contain runtime
-# tokens to their mandatory architectural justifications. Entries that no longer match any token
-# fail the staleness check so the allowlist cannot accumulate unused exemptions.
-## @description  Outputs the Layer 1 allowlist as tab-separated path and rationale rows.
+## @description  Lists the paths permitted to hold a runtime token, each with its mandatory reason.
 ## @return       Writes path and reason TSV rows to stdout. Exit 0.
 t_allowlist() {
   px_tsv_row lib/backend/compose.sh "the backend, the only runtime caller"
   px_tsv_row test/run-tests.sh "generates the fake runtime shim from a heredoc"
 }
 
-## @description  Determines whether a harness-relative file path appears in the Layer 1 allowlist.
-## @param        path  File path relative to the harness root directory.
-## @return       Exit 0 when the allowlist covers the path. Exit 1 otherwise.
+## @description  Checks whether the Layer 1 allowlist covers a harness-relative file path.
+## @return       Exit 0 when the allowlist covers the path; 1 otherwise.
 t_allowlisted() {
   local row
   while IFS= read -r row; do
@@ -1442,12 +1747,7 @@ EOF
   return 1
 }
 
-# Determines whether a file is subject to the Layer 1 static scan. Any file under bin/, any file
-# with a .sh, .env, .tmpl, or .suite extension, and any file beginning with a shell shebang can be
-# executed, sourced, or rendered into executable form, whereas Markdown documentation is excluded
-# because prose must name container runtimes and tools to describe the architecture.
-## @description  Checks whether a file is in scope for the Layer 1 static runtime token scan.
-## @param        path  Filesystem path of the candidate file.
+## @description  Determines whether a file (path) can be executed, sourced, or rendered.
 ## @return       Exit 0 when the file belongs to the scan. Exit 1 otherwise.
 t_in_scope() {
   local first=""
@@ -1462,12 +1762,8 @@ t_in_scope() {
   return 1
 }
 
-# Scans all in-scope files under a root directory for restricted tool tokens or backend engine
-# variables outside allowlisted paths. Comment lines and lines carrying the inline waiver marker
-# are ignored because neither performs an executable runtime invocation.
-## @description  Scans a directory tree for unallowlisted runtime tokens or engine variables.
-## @param        root directory, expression  Target root path and regex (default Layer 1 tokens).
-## @return       Writes one path, line number, and line per violation to stdout. Exit 0.
+## @description  Scans a directory tree (root, expression) for runtime tokens outside the allowlist.
+## @return       Writes one path:line:text record per violation to stdout. Exit 0.
 t_scan_root() {
   local root=$1 expression=${2:-$T_SCAN_RE} file rel hit text stripped
   while IFS= read -r file; do
@@ -1490,10 +1786,39 @@ $(find "$root" -type f 2>/dev/null | LC_ALL=C sort)
 EOF
 }
 
-# Identifies allowlist entries that have become stale either because the referenced file no longer
-# exists in the tree or because the file no longer contains any restricted runtime tokens.
-## @description  Reports allowlist entries whose target files are missing or hold no tokens.
-## @param        root directory  Root directory against which allowlist paths are checked.
+## @description  Reports functions in a directory tree (root) whose shelldoc violates convention C2.
+## @return       Writes one path:function:reason record per violation to stdout. Exit 0.
+t_shelldoc_gaps() {
+  local root=$1 file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    t_in_scope "$file" || continue
+    # Heredoc bodies contain fixture data rather than function definitions belonging to the scanned
+    # file, so the scanner skips them.
+    awk -v rel="${file#"$root"/}" '
+      tag != "" { if ($0 == tag) tag = ""; next }
+      /^##/ {
+        n++
+        if ($0 ~ /@return/) r = 1
+        if ($0 ~ /@audience|@stability/) print rel ":" NR ":retired tag"
+        next
+      }
+      /^[a-z_][a-z0-9_]*\(\) *\{/ {
+        name = $1; sub(/\(\).*/, "", name)
+        if (n == 0) print rel ":" name ":no shelldoc"
+        else if (!r) print rel ":" name ":no @return"
+        else if (n > 3 && name !~ /^sb_/) print rel ":" name ":more than three lines"
+      }
+      { n = 0; r = 0 }
+      match($0, /<<-?\047?[A-Za-z_]+\047?$/) {
+        tag = substr($0, RSTART); sub(/^<<-?/, "", tag); gsub(/\047/, "", tag)
+      }' "$file"
+  done <<EOF
+$(find "$root" -type f 2>/dev/null | LC_ALL=C sort)
+EOF
+}
+
+## @description  Reports allowlist entries missing from a directory tree (root) or holding no token.
 ## @return       Writes one line per stale entry to stdout. Exit 0.
 t_allowlist_stale() {
   local root=$1 row path
@@ -1512,7 +1837,7 @@ $(t_allowlist)
 EOF
 }
 
-## @description  Reports any Layer 1 allowlist entry that lacks a non-empty justification.
+## @description  Identifies any allowlist entry that lacks a mandatory justification reason.
 ## @return       Writes one path per unreasoned entry to stdout. Exit 0.
 t_allowlist_unreasoned() {
   local row path reason
@@ -1528,11 +1853,8 @@ $(t_allowlist)
 EOF
 }
 
-# Scans all in-scope harness files outside lib/backend/compose.sh for constructs that bypass shell
-# function traps: shell builtins that skip function lookup (command, env, exec), explicit /bin/
-# runtime paths that Layer 1 word-boundary regexes ignore, and PATH lookups via which or type -P.
-## @description  Scans the harness tree for shell trap bypass constructs outside the backend.
-## @return       Writes one path, line number, and line per violation to stdout. Exit 0.
+## @description  Reports runtime calls outside the backend using builtins, absolute paths, or PATH.
+## @return       Writes one path:line:text record per violation to stdout. Exit 0.
 t_scan_bypass() {
   local file rel hit
   while IFS= read -r file; do
@@ -1555,10 +1877,7 @@ EOF
 # Test assertion groups
 # ---------------------------------------------------------------------------
 
-# Checks a documentation file for the five normative policy phrases mandated by the design so that
-# any documentation edit that omits a committed operational policy is detected.
-## @description  Reports which of the five mandatory policy phrases are absent from a document.
-## @param        path  Filesystem path to the Markdown document under inspection.
+## @description  Reports which of the five committed architectural policies a document (path) omits.
 ## @return       Writes one missing phrase per line to stdout. Exit 0.
 t_missing_policies() {
   local phrase
@@ -1570,16 +1889,11 @@ $T_POLICIES
 EOF
 }
 
-## @description  Verifies harness documentation requirements and repository-wide hygiene rules.
+## @description  Verifies the documentation of this round and the two directory-wide hygiene rules.
 ## @return       Records assertions. Exit 0.
 t_group_documents() {
   local fixture
   printf '# documents and directory rules\n'
-  if [ -f "$T_DEV/README.md" ]; then
-    t_pass dev_readme_exists "$T_DEV/README.md"
-  else
-    t_fail dev_readme_exists "the index of dev tools is missing"
-  fi
   t_run grep -qi harness "$T_DEV/README.md"
   t_equals dev_readme_indexes_harness 0 "$T_STATUS"
   t_empty readme_states_policies "$(t_missing_policies "$PX_HOME/README.md")"
@@ -1589,15 +1903,29 @@ t_group_documents() {
   grep -viF 'one cluster per host' "$PX_HOME/README.md" >"$fixture"
   t_equals readme_policy_removal_is_detected 'one cluster per host' \
     "$(t_missing_policies "$fixture")"
+  t_empty shelldoc_follows_c2 "$(t_shelldoc_gaps "$PX_HOME")"
+  # Verify that the shelldoc scanner detects every category of violation in a synthetic fixture
+  # while permitting multi-parameter sb_* contract functions and function definitions embedded
+  # inside heredocs.
+  mkdir -p "$T_WORK/shelldoc/lib"
+  fixture="$T_WORK/shelldoc/lib/gaps.sh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'bare() { :; }\n'
+    printf '## @description  Has no return line.\nno_return() { :; }\n'
+    printf '## @description  A.\n##  B.\n## @return  Exit 0.\n##  C.\nlong() { :; }\n'
+    printf '## @description  A.\n## @audience  private\n## @return  Exit 0.\nold() { :; }\n'
+    printf '## @description  A.\n## @param  x\n## @param  y\n## @return  Exit 0.\nsb_ok() { :; }\n'
+    printf "cat <<'FIXTURE_EOF'\nquoted() { :; }\nFIXTURE_EOF\n"
+  } >"$fixture"
+  t_equals shelldoc_gaps_are_detected "$(printf '%s\n' 'lib/gaps.sh:bare:no shelldoc' \
+    'lib/gaps.sh:no_return:no @return' 'lib/gaps.sh:long:more than three lines' \
+    'lib/gaps.sh:11:retired tag')" "$(t_shelldoc_gaps "$T_WORK/shelldoc")"
   t_empty no_java_under_dev "$(find "$T_DEV" -name '*.java' 2>/dev/null)"
   t_empty no_user_paths "$(grep -rlE "$T_USER_PATH_RE" "$PX_HOME" 2>/dev/null)"
 }
 
-# Validates Layer 1 of the architectural boundary: confirms the live harness tree is clean,
-# verifies detection of direct runtime tokens and engine variables across commands, drivers, suite
-# libraries, and plug-ins, checks exemption handling for the backend, comments, and inline waivers,
-# and enforces allowlist justification and staleness rules.
-## @description  Executes all Layer 1 static scan and allowlist validation assertions.
+## @description  Validates the Layer 1 static source scanner and its allowlist enforcement rules.
 ## @return       Records assertions. Exit 0.
 t_group_scan() {
   local hits stale
@@ -1609,16 +1937,15 @@ t_group_scan() {
   t_contains no_direct_docker_reports_a_driver 'drivers/psql/driver.sh:3:' "$hits"
   t_contains no_direct_docker_reports_the_engine_variable \
     'drivers/evil/driver.sh:3:' "$hits"
+  t_absent scan_allows_the_backend 'compose.sh' "$hits"
+  t_absent scan_drops_a_comment_line 'commented.sh' "$hits"
+  t_absent scan_drops_a_waived_line 'waived.sh' "$hits"
   hits="$(t_scan_root "$T_WORK/scan" "$T_K8S_RE")"
   t_contains no_direct_kubectl_reports_a_suite_library 'suites/lib/common.sh:3:' "$hits"
   t_contains no_direct_kubectl_reports_helm_in_a_plugin 'plugins/evil/plugin.sh:3:' "$hits"
   t_contains no_direct_kubectl_reports_k3d_in_a_plugin 'plugins/evil/plugin.sh:4:' "$hits"
   t_contains no_direct_kubectl_reports_crictl_in_a_plugin 'plugins/evil/plugin.sh:5:' "$hits"
   t_absent no_direct_kubectl_ignores_a_runtime_name 'bin/px-run' "$hits"
-  hits="$(t_scan_root "$T_WORK/scan")"
-  t_absent scan_allows_the_backend 'compose.sh' "$hits"
-  t_absent scan_drops_a_comment_line 'commented.sh' "$hits"
-  t_absent scan_drops_a_waived_line 'waived.sh' "$hits"
   t_empty allowlist_entries_carry_a_reason "$(t_allowlist_unreasoned)"
   t_empty allowlist_entries_are_current "$(t_allowlist_stale "$PX_HOME")"
   stale="$(t_allowlist_stale "$T_WORK/stale")"
@@ -1628,21 +1955,15 @@ t_group_scan() {
     'test/run-tests.sh: no such file' "$stale"
 }
 
-# Validates Layer 2 of the architectural boundary by testing the runtime trap functions defined in
-# lib/common.sh against the active function table of processes that source it across direct calls,
-# subshells, set -e contexts, all twelve CLI entry points, and BASH_ENV suite actions.
-## @description  Executes all Layer 2 runtime function trap and bypass scan assertions.
+## @description  Validates the Layer 2 runtime trap in lib/common.sh across every evasion context.
 ## @return       Records assertions. Exit 0.
 t_group_trap() {
-  local name libs lib probe expected="" offenders="" log
+  local name libs lib probe offenders="" log
   local names=()
   printf '# layer 2, the runtime trap\n'
-  for name in $T_TRAP_NAMES; do
-    names+=("$name")
-    expected="$expected$name 2$PX_NL"
-  done
+  read -r -a names <<<"$T_TRAP_NAMES"
   t_run "$T_BASH" "$T_WORK/probe/trap-names.sh" "${names[@]}"
-  t_equals trap_blocks_eight_tool_names "${expected%"$PX_NL"}" "$T_STDOUT"
+  t_equals trap_blocks_eight_tool_names "$(printf '%s 2\n' "${names[@]}")" "$T_STDOUT"
   t_run "$T_BASH" "$T_WORK/probe/trap-direct.sh"
   t_equals trap_blocks_a_direct_call_with_exit_two 2 "$T_STATUS"
   t_empty trap_stops_the_program_at_the_call "$T_STDOUT"
@@ -1677,10 +1998,9 @@ EOF
     [ "$T_STATUS" = 2 ] || offenders="$offenders $name=$T_STATUS"
   done
   t_empty trap_resolves_in_every_command_process "$offenders"
-  # Suite test actions execute in separate child shells and must still inherit the runtime traps
-  # via BASH_ENV.
-  t_run env "PX_SESSION_ID=selftest-trapped" "$T_BASH" "$T_BIN/px-suite" \
-    --continue-on-failure "$T_WORK/suites/trapped.suite"
+  # Suite test actions execute in isolated child shells and must still inherit the runtime traps
+  # through BASH_ENV.
+  t_suite selftest-trapped --continue-on-failure "$T_WORK/suites/trapped.suite"
   t_equals trap_reaches_a_suite_action 3 "$T_STATUS"
   log="$PX_OUT/sessions/selftest-trapped/tests"
   t_contains trap_reaches_a_suite_action_message 'container runtime call blocked' \
@@ -1690,34 +2010,26 @@ EOF
   t_empty no_bypass_form_outside_the_backend "$(t_scan_bypass)"
 }
 
-# Validates Layer 3 of the architectural boundary by placing fake container runtime and Kubernetes
-# tool shims first on PATH. Verifies that eleven non-runtime CLI entry points and a hostile driver
-# attempting to read PX_DOCKER_BIN make zero runtime calls, while a genuine substrate contract call
-# is recorded by the shim.
-## @description  Executes all Layer 3 fake runtime shim negative, positive, and hostile controls.
+## @description  Validates Layer 3: no entry point or hostile driver invokes a fake tool on PATH.
 ## @return       Records assertions. Exit 0.
 t_group_shim() {
-  local calls name expected=""
+  local calls
   local names=()
   printf '# layer 3, the fake runtime\n'
   t_shim_state_reset
   # Verify that the fake Docker shim is first on PATH and actively logs invocations; otherwise an
   # empty log during negative controls could merely reflect an ineffective PATH override.
   t_shim_log_reset
-  t_with_shim "$T_BASH" "$T_WORK/probe/shim-direct.sh"
+  t_with_shim "$T_BASH" "$T_WORK/probe/shim-names.sh" docker
   t_equals shim_is_first_on_path 29.9.3 "$T_STDOUT"
   t_nonempty shim_records_a_call "$(cat "$T_SHIM_LOG")"
-  # Verify that every Kubernetes tool shim on PATH also logs invocations so an empty log below
-  # confirms that no entry point invoked any Kubernetes binary.
-  for name in ${T_K8S_NAMES//|/ }; do
-    names+=("$name")
-    expected="$expected$name version$PX_NL"
-  done
+  # Run the same positive control across every fake Kubernetes tool shim so an empty call log below
+  # confirms that no entry point invoked any of them.
+  IFS='|' read -r -a names <<<"$T_K8S_NAMES"
   t_shim_log_reset
   t_with_shim "$T_BASH" "$T_WORK/probe/shim-names.sh" "${names[@]}"
-  t_equals shim_records_each_kubernetes_tool "${expected%"$PX_NL"}" \
+  t_equals shim_records_each_kubernetes_tool "$(printf '%s version\n' "${names[@]}")" \
     "$(cat "$T_SHIM_LOG")"
-  # Run negative controls across all eleven non-runtime entry points one by one.
   t_negative_control cluster_config "$T_BIN/px-cluster" config
   t_negative_control cluster_validate "$T_BIN/px-cluster" validate --no-backend
   t_negative_control suite_dry_run "$T_BIN/px-suite" --dry-run \
@@ -1726,14 +2038,13 @@ t_group_shim() {
   t_negative_control tool_doctor "$T_BIN/px-tool" doctor --config-only
   t_negative_control collect_list "$T_BIN/px-collect" list
   t_negative_control collect_help "$T_BIN/px-collect" start --help
-  t_negative_control backend_bind "$T_WORK/probe/sb-load.sh"
+  t_negative_control backend_bind "$T_WORK/probe/sb.sh" sb_bound_backend
   t_negative_control cluster_down_dry_run "$T_BIN/px-cluster" --dry-run down \
     -e PX_SCOPE_ID=px-selftest
   # Execute a positive control through the substrate contract to confirm that a real backend call
   # records the scope label selector in the shim log, validating the negative controls above.
   t_shim_log_reset
-  t_with_shim "$T_BASH" "$T_WORK/probe/sb-list.sh"
-  t_nonempty positive_control_fills_the_record "$(cat "$T_SHIM_LOG")"
+  t_with_shim "$T_BASH" "$T_WORK/probe/sb.sh" sb_list px-selftest
   t_contains positive_control_carries_the_scope_selector \
     'label=px.harness.cluster=selftest' "$(cat "$T_SHIM_LOG")"
   t_contains positive_control_reports_the_instance \
@@ -1741,8 +2052,7 @@ t_group_shim() {
   # Run the hostile driver under px-run after pre-run snapshot resolution has initialized the
   # backend, verifying that the internal engine variable is not exported to child driver processes.
   t_shim_log_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/engine-var.sh"
+  t_px_run engine-var
   calls="$(cat "$T_SHIM_LOG")"
   t_equals hostile_driver_run_succeeds 0 "$T_STATUS"
   t_contains hostile_driver_run_reaches_the_fake_runtime \
@@ -1752,8 +2062,7 @@ t_group_shim() {
   t_absent hostile_driver_reaches_no_runtime 'hostile-driver' "$calls"
 }
 
-## @description  Runs a non-runtime entry point and verifies that the fake runtime log stays empty.
-## @param        name, command...  Control case suffix and command with arguments to execute.
+## @description  Verifies that an entry point (name, command...) succeeds and invokes no runtime.
 ## @return       Records two assertions. Exit 0.
 t_negative_control() {
   local name=$1
@@ -1764,38 +2073,15 @@ t_negative_control() {
   t_empty "negative_control_${name}_calls_no_runtime" "$(cat "$T_SHIM_LOG")"
 }
 
-# Compares the sb_* functions declared by the substrate contract against those defined in a backend
-# implementation file in both directions: a missing function breaks callers, while an undeclared
-# extra sb_* function introduces an uncontracted verb that alternative backends would not know to
-# implement.
-## @description  Reports missing or undeclared extra sb_* functions in a backend implementation.
-## @param        backend file  Filesystem path to the backend script being audited.
+## @description  Reports any substrate contract function that a backend file (path) omits or adds.
 ## @return       Writes one line per difference to stdout. Exit 0.
 t_backend_verbs() {
-  local file=$1 declared defined name
-  declared="$(sb_contract_functions)"
-  defined="$(sed -n 's/^\(sb_[a-z0-9_]*\)().*/\1/p' "$file")"
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    case "$PX_NL$defined$PX_NL" in
-    *"$PX_NL$name$PX_NL"*) ;;
-    *) printf 'missing %s\n' "$name" ;;
-    esac
-  done <<EOF
-$declared
-EOF
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    case "$PX_NL$declared$PX_NL" in
-    *"$PX_NL$name$PX_NL"*) ;;
-    *) printf 'extra %s\n' "$name" ;;
-    esac
-  done <<EOF
-$defined
-EOF
+  LC_ALL=C comm -3 <(sb_contract_functions | LC_ALL=C sort) \
+    <(sed -n 's/^\(sb_[a-z0-9_]*\)().*/\1/p' "$1" | LC_ALL=C sort) |
+    awk -F '\t' '{ print ($1 != "" ? "missing " $1 : "extra " $2) }'
 }
 
-## @description  Verifies contract-to-backend verb parity, contract version, and schema indexing.
+## @description  Verifies that the substrate contract and Compose backend agree, schemas included.
 ## @return       Records assertions. Exit 0.
 t_group_contract() {
   local fixture
@@ -1808,7 +2094,7 @@ t_group_contract() {
     "$(t_backend_verbs "$fixture")"
   t_contains contract_extra_verb_is_reported 'extra sb_not_a_contract_verb' \
     "$(t_backend_verbs "$fixture")"
-  t_equals contract_declares_27_required_verbs 27 \
+  t_equals contract_declares_30_required_verbs 30 \
     "$(sb_contract_required | grep -c .)"
   t_equals contract_declares_5_optional_verbs 5 \
     "$(sb_contract_optional | grep -c .)"
@@ -1824,44 +2110,32 @@ t_group_contract() {
   t_equals schema_index_refuses_an_unknown_field 6 "$?"
 }
 
-# Validates the CLI command surface across all twelve entry points: executable permissions, --help
-# output, exit code 2 on invalid flags, mandatory sourcing of lib/common.sh or contract.sh, and the
-# prohibition on redefining logging primitives owned by lib/common.sh.
-## @description  Verifies executable presence, flag handling, and library usage for all commands.
+## @description  Validates the twelve entry points for help, usage errors, and lib/common.sh use.
 ## @return       Records assertions. Exit 0.
 t_group_commands() {
-  local name missing="" bad="" unsourced="" own=""
+  local name missing="" help="" flag="" unsourced="" own=""
   printf '# the twelve entry points\n'
   for name in $T_COMMANDS; do
     [ -x "$T_BIN/$name" ] || missing="$missing $name"
-  done
-  t_empty twelve_entry_points_are_present "$missing"
-  for name in $T_COMMANDS; do
     t_run "$T_BASH" "$T_BIN/$name" --help
     if [ "$T_STATUS" != 0 ] || [ -z "$T_STDOUT" ]; then
-      bad="$bad $name=$T_STATUS"
+      help="$help $name=$T_STATUS"
     fi
-  done
-  t_empty every_entry_point_answers_help "$bad"
-  bad=""
-  for name in $T_COMMANDS; do
     t_run "$T_BASH" "$T_BIN/$name" --not-a-flag
-    [ "$T_STATUS" = 2 ] || bad="$bad $name=$T_STATUS"
-  done
-  t_empty every_entry_point_refuses_a_bad_flag "$bad"
-  for name in $T_COMMANDS; do
+    [ "$T_STATUS" = 2 ] || flag="$flag $name=$T_STATUS"
     grep -qE '^\.[[:space:]]*"[$]SELF/\.\./lib/(common\.sh|backend/contract\.sh)"$' \
       "$T_BIN/$name" || unsourced="$unsourced $name"
-  done
-  t_empty bins_source_common "$unsourced"
-  t_run grep -q 'common\.sh' "$PX_HOME/lib/backend/contract.sh"
-  t_equals the_contract_sources_the_shared_library 0 "$T_STATUS"
-  for name in $T_COMMANDS; do
     if grep -qE '^(log|logger|info|warn|error|debug|die|fatal)[[:space:]]*\(\)' \
       "$T_BIN/$name"; then
       own="$own $name"
     fi
   done
+  t_empty twelve_entry_points_are_present "$missing"
+  t_empty every_entry_point_answers_help "$help"
+  t_empty every_entry_point_refuses_a_bad_flag "$flag"
+  t_empty bins_source_common "$unsourced"
+  t_run grep -q 'common\.sh' "$PX_HOME/lib/backend/contract.sh"
+  t_equals the_contract_sources_the_shared_library 0 "$T_STATUS"
   t_empty no_entry_point_defines_its_own_log_function "$own"
 }
 
@@ -2525,28 +2799,13 @@ t_cli_record_cases() {
     'no cluster default is recorded' "$T_STDERR")"
 }
 
-# Extracts the ordered test identifiers from tab-separated suite plan output into a single
-# space-delimited string for concise ordering assertions.
-## @description  Extracts space-separated test identifiers from suite plan TSV rows in plan order.
-## @param        plan rows  Multi-line TSV plan output produced by px-suite --dry-run.
+## @description  Extracts test identifiers from suite plan TSV rows in planned execution order.
 ## @return       Writes the ids, separated by spaces, to stdout. Exit 0.
 t_plan_ids() {
-  local row out=""
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    out="$out ${row#*"$PX_TAB"}"
-    out="${out%%"$PX_TAB"*}"
-  done <<EOF
-$1
-EOF
-  printf '%s\n' "${out# }"
+  printf '%s\n' "$1" | awk -F '\t' 'NF { printf "%s%s", s, $2; s = " " } END { print "" }'
 }
 
-# Validates the six core capabilities of px-suite: topological dependency sorting and cycle
-# rejection, positional range boundaries (--from/--to), inclusion and exclusion filters
-# (--only/--skip), fault-tolerant continuation (--continue-on-failure), per-session directory
-# isolation, and side-effect-free dry runs.
-## @description  Executes assertions covering px-suite planning, filtering, and session isolation.
+## @description  Validates suite sorting, range boundaries, filters, fault tolerance, and isolation.
 ## @return       Records assertions. Exit 0.
 t_group_suite() {
   local suite="$T_WORK/suites"
@@ -2568,15 +2827,13 @@ t_group_suite() {
   t_run "$T_BASH" "$T_BIN/px-suite" --dry-run "$suite/cycle.suite"
   t_equals suite_refuses_a_dependency_cycle 2 "$T_STATUS"
   t_contains suite_names_the_cycle 'alpha -> beta -> alpha' "$T_STDERR"
-  t_run env "PX_SESSION_ID=selftest-stop" "$T_BASH" "$T_BIN/px-suite" \
-    "$suite/mixed.suite"
+  t_suite selftest-stop "$suite/mixed.suite"
   t_equals suite_stops_at_the_first_failure 1 "$T_STATUS"
   t_equals suite_runs_nothing_after_the_failure 3 "$(printf '%s\n' "$T_STDOUT" |
     grep -c .)"
   t_equals suite_ends_with_a_result_row "$(t_rows 4 result FAIL 1 \
     "$PX_OUT/sessions/selftest-stop")" "$(t_last_line "$T_STDOUT")"
-  t_run env "PX_SESSION_ID=selftest-go" "$T_BASH" "$T_BIN/px-suite" \
-    --continue-on-failure "$suite/mixed.suite"
+  t_suite selftest-go --continue-on-failure "$suite/mixed.suite"
   t_equals suite_continues_past_a_failure 3 "$T_STATUS"
   t_contains suite_reports_the_worst_severity "harsh${PX_TAB}ERROR" "$T_STDOUT"
   t_equals suite_result_row_follows_the_session "$(t_rows 4 result ERROR 3 \
@@ -2592,31 +2849,23 @@ t_group_suite() {
   t_suite selftest-blocked --continue-on-failure "$suite/blocked.suite"
   t_equals suite_blocked_row_has_no_bundle "1 SKIP 7 empty" "$T_STATUS $(printf '%s\n' \
     "$T_STDOUT" | awk -F '\t' '$2 == "later" { print $3, NF, ($7 == "" ? "empty" : $7) }')"
-  # Distinct session IDs must maintain isolated result directories and row counts, and reusing an
-  # existing session ID must be rejected rather than appended to.
-  t_run env "PX_SESSION_ID=selftest-second" "$T_BASH" "$T_BIN/px-suite" \
-    --continue-on-failure "$suite/mixed.suite"
+  # Distinct sessions maintain separate output directories and result rows, and reusing an active
+  # session identifier is rejected rather than appended to.
+  t_suite selftest-second --continue-on-failure "$suite/mixed.suite"
   t_equals suite_sessions_hold_their_own_rows 3 \
     "$(grep -c . "$PX_OUT/sessions/selftest-second/results.tsv")"
   t_equals suite_sessions_do_not_share_state 3 \
     "$(grep -c . "$PX_OUT/sessions/selftest-go/results.tsv")"
-  t_run env "PX_SESSION_ID=selftest-go" "$T_BASH" "$T_BIN/px-suite" \
-    --continue-on-failure "$suite/mixed.suite"
+  t_suite selftest-go --continue-on-failure "$suite/mixed.suite"
   t_equals suite_refuses_a_session_name_in_use 1 "$T_STATUS"
   t_shim_log_reset
   t_with_shim "$T_BASH" "$T_BIN/px-suite" --dry-run "$suite/order.suite"
-  t_empty suite_dry_run_makes_no_backend_call "$(cat "$T_SHIM_LOG")"
   t_empty suite_dry_run_makes_no_session "$(find "$PX_OUT/sessions" -name 'plan.tsv' \
     -newer "$T_SHIM_LOG" 2>/dev/null)"
   t_group_suite_regressions
 }
 
-# Verifies regression cases for previously resolved px-suite defects: literal preservation of
-# driver arguments without glob or tilde expansion, INCONCLUSIVE summary status when all tests
-# skip, ERROR classification for unrecognized verdict severities, exit code 6 when a test requires
-# a role group without an active scope, forwarding of action warnings to suite.log, and process
-# group termination of child processes when a test timeout expires.
-## @description  Executes regression test cases for argument parsing, verdicts, and timeouts.
+## @description  Validates suite runner regression cases and operator run-class override (R-037).
 ## @return       Records assertions. Exit 0.
 t_group_suite_regressions() {
   local suite="$T_WORK/suites" session="$PX_OUT/sessions" run_dir
@@ -2628,13 +2877,11 @@ t_group_suite_regressions() {
   t_equals suite_args_reach_the_driver_as_written \
     '[*.sql][--glob][*.sql][two\back][][a b][~/data][x=~]' \
     "$(cat "$run_dir/driver.log" 2>/dev/null)"
-  t_run env "PX_SESSION_ID=selftest-skips" "$T_BASH" "$T_BIN/px-suite" \
-    "$suite/skips.suite"
+  t_suite selftest-skips "$suite/skips.suite"
   t_equals suite_all_skip_exits_one 1 "$T_STATUS"
   t_contains suite_all_skip_is_inconclusive "result${PX_TAB}INCONCLUSIVE" \
     "$(cat "$session/selftest-skips/summary.tsv" 2>/dev/null)"
-  t_run env "PX_SESSION_ID=selftest-severity" "$T_BASH" "$T_BIN/px-suite" \
-    "$suite/severity.suite"
+  t_suite selftest-severity "$suite/severity.suite"
   t_equals suite_unknown_severity_exits_three 3 "$T_STATUS"
   t_contains suite_unknown_severity_is_an_error "unknown-severity${PX_TAB}ERROR" \
     "$T_STDOUT"
@@ -2645,26 +2892,49 @@ t_group_suite_regressions() {
   t_contains suite_requirement_without_scope_is_no_such_object \
     "needs-yarn${PX_TAB}ERROR${PX_TAB}6${PX_TAB}" "$T_STDOUT"
   t_empty suite_requirement_without_scope_calls_no_runtime "$(cat "$T_SHIM_LOG")"
-  t_run env "PX_SESSION_ID=selftest-speak" "$T_BASH" "$T_BIN/px-suite" \
-    "$suite/speak.suite"
+  t_suite selftest-speak "$suite/speak.suite"
   t_equals suite_speak_runs 0 "$T_STATUS"
   t_contains suite_log_holds_the_message_of_an_action 'hello from the action' \
     "$(cat "$session/selftest-speak/suite.log" 2>/dev/null)"
-  # Only a dedicated timeout binary terminates the entire child process group on expiry; the
-  # shell fallback terminates only the immediate test process.
+  # R-037: An operator-specified run class overrides the class declared by the suite, and px-run
+  # records the run class that it executed with.
+  t_suite selftest-class "$suite/class.suite"
+  run_dir="$(cat "$session/selftest-class/tests/classed/stdout.txt" 2>/dev/null)"
+  t_equals suite_class_of_the_suite_reaches_px_run "0 measurement" \
+    "$T_STATUS $(grep "^run$PX_TAB" "$run_dir/run-record.tsv" 2>/dev/null | cut -f 3)"
+  t_suite selftest-class-cli --class validation "$suite/class.suite"
+  run_dir="$(cat "$session/selftest-class-cli/tests/classed/stdout.txt" 2>/dev/null)"
+  t_equals suite_operator_class_wins_over_the_suite "0 validation" \
+    "$T_STATUS $(grep "^run$PX_TAB" "$run_dir/run-record.tsv" 2>/dev/null | cut -f 3)"
+  # Verify that the run class persisted in the cluster record overrides the class declared by the
+  # suite, while an explicit --class flag overrides the cluster record.
+  mkdir -p "$PX_OUT/state"
+  printf 'PX_RUN_CLASS=validation\n' >"$PX_OUT/state/cluster-suiteclass.env"
+  t_run "$T_BASH" "$T_BIN/px-suite" --cluster suiteclass -n "$suite/class.suite"
+  t_equals suite_record_class_wins_over_the_suite "0 validation" \
+    "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "classed" { print $6 }')"
+  t_run "$T_BASH" "$T_BIN/px-suite" --cluster suiteclass --class measurement -n \
+    "$suite/class.suite"
+  t_equals suite_operator_class_wins_over_the_record "0 measurement" \
+    "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "classed" { print $6 }')"
+  # Even when PX_RUN_CLASS is exported in the environment and loaded before the cluster record, the
+  # run class from the cluster record still takes precedence over the suite declaration.
+  t_run env PX_RUN_CLASS=validation "$T_BASH" "$T_BIN/px-suite" --cluster suiteclass -n \
+    "$suite/class.suite"
+  t_equals suite_record_class_wins_under_an_exported_class "0 validation" \
+    "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "classed" { print $6 }')"
+  rm -f "$PX_OUT/state/cluster-suiteclass.env"
+  # Only a GNU timeout binary terminates the entire process group of a test, whereas the fallback
+  # terminates the test process alone.
   if [ -n "$PX_TIMEOUT_BIN" ]; then
-    t_run env "PX_SESSION_ID=selftest-slow" "$T_BASH" "$T_BIN/px-suite" \
-      "$suite/slow.suite"
+    t_suite selftest-slow "$suite/slow.suite"
     t_equals suite_slow_test_expires 1 "$T_STATUS"
     t_suite_child_gone suite_time_limit_ends_the_child_of_a_test \
       "$session/selftest-slow/tests/slow/child.pid"
   fi
 }
 
-# Verifies that a background child process spawned by a timed-out test has terminated, polling for
-# up to one second because signal delivery and process termination are asynchronous events.
-## @description  Verifies that a child process recorded by a suite test is no longer running.
-## @param        name, file  Assertion name and path to the file containing the child PID.
+## @description  Verifies that a test process (name, pid file) terminates within one second.
 ## @return       Records one assertion. Exit 0.
 t_suite_child_gone() {
   local name=$1 pid="" tries=0
@@ -2685,12 +2955,7 @@ t_suite_child_gone() {
   fi
 }
 
-# Validates px-run lifecycle and snapshot reconciliation: driver exit codes propagate unchanged
-# when cluster state is healthy, and unexplained instance state changes (restarts, unexpected exits
-# of running instances, or vanished instances) produce anomaly exit code 3 unless accounted for by
-# a planned disruption action from the current run. Post-run inventory read failures yield exit
-# code 1 rather than false vanished-instance verdicts.
-## @description  Verifies px-run driver exit propagation and pre/post-run inventory reconciliation.
+## @description  Validates run wrapper status pass-through, anomaly detection, and inventory reads.
 ## @return       Records assertions. Exit 0.
 t_group_run() {
   local code record
@@ -2710,17 +2975,14 @@ t_group_run() {
   # Have the stub driver increment the fake runtime's reported restart count so the post-run
   # snapshot diverges from the pre-run baseline deterministically without timing dependencies.
   printf '0\n' >"$T_SHIM_STATE/restart-count"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/bump-restart.sh" -- 4
+  t_px_run bump-restart -- 4
   t_equals run_reports_an_unplanned_restart 3 "$T_STATUS"
   record="$T_STDOUT/run-record.tsv"
   t_contains run_records_the_unplanned_verdict \
     "regionserver${PX_TAB}0${PX_TAB}0${PX_TAB}4${PX_TAB}unplanned" \
     "$(grep '^diff' "$record" 2>/dev/null)"
   t_shim_state_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/bump-restart.sh" \
-    --disrupt 'phase:driver_start,kill,regionserver,0' -- 4
+  t_px_run bump-restart --disrupt 'phase:driver_start,kill,regionserver,0' -- 4
   t_equals run_accepts_a_planned_restart 0 "$T_STATUS"
   record="$T_STDOUT/run-record.tsv"
   t_contains run_records_the_planned_verdict \
@@ -2729,8 +2991,7 @@ t_group_run() {
   # When the container restart policy is "no", a crashed container keeps a restart count of zero
   # and is detected instead by its transition from running to exited in the post-run snapshot.
   t_shim_state_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/exit-instance.sh"
+  t_px_run exit-instance
   t_equals run_reports_an_unplanned_exit 3 "$T_STATUS"
   record="$(cat "$T_STDOUT/run-record.tsv" 2>/dev/null)"
   t_contains run_records_the_unplanned_exit \
@@ -2739,8 +3000,7 @@ t_group_run() {
     "$(t_rows 6 term regionserver 0 killed 137 9)" "$record"
   t_contains run_records_the_oom_evidence "$(t_rows 4 oom regionserver 0 no)" "$record"
   t_shim_state_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/vanish.sh"
+  t_px_run vanish
   t_equals run_reports_a_lost_instance 3 "$T_STATUS"
   t_contains run_records_the_lost_instance \
     "$(t_rows 7 diff regionserver 0 0 '' vanished running)" \
@@ -2748,8 +3008,7 @@ t_group_run() {
   # An unreachable runtime during post-run snapshot collection must be reported as an operational
   # failure (exit 1) rather than misinterpreted as a vanished container instance.
   t_shim_state_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/unreachable.sh"
+  t_px_run unreachable
   t_equals run_unread_inventory_is_a_failure 1 "$T_STATUS"
   record="$(cat "$T_STDOUT/run-record.tsv" 2>/dev/null)"
   t_contains run_unread_inventory_skips_the_diff \
@@ -2761,41 +3020,27 @@ t_group_run() {
   t_with_shim "$T_BASH" "$T_WORK/probe/sb.sh" sb_planned_record px-selftest kill \
     regionserver 0 stale
   t_equals run_stale_planned_row_is_written 0 "$T_STATUS"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-    --scope px-selftest --driver "$T_WORK/drivers/exit-instance.sh"
+  t_px_run exit-instance
   t_equals run_ignores_a_planned_row_of_an_earlier_run 3 "$T_STATUS"
   t_shim_state_reset
 }
 
-# Validates the configuration loader: five-stage precedence ordering and provenance tracking,
-# fail-closed rejection of undeclared variable names, malformed lines, export statements, and
-# missing files, immutability of PX_CONTRACT_VERSION across config files and CLI overrides, and
-# output-policy enforcement for PX_LOG_FILE destinations.
-## @description  Verifies configuration precedence, provenance tracking, and strict validation.
+## @description  Validates loader precedence, origin, fail-closed files, revision, and log copying.
 ## @return       Records assertions. Exit 0.
 t_group_config() {
   local env_dir="$T_WORK/env"
   printf '# the configuration loader\n'
+  # Stage N assigns the value N, and each stage defines one variable name more than the stage above
+  # it so that each name reflects the strongest stage that sets it.
   t_run env "PX_ENV_DIR=$env_dir" "PX_RUN_CLASS=selftest" "PX_TIMEOUT_GROUP=1" \
-    "$T_BASH" "$T_WORK/probe/config-load.sh" "$env_dir/named.env"
-  t_equals config_the_environment_wins 1 "$(t_dump_field PX_TIMEOUT_GROUP 2)"
-  t_equals config_a_named_file_beats_the_local_file 2 \
-    "$(t_dump_field PX_TIMEOUT_SCALE 2)"
-  t_equals config_the_local_file_beats_the_class_file 3 \
-    "$(t_dump_field PX_TIMEOUT_EXEC 2)"
-  t_equals config_the_class_file_beats_the_defaults 4 \
-    "$(t_dump_field PX_TIMEOUT_READY 2)"
-  t_equals config_the_defaults_are_the_weakest_stage 5 \
-    "$(t_dump_field PX_TIMEOUT_DEFAULT 2)"
-  t_equals config_reports_the_environment_origin environment \
-    "$(t_dump_field PX_TIMEOUT_GROUP 3)"
-  t_equals config_reports_the_file_origin "$env_dir/named.env" \
-    "$(t_dump_field PX_TIMEOUT_SCALE 3)"
-  t_equals config_reports_the_local_origin local "$(t_dump_field PX_TIMEOUT_EXEC 3)"
-  t_equals config_reports_the_class_origin class:selftest \
-    "$(t_dump_field PX_TIMEOUT_READY 3)"
-  t_equals config_reports_the_defaults_origin defaults \
-    "$(t_dump_field PX_TIMEOUT_DEFAULT 3)"
+    "PX_VERSIONS_ENV=$env_dir/versions.env" "PX_VERSIONS_LOCAL_ENV=$env_dir/versions-local.env" \
+    "PX_PORT_MAP_ENV=$env_dir/ports.env" "$T_BASH" "$T_WORK/probe/config-load.sh" \
+    "$env_dir/named.env"
+  t_equals loader_precedence "$(t_rows 3 PX_TIMEOUT_DEFAULT 5 defaults PX_TIMEOUT_DRAIN 6 \
+    versions PX_TIMEOUT_EXEC 3 local PX_TIMEOUT_FETCH 7 versions-local PX_TIMEOUT_GROUP 1 \
+    environment PX_TIMEOUT_PROVISION 8 ports PX_TIMEOUT_READY 4 class:selftest \
+    PX_TIMEOUT_SCALE 2 "$env_dir/named.env")" \
+    "$(printf '%s\n' "$T_STDOUT" | grep "^PX_TIMEOUT_[A-Z]*$PX_TAB")"
   t_run env "PX_ENV_DIR=$env_dir" "$T_BASH" "$T_WORK/probe/config-strict.sh" \
     "$env_dir/undeclared.env"
   t_equals config_strict_refuses_an_undeclared_name 2 "$T_STATUS"
@@ -2827,20 +3072,13 @@ t_group_config() {
     "$(cat "$PX_OUT/selftest.log" 2>/dev/null)"
   t_run env "PX_LOG_FILE=$T_WORK/escape.log" "$T_BASH" "$T_BIN/px-cluster" status
   t_equals config_log_file_outside_the_root_is_refused 2 "$T_STATUS"
-  t_equals config_refused_log_file_stays_absent no \
-    "$([ -e "$T_WORK/escape.log" ] && printf yes || printf no)"
+  t_equals config_refused_log_file_stays_absent no "$(t_exists "$T_WORK/escape.log")"
   t_run env "PX_LOG_FILE=$PX_HOME/selftest.log" "$T_BASH" "$T_BIN/px-cluster" status
   t_equals config_log_file_in_the_tree_is_refused 2 "$T_STATUS"
-  t_equals config_log_file_in_the_tree_stays_absent no \
-    "$([ -e "$PX_HOME/selftest.log" ] && printf yes || printf no)"
+  t_equals config_log_file_in_the_tree_stays_absent no "$(t_exists "$PX_HOME/selftest.log")"
 }
 
-# Validates output boundary enforcement, unique run identifier generation, and the pure-shell
-# timeout fallback: paths inside the working tree, relative paths, the filesystem root, and paths
-# escaping PX_OUT are rejected; multiple run IDs generated within the same second remain distinct;
-# and the timeout fallback preserves standard input, enforces expiry, and cleans up its watchdog
-# sleep process.
-## @description  Verifies PX_OUT boundary checks, run ID uniqueness, and timeout fallback behavior.
+## @description  Validates the output policy, run identifier generation, and the timeout fallback.
 ## @return       Records assertions. Exit 0.
 t_group_output() {
   local ids dirs
@@ -2882,10 +3120,7 @@ t_group_output() {
   t_contains a_run_directory_lives_under_the_output_root "$PX_OUT/runs/" "$dirs"
 }
 
-# Validates the JSON and TSV structured output emitters: proper escaping of quotes, backslashes,
-# and control characters, nested JSON object/array formatting, numeric literal validation, and TSV
-# rejection or sanitization of embedded tabs and newlines.
-## @description  Verifies JSON escaping, nesting, and number validation alongside TSV field rules.
+## @description  Validates the JSON emitters and the rejection of TSV fields that would break a row.
 ## @return       Records assertions. Exit 0.
 t_group_emitters() {
   local expected
@@ -2927,9 +3162,6 @@ t_group_emitters() {
 # readiness and role groups, instance access, diagnostic evidence and fault injection, scaling and
 # observation, runtime failure and teardown, and finally the px-cluster CLI subcommands.
 
-# Exercises backend identity, version reporting, capability discovery, scope creation and lookup,
-# cluster provisioning, and instance listing. Provisioning creates all defined containers and
-# starts every service except those marked on-demand.
 ## @description  Sweeps backend identity, capabilities, scope verbs, provisioning, and inventory.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_scope() {
@@ -2942,7 +3174,7 @@ t_group_sweep_scope() {
   t_outcome sweep_sb_contract_version 0 1
   t_sb sb_version_info
   t_outcome sweep_sb_version_info 0 "$(t_rows 2 engine_client 29.9.3 \
-    engine_server 29.9.3 compose_flavour plugin compose_version 2.40.0)"
+    engine_server 29.9.3 compose_version 2.40.0)"
   t_sb sb_capabilities
   t_outcome_columns sweep_sb_capabilities 0 2 "$(t_rows 2 logs_previous no \
     resource_sampling yes signal_delivery yes previous_termination no events yes \
@@ -3006,12 +3238,7 @@ t_group_sweep_scope() {
     network px-sweep_default)"
 }
 
-# Exercises the readiness barrier and role-group lifecycle verbs. A whole-scope readiness wait
-# reports intentionally stopped on-demand groups as stopped, whereas a wait explicitly targeting a
-# stopped role waits for it and times out. Any group whose instances are running when the wait
-# begins remains part of the readiness barrier, so a member crash before or during the wait is
-# reported as anomaly exit code 3 rather than an intentional stop.
-## @description  Sweeps sb_wait_ready and the sb_group_* lifecycle verbs across group states.
+## @description  Sweeps readiness checks and role groups, including stopped and crashed groups.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_ready() {
   local saved="$T_WORK/sweep-saved.txt"
@@ -3080,7 +3307,7 @@ t_group_sweep_ready() {
 2 sb_wait_ready px-sweep 0"
 }
 
-## @description  Sweeps instance access verbs: sb_exec, sb_logs, sb_copy_in/out, and sb_endpoint*.
+## @description  Sweeps instance exec, log retrieval, both copy operations, and endpoint queries.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_access() {
   printf '# verb sweep: exec, logs, copies and endpoints\n'
@@ -3130,11 +3357,7 @@ t_group_sweep_access() {
 2 sb_endpoint_release not-a-scope master 0 all"
 }
 
-# Exercises diagnostic evidence queries, signal delivery, and drain-aware restarts along with their
-# error exit codes: exit code 1 when container inspection fails, exit code 5 when capability
-# probing reports no signal delivery support, and exit code 2 when drain-restart targets a role
-# lacking a drain label or a configured RPC port.
-## @description  Sweeps diagnostic evidence verbs, sb_signal, and sb_restart_drain error paths.
+## @description  Sweeps the diagnostic evidence verbs, signal delivery, and drain-aware restarts.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_evidence() {
   printf '# verb sweep: evidence, signal and drain-aware restart\n'
@@ -3169,22 +3392,16 @@ t_group_sweep_evidence() {
   t_sb_codes sweep_signal_refusals "
 2 sb_signal px-sweep master 0 BOGUS
 6 sb_signal px-sweep master 9 TERM"
-  # Clear the cached capability table before and after simulating missing kill support so the
-  # probe re-evaluates capabilities and restores the normal table for subsequent tests.
-  : >"$T_SWEEP_STATE/no-kill"
+  # A capability probe during a runtime outage fails without caching the result, allowing signal
+  # delivery to succeed once the runtime responds again.
   rm -f "$T_SWEEP_OUT/state/compose/capabilities.tsv"
-  t_sb sb_signal px-sweep master 0 QUIT
-  t_equals sweep_signal_without_delivery_is_unsupported 5 "$T_STATUS"
-  rm -f "$T_SWEEP_STATE/no-kill" "$T_SWEEP_OUT/state/compose/capabilities.tsv"
-  # Capability probes during a runtime outage must fail without caching negative results so signal
-  # delivery succeeds once the runtime becomes reachable again.
   : >"$T_SWEEP_STATE/unreachable"
   t_sb sb_signal px-sweep master 0 QUIT
   t_equals sweep_signal_on_an_unreachable_runtime_is_failure 1 "$T_STATUS"
   t_sb sb_capabilities
   rm -f "$T_SWEEP_STATE/unreachable"
   t_equals sweep_capabilities_do_not_cache_an_outage no \
-    "$([ -e "$T_SWEEP_OUT/state/compose/capabilities.tsv" ] && printf yes || printf no)"
+    "$(t_exists "$T_SWEEP_OUT/state/compose/capabilities.tsv")"
   t_sb sb_signal px-sweep master 0 QUIT
   t_equals sweep_signal_after_an_outage 0 "$T_STATUS"
   t_sb sb_capabilities
@@ -3200,11 +3417,7 @@ t_group_sweep_evidence() {
 2 sb_restart_drain px-sweep regionserver 0 0 5"
 }
 
-# Exercises service scaling, hard and delete instance termination, event log index derivation,
-# resource usage sampling and unit conversion, and preflight environment checks. Service scaling
-# explicitly passes the target service operand to compose up so stopped on-demand services are not
-# inadvertently started.
-## @description  Sweeps sb_scale, sb_kill, sb_events, sb_sample_resources, and sb_preflight.
+## @description  Sweeps scaling, kill operations, event queries, resource samples, and preflight.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_scale() {
   printf '# verb sweep: scale, kill, events, samples and preflight\n'
@@ -3272,13 +3485,7 @@ t_group_sweep_scale() {
   rm -f "$T_SWEEP_STATE/server-version"
 }
 
-# Verifies behavior when the container runtime becomes unresponsive, followed by cluster teardown
-# and scope deletion. During a runtime outage, every contract function must report operational
-# failure (exit code 1) rather than no such object (exit code 6), except sb_exec (exit code 125)
-# and the two optional observation verbs sb_events and sb_sample_resources (exit code 5). Teardown
-# verification includes leftover container detection and fallback to project-name teardown when the
-# compose file has been removed.
-## @description  Sweeps unresponsive-runtime exit codes, sb_teardown, and sb_scope_delete.
+## @description  Sweeps unresponsive-runtime handling, teardown, and scope removal by project name.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_teardown() {
   printf '# verb sweep: runtime failure, teardown and scope removal\n'
@@ -3350,10 +3557,7 @@ t_group_sweep_teardown() {
   t_equals sweep_deleted_scope_is_no_such_object 6 "$T_STATUS"
 }
 
-# Exercises every px-cluster subcommand against the fake runtime along with px-run and px-suite
-# discovery of the active scope persisted by px-cluster up. Also verifies that a failed bring-up
-# automatically tears the cluster down unless --keep is specified.
-## @description  Sweeps all px-cluster lifecycle, inspection, and access subcommands.
+## @description  Sweeps every px-cluster subcommand plus px-run and px-suite on the recorded scope.
 ## @return       Records assertions. Exit 0.
 t_group_cluster() {
   local text record="$T_SWEEP_OUT/state/scope-compose-sweep"
@@ -3437,11 +3641,7 @@ t_group_cluster() {
   t_group_cluster_faults
 }
 
-# Exercises the state-mutating px-cluster subcommands: group, restart, signal, scale, kill, down,
-# and automatic teardown on a failed up. Single-target mutations record a planned-action row before
-# acting, while group switches record a planned-action row for each affected role returned by the
-# backend.
-## @description  Sweeps mutating px-cluster subcommands, planned-action logging, and teardown.
+## @description  Sweeps the instance-mutating px-cluster subcommands and failed up handling.
 ## @return       Records assertions. Exit 0.
 t_group_cluster_faults() {
   local text record="$T_SWEEP_OUT/state/scope-compose-sweep"
@@ -3450,7 +3650,7 @@ t_group_cluster_faults() {
   t_contains cluster_group_start_reports_ready 'nodemanager 0 ready' \
     "$(t_squeeze "$T_STDOUT")"
   t_contains cluster_group_start_runs_the_memory_check \
-    'the memory check is not installed' "$T_STDERR"
+    "memory_fit${PX_TAB}ok${PX_TAB}the limits 2560 MiB" "$T_STDERR"
   t_contains cluster_group_start_is_planned \
     "$(t_rows 4 group_start nodemanager '' 'group yarn')" "$(t_sweep_planned)"
   t_pc group status yarn
@@ -3490,8 +3690,7 @@ t_group_cluster_faults() {
   t_equals cluster_down 0 "$T_STATUS"
   t_called cluster_down_removes_the_volumes \
     'compose -p px-sweep down --volumes --remove-orphans --timeout 120'
-  t_equals cluster_down_removes_the_scope_record no \
-    "$([ -e "$record" ] && printf yes || printf no)"
+  t_equals cluster_down_removes_the_scope_record no "$(t_exists "$record")"
   t_equals down_removes_the_record no "$(t_exists "$T_SWEEP_OUT/state/cluster-sweep.env")"
   t_shim_log_reset
   t_pc down
@@ -3506,13 +3705,11 @@ t_group_cluster_faults() {
   t_equals cluster_up_failure_is_failure 1 "$T_STATUS"
   t_called cluster_up_failure_tears_down \
     'compose -p px-sweep down --volumes --remove-orphans --timeout 120'
-  t_equals cluster_up_failure_removes_the_scope_record no \
-    "$([ -e "$record" ] && printf yes || printf no)"
+  t_equals cluster_up_failure_removes_the_scope_record no "$(t_exists "$record")"
   t_equals failed_up_removes_the_record no "$(t_exists "$T_SWEEP_OUT/state/cluster-sweep.env")"
   t_pc --keep up "$T_DEPLOY"
   t_equals cluster_up_failure_with_keep_is_failure 1 "$T_STATUS"
-  t_equals cluster_up_failure_with_keep_keeps_the_scope yes \
-    "$([ -e "$record" ] && printf yes || printf no)"
+  t_equals cluster_up_failure_with_keep_keeps_the_scope yes "$(t_exists "$record")"
   t_equals failed_up_with_keep_keeps_the_record yes \
     "$(t_exists "$T_SWEEP_OUT/state/cluster-sweep.env")"
   rm -f "$T_SWEEP_STATE/up-fails"
@@ -3522,12 +3719,7 @@ t_group_cluster_faults() {
   t_empty cluster_down_leaves_no_scope_record "$text"
 }
 
-# Verifies that executing the entire self-test suite created no new files or directories anywhere
-# under the repository working tree root. Because every test command ran with the working tree root
-# as its current working directory, any accidental write to a relative path would appear there. A
-# synthetic control against a fixture tree first confirms that the diff check detects newly created
-# paths.
-## @description  Verifies that no command in the test run created paths inside the working tree.
+## @description  Verifies that no command created any path under the working tree root.
 ## @return       Records assertions. Exit 0.
 t_group_tree() {
   printf '# no write under the repository root\n'
@@ -3546,13 +3738,1563 @@ t_group_tree() {
 }
 
 # ---------------------------------------------------------------------------
-# Command-line argument parsing and suite execution
+# Deployment layer verification: generator, image, preflight, distributions, and bring-up
+# ---------------------------------------------------------------------------
+# These test groups verify the deployment layer exclusively against fake dependencies: the fake
+# container runtime, a fake curl utility, a fake Maven executable, and fake JDK installations.
+
+## @description  Extracts and sorts the published ports of a Compose file, one per line, reporting
+##               any port mapping that does not match "127.0.0.1:P:P" as "refused <entry>".
+## @return       Writes the sorted port entries to stdout. Exit 0.
+t_published() {
+  awk '/^    ports:$/ { p = 1; next }
+    p && /^      - / {
+      e = $2; gsub(/"/, "", e); n = split(e, f, ":")
+      if (n == 3 && f[1] == "127.0.0.1" && f[2] == f[3] && f[2] ~ /^[0-9]+$/) print f[2]
+      else print "refused " e
+      next
+    }
+    { p = 0 }' "$1" | sort
+}
+
+## @description  Verifies the network topology of a rendered deployment (directory, cluster): one
+##               bridge network, every service on it under its hostname, and loopback-only ports.
+## @return       Records the network topology assertions. Exit 0.
+t_a2_network_cases() {
+  local dir=$1 cluster=$2 service block bad="" want
+  local yaml="$dir/compose.yaml"
+  t_absent "network_${cluster}_no_host_networking" 'network_mode' "$(cat "$yaml")"
+  want="networks:${PX_NL}  default:${PX_NL}    driver: bridge${PX_NL}    labels:${PX_NL}"
+  want="$want      px.harness.cluster: \"$cluster\""
+  t_equals "network_${cluster}_one_labelled_bridge" "$want" \
+    "$(sed -n '/^networks:/,/^volumes:/p' "$yaml" | grep -v '^volumes:')"
+  for service in $(grep -o '^  [a-z-]*-[0-9]:$' "$yaml" | tr -d ' :'); do
+    block="$(sed -n "/^  $service:\$/,/^  [a-z][a-z-]*-[0-9]:\$/p" "$yaml")"
+    case "$block" in
+    *"    hostname: \"$service\"$PX_NL    networks:$PX_NL      - default$PX_NL"*) ;;
+    *) bad="$bad $service" ;;
+    esac
+    case "$block" in
+    *"PX_HOSTNAME: \"$service\""*) ;;
+    *) bad="$bad $service:PX_HOSTNAME" ;;
+    esac
+  done
+  t_empty "network_${cluster}_every_service_has_its_hostname" "$bad"
+  # Requirement R-032: ensure that no service port is published beyond the host loopback address.
+  t_absent "network_${cluster}_loopback_only_publish" refused "$(t_published "$yaml")"
+  t_absent "network_${cluster}_no_wildcard_in_compose" '0.0.0.0' "$(cat "$yaml")"
+  t_equals "network_${cluster}_port_map_is_the_published_set" \
+    "$(sed -n 's/^PX_PORT_[A-Z0-9_]*=//p' "$dir/ports.generated.env" | sort)" \
+    "$(t_published "$yaml")"
+}
+
+## @description  Verifies the deployment generator, its fail-closed rendering behavior, and its
+##               target directory rules.
+## @return       Records the deployment generator assertions. Exit 0.
+t_group_a2_generator() {
+  local dir text rows count bad="" miss="" line
+  local versions="$PX_HOME/$PX_DEPLOY_SUBDIR/versions.env"
+  local tag=px-harness:hbase-2.6.7-hadoop-3.4.3-profile-2.6
+  printf '# the deployment generator\n'
+  t_shim_log_reset
+  t_gen --class measurement --cluster m
+  t_equals generator_renders_the_measurement_class 0 "$T_STATUS"
+  dir="$T_A2_OUT/deploy/m"
+  t_equals generator_writes_the_directory_path "$dir" "$T_STDOUT"
+  count="$(grep -c '^  [a-z-]*-[0-9]:$' "$dir/compose.yaml" 2>/dev/null)"
+  t_equals compose_one_service_per_instance 18 "$count"
+  # Verify that a healthcheck gates every service, including the one-shot setup service.
+  for line in 'restart: "no"' 'pull_policy: never' 'healthcheck:' "image: \"$tag\""; do
+    [ "$(grep -cxF "    $line" "$dir/compose.yaml")" = "$count" ] || miss="$miss $line;"
+  done
+  t_empty compose_policies_on_every_service "$miss"
+  t_contains setup_is_gated_by_its_healthcheck 'healthcheck:' \
+    "$(sed -n '/^  setup-0:/,/^  [a-z]/p' "$dir/compose.yaml")"
+  t_a2_network_cases "$dir" m
+  t_absent debug_port_unpublished_by_default _DEBUG "$(cat "$dir/ports.generated.env")"
+  t_equals bind_host_is_every_interface 0.0.0.0 \
+    "$(t_env_value "$dir/topology.env" PX_BIND_HOST)"
+  t_absent service_host_is_gone PX_SERVICE_HOST "$(cat "$dir/topology.env")"
+  t_equals default_counts "3 3 3" \
+    "$(t_env_value "$dir/topology.env" PX_DN_COUNT PX_NM_COUNT PX_RS_COUNT)"
+  # The topology record captures the selected version set, while the jar versions bundled inside
+  # the HBase archive remain unknown until the image artifacts are staged.
+  line="$(t_env_value "$versions" PX_PHOENIX_HBASE_PROFILE_DEFAULT PX_DIST_HBASE_DEFAULT_2_6 \
+    PX_DIST_HADOOP_DEFAULT)"
+  t_equals topology_records_the_version_set "$line unstaged unstaged" \
+    "$(t_env_value "$dir/topology.env" PX_PHOENIX_HBASE_PROFILE PX_DIST_HBASE_VERSION \
+      PX_DIST_HADOOP_VERSION PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION)"
+  t_equals compose_one_service_per_regionserver 3 "$(grep -c '^  regionserver-[0-9]:$' \
+    "$dir/compose.yaml")"
+  t_empty generator_calls_no_runtime "$(cat "$T_SHIM_LOG")"
+  t_contains setup_mounts_the_namenode_volume '- namenode-0-data:/data' \
+    "$(sed -n '/^  setup-0:/,/^[a-z]/p' "$dir/compose.yaml")"
+  t_equals volumes_are_declared_once_by_their_owner 6 \
+    "$(sed -n '/^volumes:/,$p' "$dir/compose.yaml" | grep -c '^  [a-z0-9-]*-data:$')"
+  rows="$(awk '/^  [a-z-]+-[0-9]:$/ { s = $1 } /px.harness.(group|start|drain):/ \
+    { print s, $1, $2 }' "$dir/compose.yaml")"
+  t_equals yarn_labels_group 5 "$(printf '%s\n' "$rows" | grep -c 'group: "yarn"')"
+  t_equals yarn_labels_on_demand 5 "$(printf '%s\n' "$rows" | grep -c 'start: "on-demand"')"
+  t_empty yarn_labels_only_on_yarn_roles "$(printf '%s\n' "$rows" | grep -E 'group|start' |
+    grep -vE '^(resourcemanager|nodemanager|jobhistory)-')"
+  t_equals drain_label_on_every_regionserver 3 \
+    "$(printf '%s\n' "$rows" | grep -c '^regionserver-[0-9]: px.harness.drain: "regionmover"')"
+  t_equals drain_label_only_on_regionservers 3 "$(printf '%s\n' "$rows" | grep -c drain)"
+  t_equals yarn_group_record yarn "$(t_env_value "$dir/topology.env" PX_GROUPS)"
+  t_equals yarn_group_roles 'resourcemanager nodemanager jobhistory' \
+    "$(t_env_value "$dir/topology.env" PX_GROUP_YARN)"
+  t_gen --class measurement --check
+  t_equals memory_sums_with_yarn 41984 "$(t_mem_sum "$T_STDOUT")"
+  t_contains memory_sums_regionserver_is_4608_around_3072 \
+    "$(t_rows 9 regionserver-0 regionserver 0 '' '' 4608 3072 512 17)" "$T_STDOUT"
+  t_gen --class measurement --check -e PX_YARN=0
+  t_equals memory_sums_without_yarn 31744 "$(t_mem_sum "$T_STDOUT")"
+  t_absent yarn_toggle_off_renders_no_yarn_role 'resourcemanager' "$T_STDOUT"
+  t_equals memory_sums_topology_record "41984 31744 10240" "$(t_env_value \
+    "$dir/topology.env" PX_TOPOLOGY_MEM_MIB PX_TOPOLOGY_MEM_EAGER_MIB PX_GROUP_YARN_MEM_MIB)"
+  t_gen --class measurement --check -e PX_SNN=0
+  t_absent snn_toggle_off_renders_no_secondary_namenode 'secondarynamenode' "$T_STDOUT"
+  t_gen --class validation --cluster v
+  t_equals validation_class 0 "$T_STATUS"
+  dir="$T_A2_OUT/deploy/v"
+  t_equals validation_class_services 8 "$(grep -c '^  [a-z-]*-[0-9]:$' "$dir/compose.yaml")"
+  t_equals validation_class_one_per_role "1 1 1 1" "$(t_env_value "$dir/topology.env" \
+    PX_DN_COUNT PX_NM_COUNT PX_RS_COUNT PX_HDFS_REPLICATION)"
+  t_absent validation_class_renders_no_yarn 'nodemanager' "$(cat "$dir/services.tsv")"
+  t_gen --class validation --check
+  t_equals validation_class_fits_16_gib 8704 "$(t_mem_sum "$T_STDOUT")"
+  t_gen --class validation --check -e PX_YARN=1
+  t_equals validation_class_with_yarn_on_request 12032 "$(t_mem_sum "$T_STDOUT")"
+  t_gen --class measurement --config "$T_ENVD/override-24gib.env" --check
+  t_equals override_24gib 19200 "$(t_mem_sum "$T_STDOUT")"
+  t_gen --class measurement --config "$T_ENVD/override-24gib.env" --check -e PX_RS_COUNT=1
+  t_equals override_24gib_one_regionserver 15616 "$(t_mem_sum "$T_STDOUT")"
+  t_gen --class measurement --config "$T_ENVD/override-24gib.env" --check -e PX_RS_COUNT=3 \
+    -e PX_YARN=0
+  t_equals override_24gib_three_regionservers_without_yarn 19456 "$(t_mem_sum "$T_STDOUT")"
+  t_contains override_24gib_is_advisory 'TIME RESULTS FROM A RUN WITH THIS FILE ARE ADVISORY' \
+    "$(sed -n 1,20p "$T_ENVD/override-24gib.env")"
+  t_gen --class measurement --check -e PX_RS_COUNT=1
+  t_equals count_one_renders 0 "$T_STATUS"
+  # Render the maximum port map configuration: nine instances of each scalable role with JVM debug
+  # ports enabled.
+  t_gen --class measurement --cluster nine -e PX_RS_COUNT=9 -e PX_DN_COUNT=9 -e PX_NM_COUNT=9 \
+    -e PX_JVM_DEBUG=1
+  t_equals count_nine_renders 0 "$T_STATUS"
+  dir="$T_A2_OUT/deploy/nine"
+  t_equals port_map_nine 131 "$(grep -c '^PX_PORT_' "$dir/ports.generated.env")"
+  t_equals debug_switch_reaches_every_service 1 \
+    "$(t_env_value "$dir/topology.env" PX_JVM_DEBUG)"
+  t_a2_network_cases "$dir" nine
+  t_equals port_map_nine_regionserver_debug "$(seq 15011 15019 | tr '\n' ' ')" \
+    "$(sed -n 's/^PX_PORT_REGIONSERVER_DEBUG_[0-9]=//p' "$dir/ports.generated.env" |
+      sort -n | tr '\n' ' ')"
+  t_equals port_map_nine_datanode_debug "$(seq 15021 15029 | tr '\n' ' ')" \
+    "$(sed -n 's/^PX_PORT_DATANODE_DEBUG_[0-9]=//p' "$dir/ports.generated.env" |
+      sort -n | tr '\n' ' ')"
+  t_equals port_map_nine_nodemanager_debug "$(seq 15031 15039 | tr '\n' ' ')" \
+    "$(sed -n 's/^PX_PORT_NODEMANAGER_DEBUG_[0-9]=//p' "$dir/ports.generated.env" |
+      sort -n | tr '\n' ' ')"
+  t_empty port_map_nine_has_no_collision "$(grep '^PX_PORT_' "$dir/ports.generated.env" |
+    cut -d= -f2 | sort | uniq -d)"
+  t_equals port_map_base_plus_step 16040 \
+    "$(t_env_value "$dir/ports.generated.env" PX_PORT_REGIONSERVER_RPC_2)"
+  t_equals port_map_jobhistory_admin 10033 \
+    "$(t_env_value "$dir/ports.generated.env" PX_PORT_JOBHISTORY_ADMIN)"
+  # The final iteration preserves its standard error output for the two assertions following the
+  # loop.
+  for line in PX_RS_COUNT=0 PX_DN_COUNT=10 PX_NM_COUNT=abc PX_RS_COUNT=10; do
+    t_gen --class measurement --check -e "$line"
+    [ "$T_STATUS" = 2 ] || bad="$bad$line gave $T_STATUS$PX_NL"
+  done
+  t_empty count_range_exits_2 "$bad"
+  t_contains count_range_names_the_range 'outside the range 1 to 9' "$T_STDERR"
+  t_contains count_range_cites_the_ceiling 'ceiling' "$T_STDERR"
+  t_gen --check
+  t_contains unknown_class_needs_a_class 'name the run class' "$T_STDERR"
+  t_gen --class bogus --check
+  t_outcome unknown_class_exits_2 2 ''
+  t_gen --class measurement --cluster rep1 -e PX_DN_COUNT=1
+  t_equals replication_clamp_to_the_datanode_count "1 3" "$(t_env_value \
+    "$T_A2_OUT/deploy/rep1/topology.env" PX_HDFS_REPLICATION PX_HDFS_REPLICATION_REQUESTED)"
+  t_contains replication_clamp_warns 'the deployment uses replication 1' "$T_STDERR"
+  t_gen --class measurement --cluster rep2 -e PX_HDFS_REPLICATION=2
+  t_equals replication_below_the_count_is_kept 2 \
+    "$(t_env_value "$T_A2_OUT/deploy/rep2/topology.env" PX_HDFS_REPLICATION)"
+  t_gen --class measurement --cluster jdk -e PX_RS_JDK=17 -e PX_CLIENT_JDK=21
+  text="$(awk '/^  [a-z-]+-[0-9]:$/ { s = $1 } /PX_JDK:/ { print s, $2 }' \
+    "$T_A2_OUT/deploy/jdk/compose.yaml")"
+  t_contains per_role_jdk_client 'client-0: "21"' "$text"
+  t_contains per_role_jdk_regionserver 'regionserver-0: "17"' "$text"
+  t_gen --class measurement --check -e PX_CLIENT_JDK=11
+  t_equals per_role_jdk_accepts_11 0 "$T_STATUS"
+  t_gen --class measurement --check -e PX_CLIENT_JDK=8
+  t_contains per_role_jdk_refuses_8 'PX_CLIENT_JDK' "$T_STDERR"
+  t_gen --class measurement --check -e PX_RS_JDK=25
+  t_equals per_role_jdk_refuses_25 2 "$T_STATUS"
+  t_gen --class measurement --out fail1 -e PX_RS_HEAP_MIB=
+  t_equals fail_closed_unset_exits_2 2 "$T_STATUS"
+  t_contains fail_closed_unset_names_the_variable PX_RS_HEAP_MIB "$T_STDERR"
+  t_equals fail_closed_unset_writes_no_file no "$(t_exists "$T_A2_OUT/fail1")"
+  t_empty fail_closed_leaves_no_staging_directory \
+    "$(find "$T_A2_OUT" -name '.*.render.*' 2>/dev/null)"
+  t_gen --class measurement --check -e PX_RS_HEAP_MIB=4608
+  t_contains heap_bound_names_the_role 'role regionserver' "$T_STDERR"
+  t_gen --class measurement --check -e PX_NM_MEM_MIB=2176
+  t_contains heap_bound_counts_the_yarn_memory 'role nodemanager' "$T_STDERR"
+  t_gen --class measurement --check -e PX_RS_HEAP_MIB=2048
+  t_equals heap_bound_admits_a_valid_override 0 "$T_STATUS"
+  t_gen --class measurement --check -e PX_HBASE_MEMSTORE_SIZE=0.55
+  t_contains hbase_fractions_bound 'exceeds 0.8' "$T_STDERR"
+  # Verify that any image tag naming a registry host is rejected, whether or not it includes a
+  # port number.
+  miss=""
+  for line in reg.io:5000/x:t ghcr.io/x:t docker.io/library/x:t localhost/x:t; do
+    t_gen --class measurement --check -e "PX_IMAGE_TAG=$line"
+    [ "$T_STATUS" = 2 ] || miss="$miss $line gave $T_STATUS"
+  done
+  t_empty image_tag_grammar "$miss"
+  t_gen --class measurement --out d1
+  t_gen --class measurement --out d2
+  t_empty deterministic "$(diff -r "$T_A2_OUT/d1" "$T_A2_OUT/d2" 2>&1)"
+  cp -R "$T_A2_OUT/d1" "$T_A2/d1-copy"
+  t_gen --class measurement --out d1
+  t_empty deterministic_rerender "$(diff -r "$T_A2_OUT/d1" "$T_A2/d1-copy" 2>&1)"
+  mkdir -p "$T_A2_OUT/foreign"
+  printf 'keep\n' >"$T_A2_OUT/foreign/keep.txt"
+  t_gen --class measurement --out foreign
+  t_equals refuse_foreign_dir 2 "$T_STATUS"
+  t_equals refuse_foreign_dir_keeps_the_file keep "$(cat "$T_A2_OUT/foreign/keep.txt")"
+  mkdir -p "$T_A2_OUT/empty"
+  t_gen --class measurement --out empty
+  t_equals render_into_an_empty_dir 0 "$T_STATUS"
+  t_gen --class measurement --out .
+  t_equals refuse_the_output_root 2 "$T_STATUS"
+  t_gen --class measurement --out "$T_A2/outside"
+  t_equals refuse_a_dir_outside_the_output_root 2 "$T_STATUS"
+  t_gen --class measurement --out dry -e PX_DRY_RUN=1
+  t_equals dry_run_writes_nothing "0 no" "$T_STATUS $(t_exists "$T_A2_OUT/dry")"
+  t_gen --class measurement --out checked --check
+  t_equals check_writes_nothing no "$(t_exists "$T_A2_OUT/checked")"
+  # Verify that the configuration loader reads the generated port map from a rendered deployment
+  # directory as precedence stage 8.
+  t_a2 "PX_DEPLOYMENT_DIR=$T_A2_OUT/deploy/m" "$T_BASH" "$T_BIN/px-cluster" config
+  t_equals loader_reads_port_map "16030${PX_TAB}ports" \
+    "$(printf '%s\n' "$T_STDOUT" | grep "^PX_PORT_REGIONSERVER_RPC_1$PX_TAB" | cut -f 2-3)"
+  bad=""
+  for line in class-measurement.env class-validation.env override-24gib.env; do
+    bad="$bad$(grep -vE '^(#.*)?$' "$T_ENVD/$line" | grep -vE '^PX_[A-Z0-9_]+=[^ ]*$' |
+      sed "s|^|$line: |")"
+  done
+  t_empty class_files_assignments_only "$bad"
+  t_equals class_files_declare_the_same_names \
+    "$(grep -oE '^PX_[A-Z0-9_]+' "$T_ENVD/class-measurement.env" | sort | tr '\n' ' ')" \
+    "$(grep -oE '^PX_[A-Z0-9_]+' "$T_ENVD/class-validation.env" | sort | tr '\n' ' ')"
+  t_gen --strict --class measurement --check
+  t_equals strict_mode_measurement 0 "$T_STATUS"
+  t_gen --strict --class validation --check --config "$T_ENVD/override-24gib.env"
+  t_equals strict_mode_validation_and_override 0 "$T_STATUS"
+  # A re-pinned component release renders with a distinct default image tag so that different
+  # version sets never share a container image.
+  t_gen --class validation --cluster pin -e PX_DIST_HBASE_VERSION=2.6.6
+  t_equals version_set_repin_has_its_own_tag \
+    "0 px-harness:hbase-2.6.6-hadoop-3.4.3-profile-2.6" \
+    "$T_STATUS $(t_env_value "$T_A2_OUT/deploy/pin/topology.env" PX_IMAGE_TAG)"
+  # Two distinct configuration files render two independent deployments, each carrying its own
+  # image tag and JDK selection. The t_group_a2_matrix test group executes such files as a version
+  # matrix.
+  printf 'PX_IMAGE_TAG=px-harness:set-a\n' >"$T_A2/set-a.env"
+  printf 'PX_IMAGE_TAG=px-harness:set-b\nPX_CLIENT_JDK=21\n' >"$T_A2/set-b.env"
+  t_gen --class validation --cluster seta --config "$T_A2/set-a.env"
+  t_gen --class validation --cluster setb --config "$T_A2/set-b.env"
+  t_equals config_files_record_their_image_tag "px-harness:set-a px-harness:set-b" \
+    "$(t_env_value "$T_A2_OUT/deploy/seta/topology.env" PX_IMAGE_TAG) $(t_env_value \
+      "$T_A2_OUT/deploy/setb/topology.env" PX_IMAGE_TAG)"
+  t_contains config_file_sets_the_jdk 'PX_JDK: "21"' \
+    "$(sed -n '/^  client-0:/,/^  [a-z]/p' "$T_A2_OUT/deploy/setb/compose.yaml")"
+}
+
+## @description  Verifies the unified container image: its Dockerfile definition, a launcher branch
+##               for every role, and the rendered configuration for each service.
+## @return       Records the container image assertions. Exit 0.
+t_group_a2_image() {
+  local dir="$T_A2_OUT/deploy/m" out="$T_A2/render" bad="" wild="" https="" service role text line
+  local d='$' props='([aA]ddress|bind-host|hostname|quorum|defaultFS|rootdir)'
+  local hosts='0\.0\.0\.0|(zookeeper|namenode|secondarynamenode|datanode|resourcemanager'
+  hosts="$hosts|nodemanager|jobhistory|hbase-master|regionserver|client|tooling|setup)-[0-9]"
+  printf '# the image\n'
+  t_equals one_image_all_roles "$T_IMG/Dockerfile" \
+    "$(find "$T_IMG" -name 'Dockerfile*' 2>/dev/null)"
+  for role in zookeeper namenode secondarynamenode datanode resourcemanager nodemanager \
+    jobhistory hbase-master regionserver client tooling setup; do
+    grep -qE "^  ([a-z-]+ \| )*$role( \| [a-z-]+)*\)" "$T_IMG/entrypoint.sh" ||
+      bad="$bad $role"
+  done
+  t_empty one_image_all_roles_has_a_launcher "$bad"
+  bad="$(grep '^FROM ' "$T_IMG/Dockerfile" | grep -v '@sha256:')"
+  t_empty dockerfile_args_and_digests "$bad"
+  t_equals dockerfile_is_multi_stage 4 "$(grep -c '^FROM ' "$T_IMG/Dockerfile")"
+  bad=""
+  for role in PX_IMAGE_BASE_JDK11 PX_IMAGE_BASE_JDK17 PX_IMAGE_BASE_JDK21 \
+    PX_IMAGE_BASE_JDK11_SHA256 PX_IMAGE_BASE_JDK17_SHA256 PX_IMAGE_BASE_JDK21_SHA256 \
+    PX_UID PX_GID PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION PX_PHOENIX_HBASE_PROFILE; do
+    grep -q "^ARG $role\$" "$T_IMG/Dockerfile" || bad="$bad $role"
+  done
+  t_empty dockerfile_declares_the_build_arguments "$bad"
+  t_contains dockerfile_amd64_best_effort 'amd64 is best effort' "$(cat "$T_IMG/Dockerfile")"
+  t_contains dockerfile_arm64_primary 'arm64, the primary architecture' \
+    "$(cat "$T_IMG/Dockerfile")"
+  # Verify that commands executed via sb_exec also resolve the rendered configuration directory
+  # through the container environment.
+  bad=""
+  for role in HADOOP_CONF_DIR YARN_CONF_DIR HBASE_CONF_DIR; do
+    grep -qE "^(ENV +| +)$role=\\$\\{PX_CONF_DIR\\}( |$)" "$T_IMG/Dockerfile" ||
+      bad="$bad $role"
+  done
+  t_empty dockerfile_exec_reads_the_rendered_conf "$bad"
+  t_contains arm64_documented_as_primary 'arm64 is the primary architecture' \
+    "$(cat "$PX_HOME/docs/backends.md")"
+  # Verify that every service renders its configuration templates with no unexpanded placeholders
+  # remaining. Every host referenced in an address, bind, or hostname property must be either a
+  # peer hostname of the form <role>-<index> or the bind address 0.0.0.0, and no rendered file may
+  # reference the loopback address.
+  bad=""
+  for service in $(grep -o '^  [a-z-]*-[0-9]:' "$dir/compose.yaml" | tr -d ' :'); do
+    t_render "$dir" "$service"
+    if [ "$T_STATUS" != 0 ]; then
+      bad="$bad$service exit $T_STATUS: $T_STDERR$PX_NL"
+    elif grep -rqF -e "$d{" -e "${d}PX_" "$out" 2>/dev/null; then
+      bad="$bad$service: a placeholder remains$PX_NL"
+    fi
+    wild="$wild$(cat "$out"/*-site.xml 2>/dev/null | tr -d ' \n' |
+      grep -oE "<name>[^<]*$props</name><value>[^<]*</value>" |
+      sed 's|.*<value>\(hdfs://\)\{0,1\}\([^:/<]*\).*|\2|' | grep -vxE "$hosts" |
+      sed "s|^|$service |")"
+    wild="$wild$(grep -rlE '127\.0\.0\.1|localhost' "$out" 2>/dev/null)"
+    # Enabling an HTTPS policy or SSL toggle would activate the default HTTPS wildcard listeners.
+    https="$https$(cat "$out"/*-site.xml 2>/dev/null | tr -d ' \n' |
+      grep -oE '<name>[^<]*(http\.policy|ssl\.enabled)</name><value>[^<]*</value>' |
+      grep -vE '<value>(HTTP_ONLY|false)</value>')"
+  done
+  t_empty render_every_role "$bad"
+  t_empty render_hosts_are_peer_hostnames_or_binds "$wild"
+  t_empty render_no_https_policy "$https"
+  t_render "$dir" jobhistory-0
+  text="$(tr -d ' \n' <"$out/mapred-site.xml" 2>/dev/null)"
+  t_contains render_jobhistory_admin_by_hostname \
+    '<name>mapreduce.jobhistory.admin.address</name><value>jobhistory-0:10033</value>' "$text"
+  t_contains render_jobhistory_binds_every_interface \
+    '<name>mapreduce.jobhistory.bind-host</name><value>0.0.0.0</value>' "$text"
+  t_contains render_jobhistory_reaches_hdfs_by_hostname \
+    '<name>fs.defaultFS</name><value>hdfs://namenode-0:8020</value>' \
+    "$(tr -d ' \n' <"$out/core-site.xml" 2>/dev/null)"
+  t_render "$dir" nodemanager-1
+  text="$(tr -d ' \n' <"$out/yarn-site.xml" 2>/dev/null)"
+  for line in yarn.resourcemanager.address:resourcemanager-0:8032 \
+    yarn.nodemanager.hostname:nodemanager-1 yarn.nodemanager.address:nodemanager-1:8151 \
+    yarn.nodemanager.bind-host:0.0.0.0 yarn.resourcemanager.bind-host:0.0.0.0; do
+    t_contains "render_nodemanager_1_${line%%:*}" \
+      "<name>${line%%:*}</name><value>${line#*:}</value>" "$text"
+  done
+  t_render "$dir" zookeeper-0
+  t_contains render_zookeeper_binds_every_interface 'clientPortAddress=0.0.0.0' \
+    "$(cat "$out/zoo.cfg" 2>/dev/null)"
+  t_render "$dir" client-0
+  t_contains render_client_jdbc_url_by_hostname \
+    'phoenix.jdbc.url=jdbc:phoenix:zookeeper-0:2181:/hbase' \
+    "$(cat "$out/phoenix-client.properties" 2>/dev/null)"
+  t_render "$dir" regionserver-1
+  text="$(tr -d ' \n' <"$out/hbase-site.xml" 2>/dev/null)"
+  for line in hbase.zookeeper.quorum:zookeeper-0 hbase.master.hostname:hbase-master-0 \
+    hbase.unsafe.regionserver.hostname:regionserver-1 hbase.regionserver.ipc.address:0.0.0.0 \
+    hbase.regionserver.info.bindAddress:0.0.0.0 hbase.master.ipc.address:0.0.0.0 \
+    hbase.rootdir:hdfs://namenode-0:8020/hbase; do
+    t_contains "render_regionserver_1_${line%%:*}" \
+      "<name>${line%%:*}</name><value>${line#*:}</value>" "$text"
+  done
+  t_contains render_regionserver_1_rpc_port \
+    '<name>hbase.regionserver.port</name><value>16030</value>' "$text"
+  t_contains render_regionserver_1_info_port \
+    '<name>hbase.regionserver.info.port</name><value>16035</value>' "$text"
+  t_contains render_master_waits_for_every_regionserver \
+    '<name>hbase.master.wait.on.regionservers.mintostart</name><value>3</value>' "$text"
+  t_contains heap_fits_container_g1 '-XX:+UseG1GC' "$(cat "$out/jvm.opts" 2>/dev/null)"
+  t_contains heap_fits_container_fixed_heap '-Xms3072m' "$(cat "$out/jvm.opts")"
+  t_contains heap_fits_container_gc_log "file=$T_A2/logs/gc-regionserver-1.log" \
+    "$(cat "$out/jvm.opts")"
+  t_absent jvm_debug_off_by_default jdwp "$(cat "$out/jvm.opts")"
+  t_render "$T_A2_OUT/deploy/nine" regionserver-1
+  t_contains jvm_debug_binds_every_interface 'address=0.0.0.0:15012' \
+    "$(cat "$out/jvm.opts" 2>/dev/null)"
+  t_render "$dir" datanode-2
+  text="$(tr -d ' \n' <"$out/hdfs-site.xml" 2>/dev/null)"
+  for line in dfs.datanode.address:0.0.0.0:9886 dfs.datanode.hostname:datanode-2 \
+    dfs.namenode.rpc-address:namenode-0:8020 dfs.namenode.rpc-bind-host:0.0.0.0 \
+    dfs.namenode.http-bind-host:0.0.0.0; do
+    t_contains "render_datanode_2_${line%%:*}" \
+      "<name>${line%%:*}</name><value>${line#*:}</value>" "$text"
+  done
+  # Verify that the image renders the replication factor clamped by the deployment generator and
+  # rejects any replication factor that exceeds the configured DataNode count.
+  for line in "rep1 1" "rep2 2"; do
+    t_render "$T_A2_OUT/deploy/${line% *}" namenode-0
+    t_contains "replication_clamp_renders_${line#* }" \
+      "<name>dfs.replication</name><value>${line#* }</value>" \
+      "$(tr -d ' \n' <"$out/hdfs-site.xml" 2>/dev/null)"
+  done
+  t_render "$dir" namenode-0 PX_DN_COUNT=1
+  t_equals replication_above_the_count_is_refused "2 no" "$T_STATUS $(t_exists "$out")"
+  # Verify that each role's JDK version selects the appropriate JVM module options and that
+  # unsupported JDK versions (8 and 25) are rejected.
+  t_render "$dir" client-0 PX_JDK=21
+  t_contains per_role_jdk_21_options '-Djava.security.manager=allow' "$(cat "$out/jvm.opts")"
+  t_render "$dir" regionserver-0
+  t_contains per_role_jdk_17_options '--add-opens=java.base/jdk.internal.util.random=' \
+    "$(cat "$out/jvm.opts")"
+  t_absent per_role_jdk_17_has_no_security_manager 'security.manager' "$(cat "$out/jvm.opts")"
+  t_render "$dir" client-0 PX_JDK=11
+  t_equals per_role_jdk_11_accepted 0 "$T_STATUS"
+  bad=""
+  for line in 8 25; do
+    t_render "$dir" client-0 "PX_JDK=$line"
+    case "$T_STATUS:$T_STDERR" in
+    2:*'is not supported'*) ;;
+    *) bad="$bad JDK $line gave $T_STATUS" ;;
+    esac
+  done
+  t_empty per_role_jdk_refuses_8_and_25 "$bad"
+  # Verify instance identity validation, singleton indexing, and container heap sizing bounds.
+  bad=""
+  for line in "PX_INSTANCE_INDEX=" "PX_INSTANCE_INDEX=3" "PX_RS_COUNT=10" "PX_ROLE=bogus"; do
+    t_render "$dir" regionserver-0 "$line"
+    [ "$T_STATUS" = 2 ] || bad="$bad $line gave $T_STATUS"
+  done
+  t_empty identity_validation "$bad"
+  t_render "$dir" namenode-0 PX_INSTANCE_INDEX=1
+  t_equals identity_singleton_has_index_0 2 "$T_STATUS"
+  t_render "$dir" regionserver-0 PX_HEAP_MIB=4608
+  t_equals heap_fits_container 2 "$T_STATUS"
+  t_contains heap_fits_container_names_the_role 'regionserver' "$T_STDERR"
+  # Verify that the client role renders the YARN configuration files only when YARN is enabled in
+  # the deployment.
+  t_render "$T_A2_OUT/deploy/v" client-0
+  t_equals client_yarn_toggle_off "0 no" "$T_STATUS $(t_exists "$out/yarn-site.xml")"
+  t_render "$dir" client-0
+  t_equals client_yarn_toggle_on "yes yes" \
+    "$(t_exists "$out/yarn-site.xml") $(t_exists "$out/mapred-site.xml")"
+  t_a2_render_cases
+  t_a2_health_cases
+  t_a2_probe_cases
+}
+
+## @description  Verifies the fail-closed template renderer, its all-or-nothing output guarantee,
+##               and the template overlay mechanism.
+## @return       Records the template renderer assertions. Exit 0.
+t_a2_render_cases() {
+  local t="$T_A2/tmpl" bad="" line d='$'
+  mkdir -p "$t/overlay"
+  t_image PX_BIND_HOST= PX_PORT_ZOOKEEPER_CLIENT=2181 PX_DATA_DIR=/d -- "$T_BASH" \
+    "$T_IMG/render.sh" -o "$t/out" "$T_IMG/conf/zoo.cfg.tmpl"
+  t_equals render_fail_closed 2 "$T_STATUS"
+  t_contains render_fail_closed_names_the_variable PX_BIND_HOST "$T_STDERR"
+  t_equals render_fail_closed_writes_no_file no "$(t_exists "$t/out")"
+  printf 'a=%s{foo}\n' "$d" >"$t/foreign.tmpl"
+  t_image -- "$T_BASH" "$T_IMG/render.sh" -o "$t/out" "$t/foreign.tmpl"
+  t_contains render_leftover_aborts_a_foreign_placeholder "${d}{foo} is not a PX_* placeholder" \
+    "$T_STATUS $T_STDERR"
+  printf 'a=%s{PX_EVIL}\n' "$d" >"$t/evil.tmpl"
+  t_image "PX_EVIL=x${d}{PX_BIND_HOST}" PX_BIND_HOST=h -- "$T_BASH" "$T_IMG/render.sh" \
+    -o "$t/out" "$t/evil.tmpl"
+  t_contains render_leftover_aborts 'a placeholder remains' "$T_STDERR"
+  for line in "a=${d}PX_BIND_HOST" "a=${d}{PX_BIND_HOST"; do
+    printf '%s\n' "$line" >"$t/bare.tmpl"
+    t_image PX_BIND_HOST=h -- "$T_BASH" "$T_IMG/render.sh" -o "$t/out" "$t/bare.tmpl"
+    [ "$T_STATUS" = 2 ] || bad="$bad '$line' gave $T_STATUS"
+  done
+  t_empty render_leftover_aborts_bare_and_unclosed "$bad"
+  t_equals render_leftover_writes_no_file no "$(t_exists "$t/out")"
+  t_image PX_BIND_HOST=h PX_PORT_NAMENODE_RPC=8020 PX_DATA_DIR=/d -- "$T_BASH" \
+    "$T_IMG/render.sh" -o "$t/out" "$T_IMG/conf/core-site.xml.tmpl" "$t/foreign.tmpl"
+  t_equals render_all_or_nothing "2 no" "$T_STATUS $(t_exists "$t/out")"
+  printf 'overlay=%s{PX_BIND_HOST}\n' "$d" >"$t/overlay/zoo.cfg.tmpl"
+  t_image PX_BIND_HOST=h PX_PORT_ZOOKEEPER_CLIENT=2181 PX_DATA_DIR=/d -- "$T_BASH" \
+    "$T_IMG/render.sh" -o "$t/out" --overlay "$t/overlay" "$T_IMG/conf/zoo.cfg.tmpl"
+  t_equals render_overlay "0 overlay=h" "$T_STATUS $(cat "$t/out/zoo.cfg" 2>/dev/null)"
+}
+
+## @description  Verifies the container health probe for the HBase Master and for server-less roles
+##               gated by a readiness marker file.
+## @return       Records the health probe assertions. Exit 0.
+t_a2_health_cases() {
+  local master='http://127.0.0.1:16010/jmx?qry=Hadoop:service=HBase,name=Master,sub=Server'
+  local up='"tag.isActiveMaster" : "true", "masterFinishedInitializationTime" : 1'
+  # The container healthcheck probes the local service ports of its own instance over the loopback
+  # interface.
+  local env=(PX_ROLE=hbase-master PX_RS_COUNT=3 PX_PORT_HBASE_MASTER_HTTP=16010)
+  t_curl_body "$master" "{\"beans\":[{$up, \"numRegionServers\" : 2}]}"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals master_waits_for_rs 1 "$T_STATUS"
+  t_contains master_waits_for_rs_reports_the_count '2 of 3 RegionServers checked in' \
+    "$T_STDOUT"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh" live
+  t_equals healthcheck_live_mode_at_2_of_3 0 "$T_STATUS"
+  t_curl_body "$master" "{\"beans\":[{$up, \"numRegionServers\" : 3}]}"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals master_ready_at_3_of_3 0 "$T_STATUS"
+  t_contains healthcheck_ignores_proxies "--noproxy * --max-time" \
+    "$(tail -n 1 "$T_A2_CURL_LOG")"
+  # Because the HBase Master reports itself as active before hbase:meta comes online, the health
+  # probe must report the instance as unready until master initialization has completed.
+  t_curl_body "$master" "{\"beans\":[{${up%1}0, \"numRegionServers\" : 3}]}"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals master_unready_until_initialized "1 yes" \
+    "$T_STATUS $(t_flag 'has not finished its initialization' "$T_STDOUT")"
+  t_curl_body "$master" "{\"beans\":[{${up/true/false}, \"numRegionServers\" : 3}]}"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals master_inactive_is_unready 1 "$T_STATUS"
+  rm -f "$T_A2_CURL_DIR/$(printf '%s' "$master" | LC_ALL=C tr -c 'A-Za-z0-9' '_')"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals master_silent_is_unready 1 "$T_STATUS"
+  t_curl_body "$master" "{\"beans\":[{$up, \"numRegionServers\" : 3}]}"
+  t_image PX_ROLE=hbase-master PX_PORT_HBASE_MASTER_HTTP=16010 -- \
+    "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals master_without_a_count_is_usage 2 "$T_STATUS"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/healthcheck.sh" bogus
+  t_equals healthcheck_unknown_mode 2 "$T_STATUS"
+  # A role that does not run a long-lived daemon, including the one-shot setup role, becomes ready
+  # as soon as its startup sequence writes the readiness marker file.
+  mkdir -p "$T_A2/conf"
+  rm -f "$T_A2/conf/.px-ready"
+  t_image PX_ROLE=client "PX_CONF_DIR=$T_A2/conf" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals healthcheck_client_without_marker 1 "$T_STATUS"
+  t_image PX_ROLE=setup "PX_CONF_DIR=$T_A2/conf" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals healthcheck_setup_unready_until_the_probe_passed 1 "$T_STATUS"
+  : >"$T_A2/conf/.px-ready"
+  t_image PX_ROLE=client "PX_CONF_DIR=$T_A2/conf" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals healthcheck_client_with_marker 0 "$T_STATUS"
+  t_image PX_ROLE=setup "PX_CONF_DIR=$T_A2/conf" -- "$T_BASH" "$T_IMG/healthcheck.sh"
+  t_equals healthcheck_setup_with_marker 0 "$T_STATUS"
+}
+
+## @description  Starts a background loopback listener that replies "imok" to simulate ZooKeeper
+##               responding to the "ruok" four-letter command.
+## @return       Sets T_ZK_PORT and T_ZK_PID. Exit 0, or 1 when nc is absent.
+t_zk_start() {
+  command -v nc >/dev/null 2>&1 || return 1
+  T_ZK_PORT=$((20000 + $$ % 20000))
+  (
+    while :; do
+      printf 'imok\n' | nc -l 127.0.0.1 "$T_ZK_PORT" >/dev/null 2>&1 || sleep 0.1
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  T_ZK_PID=$!
+  px_on_exit "kill $T_ZK_PID 2>/dev/null"
+  sleep 0.3
+  return 0
+}
+
+## @description  Terminates the background listener started by t_zk_start and the nc process it
+##               runs.
+## @return       Stops the fake ZooKeeper listener. Exit 0.
+t_zk_stop() {
+  [ -n "${T_ZK_PID:-}" ] || return 0
+  {
+    kill "$T_ZK_PID"
+    wait "$T_ZK_PID"
+  } 2>/dev/null
+  pkill -f "nc -l 127.0.0.1 $T_ZK_PORT" 2>/dev/null || true
+  T_ZK_PID=""
+}
+
+## @description  Verifies the one-shot setup role, the NameNode formatting gate, and the ordered
+##               cluster bootstrap probe.
+## @return       Records the setup and bootstrap probe assertions. Exit 0.
+t_a2_probe_cases() {
+  local env=() log order rs nn='http://namenode-0:9870/jmx?qry=Hadoop:service=NameNode'
+  local master='http://hbase-master-0:16010/jmx?qry=Hadoop:service=HBase,name=Master,sub=Server'
+  local rm='http://resourcemanager-0:8088/ws/v1/cluster' setup="$T_A2/setup" port
+  local up='"tag.isActiveMaster" : "true", "masterFinishedInitializationTime" : 1'
+  local rsq='/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub=Server'
+  nn="$nn,name=FSNamesystemState"
+  # The setup role formats the NameNode metadata directory once and then executes the bootstrap
+  # probe.
+  mkdir -p "$setup/data" "$setup/conf" "$setup/logs"
+  env=(PX_ROLE=setup PX_INSTANCE_INDEX=0 PX_JDK=17 PX_HEAP_MIB=256 PX_MEM_MIB=512
+    PX_CLUSTER_ID=a2 PX_HOSTNAME=setup-0 PX_BIND_HOST=0.0.0.0 PX_DN_COUNT=1 PX_RS_COUNT=1
+    PX_NM_COUNT=1
+    PX_HDFS_REPLICATION=1 PX_YARN=0 PX_HBASE_BLOCKCACHE_SIZE=0.30 PX_HBASE_MEMSTORE_SIZE=0.35
+    "PX_DATA_DIR=$setup/data" "PX_LOG_DIR=$setup/logs" "PX_CONF_DIR=$setup/conf"
+    "PX_JDK_ROOT=$T_A2/jdk" "PX_HADOOP_HOME=$T_A2/hadoop" "PX_HBASE_HOME=$T_A2/hbase"
+    "PX_PHOENIX_HOME=$T_A2/phoenix" PX_TIMEOUT_READY=1 PX_POLL_INTERVAL_S=0.2)
+  while IFS= read -r port; do
+    env+=("$port")
+  done <<EOF
+$(grep -v '^#' "$T_A2_OUT/deploy/v/ports.generated.env")
+EOF
+  env+=(PX_PORT_ZOOKEEPER_CLIENT=1)
+  # A failed NameNode format leaves no completion marker behind, ensuring that the next startup
+  # attempt retries the format operation.
+  t_image "${env[@]}" PX_FAKE_HDFS_STATUS=1 -- "$T_BASH" "$T_IMG/entrypoint.sh"
+  t_equals setup_failed_format_writes_no_marker "1 no" \
+    "$T_STATUS $(t_exists "$setup/data/namenode/.px-formatted")"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/entrypoint.sh"
+  t_equals setup_formats_then_probes "4 yes" \
+    "$T_STATUS $(t_exists "$setup/data/namenode/.px-formatted")"
+  t_contains setup_probe_stops_at_zookeeper 'fail zookeeper' "$T_STDERR"
+  t_contains setup_probe_reaches_zookeeper_by_hostname 'ruok on zookeeper-0:1' "$T_STDERR"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/entrypoint.sh"
+  t_contains setup_formats_once 'formatted already' "$T_STDERR"
+  rm -rf "$setup/data"
+  mkdir -p "$setup/data"
+  t_image "${env[@]}" PX_ROLE=namenode -- "$T_BASH" "$T_IMG/entrypoint.sh"
+  t_equals namenode_gate 4 "$T_STATUS"
+  t_contains namenode_gate_names_the_setup_role 'the setup role formats it' "$T_STDERR"
+  # Exercise the ordered bootstrap probe against simulated responses for every subject. The probe
+  # contacts each peer by its hostname, which the fake curl utility serves. Because the fake
+  # ZooKeeper listener binds to the loopback address of this host, the probe runs as the zookeeper
+  # instance so that it reaches its own client port on the loopback interface.
+  if ! t_zk_start; then
+    t_skip bootstrap_probe_order_and_failure "no nc to stand in for ZooKeeper"
+    return 0
+  fi
+  t_curl_body "$nn" '{"beans":[{"FSState" : "Operational", "NumLiveDataNodes" : 3}]}'
+  t_curl_body "$master" "{\"beans\":[{$up, \"numRegionServers\" : 3}]}"
+  for rs in 0:16025 1:16035 2:16045; do
+    t_curl_body "http://regionserver-${rs%:*}:${rs#*:}$rsq" \
+      '{"beans":[{"tag.clusterId" : "c1"}]}'
+  done
+  t_curl_body "$rm/info" '{"clusterInfo":{"state":"STARTED"}}'
+  t_curl_body "$rm/metrics" '{"clusterMetrics":{"activeNodes":3}}'
+  t_curl_body 'http://jobhistory-0:19888/ws/v1/history/info' '{"historyInfo":{"startedOn":1}}'
+  mkdir -p "$T_A2/probe-logs" "$T_A2/hooks"
+  env=(PX_ROLE=zookeeper "PX_PORT_ZOOKEEPER_CLIENT=$T_ZK_PORT"
+    PX_PORT_NAMENODE_HTTP=9870 PX_PORT_HBASE_MASTER_HTTP=16010
+    PX_PORT_REGIONSERVER_HTTP_0=16025 PX_PORT_REGIONSERVER_HTTP_1=16035
+    PX_PORT_REGIONSERVER_HTTP_2=16045 PX_PORT_RESOURCEMANAGER_HTTP=8088
+    PX_PORT_JOBHISTORY_HTTP=19888 PX_DN_COUNT=3 PX_RS_COUNT=3 PX_NM_COUNT=3
+    "PX_HADOOP_HOME=$T_A2/hadoop" "PX_LOG_DIR=$T_A2/probe-logs" PX_TIMEOUT_READY=2
+    PX_POLL_INTERVAL_S=0.3)
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe" --yarn
+  t_equals bootstrap_probe_verifies_every_subject 0 "$T_STATUS"
+  log="$(cat "$T_A2/probe-logs/bootstrap-probe.log" 2>/dev/null)"
+  t_contains bootstrap_probe_logs_its_plan \
+    'plan zookeeper hdfs hdfs-namespace hbase-master regionservers yarn workload-setup monitors' \
+    "$log"
+  order="$(printf '%s\n' "$log" | sed -n 's/.* ok   \([a-z-]*\):.*/\1/p' | tr '\n' ' ')"
+  t_equals bootstrap_probe_runs_in_order \
+    'zookeeper hdfs hdfs-namespace hbase-master regionservers yarn monitors ' "$order"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe"
+  t_contains bootstrap_probe_skips_yarn_without_the_flag 'skip yarn' "$T_STDERR"
+  t_curl_body "$nn" '{"beans":[{"FSState" : "Operational", "NumLiveDataNodes" : 2}]}'
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe"
+  t_equals bootstrap_probe_fails_hdfs "4 yes" "$T_STATUS $(t_flag 'fail hdfs:' "$T_STDERR")"
+  t_curl_body "$nn" '{"beans":[{"FSState" : "Operational", "NumLiveDataNodes" : 3}]}'
+  t_image "${env[@]}" PX_FAKE_HDFS_STATUS=1 -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe"
+  t_equals bootstrap_probe_fails_hdfs_namespace "1 yes" \
+    "$T_STATUS $(t_flag 'fail hdfs-namespace' "$T_STDERR")"
+  t_curl_body "$master" "{\"beans\":[{${up%1}0, \"numRegionServers\" : 3}]}"
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe"
+  t_equals bootstrap_probe_fails_master "4 yes" \
+    "$T_STATUS $(t_flag 'fail hbase-master' "$T_STDERR")"
+  t_curl_body "$master" "{\"beans\":[{$up, \"numRegionServers\" : 3}]}"
+  t_curl_body "http://regionserver-2:16045$rsq" \
+    '{"beans":[{"tag.clusterId" : ""}]}'
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe"
+  t_equals bootstrap_probe_fails_one_regionserver "4 yes" \
+    "$T_STATUS $(t_flag 'regionserver 2: the RegionServer has not joined' "$T_STDERR")"
+  t_curl_body "http://regionserver-2:16045$rsq" \
+    '{"beans":[{"tag.clusterId" : "c1"}]}'
+  t_curl_body "$rm/metrics" '{"clusterMetrics":{"activeNodes":2}}'
+  t_image "${env[@]}" -- "$T_BASH" "$T_IMG/bin/px-bootstrap-probe" --yarn
+  t_equals bootstrap_probe_fails_yarn "4 yes" "$T_STATUS $(t_flag 'fail yarn' "$T_STDERR")"
+  printf '#!/usr/bin/env bash\nexit 3\n' >"$T_A2/hooks/10-fails"
+  chmod +x "$T_A2/hooks/10-fails"
+  t_image "${env[@]}" "PX_BOOTSTRAP_SETUP_DIR=$T_A2/hooks" -- "$T_BASH" \
+    "$T_IMG/bin/px-bootstrap-probe"
+  t_equals bootstrap_probe_fails_workload_setup "1 yes" \
+    "$T_STATUS $(t_flag 'fail workload-setup' "$T_STDERR")"
+  : >"$T_A2/heartbeat"
+  touch -t 202001010000 "$T_A2/heartbeat"
+  t_image "${env[@]}" "PX_MONITOR_HEARTBEATS=$T_A2/heartbeat" -- "$T_BASH" \
+    "$T_IMG/bin/px-bootstrap-probe"
+  t_equals bootstrap_probe_fails_a_stale_monitor "4 yes" \
+    "$T_STATUS $(t_flag 'fail monitors' "$T_STDERR")"
+  t_zk_stop
+}
+
+## @description  Verifies host preflight checks: engine memory budget, container heap bounds,
+##               Compose memory syntax forms, and fast-phase delegation.
+## @return       Records the host preflight assertions. Exit 0.
+t_group_a2_preflight() {
+  local pf="$PX_HOME/scripts/preflight.sh" hand="$T_A2/hand" row status_seen=""
+  printf '# the host preflight\n'
+  printf '25167863808\n' >"$T_A2_STATE/mem-total"
+  t_a2 PX_CLUSTER_ID=m "$T_BASH" "$pf" --phase memory
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_refuses_measurement_on_this_engine 3 "$T_STATUS"
+  row="$(printf '%s\n' "$T_STDOUT" | grep "^memory_fit${PX_TAB}fail")"
+  t_contains preflight_refusal_shows_the_sum '41984 MiB (41.00 GiB)' "$row"
+  t_contains preflight_refusal_shows_the_budget 'budget 19905 MiB (19.44 GiB)' "$row"
+  t_contains preflight_refusal_shows_the_engine 'engine 24001 MiB (23.44 GiB)' "$row"
+  t_contains preflight_refusal_shows_the_headroom 'headroom 4096 MiB (4.00 GiB)' "$row"
+  t_contains preflight_refusal_lists_the_roles 'regionserver: 3 instance(s), 13824 MiB' \
+    "$T_STDERR"
+  t_contains preflight_counts_the_on_demand_group 'group yarn starts on demand' "$T_STDERR"
+  t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_admits_validation 0 "$T_STATUS"
+  t_contains preflight_admits_validation_with_the_sum "memory_fit${PX_TAB}ok${PX_TAB}the limits \
+8704 MiB" "$T_STDOUT"
+  t_gen --class measurement --cluster o --config "$T_ENVD/override-24gib.env"
+  t_a2 PX_CLUSTER_ID=o "$T_BASH" "$pf" --phase memory
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_admits_override_24gib 0 "$T_STATUS"
+  t_contains preflight_admits_override_24gib_with_margin '705 MiB (0.69 GiB) to spare' \
+    "$T_STDOUT"
+  # Verify the memory_check boundary: admit a topology that sits 1 GiB below the available budget
+  # and reject one that exceeds the budget by 1 GiB.
+  printf '%s\n' "$(((8704 + 4096 + 1024) * 1048576))" >"$T_A2_STATE/mem-total"
+  t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory
+  status_seen="$status_seen $T_STATUS"
+  t_equals memory_check_passes_below_the_budget "0 yes" \
+    "$T_STATUS $(t_flag '1024 MiB (1.00 GiB) to spare' "$T_STDOUT")"
+  printf '%s\n' "$(((8704 + 4096 - 1024) * 1048576))" >"$T_A2_STATE/mem-total"
+  t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory
+  status_seen="$status_seen $T_STATUS"
+  t_equals memory_check_refuses_above_the_budget 3 "$T_STATUS"
+  row="$(printf '%s\n' "$T_STDOUT" | grep "^memory_fit${PX_TAB}")"
+  t_contains memory_check_names_both_totals 'the limits 8704 MiB (8.50 GiB)' "$row"
+  t_contains memory_check_names_the_engine_total 'the engine 11776 MiB (11.50 GiB)' "$row"
+  t_contains memory_check_names_the_excess 'exceed the budget by 1024 MiB (1.00 GiB)' "$row"
+  printf '25167863808\n' >"$T_A2_STATE/mem-total"
+  # Verify that a service's configured JVM heap size must remain strictly below its container
+  # memory limit.
+  mkdir -p "$hand/heap" "$hand/nolimit" "$hand/none" "$hand/empty" "$hand/forms"
+  cat >"$hand/heap/compose.yaml" <<'A2_EOF'
+services:
+  regionserver-0:
+    mem_limit: 3072m
+    labels:
+      px.harness.role: "regionserver"
+    environment:
+      PX_HEAP_MIB: "5000"
+A2_EOF
+  t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/heap"
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_heap_bound 3 "$T_STATUS"
+  t_contains preflight_heap_bound_names_the_role "heap_bound${PX_TAB}fail${PX_TAB}regionserver: \
+the heap of 5000 MiB is not below the container limit of 3072 MiB" "$T_STDOUT"
+  sed 's/"5000"/"2048"/' "$hand/heap/compose.yaml" >"$hand/heap/c2" &&
+    mv "$hand/heap/c2" "$hand/heap/compose.yaml"
+  t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/heap"
+  t_absent preflight_heap_below_the_limit_passes 'heap_bound' "$T_STDOUT"
+  printf 'services:\n  x:\n    image: "y"\n' >"$hand/nolimit/compose.yaml"
+  t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/nolimit"
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_unmeasured_limit "1 yes" \
+    "$T_STATUS $(t_flag 'service x (x) has no memory limit' "$T_STDOUT")"
+  t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/none"
+  t_equals preflight_unmeasured_deployment "1 yes" \
+    "$T_STATUS $(t_flag 'no rendered deployment at' "$T_STDOUT")"
+  printf 'services: {}\n' >"$hand/empty/compose.yaml"
+  t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/empty"
+  t_contains preflight_unmeasured_no_service 'declares no service' "$T_STDOUT"
+  cat >"$hand/forms/compose.yaml" <<'A2_EOF'
+services:
+  rs:
+    labels:
+      - "px.harness.role=regionserver"
+    environment:
+      - PX_HEAP_MIB=3072
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          memory: 4.5G
+  cl:
+    scale: 2
+    mem_limit: "4096MiB"
+    labels:
+      px.harness.role: "client"
+volumes:
+  data:
+    labels:
+      px.harness.cluster: "x"
+A2_EOF
+  t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/forms" -n
+  t_contains preflight_parses_compose_forms_replicas \
+    "memory:regionserver${PX_TAB}ok${PX_TAB}3 x 4608 MiB = 13824 MiB" "$T_STDOUT"
+  t_contains preflight_parses_compose_forms_scale \
+    "memory:client${PX_TAB}ok${PX_TAB}2 x 4096 MiB = 8192 MiB" "$T_STDOUT"
+  # Verify that the fast phase delegates runtime and port availability checks to the backend
+  # preflight.
+  mkdir -p "$hand/fast"
+  cp "$T_DEPLOY/compose.yaml" "$T_DEPLOY/ports.generated.env" "$hand/fast/"
+  t_a2 "$T_BASH" "$pf" --phase fast --deployment "$hand/fast"
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_fast_phase 0 "$T_STATUS"
+  t_contains preflight_fast_phase_reports_the_ports "port_availability${PX_TAB}ok" "$T_STDOUT"
+  t_contains preflight_fast_phase_reports_the_engine "engine_memory${PX_TAB}ok" "$T_STDOUT"
+  t_a2 "$T_BASH" "$pf" --deployment "$hand/fast"
+  t_equals preflight_runs_both_phases "0 yes yes" \
+    "$T_STATUS $(t_flag engine_binary "$T_STDOUT") $(t_flag memory_fit "$T_STDOUT")"
+  : >"$T_A2_STATE/unreachable"
+  t_a2 "$T_BASH" "$pf" --phase fast --deployment "$hand/fast"
+  status_seen="$status_seen $T_STATUS"
+  t_equals preflight_fast_phase_refuses_a_silent_engine 3 "$T_STATUS"
+  rm -f "$T_A2_STATE/unreachable"
+  t_a2 "$T_BASH" "$pf" --phase slow
+  t_equals preflight_unknown_phase 2 "$T_STATUS"
+  t_a2 "$T_BASH" "$pf" --bogus
+  t_equals preflight_unknown_option 2 "$T_STATUS"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pf" -n --deployment "$T_A2_OUT/deploy/m"
+  t_equals preflight_dry_run "0 yes" "$T_STATUS $(t_flag 'limits sum to 41984 MiB' "$T_STDOUT")"
+  t_empty preflight_dry_run_calls_no_runtime "$(cat "$T_SHIM_LOG")"
+  t_absent preflight_never_returns_4 ' 4' "$status_seen"
+}
+
+## @description  Verifies pinned artifact downloads, the local Phoenix Maven build, and container
+##               image context staging and building.
+## @return       Records the distribution and build assertions. Exit 0.
+t_group_a2_dist() {
+  local fd="$PX_HOME/scripts/fetch-dist.sh" fixture="$T_A2/dist-src/hbase-2.6.7.tar.gz"
+  local sum other pins="$T_A2_OUT/dist/pins.env" url bad="" ctx tree="$T_A2/tree" text line
+  local bp="$PX_HOME/scripts/build-phoenix.sh" sa="$PX_HOME/scripts/stage-artifacts.sh"
+  local pins_env=() jdk="$T_A2/jdk/17" foo=(PX_DIST_FOO_VERSION=1 PX_DIST_FOO_PATH=x/foo-1.tar.gz)
+  local versions="$PX_HOME/$PX_DEPLOY_SUBDIR/versions.env" archive=https://archive.apache.org/dist
+  local tag=px-harness:hbase-2.6.7-hadoop-3.4.3-profile-2.6
+  local hadoop="$T_A2/dist-src/hadoop-3.4.3.tar.gz"
+  local local_env="$T_A2/versions.local.env" probe="$T_WORK/probe/versions-check.sh"
+  printf '# pinned downloads, the Phoenix build and the image context\n'
+  sum="$(px_sha512 "$fixture")"
+  url='https://archive.apache.org/dist/x/foo-1.tar.gz'
+  t_curl_file "$url" "$fixture"
+  t_a2 "${foo[@]}" "PX_DIST_FOO_1_SHA512_ARM64=$(printf 'a%.0s' $(seq 1 128))" "$T_BASH" "$fd" foo
+  t_equals pin_mismatch_aborts 1 "$T_STATUS"
+  t_contains pin_mismatch_names_the_expected_hash "expected $(printf 'a%.0s' $(seq 1 128))" \
+    "$T_STDERR"
+  t_contains pin_mismatch_names_the_actual_hash "actual $sum" "$T_STDERR"
+  t_empty pin_mismatch_keeps_no_file "$(find "$T_A2_OUT/dist" -type f ! -name pins.env)"
+  # Verify that a SHA-512 pin split across multiple continuation variables to respect line-length
+  # limits is reassembled before verification.
+  t_a2 "${foo[@]}" "PX_DIST_FOO_1_SHA512_ARM64=${sum:0:50}" \
+    "PX_DIST_FOO_1_SHA512_ARM64_2=${sum:50:50}" "PX_DIST_FOO_1_SHA512_ARM64_3=${sum:100}" \
+    "$T_BASH" "$fd" foo
+  t_equals pin_in_parts_is_joined "0 pinned" "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
+  rm -f "$T_A2_OUT/dist/foo-1.tar.gz"
+  t_a2 "${foo[@]}" "PX_DIST_FOO_1_SHA512_ARM64=$sum" "PX_DIST_FOO_1_SHA512_ARM64_2=${sum:64}" \
+    "$T_BASH" "$fd" foo
+  t_equals pin_whole_is_not_joined "0 pinned" "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
+  rm -f "$T_A2_OUT/dist/foo-1.tar.gz"
+  : >"$T_A2_CURL_LOG"
+  t_a2 "${foo[@]}" "$T_BASH" "$fd" foo
+  t_equals tofu_records_pin "0 tofu" "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
+  t_contains tofu_records_pin_under_the_output_root "PX_DIST_FOO_1_SHA512_ARM64=$sum" \
+    "$(cat "$pins" 2>/dev/null)"
+  t_contains tofu_logs_the_hash 'trust on first use' "$T_STDERR"
+  t_contains fetch_mirror_falls_back_to_the_archive "$url" "$(cat "$T_A2_CURL_LOG")"
+  t_contains fetch_curl_refuses_other_schemes '--proto =https --proto-redir =https' \
+    "$(cat "$T_A2_CURL_LOG")"
+  : >"$T_A2_CURL_LOG"
+  t_a2 "${foo[@]}" "$T_BASH" "$fd" foo
+  t_equals tofu_reuses_the_record "0 recorded" "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
+  t_empty tofu_reuse_fetches_nothing "$(cat "$T_A2_CURL_LOG")"
+  rm -f "$T_A2_OUT/dist/foo-1.tar.gz"
+  t_a2 "${foo[@]}" "$T_BASH" "$fd" foo
+  t_equals tofu_verifies_a_new_download_against_the_record "0 recorded" \
+    "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
+  rm -f "$T_A2_OUT/dist/foo-1.tar.gz"
+  other="$T_A2/dist-src/other.tar.gz"
+  printf 'other bytes\n' >"$other"
+  t_curl_file "$url" "$other"
+  t_a2 "${foo[@]}" "$T_BASH" "$fd" foo
+  t_equals tofu_refuses_changed_bytes 1 "$T_STATUS"
+  # Because a recorded hash pin is scoped to a specific release version, downloading a different
+  # release of the same component triggers trust on first use again.
+  t_curl_file 'https://archive.apache.org/dist/x/foo-2.tar.gz' "$other"
+  t_a2 PX_DIST_FOO_VERSION=2 'PX_DIST_FOO_PATH=x/foo-{version}.tar.gz' "$T_BASH" "$fd" foo
+  t_equals tofu_pin_belongs_to_one_release "0 tofu 2" \
+    "$T_STATUS $(px_tsv_field 6 "$T_STDOUT") $(px_tsv_field 3 "$T_STDOUT")"
+  t_curl_file "$url" "$fixture"
+  # Verify that cached archive files are re-validated against their hash pin on every invocation.
+  t_a2 "${foo[@]}" "PX_DIST_FOO_1_SHA512_ARM64=$sum" "$T_BASH" "$fd" foo
+  printf 'tampered\n' >>"$T_A2_OUT/dist/foo-1.tar.gz"
+  t_a2 "${foo[@]}" "PX_DIST_FOO_1_SHA512_ARM64=$sum" "$T_BASH" "$fd" foo
+  t_equals fetch_cache_reverified "0 pinned" "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
+  t_contains fetch_cache_reverified_warns 'it is fetched again' "$T_STDERR"
+  : >"$T_A2_CURL_LOG"
+  t_a2 PX_DIST_FOO_VERSION=1 PX_DIST_FOO_URL=http://example.org/foo.tgz "$T_BASH" "$fd" foo
+  t_equals fetch_refuses_non_https "2 yes" \
+    "$T_STATUS $(t_flag 'only HTTPS addresses are fetched' "$T_STDERR")"
+  t_empty fetch_refuses_non_https_before_a_request "$(cat "$T_A2_CURL_LOG")"
+  bad="$(grep -rn 'http://' "$PX_HOME/scripts" "$PX_HOME/$PX_DEPLOY_SUBDIR" 2>/dev/null |
+    grep -v ':[[:space:]]*#' | grep -v 'www.apache.org/licenses' |
+    grep -vE "http://(127\\.0\\.0\\.1|\\\$host)")"
+  t_empty fetch_no_http_download_target "$bad"
+  t_curl_body 'https://www.apache.org/dyn/closer.lua?path=x/bar-1.tar.gz&asjson=1' \
+    '{"preferred": "https://dlcdn.apache.org/"}'
+  t_curl_file 'https://dlcdn.apache.org/x/bar-1.tar.gz' "$fixture"
+  : >"$T_A2_CURL_LOG"
+  t_a2 PX_DIST_BAR_VERSION=1 PX_DIST_BAR_PATH=x/bar-1.tar.gz "$T_BASH" "$fd" bar
+  t_equals fetch_mirror_resolution 0 "$T_STATUS"
+  t_contains fetch_mirror_resolution_uses_the_mirror 'https://dlcdn.apache.org/x/bar-1.tar.gz' \
+    "$(cat "$T_A2_CURL_LOG")"
+  t_curl_body 'https://www.apache.org/dyn/closer.lua?path=x/baz-1.tar.gz&asjson=1' \
+    '{"preferred": "http://insecure.example/"}'
+  t_curl_file 'https://archive.apache.org/dist/x/baz-1.tar.gz' "$fixture"
+  t_a2 PX_DIST_BAZ_VERSION=1 PX_DIST_BAZ_PATH=x/baz-1.tar.gz "$T_BASH" "$fd" baz
+  t_equals fetch_mirror_ignores_an_http_answer "0 yes" \
+    "$T_STATUS $(t_flag 'not HTTPS, it is ignored' "$T_STDERR")"
+  t_curl_file 'https://github.com/r/v1/tool-arm64.tar.gz' "$fixture"
+  t_curl_file 'https://example.org/jhiccup.tar.gz' "$fixture"
+  : >"$T_A2_CURL_LOG"
+  t_a2 PX_DIST_TOOL_VERSION=1 PX_DIST_TOOL_BASE_URL=https://github.com/r \
+    'PX_DIST_TOOL_FILE_ARM64=v{version}/tool-arm64.tar.gz' PX_DIST_HICCUP_VERSION=1 \
+    PX_DIST_HICCUP_URL=https://example.org/jhiccup.tar.gz "$T_BASH" "$fd" tool hiccup
+  t_equals fetch_dedicated_flows "0 tofu tofu" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    cut -f 6 | tr '\n' ' ' | sed 's/ $//')"
+  t_absent fetch_dedicated_flows_skip_the_mirror 'closer.lua' "$(cat "$T_A2_CURL_LOG")"
+  t_contains fetch_base_url_and_file_join 'https://github.com/r/v1/tool-arm64.tar.gz' \
+    "$(cat "$T_A2_CURL_LOG")"
+  # Verify that the host CPU architecture selects the architecture-specific download path, URL, and
+  # hash pin.
+  t_curl_file 'https://archive.apache.org/dist/x/amd.tar.gz' "$fixture"
+  t_a2 PX_FAKE_UNAME_M=x86_64 PX_DIST_QUX_VERSION=1 PX_DIST_QUX_PATH_AMD64=x/amd.tar.gz \
+    PX_DIST_QUX_PATH_ARM64=x/arm.tar.gz "$T_BASH" "$fd" qux
+  t_equals fetch_arch_amd64 "0 amd64" "$T_STATUS $(px_tsv_field 2 "$T_STDOUT")"
+  t_a2 PX_FAKE_UNAME_M=riscv64 PX_DIST_QUX_VERSION=1 PX_DIST_QUX_PATH=x/a.tar.gz "$T_BASH" \
+    "$fd" qux
+  t_equals fetch_arch_unsupported 5 "$T_STATUS"
+  bad=""
+  for line in "6 nosuch" "2 Bad_Name"; do
+    t_a2 "$T_BASH" "$fd" "${line#* }"
+    [ "$T_STATUS" = "${line%% *}" ] || bad="$bad ${line#* } gave $T_STATUS"
+  done
+  t_a2 PX_DIST_BOTH_VERSION=1 PX_DIST_BOTH_PATH=x/a.tar.gz PX_DIST_BOTH_URL=https://e.org/a.tar.gz \
+    "$T_BASH" "$fd" both
+  [ "$T_STATUS" = 2 ] || bad="$bad both gave $T_STATUS"
+  t_a2 "${foo[@]}" PX_DIST_FOO_1_SHA512_ARM64=xyz "$T_BASH" "$fd" foo
+  [ "$T_STATUS" = 2 ] || bad="$bad pin xyz gave $T_STATUS"
+  t_a2 PX_DIST_FOO_PATH=x/foo-1.tar.gz "$T_BASH" "$fd" foo
+  [ "$T_STATUS" = 2 ] || bad="$bad an entry without a release gave $T_STATUS"
+  t_empty fetch_arch_and_errors "$bad"
+  : >"$T_A2_CURL_LOG"
+  t_a2 "${foo[@]}" "$T_BASH" "$fd" -n foo
+  t_equals fetch_dry_run "0 " "$T_STATUS $(cat "$T_A2_CURL_LOG")"
+  # Verify that the default version catalog tracks the latest patch releases with declared hash
+  # pins, and that the committed catalog defines only fallback defaults so any precedence stage can
+  # re-pin the active selection.
+  t_equals versions_track_the_latest_patch_releases "2.6 2.6.7 3.4.3" \
+    "$(t_env_value "$versions" PX_PHOENIX_HBASE_PROFILE_DEFAULT PX_DIST_HBASE_DEFAULT_2_6 \
+      PX_DIST_HADOOP_DEFAULT)"
+  t_empty versions_set_no_selection "$(grep -E \
+    '^PX_(PHOENIX_HBASE_PROFILE|DIST_HBASE_VERSION|DIST_HADOOP_VERSION|IMAGE_TAG)=' "$versions")"
+  t_a2 "$T_BASH" "$fd" -n hbase hadoop
+  t_equals declared_pins_cover_the_defaults "0 2 0" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    grep -c "^plan${PX_TAB}fetch${PX_TAB}.* pinned\$") $(printf '%s\n' "$T_STDOUT" |
+    grep -c ' tofu$')"
+  t_contains default_hbase_path "$archive/hbase/2.6.7/hbase-2.6.7-hadoop3-bin.tar.gz" "$T_STDOUT"
+  t_contains default_hadoop_arm64_file \
+    "$archive/hadoop/common/hadoop-3.4.3/hadoop-3.4.3-aarch64.tar.gz" "$T_STDOUT"
+  t_a2 PX_FAKE_UNAME_M=x86_64 "$T_BASH" "$fd" -n hbase hadoop
+  t_equals declared_pins_cover_the_defaults_amd64 "0 2" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    grep -c "^plan${PX_TAB}fetch${PX_TAB}.* pinned\$")"
+  t_contains default_hadoop_amd64_file "$archive/hadoop/common/hadoop-3.4.3/hadoop-3.4.3.tar.gz" \
+    "$T_STDOUT"
+  t_a2 PX_DIST_HADOOP_VERSION=3.4.2 "$T_BASH" "$fd" -n hadoop
+  t_contains hadoop_arm64_file_per_release \
+    "$archive/hadoop/common/hadoop-3.4.2/hadoop-3.4.2-aarch64-lean.tar.gz" "$T_STDOUT"
+  t_a2 PX_DIST_HADOOP_VERSION=3.9.9 "$T_BASH" "$fd" -n hadoop
+  t_equals hadoop_release_without_an_arm64_file "6 yes" \
+    "$T_STATUS $(t_flag 'PX_DIST_HADOOP_3_9_9_PATH' "$T_STDERR")"
+  # A declared hash pin for a default release is always strictly enforced and never silently
+  # replaced by trust on first use: serving the test fixture tarball at the HBase 2.6.7 URL must be
+  # rejected.
+  t_curl_file "$archive/hbase/2.6.7/hbase-2.6.7-hadoop3-bin.tar.gz" "$fixture"
+  t_a2 "$T_BASH" "$fd" hbase
+  line="$(t_env_value "$versions" PX_DIST_HBASE_2_6_7_SHA512_ARM64)"
+  line="$line$(t_env_value "$versions" PX_DIST_HBASE_2_6_7_SHA512_ARM64_2)"
+  t_equals declared_pin_refuses_other_bytes "1 yes" \
+    "$T_STATUS $(t_flag "expected $line, actual $sum" "$T_STDERR")"
+  t_absent declared_pin_records_no_tofu PX_DIST_HBASE_2_6_7 "$(cat "$pins" 2>/dev/null)"
+  # Verify that every supported HBase profile maps to its corresponding compatibility module in the
+  # repository pom.xml and that its default HBase release falls within that module's supported
+  # version range.
+  bad=""
+  for line in 2.5.0:2.5.0:2.5.3 2.5.4:2.5.4:2.5.10 2.5:2.5.4:2.5.16 2.6.0:2.6.0:2.6.1 \
+    2.6.3:2.6.0:2.6.3 2.6:2.6.4:2.6.7; do
+    IFS=: read -r text other url <<<"$line"
+    t_a2 "PX_PHOENIX_HBASE_PROFILE=$text" "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" \
+      --tree "$PX_TREE_ROOT" -n
+    case "$T_STATUS $T_STDERR" in
+    "0 "*"profile $text (compatibility module $other) compiles against HBase "*) ;;
+    *) bad="$bad $text:build" ;;
+    esac
+    t_a2 "PX_PHOENIX_HBASE_PROFILE=$text" "$T_BASH" "$probe"
+    [ "$T_STATUS $T_STDOUT" = "0 $text $url" ] || bad="$bad $text:$T_STATUS:$T_STDOUT"
+  done
+  t_empty profiles_map_to_their_module_and_default_release "$bad"
+  # Verify that an HBase release outside the version range admitted by its profile's compatibility
+  # module is rejected, both at the upper and lower bounds of a closed range and below the floor of
+  # an open-ended range.
+  bad=""
+  for line in 2.6.0:2.6.7:'2.6.0 to 2.6.3' 2.6:2.6.3:'2.6.4 and every later 2.6 release' \
+    2.6:2.7.0:'2.6.4 and every later 2.6 release' 2.5.0:2.5.4:'2.5.0 to 2.5.3'; do
+    IFS=: read -r text other url <<<"$line"
+    t_a2 "PX_PHOENIX_HBASE_PROFILE=$text" "PX_DIST_HBASE_VERSION=$other" "$T_BASH" "$probe"
+    case "$T_STATUS $T_STDERR" in
+    "2 "*"HBase '$other'"*"of profile $text: its compatibility module"*"admits HBase $url"*) ;;
+    *) bad="$bad $text:$other" ;;
+    esac
+  done
+  t_a2 PX_PHOENIX_HBASE_PROFILE=2.7 "$T_BASH" "$probe"
+  [ "$T_STATUS" = 2 ] || bad="$bad unknown profile gave $T_STATUS"
+  t_empty range_refuses_a_release_outside_the_module "$bad"
+  t_a2 PX_PHOENIX_HBASE_PROFILE=2.6.0 PX_DIST_HBASE_VERSION=2.6.7 "$T_BASH" \
+    "$PX_HOME/scripts/preflight.sh" -n
+  t_equals preflight_refuses_a_release_outside_the_range "2 yes" \
+    "$T_STATUS $(t_flag "admits HBase 2.6.0 to 2.6.3" "$T_STDERR")"
+  # Verify phoenix_is_local_only (R-019): Phoenix artifacts are always built from the local working
+  # tree and never downloaded from a remote distribution URL.
+  t_empty phoenix_is_local_only "$(grep -rniE 'https?://[^ ]*phoenix[^ ]*(\.tar\.gz|\.jar)' \
+    "$PX_HOME/scripts" "$PX_HOME/$PX_DEPLOY_SUBDIR" 2>/dev/null)"
+  t_empty phoenix_is_never_a_dist_entry "$(grep '^PX_DIST_' "$versions" | grep -i phoenix)"
+  t_contains phoenix_jars_come_from_the_build_record \
+    'for SA_KEY in server_jar client_jar pherf_jar distributed_jar' "$(cat "$sa")"
+  # Verify build-phoenix.sh (R-028): the selected HBase profile is propagated to the Maven command
+  # line.
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -n
+  t_equals build_phoenix_dry_run 0 "$T_STATUS"
+  t_contains build_phoenix_dry_run_names_the_jdk "JAVA_HOME=$jdk" "$T_STDOUT"
+  t_contains build_phoenix_dry_run_names_the_modules \
+    '-pl phoenix-server,phoenix-client-parent/phoenix-client-embedded,phoenix-pherf -am' \
+    "${T_STDOUT//\\/}"
+  t_contains build_phoenix_dry_run_selects_the_default_profile '-Dhbase.profile=2.6 -DskipTests' \
+    "$T_STDOUT"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHOENIX_HBASE_PROFILE=2.5 "$T_BASH" "$bp" --tree "$tree" -n
+  t_contains build_phoenix_profile_reaches_maven '-Dhbase.profile=2.5 -DskipTests' "$T_STDOUT"
+  t_empty build_phoenix_dry_run_runs_no_maven "$(cat "$T_A2_MVN_LOG")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHOENIX_HBASE_PROFILE=2.7 "$T_BASH" "$bp" --tree "$tree" -n
+  t_equals build_phoenix_refuses_an_unknown_profile 2 "$T_STATUS"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHOENIX_HBASE_PROFILE=2.6.3 "$T_BASH" "$bp" --tree "$tree" -n
+  t_equals build_phoenix_refuses_a_pom_with_another_module "1 yes" \
+    "$T_STATUS $(t_flag 'Bring the table up to date' "$T_STDERR")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  t_equals build_phoenix_builds_and_records 0 "$T_STATUS"
+  t_contains build_phoenix_runs_maven_with_the_jdk "JAVA_HOME=$jdk " "$(cat "$T_A2_MVN_LOG")"
+  t_equals build_phoenix_records_the_profile "5.4.0-SNAPSHOT 2.6 2.6.4 2.6.5-hadoop3 3.4.2 17" \
+    "$(t_build_record phoenix_version hbase_profile compat_module hbase_version hadoop_version \
+      jdk)"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_BUILD_JDK=8
+  t_equals build_phoenix_refuses_jdk_8 2 "$T_STATUS"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_BUILD_JDK=11
+  t_equals build_phoenix_refuses_a_mismatched_jdk 2 "$T_STATUS"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_PHERF=1 -n
+  t_equals build_phoenix_distributed_needs_the_module "5 yes" "$T_STATUS $(t_flag \
+    'the tree holds no phoenix-pherf-distributed module, which PX_PHERF=1 builds' "$T_STDERR")"
+  mkdir -p "$tree/phoenix-pherf-distributed"
+  printf '<project/>\n' >"$tree/phoenix-pherf-distributed/pom.xml"
+  touch -t 202001010000 "$tree/phoenix-pherf-distributed/pom.xml"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_PHERF=1 -n
+  t_contains build_phoenix_selects_the_module_from_px_pherf \
+    'phoenix-pherf,phoenix-pherf-distributed -am' "${T_STDOUT//\\/}"
+  rm -rf "$tree/phoenix-pherf-distributed"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_STATUS=1 "$T_BASH" "$bp" --tree "$tree"
+  t_equals build_phoenix_failure_removes_the_record "1 no" \
+    "$T_STATUS $(t_exists "$T_A2_OUT/build/phoenix/build.tsv")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_NO_PHERF_CP=1 "$T_BASH" "$bp" --tree "$tree"
+  t_equals build_phoenix_refuses_a_missing_pherf_classpath "1 yes no" "$T_STATUS $(t_flag \
+    "the build wrote no class path of phoenix-pherf: $tree/phoenix-pherf/target/classes/\
+mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/build.tsv")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  t_curl_file "$archive/hadoop/common/hadoop-3.4.3/hadoop-3.4.3-aarch64.tar.gz" "$hadoop"
+  t_curl_file "$archive/hadoop/common/hadoop-3.4.3/hadoop-3.4.3.tar.gz" "$hadoop"
+  url='https://github.com/async-profiler/async-profiler/releases/download'
+  t_curl_file "$url/v4.1/async-profiler-4.1-linux-arm64.tar.gz" \
+    "$T_A2/dist-src/async-profiler-4.1.tar.gz"
+  t_curl_file "$url/v4.1/async-profiler-4.1-linux-x64.tar.gz" \
+    "$T_A2/dist-src/async-profiler-4.1.tar.gz"
+  # Because the synthetic fixture archives stand in for the default releases during staging, supply
+  # their hashes at the highest-precedence configuration stage.
+  pins_env=("PX_IMAGE_BASE_JDK11_SHA256_ARM64=$(printf '1%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK17_SHA256_ARM64=sha256:$(printf '7%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK21_SHA256_ARM64=$(printf '2%.0s' $(seq 1 64))")
+  for line in ARM64 AMD64; do
+    pins_env+=("PX_DIST_HBASE_2_6_7_SHA512_$line=$sum"
+      "PX_DIST_HADOOP_3_4_3_SHA512_$line=$(px_sha512 "$hadoop")")
+  done
+  t_a2 "${pins_env[@]:0:2}" "${pins_env[@]:3}" "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_requires_every_digest 1 "$T_STATUS"
+  t_contains stage_artifacts_names_the_missing_digest \
+    'build argument PX_IMAGE_BASE_JDK21_SHA256' "$T_STDERR"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_checks 0 "$T_STATUS"
+  ctx="$(px_tsv_field 2 "$T_STDOUT")"
+  t_equals stage_artifacts_context_under_the_output_root \
+    "$T_A2_OUT/images/px-harness_hbase-2.6.7-hadoop-3.4.3-profile-2.6" "$ctx"
+  bad=""
+  for line in Dockerfile entrypoint.sh healthcheck.sh render.sh lib/image.sh \
+    bin/px-bootstrap-probe conf/hbase-site.xml.tmpl .dockerignore \
+    dist/hbase-2.6.7-hadoop3-bin.tar.gz dist/hadoop-3.4.3-aarch64.tar.gz \
+    dist/async-profiler-4.1-linux-arm64.tar.gz phoenix/phoenix-server-hbase-2.6.jar \
+    phoenix/phoenix-client-embedded-hbase-2.6.jar phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar; do
+    [ -f "$ctx/$line" ] || bad="$bad $line"
+  done
+  t_empty stage_artifacts_context_holds_every_part "$bad"
+  # Verify that the bundled ZooKeeper and Hadoop client versions recorded during staging are
+  # extracted from the actual jar entries inside the HBase archive rather than matched from
+  # similarly named files.
+  t_equals staging_record_reads_the_shipped_jars "2.6 2.6.4 2.6.7 3.4.3 3.8.6 3.4.1" \
+    "$(t_tsv_values "$ctx.staged.tsv" hbase_profile compat_module hbase_version hadoop_version \
+      zookeeper_version hbase_hadoop_version)"
+  t_shim_log_reset
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa"
+  t_equals stage_artifacts_builds_through_contract "0 $tag" \
+    "$T_STATUS $(px_tsv_field 1 "$T_STDOUT")"
+  t_equals image_build_reports_the_image_id sha256:f00dfeed0001 "$(px_tsv_field 2 "$T_STDOUT")"
+  text="$(cat "$T_SHIM_LOG")"
+  t_contains image_build_runs_in_the_backend "build --tag $tag" "$text"
+  t_contains image_build_passes_the_host_uid "--build-arg PX_UID=$(id -u) " "$text"
+  t_contains image_build_passes_the_host_gid "--build-arg PX_GID=$(id -g) " "$text"
+  bad=""
+  for line in PX_HBASE_VERSION=2.6.7 PX_HADOOP_VERSION=3.4.3 PX_ZOOKEEPER_VERSION=3.8.6 \
+    PX_HBASE_HADOOP_VERSION=3.4.1 PX_PHOENIX_HBASE_PROFILE=2.6; do
+    case "$text " in
+    *"--build-arg $line "*) ;;
+    *) bad="$bad $line" ;;
+    esac
+  done
+  t_empty image_build_passes_the_version_set "$bad"
+  t_contains image_build_passes_the_digest_of_the_arch \
+    "--build-arg PX_IMAGE_BASE_JDK17_SHA256=$(printf '7%.0s' $(seq 1 64)) " "$text"
+  t_contains image_build_passes_the_staged_paths \
+    '--build-arg PX_STAGED_HBASE=dist/hbase-2.6.7-hadoop3-bin.tar.gz' "$text"
+  t_contains image_build_names_the_context "--file $ctx/Dockerfile $ctx" "$text"
+  t_absent image_build_defaults_to_the_host_architecture '--platform' "$text"
+  # Verify that rendering a deployment for a staged image records the exact jar versions carried by
+  # that image, and that a staging record produced for a different version set causes the generator
+  # to refuse the render.
+  t_gen --class validation --cluster staged
+  t_equals topology_records_the_shipped_jars "2.6 2.6.7 3.4.3 3.8.6 3.4.1" \
+    "$(t_env_value "$T_A2_OUT/deploy/staged/topology.env" PX_PHOENIX_HBASE_PROFILE \
+      PX_DIST_HBASE_VERSION PX_DIST_HADOOP_VERSION PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION)"
+  t_gen --class validation --check -e "PX_IMAGE_TAG=$tag" -e PX_DIST_HBASE_VERSION=2.6.6
+  t_equals render_refuses_the_image_of_another_version_set "2 yes" \
+    "$T_STATUS $(t_flag "was staged with hbase_version '2.6.7'" "$T_STDERR")"
+  : >"$T_A2_STATE/build-fails"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa"
+  t_equals image_build_failure_is_failure 1 "$T_STATUS"
+  rm -f "$T_A2_STATE/build-fails"
+  # When a base image has no pre-declared SHA-256 digest, trust on first use records the digest
+  # resolved by the container backend, and subsequent image builds reuse that recorded digest.
+  line="$(printf 'b%.0s' $(seq 1 64))"
+  : >"$T_A2_STATE/no-manifest"
+  t_a2 "${pins_env[@]:0:2}" "${pins_env[@]:3}" "$T_BASH" "$sa"
+  t_equals base_digest_unresolved_is_a_presence_failure "1 yes" \
+    "$T_STATUS $(t_flag 'build argument PX_IMAGE_BASE_JDK21_SHA256' "$T_STDERR")"
+  rm -f "$T_A2_STATE/no-manifest"
+  t_shim_log_reset
+  t_a2 "${pins_env[@]:0:2}" "${pins_env[@]:3}" "$T_BASH" "$sa"
+  t_equals base_digest_trust_on_first_use "0 yes" \
+    "$T_STATUS $(t_flag 'trust on first use: the base image eclipse-temurin:21' "$T_STDERR")"
+  t_equals base_digest_is_recorded "sha256:$line" \
+    "$(t_env_value "$T_A2_OUT/images/pins.env" PX_IMAGE_BASE_JDK21_SHA256_ARM64)"
+  t_contains base_digest_reaches_the_build "--build-arg PX_IMAGE_BASE_JDK21_SHA256=$line " \
+    "$(cat "$T_SHIM_LOG")"
+  t_shim_log_reset
+  t_a2 "${pins_env[@]:0:2}" "${pins_env[@]:3}" "$T_BASH" "$sa"
+  t_equals base_digest_record_is_reused "0 no" \
+    "$T_STATUS $(t_flag 'buildx' "$(cat "$T_SHIM_LOG")")"
+  t_a2 "$T_BASH" "$T_WORK/probe/sb.sh" sb_image_build "$T_A2/nowhere" px-harness:x
+  t_equals image_build_without_a_context_is_usage 2 "$T_STATUS"
+  bad=""
+  for line in reg.io:5000/x:t ghcr.io/x:t docker.io/library/x:t; do
+    t_a2 "$T_BASH" "$T_WORK/probe/sb.sh" sb_image_build "$ctx" "$line"
+    [ "$T_STATUS" = 2 ] || bad="$bad sb_image_build $line gave $T_STATUS"
+    t_a2 "${pins_env[@]}" "PX_IMAGE_TAG=$line" "$T_BASH" "$sa" --stage-only
+    [ "$T_STATUS" = 2 ] || bad="$bad stage-artifacts $line gave $T_STATUS"
+  done
+  t_empty image_build_refuses_a_registry_tag "$bad"
+  t_a2 "$T_BASH" "$T_WORK/probe/sb.sh" sb_image_build "$ctx" px-harness:x 'not an arg'
+  t_equals image_build_refuses_a_malformed_argument 2 "$T_STATUS"
+  # Verify that each pre-staging validation check independently detects and reports its respective
+  # defect.
+  printf 'x\n' >"$tree/phoenix-server/src/main/Changed.java.txt"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_freshness "1 yes" "$T_STATUS $(t_flag 'freshness:' "$T_STDERR")"
+  rm -f "$tree/phoenix-server/src/main/Changed.java.txt"
+  t_a2 "${pins_env[@]}" PX_PHOENIX_HBASE_PROFILE=2.6.0 PX_DIST_HBASE_VERSION=2.6.7 "$T_BASH" \
+    "$sa" --stage-only
+  t_equals stage_artifacts_refuses_a_release_outside_the_range "2 yes" \
+    "$T_STATUS $(t_flag "HBase '2.6.7' (PX_DIST_HBASE_VERSION) is outside the range" "$T_STDERR")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHOENIX_HBASE_PROFILE=2.5 "$T_BASH" "$bp" --tree "$tree"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_refuses_the_build_of_another_profile "1 yes" \
+    "$T_STATUS $(t_flag 'the build record is of the HBase profile 2.5' "$T_STDERR")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  t_curl_file "$archive/hbase/2.6.5/hbase-2.6.5-hadoop3-bin.tar.gz" \
+    "$T_A2/dist-src/hbase-2.6.5.tar.gz"
+  t_a2 "${pins_env[@]}" PX_DIST_HBASE_VERSION=2.6.5 "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_reads_one_jar_of_each "1 yes yes" "$T_STATUS $(t_flag \
+    'ships no lib/zookeeper-<release>.jar' "$T_STDERR") $(t_flag \
+    'ships more than one lib/hadoop-common-<release>.jar' "$T_STDERR")"
+  t_a2 "${pins_env[@]}" PX_FAKE_UNAME_M=x86_64 "$T_BASH" "$sa" --stage-only
+  t_contains stage_artifacts_amd64_is_best_effort 'amd64, which is best effort' "$T_STDERR"
+  # Verify end-to-end version re-pinning: a local version override file selects an alternate HBase
+  # profile, HBase release, and Hadoop release. The Phoenix build, deployment rendering, and
+  # artifact retrieval all honor the override, and any release without a declared pin uses trust on
+  # first use.
+  printf '%s\n' PX_PHOENIX_HBASE_PROFILE=2.5 PX_DIST_HBASE_VERSION=2.5.15 \
+    PX_DIST_HADOOP_VERSION=3.4.2 >"$local_env"
+  t_curl_file "$archive/hbase/2.5.15/hbase-2.5.15-hadoop3-bin.tar.gz" \
+    "$T_A2/dist-src/hbase-2.5.15.tar.gz"
+  t_curl_file "$archive/hadoop/common/hadoop-3.4.2/hadoop-3.4.2-aarch64-lean.tar.gz" \
+    "$T_A2/dist-src/hadoop-3.4.2.tar.gz"
+  t_a2 "PX_VERSIONS_LOCAL_ENV=$local_env" "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  t_equals repin_reaches_the_build_record "0 2.5 2.5.4" \
+    "$T_STATUS $(t_build_record hbase_profile compat_module)"
+  t_a2 "PX_VERSIONS_LOCAL_ENV=$local_env" "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals repin_is_trust_on_first_use "0 yes yes" "$T_STATUS $(t_flag \
+    'trust on first use: hbase (arm64)' "$T_STDERR") $(t_flag \
+    'trust on first use: hadoop (arm64)' "$T_STDERR")"
+  t_contains repin_records_the_pin_of_its_release PX_DIST_HBASE_2_5_15_SHA512_ARM64= \
+    "$(cat "$pins")"
+  t_a2 "PX_VERSIONS_LOCAL_ENV=$local_env" "$T_BASH" "$T_GEN" --class validation --cluster repin
+  t_equals repin_reaches_the_render \
+    "2.5 2.5.15 3.4.2 3.8.4 3.3.6 px-harness:hbase-2.5.15-hadoop-3.4.2-profile-2.5" \
+    "$(t_env_value "$T_A2_OUT/deploy/repin/topology.env" PX_PHOENIX_HBASE_PROFILE \
+      PX_DIST_HBASE_VERSION PX_DIST_HADOOP_VERSION PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION \
+      PX_IMAGE_TAG)"
+  t_a2 "PX_VERSIONS_LOCAL_ENV=$local_env" "$T_BASH" "$T_BIN/px-cluster" config
+  t_contains repin_origin_is_the_local_version_override \
+    "$(t_rows 3 PX_DIST_HBASE_VERSION 2.5.15 versions-local)" "$T_STDOUT"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  # Verify the stray-file staging check against a copy of the harness whose image directory holds
+  # an editor backup file, a hidden file, and a symbolic link.
+  cp -R "$PX_HOME" "$T_A2/harness"
+  : >"$T_A2/harness/$PX_DEPLOY_SUBDIR/image/conf/x.tmpl~"
+  : >"$T_A2/harness/$PX_DEPLOY_SUBDIR/image/.DS_Store"
+  ln -s ../entrypoint.sh "$T_A2/harness/$PX_DEPLOY_SUBDIR/image/lib/link.sh"
+  t_a2 "PX_HOME=$T_A2/harness" "${pins_env[@]}" "$T_BASH" \
+    "$T_A2/harness/scripts/stage-artifacts.sh" --stage-only
+  t_equals stage_artifacts_strays "1 3" \
+    "$T_STATUS $(printf '%s\n' "$T_STDERR" | grep -c 'staging check failed: strays:')"
+  # Verify build-jhiccup.sh: the dedicated retrieval and build flow for jHiccup (R-024).
+  url='https://github.com/giltene/jHiccup/archive/refs/tags/jHiccup-2.0.10.tar.gz'
+  t_curl_file "$url" "$T_A2/dist-src/jHiccup-2.0.10.tar.gz"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$PX_HOME/scripts/build-jhiccup.sh"
+  t_equals build_jhiccup_needs_the_build_product "1 yes" \
+    "$T_STATUS $(t_flag 'made no target/jHiccup.jar' "$T_STDERR")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" \
+    "$PX_HOME/scripts/build-jhiccup.sh"
+  t_outcome build_jhiccup_records_the_tool 0 \
+    "$(t_rows 2 jar "$T_A2_OUT/build/jhiccup/jHiccup.jar")"
+  t_contains build_jhiccup_pins_its_source "PX_DIST_JHICCUP_2_0_10_SHA512_ARM64=" "$(cat "$pins")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_PRODUCT=target/jHiccup.jar \
+    "PX_DIST_JHICCUP_2_0_10_SHA512_ARM64=$(printf 'b%.0s' $(seq 1 128))" "$T_BASH" \
+    "$PX_HOME/scripts/build-jhiccup.sh"
+  t_equals build_jhiccup_verifies_a_declared_pin 1 "$T_STATUS"
+}
+
+## @description  Verifies that each cross-platform helper produces identical results when isolated
+##               to each supported underlying system utility in turn.
+## @return       Records the platform fallback assertions. Exit 0.
+t_group_a2_platform() {
+  local file="$T_A2/dist-src/hbase-2.6.5.tar.gz" want tool dir bad="" tried="" path name
+  printf '# platform fallbacks\n'
+  want="$(px_sha512 "$file")"
+  for tool in sha512sum gsha512sum shasum openssl; do
+    command -v "$tool" >/dev/null 2>&1 || continue
+    dir="$T_A2/only-$tool"
+    mkdir -p "$dir"
+    ln -sf "$(command -v "$tool")" "$dir/$tool"
+    ln -sf "$(command -v tr)" "$dir/tr"
+    t_run "$T_BASH" "$T_A2/sha-probe.sh" "$dir" "$file"
+    tried="$tried $tool"
+    [ "$T_STDOUT" = "$want" ] || bad="$bad $tool gave '$T_STDOUT'"
+  done
+  t_nonempty platform_fallbacks_tried_a_program "$tried"
+  t_empty platform_fallbacks "$bad"
+  mkdir -p "$T_A2/no-sha"
+  ln -sf "$(command -v tr)" "$T_A2/no-sha/tr"
+  t_run "$T_BASH" "$T_A2/sha-probe.sh" "$T_A2/no-sha" "$file"
+  t_equals platform_fallbacks_without_a_program_is_unsupported 5 "$T_STATUS"
+  # Verify CPU core count detection via getconf, via sysctl, and when neither tool is available,
+  # millisecond timestamp fallback without GNU date, and physical path resolution across a
+  # symbolic link.
+  mkdir -p "$T_A2/plat/target"
+  ln -sf target "$T_A2/plat/link"
+  path="$(cd -P "$T_A2/plat/target" && pwd -P)/sub/new"
+  bad=""
+  for tool in getconf sysctl none; do
+    [ "$tool" != sysctl ] || sysctl -n hw.ncpu >/dev/null 2>&1 || continue
+    dir="$T_A2/plat/only-$tool"
+    mkdir -p "$dir"
+    for name in $tool date readlink; do
+      ! command -v "$name" >/dev/null 2>&1 || ln -sf "$(command -v "$name")" "$dir/$name"
+    done
+    want="$(px_nproc)"
+    [ "$tool" != none ] || want=1
+    t_run "$T_BASH" "$T_A2/platform-probe.sh" "$dir" "$T_A2/plat/link/sub/new"
+    [ "$T_STDOUT" = "$want milliseconds $path" ] || bad="$bad $tool gave '$T_STDOUT'"
+  done
+  t_empty platform_fallbacks_of_the_other_helpers "$bad"
+}
+
+## @description  Verifies cluster bring-up from a run class, including preflight checks and safety
+##               guards against overwriting active deployments.
+## @return       Records the cluster bring-up assertions. Exit 0.
+t_group_a2_cluster() {
+  local pc="$T_BIN/px-cluster" dir="$T_A2_OUT/deploy/a2" trace_v trace_m text
+  local -a words=()
+  printf '# the bring-up from a run class\n'
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation render -n --out u3-render-n
+  t_equals cluster_render_dry_run_prints_the_service_table "0 8 no" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c .) $(t_exists "$T_A2_OUT/u3-render-n")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation render
+  t_equals cluster_render "0 $dir" "$T_STATUS $T_STDOUT"
+  t_empty cluster_render_calls_no_runtime "$(cat "$T_SHIM_LOG")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 render --help
+  t_equals cluster_render_help 0 "$T_STATUS"
+  # Requirement R-278: single-command cluster bring-up documents the required container image and
+  # the exact commands used to build it.
+  t_a2 "$T_BASH" "$pc" up --help
+  t_contains cluster_up_help_names_the_image_build \
+    'scripts/build-phoenix.sh builds the Phoenix jars, then scripts/stage-artifacts.sh' \
+    "$(printf '%s\n' "$T_STDOUT" | tr -s ' \n' ' ')"
+  t_a2 "$T_BASH" "$pc" --cluster a2 up
+  t_equals cluster_up_needs_a_class_or_a_directory 2 "$T_STATUS"
+  t_a2_provision "$dir"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --dry-run --class validation up
+  t_equals cluster_up_dry_run_from_a_class 0 "$T_STATUS"
+  t_empty cluster_up_dry_run_from_a_class_mutates_no_runtime "$(grep -E \
+    '(^| )(up|create|run|build|rm|start|stop|kill)( |$)' "$T_SHIM_LOG")"
+  t_equals up_plan_prints_plan_and_check_rows "yes yes yes yes yes" "$(t_flag \
+    "plan${PX_TAB}scope${PX_TAB}sb_scope_create a2" "$T_STDOUT") $(t_flag \
+    "cluster${PX_TAB}ok" "$T_STDOUT") $(t_flag "one_cluster${PX_TAB}ok" "$T_STDOUT") $(t_flag \
+    "image${PX_TAB}ok" "$T_STDOUT") $(t_flag "memory_fit${PX_TAB}ok" "$T_STDOUT")"
+  t_equals up_dry_run_ends_with_a_result_row "$(t_rows 4 result ok 0 a2) 1" \
+    "$(t_last_line "$T_STDOUT") $(printf '%s\n' "$T_STDOUT" | grep -c "^result$PX_TAB")"
+  t_equals up_plan_creates_nothing "no no no 0" "$(t_exists "$T_A2_OUT/state/scope-compose-a2")\
+ $(t_exists "$T_A2_OUT/state/cluster-a2.env") $(t_flag ' up --no-start' "$(cat \
+    "$T_SHIM_LOG")") $(find "$T_A2_OUT/plan" -type f 2>/dev/null | grep -c .)"
+  printf '%s\n' "$((6 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --dry-run --class validation up
+  t_equals up_plan_refused_memory_is_3 "3 yes" "$T_STATUS $(t_flag "memory_fit${PX_TAB}fail" \
+    "$T_STDOUT")"
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  mkdir -p "$T_A2_OUT/state/px-k3d"
+  printf 'scope\tk3d-px\n' >"$T_A2_OUT/state/px-k3d/scope-k3d-px.tsv"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --dry-run --class validation up
+  rm -f "$T_A2_OUT/state/px-k3d/scope-k3d-px.tsv"
+  t_equals up_plan_beside_a_k3d_cluster_is_3 "3 yes yes" "$T_STATUS $(t_flag \
+    "one_cluster${PX_TAB}fail" "$T_STDOUT") $(t_flag "memory_fit${PX_TAB}ok" "$T_STDOUT")"
+  t_equals up_dry_run_refusal_ends_with_a_fail_row "$(t_rows 4 result fail 3 a2)" \
+    "$(t_last_line "$T_STDOUT")"
+  : >"$T_A2_STATE/no-image"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --dry-run --class validation up
+  rm -f "$T_A2_STATE/no-image"
+  t_equals up_plan_missing_image_is_6 "6 yes" "$T_STATUS $(t_flag \
+    "image${PX_TAB}fail${PX_TAB}the host holds no image" "$T_STDOUT")"
+  t_contains up_plan_missing_image_names_the_build 'run px-cluster build --cluster a2 --class' \
+    "$T_STDOUT"
+  # Requirement R-278: specifying a run class and a topology configuration file suffices to perform
+  # the complete cluster bring-up sequence.
+  printf 'PX_RS_COUNT=1\n' >"$T_A2/topology.env"
+  # When the required container image is absent on the host, bring-up fails before running
+  # preflight checks and reports the two build commands needed to produce the image.
+  : >"$T_A2_STATE/no-image"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation --config "$T_A2/topology.env" up
+  rm -f "$T_A2_STATE/no-image"
+  t_equals missing_image_refuses_the_bring_up "2 yes yes" "$T_STATUS $(t_flag \
+    'scripts/build-phoenix.sh, then' "$T_STDERR") $(t_flag \
+    'scripts/stage-artifacts.sh --tag px-harness:hbase-2.6.7-hadoop-3.4.3-profile-2.6' \
+    "$T_STDERR")"
+  t_absent missing_image_runs_no_preflight 'memory_fit' "$T_STDERR"
+  t_absent missing_image_creates_nothing 'up --no-start' "$(cat "$T_SHIM_LOG")"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation --config "$T_A2/topology.env" up \
+    --timeout 5
+  t_equals single_bring_up_from_class_and_topology 0 "$T_STATUS"
+  t_contains single_bring_up_runs_the_preflight "memory_fit${PX_TAB}ok" "$T_STDERR"
+  t_contains single_bring_up_provisions_the_render "compose -p px-a2 -f $dir/compose.yaml" \
+    "$(cat "$T_SHIM_LOG")"
+  t_equals single_bring_up_records_the_deployment "$dir" \
+    "$(cat "$T_A2_OUT/state/deployment-compose-a2" 2>/dev/null)"
+  # Because rendering overwrites the files in the target deployment directory, neither a second
+  # bring-up nor a direct render call may modify the deployment directory of a cluster that is up.
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation up
+  t_equals cluster_up_refuses_to_render_over_a_cluster_that_is_up "2 yes" \
+    "$T_STATUS $(t_flag 'run px-cluster down first' "$T_STDERR")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation render
+  t_equals cluster_render_refuses_the_deployment_of_a_cluster_that_is_up 2 "$T_STATUS"
+  t_empty cluster_refused_render_calls_no_runtime "$(cat "$T_SHIM_LOG")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 scale datanode 2
+  t_equals scale_refuses_a_role_with_a_service_per_instance 2 "$T_STATUS"
+  t_contains scale_names_the_render_as_the_remedy 'Render the deployment with the new count' \
+    "$T_STDERR"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 down
+  t_equals cluster_down_after_a_class_bring_up 0 "$T_STATUS"
+  t_equals cluster_down_removes_the_deployment_record no \
+    "$(t_exists "$T_A2_OUT/state/deployment-compose-a2")"
+  t_a2_record_stale "$dir"
+  # Verify that the host preflight rejects the full measurement topology on the reference host's
+  # engine memory budget before creating any container instances.
+  printf '25167863808\n' >"$T_A2_STATE/mem-total"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class measurement up
+  t_equals cluster_up_refuses_measurement_on_this_engine 3 "$T_STATUS"
+  t_absent cluster_up_refusal_creates_nothing 'up --no-start' "$(cat "$T_SHIM_LOG")"
+  t_contains cluster_up_refusal_shows_the_arithmetic 'budget 19905 MiB (19.44 GiB)' "$T_STDERR"
+  # The memory preflight check runs again against the recorded deployment directory before starting
+  # an on-demand service group: if the engine memory allocation has shrunk, starting the YARN group
+  # is refused.
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_gen --class measurement --cluster a2
+  t_a2_provision "$dir"
+  # Both preflight checks execute in a child process. A decoy runtime binary placed early on PATH
+  # must never be invoked, because the check must query the engine designated by PX_DOCKER_BIN.
+  : >"$T_A2/decoy.log"
+  t_a2 "PATH=$T_A2/decoy:$T_A2_BIN:$PATH" "$T_BASH" "$pc" --cluster a2 --class measurement up \
+    --no-wait
+  t_equals cluster_up_measurement_on_a_large_engine 0 "$T_STATUS"
+  printf '25167863808\n' >"$T_A2_STATE/mem-total"
+  t_a2 "PATH=$T_A2/decoy:$T_A2_BIN:$PATH" "$T_BASH" "$pc" --cluster a2 group start yarn \
+    --timeout 5
+  t_equals memory_recheck_runs_preflight 3 "$T_STATUS"
+  t_contains memory_recheck_refuses_the_group 'the memory check refused the start of group yarn' \
+    "$T_STDERR"
+  t_empty preflight_child_uses_the_engine_of_the_parent "$(cat "$T_A2/decoy.log")"
+  # Because the cluster record preserves the run class from bring-up, invoking scale without --class
+  # re-renders the measurement deployment and leaves all other instances unchanged.
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_a2 "$T_BASH" "$pc" --cluster a2 scale regionserver 4 --timeout 5
+  t_equals scale_keeps_the_class "0 measurement" "$T_STATUS $(t_env_value "$dir/topology.env" \
+    PX_RUN_CLASS)"
+  # Verify that the memory recheck fails closed if the preflight script is missing or not
+  # executable.
+  rm -f "$T_A2/harness/scripts/preflight.sh"
+  t_a2 "PX_HOME=$T_A2/harness" "$T_BASH" "$T_WORK/probe/memory-recheck.sh" "$T_A2/harness"
+  t_equals memory_recheck_without_its_script_is_failure "status 1 yes" \
+    "$T_STDOUT $(t_flag 'is missing or not executable' "$T_STDERR")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 down
+  # Verify that both the validation and measurement run classes execute the exact same code path,
+  # differing only in their parameter values.
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  trace_v="$(t_a2_trace validation)"
+  trace_m="$(t_a2_trace measurement)"
+  t_nonempty class_switch_trace_is_recorded "$trace_v"
+  t_equals class_switch_changes_no_script_path "$trace_v" "$trace_m"
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+## @description  Verifies end-to-end version matrix execution: running a test suite sequentially
+##               across two distinct component version sets.
+## @return       Records the version matrix assertions. Exit 0.
+t_group_a2_matrix() {
+  local home="$T_A2/tree/dev/harness" a="$T_A2/set-a.env" b="$T_A2/set-b.env"
+  local suite="$T_A2/matrix.suite" archive=https://archive.apache.org/dist rows line bad=""
+  local n profile release jdk file
+  local pins_env=("PX_IMAGE_BASE_JDK11_SHA256_ARM64=$(printf '1%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK17_SHA256_ARM64=$(printf '7%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK21_SHA256_ARM64=$(printf '2%.0s' $(seq 1 64))")
+  printf '# the version matrix\n'
+  # Place a copy of the harness inside the synthetic fixture repository tree so that building each
+  # version set invokes the fake Maven shim against the fixture tree rather than the real working
+  # tree.
+  rm -rf "$home"
+  mkdir -p "$T_A2/tree/dev"
+  cp -R "$PX_HOME" "$home"
+  t_curl_file "$archive/hbase/2.6.6/hbase-2.6.6-hadoop3-bin.tar.gz" \
+    "$T_A2/dist-src/hbase-2.6.6.tar.gz"
+  printf '%s\n' PX_DIST_HBASE_VERSION=2.6.6 PX_DIST_HADOOP_VERSION=3.4.2 PX_RS_JDK=17 >"$a"
+  printf '%s\n' PX_PHOENIX_HBASE_PROFILE=2.5 PX_DIST_HBASE_VERSION=2.5.15 \
+    PX_DIST_HADOOP_VERSION=3.4.2 PX_RS_JDK=21 >"$b"
+  printf 'suite: selftest-matrix\ntimeout: 60\n\ntest: one\n  action: exit 0\n' >"$suite"
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_gen --class validation --cluster a2
+  t_a2_provision "$T_A2_OUT/deploy/a2"
+  t_shim_log_reset
+  : >"$T_A2_MVN_LOG"
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$T_A2/jdk/17" PX_TIMEOUT_READY=30 "${pins_env[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$home/bin/px-cluster" --cluster a2 \
+    --class validation matrix "$suite" "$a" "$b"
+  line="$(printf '%s\n' "$T_STDOUT" | tail -n 1)"
+  rows="$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 != "result"')"
+  # The terminal result row reports the worst session severity observed across the version sets.
+  file="$T_A2_OUT/sessions/$(printf '%s\n' "$rows" | awk -F '\t' '$1 == 1 { print $7 }')"
+  t_equals matrix_ends_with_a_result_row "result $(t_tsv_values "$file/summary.tsv" severity) 0\
+ yes" "$(printf '%s\n' "$line" | cut -f 1-3 | tr '\t' ' ') $(t_exists "$(printf '%s\n' \
+    "$line" | cut -f 4)/matrix.tsv")"
+  t_equals matrix_runs_every_set 0 "$T_STATUS"
+  t_equals matrix_brings_each_set_up_and_down "2 2" \
+    "$(grep -c ' up --no-start' "$T_SHIM_LOG") $(grep -c ' down --volumes' "$T_SHIM_LOG")"
+  t_equals matrix_builds_the_profile_of_each_set "2.6 2.5" \
+    "$(sed -n 's/.*-Dhbase.profile=\([^ ]*\).*/\1/p' "$T_A2_MVN_LOG" | tr '\n' ' ' | sed 's/ $//')"
+  t_equals matrix_reports_each_set "1 2.6 2.6.6 3.4.2 down 0|2 2.5 2.5.15 3.4.2 down 0" \
+    "$(printf '%s\n' "$rows" | awk -F '\t' '{ printf "%s%s %s %s %s %s %s", sep, $1, $3, $4, \
+      $5, $8, $9; sep = "|" }')"
+  t_equals matrix_records_each_set "$rows" \
+    "$(cat "$(find "$T_A2_OUT/matrix" -name matrix.tsv 2>/dev/null | sed -n 1p)" 2>/dev/null)"
+  # Verify that the session summary record for each matrix entry captures its own HBase profile,
+  # HBase release version, and per-role JDK pins.
+  for line in "1:2.6:2.6.6:PX_RS_JDK=17" "2:2.5:2.5.15:PX_RS_JDK=21"; do
+    IFS=: read -r n profile release jdk <<<"$line"
+    file="$T_A2_OUT/sessions/$(printf '%s\n' "$rows" | awk -F '\t' -v n="$n" \
+      '$1 == n { print $7 }')/summary.tsv"
+    case " $(t_tsv_values "$file" hbase_profile hbase_version jdks) " in
+    " $profile $release "*" $jdk "*) ;;
+    *) bad="$bad set $n" ;;
+    esac
+  done
+  t_empty matrix_session_records_its_version_set "$bad"
+  t_equals matrix_topology_records_the_last_set "2.5 2.5.15 3.4.2 3.8.4 3.3.6" \
+    "$(t_env_value "$T_A2_OUT/deploy/a2/topology.env" PX_PHOENIX_HBASE_PROFILE \
+      PX_DIST_HBASE_VERSION PX_DIST_HADOOP_VERSION PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION)"
+  t_contains matrix_services_run_the_jdk_of_the_set "$(t_rows 9 regionserver-0 regionserver 0)" \
+    "$(grep -v '^#' "$T_A2_OUT/deploy/a2/services.tsv" | awk -F '\t' '$9 == 21')"
+  t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" matrix "$suite" "$T_A2/no-such.env"
+  t_equals matrix_refuses_a_missing_set 6 "$T_STATUS"
+  t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" matrix "$suite"
+  t_equals matrix_needs_a_set 2 "$T_STATUS"
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+## @description  Brings the test deployment cluster up for a given run class (class) and tears it
+##               down again to trace the resulting runtime invocation pattern.
+## @return       Writes the normalized, deduplicated runtime verbs and flags to stdout. Exit 0.
+t_a2_trace() {
+  t_gen --class "$1" --cluster a2
+  t_a2_provision "$T_A2_OUT/deploy/a2"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 --class "$1" up --no-wait
+  t_a2 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  awk '{
+    out = ""
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^[a-z][a-z-]*-[0-9]$/ || $i ~ /^a2[0-9]+$/ || $i ~ /\//) continue
+      out = out " " $i
+    }
+    print out
+  }' "$T_SHIM_LOG" | LC_ALL=C sort -u
+}
+
+# ---------------------------------------------------------------------------
+# Command-line argument parsing and test suite execution
 # ---------------------------------------------------------------------------
 
-while getopts ":vkh" T_OPTION; do
+while getopts ":kh" T_OPTION; do
   case "$T_OPTION" in
-  v) T_VERBOSE=1 ;;
-  k) T_KEEP=1 ;;
+  # Instruct the exit hook to preserve the temporary fixture directory. PX_KEEP remains unexported
+  # so that no command under test inherits it.
+  k) PX_KEEP=1 ;;
   h)
     usage
     exit "$PX_EXIT_OK"
@@ -3603,9 +5345,20 @@ t_group_run
 t_group_config
 t_group_output
 t_group_emitters
+t_group_a2_generator
+t_group_a2_image
+t_group_a2_preflight
+t_group_a2_dist
+t_group_a2_platform
+t_group_a2_cluster
+t_group_a2_matrix
 t_group_tree
 
 printf '1..%s\n' "$T_NUMBER"
+if [ -n "$T_SKIPPED" ]; then
+  printf '# skipped, so not proven on this host:\n'
+  printf '%s' "$T_SKIPPED" | sed 's/^/#/'
+fi
 if [ "$T_FAILED" = 0 ]; then
   printf '# %s assertions, all passed\n' "$T_NUMBER"
   exit "$PX_EXIT_OK"

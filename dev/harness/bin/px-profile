@@ -14,50 +14,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Front end for the sampling profiler. This round establishes the command-line interface, target
-# resolution logic, and artifact naming conventions, while round A6 attaches the profiler to the
-# target roles and stages the captured recordings alongside the run artifacts.
+# This script provides the front end for the sampling profiler. The shared telemetry library in
+# lib/telemetry.sh defines the command surface, target resolution logic, and artifact naming
+# conventions, while round A6 attaches the profiler to the target roles and stages the captured
+# recordings alongside the run artifacts.
 #
-# The command surface intentionally omits a sampling-interval option. The system design mandates a
-# fixed execution timer cadence of 7,919 microseconds with no skipped samples, both of which are
-# configured by round A6. Allowing callers to override the interval would produce recordings that
-# cannot be compared across runs.
-#
-# When the profiler binary is unavailable, the front end records a skip status rather than a
-# failure because a host without the profiling tool installed must still be able to complete a run.
-#
-# ARTIFACT NAMING
-#   <out>/profiles/index.tsv
-#       Tab-separated index containing tool, target, status, artifact, and detail columns, with one
-#       row per profiling target.
-#   <out>/profiles/<role>-<index>/<event>-<session>.<ext>
-#       Path for a single recording artifact. The session tag is set to the run ID so that all
-#       artifacts belonging to the same run sort together and separate runs cannot overwrite each
-#       other.
+# The front end intentionally omits a sampling-interval option. The system design fixes the
+# execution timer at a cadence of 7,919 microseconds with no skipped samples, and round A6
+# configures both parameters. Exposing an interval option here would allow a run to produce
+# measurements that cannot be compared against any other run.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/telemetry.sh
+. "$SELF/../lib/telemetry.sh"
 
 set -euo pipefail
 px_trap_enable
 
-PROFILE_EVENTS="cpu alloc lock wall itimer"
-PROFILE_FORMATS="html collapsed jfr"
-PROFILE_TOOL="asprof"
+TM_KIND=profiles TM_INDEX_TOOL=profile TM_TOOL=asprof
+TM_STAGED=async-profiler/bin/asprof TM_TEST=-x TM_PATH_FALLBACK=1
+TM_LIST_CMD=events TM_OPT=--event TM_LIST="cpu alloc lock wall itimer" TM_DEFAULT=itimer
+TM_FORMATS="html collapsed jfr" TM_EXT=html
+TM_ENV_TARGETS=PX_PROFILE_TARGETS TM_ENV_DURATION=PX_PROFILE_DURATION_S
+TM_SKIP="asprof is not staged under PX_TOOLKIT_DIR and not on PATH"
+TM_WARN="asprof is absent, every profiling target is skipped"
+TM_A6="round A6 attaches the profiler. px-profile plan reports the targets"
 
-PROFILE_ACTION=""
-PROFILE_SPEC=""
-PROFILE_EVENT=""
-PROFILE_FORMAT="html"
-PROFILE_DURATION=""
-PROFILE_OUT=""
-PROFILE_CONFIG_FILES=()
-PROFILE_ROWS=""
-PROFILE_TOOL_PATH=""
+## @description  Assigns TM_EXT to the file extension corresponding to a given output format.
+## @return       Sets TM_EXT and exits 0.
+tm_extension() {
+  case "$1" in
+  collapsed) TM_EXT=txt ;;
+  *) TM_EXT=$1 ;;
+  esac
+}
 
-## @description  Prints the command-line usage documentation and supported options.
-## @return       Writes the help text to stdout and exits 0.
+## @description  Prints the command-line usage and supported options for the profiler front end.
+## @return       Writes the usage text to stdout and exits 0.
 usage() {
   cat <<'EOF'
 Usage: px-profile [plan|record|events] [option...]
@@ -83,217 +78,4 @@ owns, 6 no such object.
 EOF
 }
 
-## @description  Checks whether a given value matches any word in a whitespace-delimited list.
-## @param        value, words  The candidate value and the list of permitted words to search.
-## @return       Exits 0 when the value matches one of the words, or 1 otherwise.
-profile_in_list() {
-  local value=$1 word
-  for word in $2; do
-    if [ "$word" = "$value" ]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Target specifications accept either commas or spaces as delimiters because configuration files
-# and shell command lines favor different conventions. Results are written directly to the
-# PROFILE_ROWS global variable rather than stdout so that a malformed target terminates the main
-# process with the usage exit code instead of exiting only a subshell.
-## @description  Parses a target specification into tab-separated role and index rows.
-## @param        specification  The comma- or space-delimited target specification string.
-## @return       Populates PROFILE_ROWS with role and index TSV rows, or exits 2 if malformed.
-profile_parse_targets() {
-  local item role index
-  PROFILE_ROWS=""
-  for item in ${1//,/ }; do
-    role=${item%%/*}
-    index=${item#*/}
-    if [ "$index" = "$item" ]; then
-      index=0
-    fi
-    if [ -z "$role" ] || ! [[ $index =~ $PX_RE_INT ]]; then
-      px_usage_error "a target is ROLE or ROLE/INDEX, got '$item'"
-    fi
-    PROFILE_ROWS="$PROFILE_ROWS$role$PX_TAB$index$PX_NL"
-  done
-  if [ -z "$PROFILE_ROWS" ]; then
-    px_usage_error "name a target with --target, or set PX_PROFILE_TARGETS"
-  fi
-}
-
-## @description  Resolves the output file extension corresponding to a requested recording format.
-## @param        format  The logical output format name.
-## @return       Writes the file extension to stdout and exits 0.
-profile_extension() {
-  case "$1" in
-  html) printf 'html\n' ;;
-  collapsed) printf 'txt\n' ;;
-  jfr) printf 'jfr\n' ;;
-  esac
-}
-
-# Resolution prefers the binary staged under the toolkit directory so that a run profiles with the
-# exact version it recorded rather than whatever version happens to be on the host PATH. The result
-# is stored in the PROFILE_TOOL_PATH global variable instead of written to stdout because running a
-# probe inside a command substitution spawns a subshell, causing the failure trap to report an
-# absent tool as an error even though a missing profiler is an expected outcome.
-## @description  Locates the profiler launcher executable.
-## @return       Sets PROFILE_TOOL_PATH and exits 0 if found, or exits 6 when the tool is absent.
-profile_find_tool() {
-  local staged="${PX_TOOLKIT_DIR:-}/async-profiler/bin/$PROFILE_TOOL"
-  PROFILE_TOOL_PATH=""
-  if [ -n "${PX_TOOLKIT_DIR:-}" ] && [ -x "$staged" ]; then
-    PROFILE_TOOL_PATH="$staged"
-    return 0
-  fi
-  if command -v "$PROFILE_TOOL" >/dev/null 2>&1; then
-    PROFILE_TOOL_PATH="$PROFILE_TOOL"
-    return 0
-  fi
-  return "$PX_EXIT_NO_OBJECT"
-}
-
-# Planning emits one row per target showing the artifact path that a recording session would
-# produce. Because generating a plan neither writes files nor requires a running cluster, operators
-# can verify target resolution and artifact naming before starting a run.
-## @description  Reports the planned profiling targets and their output artifact paths.
-## @param        base directory  The root directory under which profile artifacts are organized.
-## @return       Writes the planned target TSV rows to stdout and exits 0.
-profile_plan() {
-  local base=$1 row role index
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    role="$(px_tsv_field 1 "$row")"
-    index="$(px_tsv_field 2 "$row")"
-    px_tsv_row "$role" "$index" "$PROFILE_EVENT" "$PROFILE_DURATION" \
-      "$base/$role-$index/$PROFILE_EVENT-$PROFILE_SESSION.$PROFILE_EXTENSION"
-  done <<EOF
-$PROFILE_ROWS
-EOF
-}
-
-# The profiler availability check runs before attaching to any process. When the host lacks the
-# profiler binary, every target is recorded as skipped in the index and the command succeeds,
-# because profiling telemetry serves as diagnostic evidence rather than an execution gate.
-## @description  Executes a profiling recording session across all configured targets.
-## @param        base directory  The directory where the profile index and artifacts are written.
-## @return       Exits 0 when all targets are skipped, or exits 5 while round A6 owns attaching.
-profile_record() {
-  local base=$1 row role index
-  if ! profile_find_tool; then
-    while IFS= read -r row; do
-      [ -n "$row" ] || continue
-      role="$(px_tsv_field 1 "$row")"
-      index="$(px_tsv_field 2 "$row")"
-      px_tsv_row profile "$role/$index" skip "" \
-        "$PROFILE_TOOL is not staged under PX_TOOLKIT_DIR and not on PATH" \
-        >>"$base/index.tsv"
-    done <<EOF
-$PROFILE_ROWS
-EOF
-    px_warn "$PROFILE_TOOL is absent, every profiling target is skipped"
-    return 0
-  fi
-  px_debug "the profiler is $PROFILE_TOOL_PATH"
-  px_die "$PX_EXIT_UNSUPPORTED" \
-    "round A6 attaches the profiler. px-profile plan reports the targets"
-}
-
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
-  --target)
-    px_cli_need_value "$@"
-    PROFILE_SPEC="$PROFILE_SPEC $2"
-    shift
-    ;;
-  --event) px_cli_need_value "$@" && PROFILE_EVENT="$2" && shift ;;
-  --format) px_cli_need_value "$@" && PROFILE_FORMAT="$2" && shift ;;
-  --duration) px_cli_need_value "$@" && PROFILE_DURATION="$2" && shift ;;
-  --out) px_cli_need_value "$@" && PROFILE_OUT="$2" && shift ;;
-  --config) px_cli_need_value "$@" && PROFILE_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *)
-    if [ -n "$PROFILE_ACTION" ]; then
-      px_usage_error "unexpected argument: $1"
-    fi
-    PROFILE_ACTION="$1"
-    ;;
-  esac
-  shift
-done
-
-if [ -z "$PROFILE_ACTION" ]; then
-  PROFILE_ACTION=plan
-fi
-case "$PROFILE_ACTION" in
-plan | record) ;;
-events)
-  for PROFILE_NAME in $PROFILE_EVENTS; do
-    printf '%s\n' "$PROFILE_NAME"
-  done
-  exit 0
-  ;;
-*) px_usage_error "unknown subcommand: $PROFILE_ACTION" ;;
-esac
-
-if [ "${#PROFILE_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${PROFILE_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
-
-if [ -z "$PROFILE_EVENT" ]; then
-  PROFILE_EVENT=itimer
-fi
-if [ -z "$PROFILE_DURATION" ]; then
-  PROFILE_DURATION="${PX_PROFILE_DURATION_S:-60}"
-fi
-if [ -z "$PROFILE_SPEC" ]; then
-  PROFILE_SPEC="${PX_PROFILE_TARGETS:-}"
-fi
-if ! profile_in_list "$PROFILE_EVENT" "$PROFILE_EVENTS"; then
-  px_usage_error "--event accepts $PROFILE_EVENTS, got '$PROFILE_EVENT'"
-fi
-if ! profile_in_list "$PROFILE_FORMAT" "$PROFILE_FORMATS"; then
-  px_usage_error "--format accepts $PROFILE_FORMATS, got '$PROFILE_FORMAT'"
-fi
-if ! [[ $PROFILE_DURATION =~ $PX_RE_INT ]] || [ "$PROFILE_DURATION" -lt 1 ]; then
-  px_usage_error "--duration needs a whole number of seconds, got '$PROFILE_DURATION'"
-fi
-profile_parse_targets "$PROFILE_SPEC"
-
-PROFILE_EXTENSION="$(profile_extension "$PROFILE_FORMAT")"
-# The session tag correlates all profiling artifacts generated during a single invocation. When an
-# active run already provides a run identifier, the session adopts it so that the profile artifacts
-# and the run manifest share a consistent identifier.
-PROFILE_SESSION="${PX_RUN_ID:-$(px_run_id)}"
-
-if [ -n "$PROFILE_OUT" ]; then
-  PROFILE_BASE="$PROFILE_OUT/profiles"
-elif [ -n "${PX_RUN_DIR:-}" ]; then
-  PROFILE_BASE="$PX_RUN_DIR/profiles"
-elif [ "$PROFILE_ACTION" = record ]; then
-  PROFILE_BASE="$(px_run_dir)/profiles"
-else
-  PROFILE_BASE="$(px_out_root)/profiles"
-fi
-
-# Output directory policy validation runs at the top level rather than inline within a function
-# argument so that a policy refusal terminates the main process directly instead of failing only
-# inside a subshell.
-if [ "$PROFILE_ACTION" = plan ]; then
-  PROFILE_DIR="$(px_out_resolve "$PROFILE_BASE")" || exit $?
-  profile_plan "$PROFILE_DIR"
-  exit 0
-fi
-PROFILE_DIR="$(px_out_subdir "$PROFILE_BASE")" || exit $?
-profile_record "$PROFILE_DIR"
+tm_main "$@"

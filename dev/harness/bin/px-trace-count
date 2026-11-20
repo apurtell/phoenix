@@ -19,44 +19,35 @@
 # allocated heap volume. Because counts do not shift under host load, regressions evaluated from
 # counts remain reliable on shared development machines where elapsed durations do not.
 #
-# This implementation round establishes the command surface, target resolution, and artifact naming
-# conventions, while round A6 attaches the counting agent to the target roles and reads the
-# counters back.
-#
-# Artifact naming layout:
-#   <out>/traces/index.tsv
-#     Records one row per target with the tool, target, status, artifact, and detail columns.
-#   <out>/traces/<role>-<index>/<counter>-<session>.tsv
-#     Stores a single count table ordered as name followed by count. The session tag uses the run
-#     id so that all artifacts from a single run sort together and separate runs cannot overwrite
-#     each other.
+# The shared telemetry library in lib/telemetry.sh defines the command surface, target resolution
+# logic, and artifact naming conventions, while round A6 attaches the counting agent to the target
+# roles and reads the collected counters back. Because trace counts are comparable only between runs
+# instrumented with the exact same agent binary, resolution accepts only the staged agent.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/telemetry.sh
+. "$SELF/../lib/telemetry.sh"
 
 set -euo pipefail
 px_trap_enable
 
-# Define the supported counter families, each of which records a discrete count rather than a
-# duration:
-#   invocations  Measures how many times each traced method executed.
+# Supported counter families, each of which records a deterministic count and never a duration:
+#   invocations  Tracks how many times each traced method executed.
 #   phoenix      Captures the query counters reported by the database client.
-#   allocations  Tracks the total volume of heap memory allocated during the run.
-TRACE_COUNTERS="invocations phoenix allocations"
-TRACE_TOOL="px-trace-agent.jar"
+#   allocations  Measures the total volume of heap memory allocated during the run.
+TM_KIND=traces TM_INDEX_TOOL=trace TM_TOOL=px-trace-agent.jar
+TM_STAGED=trace/px-trace-agent.jar TM_TEST=-f TM_PATH_FALLBACK=0
+TM_LIST_CMD=counters TM_OPT=--counter TM_LIST="invocations phoenix allocations"
+TM_DEFAULT=invocations TM_EXT=tsv
+TM_ENV_TARGETS=PX_TRACE_TARGETS TM_ENV_DURATION=PX_TRACE_DURATION_S
+TM_SKIP="px-trace-agent.jar is not staged under PX_TOOLKIT_DIR"
+TM_WARN="px-trace-agent.jar is not staged, every counting target is skipped"
+TM_A6="round A6 attaches the counting agent. px-trace-count plan reports the targets"
 
-TRACE_ACTION=""
-TRACE_SPEC=""
-TRACE_COUNTER=""
-TRACE_DURATION=""
-TRACE_OUT=""
-TRACE_CONFIG_FILES=()
-TRACE_ROWS=""
-TRACE_TOOL_PATH=""
-
-## @description  Prints the command-line usage and subcommand reference.
-## @return       Writes the help text to stdout and returns exit code 0.
+## @description  Prints the command-line usage and supported options for the trace-count front end.
+## @return       Writes the usage text to stdout and exits 0.
 usage() {
   cat <<'EOF'
 Usage: px-trace-count [plan|record|counters] [option...]
@@ -82,184 +73,4 @@ owns, 6 no such object.
 EOF
 }
 
-# Parses the target specification into tab-separated role and index rows. The specification accepts
-# either commas or spaces as separators because configuration files and shell command lines favor
-# different delimiters. The parsed rows are assigned to the TRACE_ROWS global variable rather than
-# emitted to stdout so that a malformed target terminates the main process with the usage exit code
-# instead of only exiting a subshell.
-## @description  Parses the target specification into role and index rows in TRACE_ROWS.
-## @param        specification  Target specification string delimited by commas or spaces.
-## @return       Sets TRACE_ROWS to role and index TSV rows, or exits 2 on a malformed target.
-trace_parse_targets() {
-  local item role index
-  TRACE_ROWS=""
-  for item in ${1//,/ }; do
-    role=${item%%/*}
-    index=${item#*/}
-    if [ "$index" = "$item" ]; then
-      index=0
-    fi
-    if [ -z "$role" ] || ! [[ $index =~ $PX_RE_INT ]]; then
-      px_usage_error "a target is ROLE or ROLE/INDEX, got '$item'"
-    fi
-    TRACE_ROWS="$TRACE_ROWS$role$PX_TAB$index$PX_NL"
-  done
-  if [ -z "$TRACE_ROWS" ]; then
-    px_usage_error "name a target with --target, or set PX_TRACE_TARGETS"
-  fi
-}
-
-# Locates the counting agent staged under the toolkit directory, ensuring that counts are compared
-# only between runs traced with the same agent binary. The resolved path is stored in the
-# TRACE_TOOL_PATH global variable rather than written to stdout because running a probe inside a
-# command substitution spawns a subshell where the failure trap would report an absent tool as an
-# error, even though an absent tool is a normal outcome.
-## @description  Locates the staged counting agent under the toolkit directory.
-## @return       Sets TRACE_TOOL_PATH and returns 0 if present, or returns 6 if the agent is absent.
-trace_find_tool() {
-  local staged="${PX_TOOLKIT_DIR:-}/trace/$TRACE_TOOL"
-  TRACE_TOOL_PATH=""
-  if [ -n "${PX_TOOLKIT_DIR:-}" ] && [ -f "$staged" ]; then
-    TRACE_TOOL_PATH="$staged"
-    return 0
-  fi
-  return "$PX_EXIT_NO_OBJECT"
-}
-
-# Emits the execution plan as one row per target showing the count table path that would be written.
-# Planning creates no files and requires no active cluster, allowing operators to verify target
-# resolution and artifact naming before executing a run.
-## @description  Reports the planned target rows and output count table paths.
-## @param        base directory  Base trace output directory for the count tables.
-## @return       Writes the planned TSV rows to stdout and returns exit code 0.
-trace_plan() {
-  local base=$1 row role index
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    role="$(px_tsv_field 1 "$row")"
-    index="$(px_tsv_field 2 "$row")"
-    px_tsv_row "$role" "$index" "$TRACE_COUNTER" "$TRACE_DURATION" \
-      "$base/$role-$index/$TRACE_COUNTER-$TRACE_SESSION.tsv"
-  done <<EOF
-$TRACE_ROWS
-EOF
-}
-
-# Collects trace counts across all resolved targets. The agent availability check runs first: if a
-# host does not have the staged counting agent, the function records a skip entry for every target
-# and succeeds, ensuring that missing counts are explicitly reported and never guessed.
-## @description  Collects trace counts for each target or records skips when the agent is absent.
-## @param        base directory  Base trace output directory for the index and count tables.
-## @return       Returns 0 when every target is skipped, or exits 5 while round A6 owns the attach.
-trace_record() {
-  local base=$1 row role index
-  if ! trace_find_tool; then
-    while IFS= read -r row; do
-      [ -n "$row" ] || continue
-      role="$(px_tsv_field 1 "$row")"
-      index="$(px_tsv_field 2 "$row")"
-      px_tsv_row trace "$role/$index" skip "" \
-        "$TRACE_TOOL is not staged under PX_TOOLKIT_DIR" >>"$base/index.tsv"
-    done <<EOF
-$TRACE_ROWS
-EOF
-    px_warn "$TRACE_TOOL is not staged, every counting target is skipped"
-    return 0
-  fi
-  px_debug "the counting agent is $TRACE_TOOL_PATH"
-  px_die "$PX_EXIT_UNSUPPORTED" \
-    "round A6 attaches the counting agent. px-trace-count plan reports the targets"
-}
-
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose)
-    PX_VERBOSE=1
-    export PX_VERBOSE
-    ;;
-  --target)
-    px_cli_need_value "$@"
-    TRACE_SPEC="$TRACE_SPEC $2"
-    shift
-    ;;
-  --counter) px_cli_need_value "$@" && TRACE_COUNTER="$2" && shift ;;
-  --duration) px_cli_need_value "$@" && TRACE_DURATION="$2" && shift ;;
-  --out) px_cli_need_value "$@" && TRACE_OUT="$2" && shift ;;
-  --config) px_cli_need_value "$@" && TRACE_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *)
-    if [ -n "$TRACE_ACTION" ]; then
-      px_usage_error "unexpected argument: $1"
-    fi
-    TRACE_ACTION="$1"
-    ;;
-  esac
-  shift
-done
-
-if [ -z "$TRACE_ACTION" ]; then
-  TRACE_ACTION=plan
-fi
-case "$TRACE_ACTION" in
-plan | record) ;;
-counters)
-  for TRACE_NAME in $TRACE_COUNTERS; do
-    printf '%s\n' "$TRACE_NAME"
-  done
-  exit 0
-  ;;
-*) px_usage_error "unknown subcommand: $TRACE_ACTION" ;;
-esac
-
-if [ "${#TRACE_CONFIG_FILES[@]}" -gt 0 ]; then
-  px_config_load "${TRACE_CONFIG_FILES[@]}"
-else
-  px_config_load
-fi
-
-if [ -z "$TRACE_COUNTER" ]; then
-  TRACE_COUNTER=invocations
-fi
-if [ -z "$TRACE_DURATION" ]; then
-  TRACE_DURATION="${PX_TRACE_DURATION_S:-60}"
-fi
-if [ -z "$TRACE_SPEC" ]; then
-  TRACE_SPEC="${PX_TRACE_TARGETS:-}"
-fi
-case " $TRACE_COUNTERS " in
-*" $TRACE_COUNTER "*) ;;
-*) px_usage_error "--counter accepts $TRACE_COUNTERS, got '$TRACE_COUNTER'" ;;
-esac
-if ! [[ $TRACE_DURATION =~ $PX_RE_INT ]] || [ "$TRACE_DURATION" -lt 1 ]; then
-  px_usage_error "--duration needs a whole number of seconds, got '$TRACE_DURATION'"
-fi
-trace_parse_targets "$TRACE_SPEC"
-
-# The session tag links every artifact produced by a single invocation. When a run already defines
-# PX_RUN_ID, that identifier is reused so that the count tables and the run manifest share the same
-# session tag.
-TRACE_SESSION="${PX_RUN_ID:-$(px_run_id)}"
-
-if [ -n "$TRACE_OUT" ]; then
-  TRACE_BASE="$TRACE_OUT/traces"
-elif [ -n "${PX_RUN_DIR:-}" ]; then
-  TRACE_BASE="$PX_RUN_DIR/traces"
-elif [ "$TRACE_ACTION" = record ]; then
-  TRACE_BASE="$(px_run_dir)/traces"
-else
-  TRACE_BASE="$(px_out_root)/traces"
-fi
-
-# Output directory policy validation is evaluated at the top level rather than inside a command
-# argument so that any policy refusal terminates the main process instead of only a subshell.
-if [ "$TRACE_ACTION" = plan ]; then
-  TRACE_DIR="$(px_out_resolve "$TRACE_BASE")" || exit $?
-  trace_plan "$TRACE_DIR"
-  exit 0
-fi
-TRACE_DIR="$(px_out_subdir "$TRACE_BASE")" || exit $?
-trace_record "$TRACE_DIR"
+tm_main "$@"
