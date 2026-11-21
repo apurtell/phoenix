@@ -66,17 +66,22 @@ DV_END=""
 
 # Remote shell script that launches a Java main class inside client 0. The remote child shell
 # expands the instance environment variables for the JDK, the client configuration directory, and
-# the client JAR directories. It accepts positional arguments for the remote working directory, the
-# extra classpath prefix, the number of additional JVM options, those JVM options, and finally the
-# main class followed by its arguments. Before replacing itself via exec, the shell writes its PID
-# to java.pid so that the Java process inherits that PID and DV_STOP_SCRIPT can stop it.
+# the JAR directories. It accepts positional arguments for the remote working directory, the extra
+# classpath prefix, the count of additional JVM options, those JVM options, and finally the main
+# class followed by its arguments. Before replacing itself via exec, the shell writes its PID to
+# java.pid so that the Java process inherits that PID and DV_STOP_SCRIPT can stop it. Consistent
+# with "hbase classpath", the classpath concludes with HBase's lib/jdk11 directory and
+# commons-codec JAR: JDK 11 removed JAXB, which Pherf requires to read its scenario files, and the
+# commons-csv library bundled in the Pherf JAR depends on commons-codec, which the client JARs
+# package only under a relocated package name.
 DV_JAVA_SCRIPT="$(
   cat <<'SCRIPT_EOF'
 cd "$1" || exit 1
 prefix=$2
 count=$3
 shift 3
-jars="client-facing-thirdparty/*"
+jars="client-facing-thirdparty/*:$PX_HBASE_HOME/lib/jdk11/*"
+codec=("$PX_HBASE_HOME"/lib/commons-codec-*.jar)
 opts=()
 while [ "$count" -gt 0 ]; do
   opts+=("$1")
@@ -85,7 +90,7 @@ while [ "$count" -gt 0 ]; do
 done
 printf '%s\n' "$$" >java.pid
 exec "$PX_JDK_ROOT/$PX_JDK/bin/java" $(cat "$PX_CONF_DIR/jvm.opts") "${opts[@]}" \
-  -cp "$prefix$PX_CONF_DIR:$PX_PHOENIX_HOME/client/*:$PX_HBASE_HOME/lib/$jars" "$@"
+  -cp "$prefix$PX_CONF_DIR:$PX_PHOENIX_HOME/client/*:$PX_HBASE_HOME/lib/$jars:$codec" "$@"
 SCRIPT_EOF
 )"
 

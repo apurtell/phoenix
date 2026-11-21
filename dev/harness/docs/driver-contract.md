@@ -379,14 +379,16 @@ A driver stages input and output files through a dedicated remote working direct
 outputs into `$PX_DRIVER_DIR` using `sb_copy_out`. The `restore` verb removes the remote working
 directory during cleanup.
 
-`sb_exec` propagates the exit status of the remote command. For substrate operations managed by the
-harness—specifically `dv_remote`, `dv_put`, `dv_get`, and the cleanup script—the driver translates
+`sb_exec` propagates the exit status of the remote program. For substrate calls managed by the
+harness—specifically `dv_remote`, `dv_put`, `dv_get`, and the clear script—the driver translates
 the return status according to the following mapping: 0 maps to 0; 2 maps to 2; 124 (indicating
 that the call reached its time limit) maps to 1; 125, 126, 127, and 6 (indicating that the
-substrate could not launch the program or could not locate the target instance) map to 3; and all
-other statuses map to 1. Because the exit code of a Java main class reflects the outcome of the
-workload itself, `dv_java` applies a slightly different mapping: 0 maps to 0; 124 maps to 1; 125,
-126, and 127 map to 3; and every other status, including 2 and 6, maps to 1.
+substrate could not start the program or could not locate the target instance) map to 3; and every
+other status maps to 1. Because the exit status of a Java main class reflects the outcome of the
+workload itself, `dv_java` applies its own mapping: 0 maps to 0; 124 maps to 1; 125, 126, and 127
+map to 3; and every other status, including 2 and 6, maps to 1. Furthermore, because `sb_exec`
+forwards its standard input to the remote program, a driver that invokes it while iterating over
+rows on standard input must redirect the call's input from `/dev/null`.
 
 ## The driver kit
 

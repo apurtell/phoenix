@@ -422,6 +422,9 @@ t_shim_state_reset() {
     px-selftest-regionserver-1 running 'Up 3 minutes (healthy)' \
     phoenix-harness:selftest regionserver 1 0 >"$T_SHIM_STATE/instances.txt"
   printf '0\n' >"$T_SHIM_STATE/restart-count"
+  # The backend stores its container start table in the output root; remove it so that a start
+  # timestamp recorded by an earlier test case does not add a restart to the next test case.
+  rm -f "$PX_OUT"/state/compose/starts-* ${T_A3_OUT:+"$T_A3_OUT"/state/compose/starts-*}
   t_seed_deployment "$PX_OUT" ${T_A3_OUT:+"$T_A3_OUT"}
 }
 
@@ -796,7 +799,7 @@ fake_join() {
 ## @description  Sets the state and status (field, key, state, status) of matching instances.
 ## @return       Exit 0.
 fake_rewrite() {
-  local field=$1 key=$2 state=$3 status=$4 line value out=""
+  local field=$1 key=$2 state=$3 status=$4 line value out="" seq
   [ -f "$fake_inv" ] || return 0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -805,6 +808,13 @@ fake_rewrite() {
     [ "$field" = id ] || value=$f_service
     if [ "$value" = "$key" ]; then
       [ -n "$state" ] || continue
+      # A start of a container that does not run gives it a new start time,
+      # as the runtime does, and the backend counts that change.
+      if [ "$state" = running ] && [ "$f_state" != running ] && [ -d "$fake_state" ]; then
+        seq=$(($(cat "$fake_state/start-seq" 2>/dev/null || echo 0) + 1))
+        printf '%s\n' "$seq" >"$fake_state/start-seq"
+        printf '2026-01-03T00:00:00.%06dZ\n' "$seq" >"$fake_state/started-$f_id"
+      fi
       f_state=$state
       f_status=$status
       line="$(fake_join)"
@@ -929,9 +939,11 @@ inspect)
     fi
     case "$fake_template" in
     *RestartCount*)
-      # A restart-count-<id> file holds the count of one instance.
-      printf '/%s|%s\n' "$f_name" "$(cat "$fake_state/restart-count-$fake_id" 2>/dev/null ||
-        cat "$fake_state/restart-count" 2>/dev/null || echo 0)"
+      # A restart-count-<id> file holds the count of one instance, and a
+      # started-<id> file its start time, which each start changes.
+      printf '/%s|%s|%s|%s\n' "$f_name" "$(cat "$fake_state/restart-count-$fake_id" \
+        2>/dev/null || cat "$fake_state/restart-count" 2>/dev/null || echo 0)" "$fake_id" \
+        "$(cat "$fake_state/started-$fake_id" 2>/dev/null || echo 2026-01-01T00:00:00Z)"
       ;;
     *State.Status*)
       printf '%s|%s|%s|2026-01-01T00:00:00Z\n' "$f_state" "$fake_code" "$fake_oom"
@@ -1117,12 +1129,25 @@ compose)
     done
     ;;
   exec)
+    fake_feed=0
     while [ $# -gt 0 ]; do
       case "$1" in
-      -T | --index=*) shift ;;
+      -T)
+        fake_feed=1
+        shift
+        ;;
+      --index=*) shift ;;
       *) break ;;
       esac
     done
+    # Without a terminal, compose gives all of its stdin to the command, also
+    # to a command that reads none. The fake reads it all first, as compose
+    # does, so a caller that loops over rows on stdin loses the rest of them.
+    if [ "$fake_feed" = 1 ]; then
+      cat >"$fake_state/exec-stdin.$$"
+      exec <"$fake_state/exec-stdin.$$"
+      rm -f "$fake_state/exec-stdin.$$"
+    fi
     # The command learns its service, as a command of an instance would.
     export PX_FAKE_SERVICE=${1:-}
     shift
@@ -1755,12 +1780,14 @@ A2_EOF
   touch -t 202001010000 "$T_A2"/tree/pom.xml "$T_A2"/tree/*/pom.xml \
     "$T_A2"/tree/*/*/pom.xml 2>/dev/null || true
 
-  # Build the release archives served by the fake fetch layer, each containing a single top-level
-  # directory. The jHiccup source archive includes its POM. Each valid HBase archive contains its
-  # bundled ZooKeeper and Hadoop client JARs alongside look-alike JARs that must not match, while
-  # HBase 2.6.5 intentionally omits ZooKeeper and bundles two conflicting Hadoop client JARs.
+  # Build the release archives served by the fetch layer, each containing a single top-level
+  # directory. The jHiccup source release archive includes its POM file configured with language
+  # level 1.6, matching the real upstream release. Each HBase release archive contains the bundled
+  # ZooKeeper and Hadoop client JARs that it ships alongside JARs whose names only resemble them,
+  # whereas HBase 2.6.5 omits ZooKeeper and ships two Hadoop client JARs.
   mkdir -p "$T_A2/dist-src/jHiccup-2.0.10"
-  printf '<project/>\n' >"$T_A2/dist-src/jHiccup-2.0.10/pom.xml"
+  printf '<project><source>1.6</source><target>1.6</target></project>\n' \
+    >"$T_A2/dist-src/jHiccup-2.0.10/pom.xml"
   (cd "$T_A2/dist-src" && tar -czf jHiccup-2.0.10.tar.gz jHiccup-2.0.10)
   for line in hbase-2.6.7:3.8.6:3.4.1 hbase-2.6.6:3.8.5:3.4.0 hbase-2.5.15:3.8.4:3.3.6; do
     IFS=: read -r name zk client <<<"$line"
@@ -1875,6 +1902,16 @@ A3_EOF
 shift
 # A stub driver. It raises the restart count, then works on for 30 seconds.
 printf '1\n' >"$PX_FAKE_STATE_DIR/restart-count"
+exec sleep 30
+DRIVER_EOF
+  cat >"$T_WORK/drivers/start-wait.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. It restarts the one instance as "docker restart" does: the
+# start time changes, the restart count stays 0 and the state stays running.
+# Then it works on for 30 seconds.
+printf '2026-01-02T00:00:00Z\n' >"$PX_FAKE_STATE_DIR/started-c0ffee000001"
 exec sleep 30
 DRIVER_EOF
   cat >"$T_WORK/drivers/exit-wait.sh" <<'DRIVER_EOF'
@@ -3325,8 +3362,15 @@ t_group_run() {
     "$T_WORK/drivers/exit-code.sh" -- 0
   t_equals run_without_a_cluster 0 "$T_STATUS"
   t_absent run_without_a_cluster_reports_no_error 'ERROR' "$T_STDERR"
-  # Have the stub driver increment the fake runtime's reported restart count so the post-run
-  # snapshot diverges from the pre-run baseline deterministically without timing dependencies.
+  # An initial snapshot that finds no existing start table is normal operation, so the failure
+  # trap must emit no diagnostic for it.
+  t_shim_state_reset
+  t_px_run exit-code -- 0
+  t_equals run_with_a_new_start_table "0 no" \
+    "$T_STATUS $(t_flag 'command failed' "$T_STDERR")"
+  # Have the stub driver increment the restart count reported by the fake runtime so that the
+  # post-run snapshot diverges from the pre-run snapshot deterministically without any timing
+  # assumptions.
   printf '0\n' >"$T_SHIM_STATE/restart-count"
   t_px_run bump-restart -- 4
   t_equals run_reports_an_unplanned_restart 3 "$T_STATUS"
@@ -3348,8 +3392,10 @@ t_group_run() {
     --disrupt 'phase:driver_start,kill,regionserver,0' -- 4
   t_equals run_accepts_a_planned_restart 0 "$T_STATUS"
   record="$T_STDOUT/run-record.tsv"
+  # The total restart count combines the 4 restarts from the driver and 1 from the recovery gate
+  # starting the instance, which assigns the instance a new start time.
   t_contains run_records_the_planned_verdict \
-    "regionserver${PX_TAB}0${PX_TAB}0${PX_TAB}4${PX_TAB}planned" \
+    "regionserver${PX_TAB}0${PX_TAB}0${PX_TAB}5${PX_TAB}planned" \
     "$(grep '^diff' "$record" 2>/dev/null)"
   # When the container restart policy is "no", a crashed container keeps a restart count of zero
   # and is detected instead by its transition from running to exited in the post-run snapshot.
@@ -3723,6 +3769,15 @@ t_group_sweep_evidence() {
   t_equals sweep_restart_count_inspects_every_instance_at_once "1 0" \
     "$(grep -c RestartCount "$T_SHIM_LOG") $(awk '/RestartCount/ && NF == 4' "$T_SHIM_LOG" |
       grep -c .)"
+  # A restart triggered from outside the harness changes only the instance start time; its
+  # reported restart count increments by 1 once, and subsequent reads preserve that count.
+  printf '2026-01-02T00:00:00Z\n' >"$T_SWEEP_STATE/started-ms01"
+  t_sb sb_restart_count px-sweep
+  count=$T_STDOUT
+  t_sb sb_restart_count px-sweep
+  t_equals sweep_restart_count_adds_a_changed_start_once "yes yes" \
+    "$(t_flag "$(t_rows 3 master 0 1)" "$count") $(t_flag "$(t_rows 3 master 0 1)" "$T_STDOUT")"
+  rm -f "$T_SWEEP_STATE/started-ms01" "$T_SWEEP_OUT/state/compose/starts-px-sweep.tsv"
   t_sb sb_termination_reason px-sweep master 0
   t_outcome sweep_sb_termination_reason 0 \
     "$(t_rows 4 running 0 '' 2026-01-01T00:00:00Z)"
@@ -3863,6 +3918,7 @@ t_group_sweep_scale() {
 ## @description  Sweeps unresponsive-runtime handling, teardown, and scope removal by project name.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_teardown() {
+  local table
   printf '# verb sweep: runtime failure, teardown and scope removal\n'
   : >"$T_SWEEP_STATE/unreachable"
   t_sb_codes sweep_runtime_failure_is_failure "
@@ -3921,10 +3977,14 @@ t_group_sweep_teardown() {
     'compose -p px-sweep down --volumes --remove-orphans --timeout 120' raw
   t_contains sweep_teardown_warns_of_the_missing_file 'is gone' "$T_STDERR"
   mv "$T_DEPLOY/compose.away" "$T_DEPLOY/compose.yaml"
+  : >"$T_SWEEP_OUT/state/compose/starts-px-sweep.tsv"
+  table="$(t_exists "$T_SWEEP_OUT/state/compose/starts-px-sweep.tsv")"
   t_shim_log_reset
   t_sb sb_scope_delete px-sweep
   t_outcome sweep_sb_scope_delete 0 ""
   t_called sweep_scope_delete_removes_the_network 'network rm px-sweep_default'
+  t_equals sweep_scope_delete_removes_the_start_table "yes no" \
+    "$table $(t_exists "$T_SWEEP_OUT/state/compose/starts-px-sweep.tsv")"
   t_sb sb_scope_exists px-sweep
   t_equals sweep_deleted_scope_is_no_such_object 6 "$T_STATUS"
 }
@@ -5456,6 +5516,10 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     "$PX_HOME/scripts/build-jhiccup.sh"
   t_outcome build_jhiccup_records_the_tool 0 \
     "$(t_rows 2 jar "$T_A2_OUT/build/jhiccup/jHiccup.jar")"
+  # Verify A7: javac 11 and later reject the Java 1.6 language level configured in the release.
+  t_equals build_jhiccup_sets_language_level_1_8 \
+    '<project><source>1.8</source><target>1.8</target></project>' \
+    "$(cat "$T_A2_OUT/build/jhiccup/src/pom.xml")"
   t_contains build_jhiccup_pins_its_source "PX_DIST_JHICCUP_2_0_10_SHA512_ARM64=" "$(cat "$pins")"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_PRODUCT=target/jHiccup.jar \
     "PX_DIST_JHICCUP_2_0_10_SHA512_ARM64=$(printf 'b%.0s' $(seq 1 128))" "$T_BASH" \
@@ -6450,6 +6514,7 @@ t_a3_abort_cases() {
       "$(t_validate "$bundle" >/dev/null; printf '%s' "$T_STATUS")"
   done <<'A3_EOF'
 restart-wait an_unplanned_restart restarted 0 to 1
+start-wait an_outside_restart restarted 0 to 1
 exit-wait an_unplanned_exit went from running to exited
 vanish-wait a_lost_instance vanished
 oom-wait an_oom_kill went from running to exited
@@ -6483,7 +6548,8 @@ t_a3_quiet_cases() {
   record="$(t_record)"
   t_contains quiet_validation_records_the_check_off "$(t_rows 3 quiet quiet_host off)" "$record"
   t_contains quiet_off_check_contaminates_the_run \
-    "$(t_rows 3 contamination quiet-host 'the quiet-host check is off')" "$record"
+    "$(t_rows 3 contamination quiet-host \
+      'the quiet-host check is off, so a failed time verdict is ADVISORY')" "$record"
   t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class measurement \
     -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
   record="$(t_record)"
@@ -6687,7 +6753,10 @@ t_fixtures_a5() {
   T_A5="$T_WORK/a5"
   T_A5_STATE="$T_A5/state"
   mkdir -p "$T_A5/bin" "$T_A5/jdk/fake/bin" "$T_A5/conf" "$T_A5/plugins" "$T_A5_STATE" \
-    "$T_A5/sql" "$T_A5/verdicts"
+    "$T_A5/sql" "$T_A5/verdicts" "$T_A5/hbase/lib"
+  # Create the commons-codec JAR in the HBase lib directory, which client classpaths reference by
+  # its filename.
+  : >"$T_A5/hbase/lib/commons-codec-1.15.jar"
   # Materialize the bootstrap probe for client 0. Because the fake runtime executes container
   # commands directly on the host, placing this shim first on PATH for every fake-runtime call
   # allows it to stand in for the container image probe. It logs its arguments and fails when a
@@ -6866,6 +6935,8 @@ t_a5_state_reset() {
   } >"$T_A5_STATE/instances.txt"
   printf '0\n' >"$T_A5_STATE/restart-count"
   printf 'sha256:f00dfeed00a5\n' >"$T_A5_STATE/image-id"
+  # Remove recorded start times so an earlier test case does not add a restart to the next one.
+  rm -f "$PX_OUT"/state/compose/starts-*
   t_seed_deployment "$PX_OUT"
 }
 
@@ -7457,10 +7528,12 @@ t_group_a5_report() {
   t_equals report_unknown_class_is_an_error "3 ERROR" "$T_STATUS $(t_result)"
   t_report measurement "" --verdict "$dir/none.tsv"
   t_equals report_absent_stream_is_6 6 "$T_STATUS"
-  # Verify requirement R-071: in a contaminated run, a duration-class FAIL is downgraded to
-  # ADVISORY, whereas a count-class FAIL remains authoritative and fails the run.
+  # Verify requirement R-071: in a contaminated run, a time FAIL verdict is downgraded to
+  # ADVISORY, whereas a count FAIL verdict still fails the run. A time PASS verdict remains PASS
+  # because the rule demotes only FAIL verdicts.
   printf 'latency\tFAIL\tduration\tdriver:x\tslow\nrows\tFAIL\tcount\tdriver:x\tshort\n' \
     >"$dir/mixed.tsv"
+  printf 'pause\tPASS\tduration\tcheck:x\tshort\n' >>"$dir/mixed.tsv"
   t_report measurement quiet-host --verdict "$dir/mixed.tsv"
   t_equals report_contaminated_run_fails_on_the_count "1 FAIL" "$T_STATUS $(t_result)"
   t_contains report_contaminated_time_verdict_is_advisory \
@@ -7473,7 +7546,9 @@ t_group_a5_report() {
   t_report validation "" --verdict "$dir/mixed.tsv"
   t_contains report_validation_time_verdict_is_advisory \
     "latency${PX_TAB}ADVISORY${PX_TAB}duration" "$T_STDOUT"
-  # Confirm that evaluating a run bundle applies the same downgrade rule using the class and
+  t_contains report_validation_time_pass_stays_pass \
+    "pause${PX_TAB}PASS${PX_TAB}duration${PX_TAB}check:x${PX_TAB}short${PX_TAB}PASS" "$T_STDOUT"
+  # Confirm that evaluating a run bundle applies the same downgrade rule using the run class and
   # contamination recorded in the bundle itself rather than ambient environment variables.
   copy="$(t_bundle_copy "$base" contaminated)"
   cat "$dir/mixed.tsv" >>"$copy/verdicts.tsv"
@@ -7702,6 +7777,13 @@ t_cluster_checks() {
 ## @return       Writes the severity string to stdout, or empty when no matching row exists. Exit 0.
 t_severity_of() { awk -F '\t' -v c="$2" '$1 == c { s = $2 } END { print s }' "$1/verdicts.tsv"; }
 
+## @description  Reports the space-separated severity and detail of a check (bundle, check) from
+##               a verdict stream.
+## @return       Writes the values to stdout, or empty when no matching row exists. Exit 0.
+t_detail_of() {
+  awk -F '\t' -v c="$2" '$1 == c { s = $2 " " $5 } END { print s }' "$1/verdicts.tsv"
+}
+
 ## @description  Verifies the built-in and supplementary cluster checks (R-072, R-073, R-074) across
 ##               fixture bundles.
 ## @return       Records test assertions. Exit 0.
@@ -7793,8 +7875,39 @@ t_group_a5_checks() {
   t_cluster_checks "$dir"
   t_equals cluster_log_warnings_are_advisory ADVISORY "$(t_severity_of "$dir" cluster.log)"
   rm -f "$T_A5_STATE/logs-c0ffee00a502.txt"
-  # Verify regression A5-LIVE-2: unified JVM logging pads tag brackets to the widest tag set seen so
-  # far, so a GC pause line following a safepoint line carries a right-padded [gc       ] tag.
+  # Verify A7: a hard kill of a RegionServer causes DataNodes to log errors while the cluster
+  # recovers. Any log line within the recovery window (now - 50 s to now - 9 s) is ignored under
+  # either timestamp layout, whereas lines after recovery or before injection (now - 60 s) are
+  # counted. A recover row with no recovery timestamp indicates a failed recovery and defines no
+  # window.
+  line="$(px_epoch_s)"
+  dir="$(t_check_bundle window "$(t_rows 5 recover 2 "$(((line - 70) * 1000))" "" fail)")"
+  px_utc_fields "$((line - 30))"
+  copy=${PX_UTC_TEXT%Z}
+  {
+    printf '%s,196 ERROR [DataXceiver] datanode.DataNode: error processing WRITE_BLOCK\n' \
+      "${copy/T/ }"
+    printf '%s,201 WARN [main] Server: the pipeline broke\n' "$copy"
+  } >"$T_A5_STATE/window.txt"
+  got=""
+  for copy in "" "0 after the recovery" "60 before the injection"; do
+    cp "$T_A5_STATE/window.txt" "$T_A5_STATE/logs-c0ffee00a502.txt"
+    if [ -n "$copy" ]; then
+      px_utc_fields "$((line - ${copy%% *}))"
+      printf '%s,500 ERROR [main] Server: %s\n' "${PX_UTC_TEXT%Z}" "${copy#* }" \
+        >>"$T_A5_STATE/logs-c0ffee00a502.txt"
+    fi
+    t_cluster_checks "$dir"
+    want="$(t_detail_of "$dir" cluster.log)"
+    got="$got|${want%% ERROR or FATAL*} $(t_flag "2 lines in a recovery window" "$want")"
+    got="$got${copy:+ $(t_flag "first: ${PX_UTC_TEXT%Z},500 ERROR [main] Server: ${copy#* }" \
+      "$want")}"
+  done
+  t_equals cluster_log_counts_no_line_of_a_recovery_window \
+    "|PASS 0 yes|FAIL 1 yes yes|FAIL 1 yes yes" "$got"
+  rm -f "$T_A5_STATE/logs-c0ffee00a502.txt" "$T_A5_STATE/window.txt"
+  # Verify regression A5-LIVE-2: the JDK pads log line tags to the widest tag set written so far,
+  # so a GC pause line following a safepoint line carries a padded [gc       ] tag.
   t_a5_state_reset
   dir="$(t_check_bundle gcpad)"
   {
@@ -8238,8 +8351,14 @@ A5_EOF
     /disruptions/0/state) $(awk -F '\t' '$1 == "action" { a++ } $1 == "recover" { r++ }
     $1 == "skip" && $3 == "disruption 1" { s++ } END { print a + 0, r + 0, s + 0 }' \
     "$run/run-record.tsv")"
+  # Verify A7: the recovery gate starts the killed instance, updating its start time and raising
+  # its restart count from 0 to 1 just as on a real container runtime. The planned kill covers
+  # that change, so the run passes.
+  t_equals planned_kill_at_steady_counts_a_planned_restart "yes PASS" \
+    "$(t_flag "$(t_rows 8 diff regionserver 0 0 1 planned running running)" \
+      "$(cat "$run/run-record.tsv" 2>/dev/null)") $(t_severity_of "$run" cluster.restart)"
   # Confirm that disruption entries that never fired or were skipped by the backend provide no
-  # recovery evidence and result in a SKIP verdict.
+  # recovery evidence.
   dir="$(t_check_bundle skipped "$(t_rows 9 disrupt 1 phase phase:phase@kill kill \
     regionserver 0 hard skip)")"
   grep -v '^recover' "$dir/run-record.tsv" >"$dir/r.tsv"
@@ -8823,6 +8942,12 @@ A5_EOF
  report:0" "$T_STATUS $(t_verb_codes "$pherf")"
   t_contains pherf_puts_the_phoenix_client_jars_on_the_class_path ":$T_A5/phoenix/client/*:" \
     ":$(t_java_cp org.apache.phoenix.pherf.Pherf):"
+  # Verify A7: JDK 11 removed JAXB, which Pherf requires and HBase ships in lib/jdk11, and the
+  # commons-csv library bundled in the Pherf JAR requires the commons-codec JAR from HBase.
+  t_contains pherf_puts_the_jaxb_jars_of_hbase_on_the_class_path ":$T_A5/hbase/lib/jdk11/*:" \
+    ":$(t_java_cp org.apache.phoenix.pherf.Pherf):"
+  t_contains pherf_puts_the_codec_jar_of_hbase_on_the_class_path \
+    ":$T_A5/hbase/lib/commons-codec-1.15.jar:" ":$(t_java_cp org.apache.phoenix.pherf.Pherf):"
   t_equals pherf_result_paths_are_in_the_run_work_directory "/tmp/px/${pherf##*/}/results\
  /tmp/px/${pherf##*/}/results/summary.html" "$(sed -n \
     's/^pherf\.default\.results\.dir=//p' "$pherf/drivers/pherf/stage/pherf.properties")\
@@ -9007,14 +9132,27 @@ if [ "$mode" = control ]; then
   exec sleep 30
 fi
 A6_EOF
+  # Materialize the fake jcmd shim: JFR.start creates an empty target file and JFR.stop writes the
+  # recording content, matching JVM behavior. When the jcmd-refuses flag file is present, the JVM
+  # has lost the recording, so JFR.stop writes nothing while jcmd still exits with status 0.
   cat >"$T_A6/jdk/17/bin/jcmd" <<'A6_EOF'
 #!/usr/bin/env bash
 printf '%s %s\n' "${PX_FAKE_SERVICE:-}" "$*" >>"$PX_FAKE_STATE_DIR/jcmd.log"
+file="" stop=0
 for arg in "$@"; do
   case "$arg" in
-  filename=*) printf 'jfr recording\n' >"${arg#filename=}" ;;
+  filename=*) file=${arg#filename=} ;;
+  JFR.stop) stop=1 ;;
   esac
 done
+[ -n "$file" ] || exit 0
+if [ "$stop" = 0 ]; then
+  : >"$file"
+elif [ -e "$PX_FAKE_STATE_DIR/jcmd-refuses" ]; then
+  printf 'Could not write recording to file. Could not find the recording.\n'
+else
+  printf 'jfr recording\n' >"$file"
+fi
 A6_EOF
   cp "$T_A6/jdk/17/bin/java" "$T_A6/jdk-nojcmd/17/bin/java"
   chmod +x "$T_A6/bin"/* "$T_A6/tools/async-profiler/bin/asprof" "$T_A6/jdk/17/bin"/* \
@@ -9095,6 +9233,7 @@ t_a6_state_reset() {
   done >"$T_A6_STATE/instances.txt"
   printf '0\n' >"$T_A6_STATE/restart-count"
   printf 'sha256:f00dfeed00a6\n' >"$T_A6_STATE/image-id"
+  rm -f "$T_A6_OUT"/state/compose/starts-* "$T_A6_OUT/state/collect-selftest.tsv"
   mkdir -p "$T_A6_OUT/state"
   printf 'px-selftest\n' >"$T_A6_OUT/state/scope-compose-selftest"
   printf '%s\n' "$T_A6/deploy" >"$T_A6_OUT/state/deployment-compose-selftest"
@@ -9378,15 +9517,32 @@ t_group_a6_tools() {
     "$run/traces/counters.tsv") $(awk 'NR > 1' "$run/traces/counters.tsv" | grep -c .) $(awk \
     -F '\t' 'NR == 2 { print $7 }' "$run/traces/counters.tsv") $(t_severity_of "$run" \
     collector.trace)"
+  # Verify A7: a JVM restart loses the active recording while jcmd still exits with status 0 on
+  # the refused stop, and the empty file created at start must not pass as a valid recording.
+  copy="$(t_a6_copy "$run" refused jfr)"
+  : >"$T_A6_STATE/jcmd-refuses"
+  t_a6_cycle jfr "$copy"
+  rm -f "$T_A6_STATE/jcmd-refuses"
+  got="$(awk -F '\t' '$1 == "jfr" && $2 == "regionserver-0" { print $3 }' \
+    "$copy/metrics/index.tsv")"
+  t_equals jfr_stop_that_writes_no_recording_fails "0 1 fail ADVISORY" \
+    "$T_CYCLE $got $(t_severity_of "$copy" collector.jfr)"
+  # Verify O8: diagnostic output from remote collector tools is redirected to logs/collect.log in
+  # the bundle rather than emitted to stderr.
+  t_equals collect_remote_output_goes_to_the_log "yes no" "$(t_flag 'Could not write recording' \
+    "$(cat "$copy/logs/collect.log" 2>/dev/null)") $(t_flag 'Could not write recording' \
+    "$T_STDERR")"
+  t_equals collect_stop_prints_index_and_result "$(t_rows 4 result fail 1 "$copy")" \
+    "$(t_last_line "$T_STDOUT")"
   # RQ-130: A missing jcmd binary or absent trace reader produces a SKIP verdict rather than a
-  # run failure.
+  # failure.
   copy="$(t_a6_copy "$run" nojcmd jfr)"
-  t_a6_cycle px-jfr "$copy" "PX_JDK_ROOT=$T_A6/jdk-nojcmd"
+  t_a6_cycle jfr "$copy" "PX_JDK_ROOT=$T_A6/jdk-nojcmd"
   t_equals jfr_without_jcmd_skips "0 0 SKIP no" "$T_CYCLE $(t_severity_of "$copy" \
     collector.jfr) $(t_exists "$copy/jfr/regionserver-0.jfr")"
   copy="$(t_a6_copy "$run" noreader traces)"
   : >"$T_A6_STATE/no-trace-reader"
-  t_a6_cycle px-trace-count "$copy"
+  t_a6_cycle trace "$copy"
   rm -f "$T_A6_STATE/no-trace-reader"
   t_equals trace_count_without_its_reader_skips "0 0 SKIP no" "$T_CYCLE $(t_severity_of \
     "$copy" collector.trace) $(t_exists "$copy/traces/counters.tsv")"

@@ -565,9 +565,15 @@ causes the run to fail with exit code 4 if the host remains busy when the wait e
 disabled and takes no sample only when the wait duration is 0 and no quiet host is required, which
 is the configuration of the validation run class. Both a disabled check and a busy host on a run
 that does not require a quiet host mark the run as contaminated: the run record receives a
-`contamination quiet-host` row, every timing verdict of the run becomes ADVISORY, and every verb
-receives `PX_CONTAMINATION=quiet-host`. A measurement run is also marked contaminated whenever its
-sizing diverges from the standard measurement table: through an override of `PX_<KEY>_MEM_MIB`,
+`contamination quiet-host` row, any failed timing verdict of the run becomes ADVISORY, and every
+verb receives `PX_CONTAMINATION=quiet-host`. The check outputs its load samples, followed by a
+`quiet_host STATE SAMPLES ELAPSED LOAD` summary row reporting a state of `quiet`, `contaminated`,
+`refused`, `unmeasured`, or `off`, and concludes with a `result STATUS CODE host` row where the
+status is `ok` for a quiet host, `warn` when the host is contaminated or unmeasured, `fail` when a
+required quiet host is refused or unmeasured, and `skip` when the check is disabled; `px-run`
+persists the `quiet_host` row in its run record. A measurement run is also marked contaminated
+whenever
+its sizing diverges from the standard measurement table: through an override of `PX_<KEY>_MEM_MIB`,
 `PX_<KEY>_HEAP_MIB`, or `PX_<KEY>_DIRECT_MIB` in its own configuration, through an override named in
 the cluster's topology record (such as `override-24gib.env`), or by running against a cluster
 rendered for another class. In that case, the run record receives a `contamination sizing` row

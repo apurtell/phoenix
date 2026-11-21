@@ -149,8 +149,10 @@ within each run bundle. For every hook invocation, the harness appends a telemet
 `ts_ms hook status elapsed_ms` to `<base>/plugins/<id>/hooks.tsv`, and it records an entry with the
 hook name `check` for each check script executed by `suites/check-cluster.sh`. Like workload
 drivers, hooks must interact with the cluster exclusively through the substrate contract: they must
-never invoke a container runtime or Kubernetes CLI directly, and the harness self-test actively
-scans `plugins/` for forbidden tool references.
+never invoke a container runtime or Kubernetes tool directly, and the harness self-test actively
+scans `plugins/` for forbidden tool references. Because `sb_exec` forwards its standard input to the
+remote command, any hook that invokes it inside a loop reading rows from standard input must
+redirect the call's input from `/dev/null`.
 
 During cluster rendering and suite resolution, render hooks and the `suites` hook write their
 output into a temporary staging directory assigned to `PX_HOOK_OUT`. Once the hook finishes, the

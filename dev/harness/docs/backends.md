@@ -103,7 +103,9 @@ and the driver contract in A5 lists the code.
 `sb_exec` is the sole contract function that propagates an external exit status, returning the exit
 status of the command it executed inside the instance. Four exit codes remain reserved so that
 callers can distinguish a substrate execution-framing failure from a command execution failure. A
-program running inside a role must never exit with any of these four codes.
+program running inside a role must never exit with any of these four codes. Because `sb_exec`
+forwards its standard input to the executed command, any caller invoking it inside a loop that reads
+rows from standard input must redirect the call's input from `/dev/null`.
 
 | Code | Constant | Meaning |
 |---|---|---|
@@ -316,16 +318,20 @@ reads neither directory.
 
 ### compose.yaml
 
-The root of the deployment directory must contain a file named `compose.yaml`; no alternative
-compose file names are recognized, and a directory lacking `compose.yaml` fails with usage exit
-code 2. On every Compose invocation, the backend explicitly passes the project name
-`<PX_PROJECT_PREFIX>-<cluster>` along with the compose file path and project directory while the
-file exists, making an embedded project name inside `compose.yaml` unnecessary. Every service must
-configure its restart policy as `no` so that failed containers remain terminated and preserve
-accurate failure evidence; the backend neither restarts failed instances automatically nor validates
-the restart policy. Services that define a container healthcheck derive their readiness state from
-that probe, whereas services without a healthcheck are considered ready while running, and one-shot
-services are considered ready once they exit with status 0.
+The root of the deployment directory must contain `compose.yaml`; no alternative file names are
+recognized, and a directory lacking it fails with usage exit code 2. On every Compose invocation,
+the backend passes the project name `<PX_PROJECT_PREFIX>-<cluster>` along with the file path and the
+directory as the project directory while the file exists, so the file requires no embedded project
+name of its own. Every service sets its restart policy to `no` so that a terminated instance remains
+terminated and restart evidence stays meaningful; the backend neither restarts instances
+automatically nor validates the configured policy. Because the container runtime counts only
+policy-driven restarts, `sb_restart_count` also tracks each container's most recent start timestamp
+in `$(px_state_dir)/compose/starts-<scope>.tsv` and increments the count by 1 whenever that
+timestamp changes between calls: an external restart initiated outside the harness, such as
+`docker restart`, leaves the container state as `running` and alters only its start time.
+`sb_scope_delete` removes this state table. A service that declares a healthcheck derives its
+readiness from that probe, whereas a service without one is considered ready while running, and a
+one-shot service that exited with status 0 is considered ready as well.
 
 Every service must declare a memory limit via `mem_limit` or `deploy.resources.limits.memory`,
 formatted in YAML block style with one key per line. `px-cluster up` runs the host preflight check

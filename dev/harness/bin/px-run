@@ -1257,7 +1257,7 @@ quiet_check() {
 ## @return       Exits 0.
 contaminate() {
   CONTAMINATION="${CONTAMINATION:+$CONTAMINATION,}$1"
-  record_row contamination "$1" "${*:2}, so every time verdict is ADVISORY"
+  record_row contamination "$1" "${*:2}, so a failed time verdict is ADVISORY"
 }
 
 ## @description  Marks a measurement run as contaminated if its cluster sizing diverges from the

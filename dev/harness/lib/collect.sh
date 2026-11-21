@@ -120,7 +120,11 @@ ck_targets() {
 ck_exec() {
   local role=$1 index=$2 script=$3
   shift 3
-  sb_exec "$CK_SCOPE" "$role" "$index" "" -- bash -c "$script" px-collect "$@" >&2
+  # Because sb_exec forwards its standard input to the remote instance while callers iterate over
+  # target rows on standard input, redirect standard input from /dev/null so that the remote call
+  # does not consume the remaining rows.
+  sb_exec "$CK_SCOPE" "$role" "$index" "" -- bash -c "$script" px-collect "$@" </dev/null \
+    >>"$PX_RUN_DIR/logs/collect.log"
 }
 
 ## @description  Runs a remote script for (role, index, script, argument...) like ck_exec after
@@ -141,7 +145,7 @@ ck_fetch() {
   local status=0 file="$PX_RUN_DIR/$4"
   mkdir -p "${file%/*}" || return "$PX_EXIT_FAIL"
   sb_exec "$CK_SCOPE" "$1" "$2" "" -- bash -c "$CK_FETCH_SCRIPT" px-fetch "$CK_REMOTE/$3" \
-    >"$file.tmp" || status=$?
+    </dev/null >"$file.tmp" || status=$?
   if [ "$status" = 0 ]; then
     mv -f "$file.tmp" "$file" || status=$PX_EXIT_FAIL
   fi

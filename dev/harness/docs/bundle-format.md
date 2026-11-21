@@ -328,15 +328,17 @@ startup order:
 | `container` | `px-collect`: instance samples in the sample schema | `metrics/container/*.csv` |
 | `trace` | `px-trace-count`: Phoenix trace counters from every RegionServer | `traces/*.tsv` |
 
-By default, the measurement run class enables all six collectors, whereas the validation class
-enables none. Driver HDR histogram logs are not managed as collectors, and `px-run` never disables
-them. The target instances for `profile`, `jfr`, and `hiccup` are the instances listed in
+By default, the measurement run class starts all six collectors, whereas the validation class starts
+none. Driver HDR histogram logs are not managed as collectors, and `px-run` never disables them. The
+target instances for `profile`, `jfr`, and `hiccup` are the instances listed in
 `cluster/services.tsv` whose roles match `PX_COLLECT_TARGETS`, which defaults to `all`. Collectors
 interact with the cluster exclusively through `sb_exec` and retrieve remote files by streaming the
 output of `cat`. Each CSV row records a single sampling pass taken at the interval
 `PX_COLLECT_INTERVAL_S`, ending with the `run_class` and `contamination` columns; because the
 initial pass executes before the run verb starts and the final pass executes after it finishes, the
-sample series spans the entire workload execution.
+sample series spans the entire workload execution. A counter delta in `traces/counters.tsv` is valid
+only for a RegionServer that retained its JVM throughout the run, because a restarted JVM resets its
+counters to 0 and the instance's `diff` row in `run-record.tsv` records the state transition.
 
 **The index.** The file `metrics/index.tsv` is an unheadered stream recording one row per collection
 target with the fields `collector target status
@@ -682,15 +684,19 @@ source `check:cluster`.
 
 Any subject lacking applicable evidence emits a `SKIP` verdict stating the reason, such as no
 cluster, no disruption, or no GC log. The `cluster.recovery` subject emits `FAIL` for any
-disruption whose state is `fail` (a failed fault injection) or `missed`, as well as when recovery
-time exceeds the threshold, and it emits `SKIP` only when no disruption entry is `ok`, `fail`, or
-`missed`, since entries that are `skip` or never fired provide no recovery evidence. The log
-subject saves each daemon log in `logs/instance/`, and the GC subject saves each garbage-collection
-log in `logs/gc/`. When a planned disruption action covered an instance, the log subject still
-archives its log file but excludes its lines from the error and warning counts. For each affected
-instance, the restart subject reports its state change, its restart counts, its termination reason
-and exit code, and its out-of-memory flag, matching the fields of the `anomaly` member of the
-manifest.
+disruption whose state is `fail` (a failed fault injection) or `missed`, and it emits `SKIP` only
+when no disruption entry is `ok`, `fail`, or `missed`, since entries that are `skip` or never fired
+prove nothing. The log subject saves each daemon log in `logs/instance/`, and the GC subject saves
+each GC log in `logs/gc/`. When a planned action covered an instance, the log subject still
+preserves its log file but excludes its lines from the counts. It also excludes any line logged by
+any instance during a disruption's recovery window—from the injection timestamp to the recovery
+timestamp of the `recover` row, with 2 s of slack at each end—because an intentional fault
+expectedly causes peer instances to log errors, such as a DataNode whose write pipeline from a
+killed RegionServer breaks. Each line's timestamp is taken from its leading UTC date and time. Lines
+logged after the recovery window are counted as usual, and `cluster.post_recovery` verifies any
+faults that remain. For each instance, the restart subject reports its state change, its restart
+counts, its termination reason and exit code, and its out-of-memory flag, matching the fields of the
+`anomaly` member of the manifest.
 
 The oom subject evaluates peak memory utilization for each role against its limit across two sample
 sources combined: the `pre` and `post` snapshots, and the continuous instance samples collected by

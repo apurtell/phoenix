@@ -377,12 +377,12 @@ px_compose_record_set() {
   }
 }
 
-## @description  Remove the persistent state record file for SCOPE if it exists.
-## @return       Exit 0 always.
+## @description  Remove the persistent state record and start table for SCOPE.
+## @return       Exit 0.
 px_compose_record_delete() {
   local path
   if path="$(px_compose_record_path "${1:-}")"; then
-    rm -f "$path"
+    rm -f "$path" "${path%/scope-*}/starts-${1:-}.tsv"
   fi
   return 0
 }
@@ -2157,13 +2157,15 @@ px_compose_inspect() {
 }
 
 # Queries the cumulative container restart count for every instance in the scope by combining one
-# container inventory listing with one batch inspection across all containers in the scope.
-## @description  Report the runtime restart count for each instance of one scope in a single pass.
+# container inventory listing with one batch inspection across all containers, while maintaining the
+# scope's container start table.
+## @description  Report the restart count for each instance of a scope and update its start table.
 ## @param        scope_id: the scope ID returned by sb_scope_create
-## @return       Write one restart TSV row per instance to stdout and exit 0, exit 1 when the
-##               runtime does not respond, or exit 2 on invalid usage.
+## @return       Write one restart TSV row per instance to stdout and exit 0, exit 1 if the runtime
+##               does not respond or the start table cannot be written, or exit 2 on invalid usage.
 sb_restart_count() {
-  local scope=${1:-} rows line names="" counts name count id
+  local scope=${1:-} rows line names="" counts name count id cid started
+  local path tmp seen="" table="" row extra
   px_compose_scope_load "$scope" || return $?
   rows="$(px_compose_ps "$scope")" || return "$SB_EXIT_FAIL"
   set --
@@ -2175,21 +2177,48 @@ sb_restart_count() {
 $rows
 EOF
   [ $# -gt 0 ] || return 0
-  if ! counts="$(px_compose_engine 30 inspect --format '{{.Name}}|{{.RestartCount}}' "$@")"; then
+  if ! counts="$(px_compose_engine 30 inspect \
+    --format '{{.Name}}|{{.RestartCount}}|{{.Id}}|{{.State.StartedAt}}' "$@")"; then
     px_error "the runtime did not answer an inspection of scope $scope"
     return "$SB_EXIT_FAIL"
   fi
+  # The container runtime increments RestartCount only for restarts triggered by a restart policy,
+  # whereas every service in the deployment uses a policy of no. Consequently, an external restart
+  # outside the harness—such as "docker restart"—leaves the runtime counter at 0 and the container
+  # state as running. To detect these events, the start table records the most recent start time of
+  # each container and increments the reported restart count by 1 whenever that timestamp changes
+  # between successive calls.
+  path="$(px_compose_state_dir)/starts-$scope.tsv" || return "$SB_EXIT_FAIL"
+  [ ! -f "$path" ] || seen="$(cat "$path")"
   # Container inspection prefixes each reported container name with a leading slash.
-  while IFS='|' read -r name count; do
+  while IFS='|' read -r name count cid started; do
     [ -n "$name" ] || continue
     id="$(sb_row_get "${name#/}" "$names")" || continue
     case "$count" in
     '' | *[!0-9]*) count=0 ;;
     esac
-    px_tsv_row "${id%%/*}" "${id#*/}" "$count"
+    [ -n "$started" ] || started=none
+    extra=0
+    # A newly observed container will naturally be absent from the existing start table; exiting
+    # explicitly inside the command substitution prevents a caller's ERR failure trap from firing
+    # on that expected lookup miss.
+    if row="$(sb_row_get "$cid" "$seen" || exit "$?")"; then
+      extra=${row#*"$PX_TAB"}
+      [ "${row%%"$PX_TAB"*}" = "$started" ] || extra=$((extra + 1))
+    fi
+    table="$table$(px_tsv_row "$cid" "$started" "$extra")$PX_NL"
+    px_tsv_row "${id%%/*}" "${id#*/}" "$((count + extra))"
   done <<EOF
 $counts
 EOF
+  # Atomically renaming the temporary file replaces the start table in a single step, ensuring that
+  # a concurrent reader never observes a partially written table.
+  tmp="$path.$$.$RANDOM"
+  if ! printf '%s' "$table" >"$tmp" || ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"
+    px_error "cannot write the start table $path"
+    return "$SB_EXIT_FAIL"
+  fi
 }
 
 ## @description  Report normalized termination evidence for an instance in the shared vocabulary.

@@ -75,6 +75,11 @@ tar -xzf "$BJ_ARCHIVE" -C "$BJ_SRC" --strip-components 1 ||
   px_die "$PX_EXIT_FAIL" "the verified archive $BJ_ARCHIVE does not unpack"
 [ -f "$BJ_SRC/pom.xml" ] ||
   px_die "$PX_EXIT_FAIL" "the jHiccup source release holds no pom.xml"
+# The upstream jHiccup 2.0.10 POM configures source and target language levels of 1.6, which
+# javac 11 and later reject. Upgrade both settings to 1.8, the lowest language level accepted by
+# every supported build JDK and executable by every runtime JDK in the container image.
+sed -i.px -E 's#<(source|target)>1\.6</#<\1>1.8</#g' "$BJ_SRC/pom.xml" ||
+  px_die "$PX_EXIT_FAIL" "cannot set the language level 1.8 in $BJ_SRC/pom.xml"
 
 px_info "building jHiccup with JDK $PX_BUILD_JDK_SEL ($PX_BUILD_HOME), log $BJ_LOG"
 px_maven_run "$BJ_LOG" -B -f "$BJ_SRC/pom.xml" -DskipTests package
