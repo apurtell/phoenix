@@ -78,11 +78,13 @@ Five invariants govern the execution of every verb.
 
 1. **Order and guarantees.** `px-run` always invokes `describe` first; if `describe` fails, no
    further verbs execute. If `validate` fails, `prepare` and `run` are skipped. If `prepare` fails,
-   `run` is skipped. Conversely, `restore` is guaranteed to run whenever `prepare` has started,
-   even following a verb failure, a timeout, or an abort, and `report` is guaranteed to run
-   whenever `validate` has executed. Consequently, `restore` must gracefully handle a partially
-   completed `prepare` phase as well as a cluster that has lost an instance, and `report` must
-   handle a bundle to which `run` never wrote.
+   `run` is skipped. Conversely, `restore` runs whenever `prepare` has executed, even following a
+   verb failure, a timeout, or an abort. The only exception is an anomaly abort: because the
+   cluster state can no longer be trusted, `restore` is never invoked after one, and `px-run` emits
+   a `SKIP` verdict row for `driver.restore` citing the reason `anomaly abort`. Meanwhile, `report`
+   executes whenever `validate` has run. Consequently, `restore` must gracefully
+   handle a partially completed `prepare` phase as well as a cluster that has lost an instance, and
+   `report` must handle a bundle to which `run` never wrote.
 2. **Idempotence.** Both `prepare` and `restore` must produce the exact same outcome when executed
    twice in succession.
 3. **No cluster for three verbs.** The `describe`, `validate`, and `report` verbs must not open

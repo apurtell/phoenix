@@ -31,9 +31,11 @@
 #      one to recover.
 #   4. Capture the post-run snapshot and compare it against the pre-run snapshot.
 #   5. Run restore whenever prepare ran, run report whenever validate ran, execute the cluster
-#      checks, and run the collect hook.
-#   6. Merge the verdicts with px-report, write and validate the manifest with px-bundle, and tear
-#      down the cluster by default.
+#      checks, and invoke the collect hook. After an anomaly abort, restore is never executed and
+#      is recorded with a SKIP verdict.
+#   6. Merge all verdict streams with px-report, and write and validate the bundle manifest with
+#      px-bundle. The run leaves the cluster running because each command tears down only the
+#      resources that it provisioned.
 #
 # A failing step blocks only the downstream steps that depend on it, so restore and report still
 # execute and the bundle remains complete. px-run writes one verdict row per verb, and px-report
@@ -1778,9 +1780,18 @@ phase_reached snapshot_post
 disrupt_sweep
 disrupt_rows
 
-# Run restore whenever prepare was attempted, run report whenever validate ran, and execute the
-# cluster checks while the cluster is still running.
-[ "$PREPARE_RAN" = 0 ] || verb_run restore "$(verb_deadline)"
+# Run restore whenever prepare ran, run report whenever validate ran, and then execute the cluster
+# checks while the cluster remains active. Following an anomaly abort, restore is never executed
+# because the cluster state cannot be trusted and invoking restore would block for its full timeout
+# bound against an unresponsive instance.
+if [ "$PREPARE_RAN" = 1 ]; then
+  if [ "$ABORTED" = 1 ]; then
+    sx_verdict driver.restore SKIP "anomaly abort: the cluster cannot be trusted, so restore" \
+      "does not run"
+  else
+    verb_run restore "$(verb_deadline)"
+  fi
+fi
 verb_run report "$(verb_deadline)"
 [ -z "$SCOPE" ] || checks_run
 hook_run collect || true

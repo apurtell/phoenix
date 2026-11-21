@@ -495,7 +495,8 @@ out-of-memory kill immediately aborts the run with exit code 3 regardless of wha
 return: `px-run` stops the active verb, writes an `abort` row recording the instance and its state
 change, and then captures the second snapshot to preserve the failure evidence. Because a workload
 running on a broken cluster produces no valid measurements, the run does not wait for the verb to
-finish.
+finish. Following an anomaly abort, `restore` is never executed against the untrusted cluster, and
+the `driver.restore` verdict is recorded as `SKIP` with the reason `anomaly abort`.
 
 An action qualifies as planned only when `px-cluster` (`kill`, `signal`, `restart`, `scale`, or
 `group`) or a scheduled disruption managed by `px-run` logs an entry in the planned-action record

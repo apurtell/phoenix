@@ -102,9 +102,9 @@ T_SCAN_RE="$T_RUNTIME_RE|$T_ENGINE_RE"
 T_WAIVER='# px-allow-docker:'
 
 # Invocation patterns checked by Layer 2 that would bypass shell function traps: explicit binary
-# paths never resolve to shell functions, and the command, env, and exec builtins skip function
-# lookup.
-T_BYPASS_RE='(command|env|exec)[[:space:]]+('"$T_RUNTIME_NAMES"')([^[:alnum:]_-]|$)'
+# paths never resolve to shell functions, and the three builtins skip the shell function table.
+T_BYPASS_RE='(^|[^[:alnum:]_.-])(command|env|exec)[[:space:]]+('"$T_RUNTIME_NAMES"')'
+T_BYPASS_RE="$T_BYPASS_RE([^[:alnum:]_-]|\$)"
 T_BYPASS_RE="$T_BYPASS_RE|/bin/($T_RUNTIME_NAMES)([^[:alnum:]_-]|\$)"
 T_BYPASS_RE="$T_BYPASS_RE|(which|type -P)[[:space:]]+($T_RUNTIME_NAMES)"
 
@@ -6530,6 +6530,25 @@ A3_EOF
     "$(cat "$PX_HOME/README.md")"
   t_contains abort_code_is_documented_for_backends 'aborts the run at once with exit 3' \
     "$(tr -s ' \n' ' ' <"$PX_HOME/docs/backends.md")"
+  # Verify A8: following an anomaly abort, the restore verb never executes against the untrusted
+  # cluster, a SKIP verdict records the reason, the run performs no teardown, and the resulting
+  # bundle still passes validation. Setting PX_KEEP=1 does not alter this behavior.
+  t_shim_state_reset
+  t_shim_log_reset
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_POLL_INTERVAL_S=0.2 \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/restart-wait.sh"
+  bundle="$(t_bundle)"
+  t_equals abort_skips_restore "3 describe validate prepare run report 0" \
+    "$T_STATUS $(t_verbs_of "$bundle") $(t_calls 'compose -p px-selftest down')"
+  t_equals abort_restore_verdict_is_skip "SKIP yes" "$(t_severity_of "$bundle" driver.restore)\
+ $(t_flag 'anomaly abort' "$(awk -F '\t' '$1 == "driver.restore"' "$bundle/verdicts.tsv")")"
+  t_equals abort_bundle_validates 0 \
+    "$(t_validate "$bundle" >/dev/null; printf '%s' "$T_STATUS")"
+  t_shim_state_reset
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_POLL_INTERVAL_S=0.2 \
+    -e PX_KEEP=1 -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/restart-wait.sh"
+  t_equals abort_with_keep_skips_restore "3 describe validate prepare run report SKIP" \
+    "$T_STATUS $(t_verbs_of "$(t_bundle)") $(t_severity_of "$(t_bundle)" driver.restore)"
   t_shim_state_reset
 }
 
@@ -7945,15 +7964,17 @@ t_group_a5_checks() {
   t_equals thresholds_hold_the_recovery_bound 120 \
     "$(sed -n 's/^recovery\.seconds\.max=//p' "$base")"
   bad=""
+  # Pass the target files directly to grep rather than piping from an upstream command: under
+  # pipefail, a producer piped into grep -q can receive SIGPIPE when grep exits upon finding the
+  # first match, causing the overall pipeline to fail.
   while IFS="=" read -r key _; do
     case "$key" in '' | '#'*) continue ;; esac
-    cat "$PX_HOME/suites/checks"/*.sh |
-      grep -qE "(ck|sc)_threshold [a-z_\$\"]+ ${key//./\\.}( |$)" ||
+    grep -qE "(ck|sc)_threshold [a-z_\$\"]+ ${key//./\\.}( |$)" "$PX_HOME/suites/checks"/*.sh ||
       bad="$bad $key is not read through sx_threshold;"
-    grep -nE "${key//./\\.}=[0-9]" "$PX_HOME/suites/checks"/*.sh | grep -q . &&
+    grep -qE "${key//./\\.}=[0-9]" "$PX_HOME/suites/checks"/*.sh &&
       bad="$bad $key has a literal value;"
   done <"$base"
-  grep -nE '(ck_over +[^ ]+ +"?[0-9]|-v m="?[0-9])' "$PX_HOME/suites/checks"/*.sh | grep -q . &&
+  grep -qE '(ck_over +[^ ]+ +"?[0-9]|-v m="?[0-9])' "$PX_HOME/suites/checks"/*.sh &&
     bad="$bad a comparison holds a literal;"
   t_empty cluster_checks_hold_no_threshold_literal "$bad"
   # Confirm that a plug-in threshold overlay overrides its target key while leaving all other
@@ -8138,7 +8159,7 @@ t_group_a5_plugins() {
   t_equals every_run_hook_marker_is_in_the_bundle yes "$(for kind in fetch-data pre-workload \
     post-workload thresholds collect; do [ -f "$run/plugins/example/$kind.marker" ] || echo no
     done; for kind in conf-overlay jvm-opts image-check; do
-      [ -f "$run/cluster/plugins/example/$kind.marker" ] || echo no; done | grep -q no &&
+      [ -f "$run/cluster/plugins/example/$kind.marker" ] || echo no; done | grep -c no >/dev/null &&
       echo no || echo yes)"
   t_contains example_driver_counts_the_staged_rows "plugin.example.rows${PX_TAB}PASS" \
     "$(cat "$run/report/verdicts.tsv" 2>/dev/null)"
