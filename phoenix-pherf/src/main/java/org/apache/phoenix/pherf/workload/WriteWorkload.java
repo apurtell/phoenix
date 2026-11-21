@@ -35,6 +35,8 @@ import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.WriteParams;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.exception.PherfException;
+import org.apache.phoenix.pherf.latency.LatencyRecorders;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.result.DataLoadThreadTime;
 import org.apache.phoenix.pherf.result.DataLoadTimeSummary;
 import org.apache.phoenix.pherf.result.ResultUtil;
@@ -241,6 +243,11 @@ public class WriteWorkload implements Workload {
       public Info call() throws Exception {
         int rowsCreated = 0;
         long start = 0, last = 0, duration, totalDuration;
+        // Each committed write batch is recorded as a single latency sample.
+        final String latencyOperation = "load:" + scenario.getName() + ":" + tableName;
+        long batchStartMicros = 0;
+        int pendingRows = 0;
+        boolean written = false;
         SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
         Connection connection = null;
         PreparedStatement stmt = null;
@@ -258,11 +265,13 @@ public class WriteWorkload implements Workload {
             logPerNRows = Integer.valueOf(customizedLogPerNRows);
           }
           last = start = EnvironmentEdgeManager.currentTimeMillis();
+          batchStartMicros = Micros.now();
           String sql = pUtil.buildSql(columns, tableName);
           stmt = connection.prepareStatement(sql);
           for (long i = rowCount; (i > 0)
             && ((EnvironmentEdgeManager.currentTimeMillis() - logStartTime) < maxDuration); i--) {
             stmt = pUtil.buildStatement(rulesApplier, scenario, columns, stmt, simpleDateFormat);
+            pendingRows++;
             if (useBatchApi) {
               stmt.addBatch();
             } else {
@@ -282,6 +291,9 @@ public class WriteWorkload implements Workload {
                 }
               }
               connection.commit();
+              LatencyRecorders.record(latencyOperation, LatencyRecorders.STEADY,
+                Micros.now() - batchStartMicros);
+              pendingRows = 0;
               duration = EnvironmentEdgeManager.currentTimeMillis() - last;
               LOGGER.info("Writer (" + Thread.currentThread().getName()
                 + ") committed Batch. Total " + getBatchSize() + " rows for this thread ("
@@ -297,8 +309,10 @@ public class WriteWorkload implements Workload {
               Thread.sleep(threadSleepDuration);
               // Re-compute the start time for the next batch
               last = EnvironmentEdgeManager.currentTimeMillis();
+              batchStartMicros = Micros.now();
             }
           }
+          written = true;
         } catch (SQLException e) {
           LOGGER.error("Scenario " + scenario.getName() + " failed with exception ", e);
           throw e;
@@ -325,6 +339,10 @@ public class WriteWorkload implements Workload {
 
             try {
               connection.commit();
+              if (written && pendingRows > 0) {
+                LatencyRecorders.record(latencyOperation, LatencyRecorders.STEADY,
+                  Micros.now() - batchStartMicros);
+              }
               duration = EnvironmentEdgeManager.currentTimeMillis() - start;
               LOGGER.info("Writer ( " + Thread.currentThread().getName()
                 + ") committed Final Batch. Duration (" + duration + ") Ms");

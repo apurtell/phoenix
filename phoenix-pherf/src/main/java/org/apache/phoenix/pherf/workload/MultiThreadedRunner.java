@@ -30,6 +30,8 @@ import org.apache.phoenix.pherf.PherfConstants.GeneratePhoenixStats;
 import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
+import org.apache.phoenix.pherf.latency.LatencyRecorders;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.result.DataModelResult;
 import org.apache.phoenix.pherf.result.ResultManager;
 import org.apache.phoenix.pherf.result.RunTime;
@@ -60,6 +62,7 @@ class MultiThreadedRunner implements Callable<Void> {
   private final XMLConfigParser parser;
   private final boolean writeRuntimeResults;
   private final Map<String, String> connectionProperties;
+  private final String latencyOperation;
 
   /**
    * MultiThreadedRunner
@@ -92,6 +95,7 @@ class MultiThreadedRunner implements Callable<Void> {
     this.parser = parser;
     this.writeRuntimeResults = writeRuntimeResults;
     this.connectionProperties = connectionProperties;
+    this.latencyOperation = "query:" + scenario.getName() + ":" + query.getId();
   }
 
   /**
@@ -158,6 +162,8 @@ class MultiThreadedRunner implements Callable<Void> {
     PreparedStatement statement = null;
     ResultSet rs = null;
     Long queryStartTime = EnvironmentEdgeManager.currentTimeMillis();
+    long startMicros = Micros.now();
+    long elapsedMicros = 0;
     Date startDate = Calendar.getInstance().getTime();
     String exception = null;
     boolean failed = false;
@@ -184,10 +190,13 @@ class MultiThreadedRunner implements Callable<Void> {
         rs = statement.getResultSet();
         Pair<Long, Long> r = getResults(rs, queryIteration, isSelectCountStatement, queryStartTime);
         resultRowCount = r.getFirst();
-        queryElapsedTime = r.getSecond();
       } else {
         conn.commit();
       }
+      // Populate legacy reporting metrics by rounding the elapsed microsecond measurement to
+      // milliseconds.
+      elapsedMicros = Micros.now() - startMicros;
+      queryElapsedTime = Micros.toMillis(elapsedMicros);
     } catch (Exception e) {
       LOGGER.error("Exception while executing query iteration " + queryIteration, e);
       exception = e.getMessage();
@@ -196,6 +205,11 @@ class MultiThreadedRunner implements Callable<Void> {
     } finally {
       getThreadTime().getRunTimesInMs().add(new RunTime(exception, startDate, resultRowCount,
         queryElapsedTime, queryElapsedTime > query.getTimeoutDuration()));
+      // Record the latency measurement before closing JDBC resources or invoking metrics sinks so
+      // that a downstream failure does not discard the sample.
+      if (!failed) {
+        LatencyRecorders.record(latencyOperation, LatencyRecorders.STEADY, elapsedMicros);
+      }
 
       if (rs != null) rs.close();
       if (statement != null) statement.close();

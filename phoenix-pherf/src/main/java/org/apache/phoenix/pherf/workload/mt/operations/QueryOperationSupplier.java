@@ -25,6 +25,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.TenantGroup;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -74,9 +75,10 @@ public class QueryOperationSupplier extends BaseOperationSupplier {
         long startTime = 0;
         int status = 0;
         Long resultRowCount = 0L;
-        Long queryElapsedTime = 0L;
+        long elapsedMicros = 0;
         try (Connection connection = phoenixUtil.getConnection(tenantId)) {
           startTime = EnvironmentEdgeManager.currentTimeMillis();
+          long startMicros = Micros.now();
 
           // TODO handle dynamic statements
           try (PreparedStatement statement = connection.prepareStatement(query.getStatement())) {
@@ -86,14 +88,14 @@ public class QueryOperationSupplier extends BaseOperationSupplier {
               Pair<Long, Long> r =
                 phoenixUtil.getResults(query, rs, opName, isSelectCountStatement, startTime);
               resultRowCount = r.getFirst();
-              queryElapsedTime = r.getSecond();
+              elapsedMicros = Micros.now() - startMicros;
             }
           }
         } catch (Exception e) {
           LOGGER.error("Operation " + opName + " failed with exception ", e);
           status = -1;
         }
-        return new OperationStats(input, startTime, status, resultRowCount, queryElapsedTime);
+        return new OperationStats(input, startTime, status, resultRowCount, elapsedMicros);
       }
     };
   }

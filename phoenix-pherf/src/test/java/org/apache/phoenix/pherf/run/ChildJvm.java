@@ -25,6 +25,7 @@ import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -42,6 +43,8 @@ public final class ChildJvm {
   private static final long TIMEOUT_SECONDS = 180;
   private static final int TAIL_LINES = 60;
   private final File root;
+  private final List<String> systemProperties = new ArrayList<>();
+  private final List<String> pherfProperties = new ArrayList<>();
 
   public ChildJvm(File root) {
     this.root = root;
@@ -95,7 +98,17 @@ public final class ChildJvm {
     Files.write(new File(dir, service.getName()).toPath(), names, StandardCharsets.UTF_8);
   }
 
-  /** Executes the Pherf CLI once for each provided list of command-line arguments. */
+  /** Configures a system property to be set in the child JVM. */
+  public void systemProperty(String name, String value) {
+    systemProperties.add("-D" + name + "=" + value);
+  }
+
+  /** Appends a configuration key and value to the child JVM's copy of pherf.properties. */
+  public void pherfProperty(String key, String value) {
+    pherfProperties.add(key + "=" + value);
+  }
+
+  /** Executes Pherf once for each provided set of arguments. */
   public void runCli(List<List<String>> invocations) throws Exception {
     List<String> args = new ArrayList<>();
     args.add("cli");
@@ -123,6 +136,11 @@ public final class ChildJvm {
     Files.copy(new File(targetDir(), "classes/" + PherfConstants.PHERF_PROPERTIES).toPath(),
       new File(overlay(), PherfConstants.PHERF_PROPERTIES).toPath(),
       StandardCopyOption.REPLACE_EXISTING);
+    if (!pherfProperties.isEmpty()) {
+      Files.write(new File(overlay(), PherfConstants.PHERF_PROPERTIES).toPath(),
+        ("\n" + String.join("\n", pherfProperties) + "\n").getBytes(StandardCharsets.UTF_8),
+        StandardOpenOption.APPEND);
+    }
 
     List<String> command = new ArrayList<>();
     command.add(new File(System.getProperty("java.home"), "bin/java").getPath());
@@ -133,6 +151,7 @@ public final class ChildJvm {
     }
     command.add("-Djava.io.tmpdir=" + new File(root, "tmp").getPath());
     command.add("-D" + Records.DIR_PROPERTY + "=" + records().getPath());
+    command.addAll(systemProperties);
     command.add("-cp");
     command.add(overlay().getPath() + File.pathSeparator
       + System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")));

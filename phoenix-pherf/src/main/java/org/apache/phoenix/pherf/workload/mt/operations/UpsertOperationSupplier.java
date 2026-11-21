@@ -29,6 +29,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.TenantGroup;
 import org.apache.phoenix.pherf.configuration.Upsert;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -79,7 +80,7 @@ public class UpsertOperationSupplier extends BaseOperationSupplier {
         final String opName = String.format("%s:%s:%s:%s:%s", scenarioName, tableName, opGroup,
           tenantGroup, input.getTenantId());
         long rowsCreated = 0;
-        long startTime = 0, duration, totalDuration;
+        long startTime = 0, startMicros = 0, duration;
         int status = 0;
         SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
@@ -103,6 +104,7 @@ public class UpsertOperationSupplier extends BaseOperationSupplier {
           String sql = phoenixUtil.buildSql(upsert.getColumn(), tableName);
           LOGGER.info("Operation " + opName + " executing " + sql);
           startTime = EnvironmentEdgeManager.currentTimeMillis();
+          startMicros = Micros.now();
           PreparedStatement stmt = null;
           try {
             stmt = connection.prepareStatement(sql);
@@ -158,8 +160,8 @@ public class UpsertOperationSupplier extends BaseOperationSupplier {
           status = -1;
         }
 
-        totalDuration = EnvironmentEdgeManager.currentTimeMillis() - startTime;
-        return new OperationStats(input, startTime, status, rowsCreated, totalDuration);
+        return new OperationStats(input, startTime, status, rowsCreated,
+          Micros.now() - startMicros);
       }
     };
   }

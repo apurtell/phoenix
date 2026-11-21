@@ -19,6 +19,8 @@ package org.apache.phoenix.pherf.workload.mt.operations;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.phoenix.pherf.latency.LatencyRecorders;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.result.ResultValue;
 import org.apache.phoenix.pherf.spi.Extensions;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
@@ -33,14 +35,21 @@ public class OperationStats {
   private final long rowCount;
   private final long durationInMs;
   private final long startTime;
+  // Marked transient so that the serialized JSON log format for the operation remains unchanged.
+  private final transient long durationInMicros;
 
+  /**
+   * Constructs operation statistics from an elapsed duration in microseconds and derives the
+   * millisecond duration by rounding that value.
+   */
   public OperationStats(TenantOperationInfo input, long startTime, int status, long rowCount,
-    long durationInMs) {
+    long durationInMicros) {
     this.input = input;
     this.startTime = startTime;
     this.status = status;
     this.rowCount = rowCount;
-    this.durationInMs = durationInMs;
+    this.durationInMicros = durationInMicros;
+    this.durationInMs = Micros.toMillis(durationInMicros);
   }
 
   public String getModelName() {
@@ -113,9 +122,11 @@ public class OperationStats {
   }
 
   /**
-   * Publishes this operation to the active metrics sinks. This method should be invoked at the
-   * point where Pherf logs the operation as JSON; because it introduces no additional fields, the
-   * serialized JSON output remains unchanged.
+   * Publishes this operation to the configured metrics sinks and, if execution succeeded, records a
+   * sample in the latency recorders. Idle time and user-defined operations do not measure database
+   * work and are therefore excluded from latency sampling. Invoke this method at the point where
+   * Pherf logs the operation as JSON; because it introduces no persistent fields, the serialized
+   * JSON structure remains unchanged.
    */
   public void recordMetrics() {
     if (Extensions.hasMetricsSinks()) {
@@ -124,6 +135,14 @@ public class OperationStats {
           getOpType().name(), "tenant", getTenantId(), "tenant_group", getTenantGroup(), "status",
           String.valueOf(status)),
         durationInMs, rowCount);
+    }
+    Operation.OperationType type = getOpType();
+    if (
+      status == 0 && type != Operation.OperationType.IDLE_TIME
+        && type != Operation.OperationType.USER_DEFINED
+    ) {
+      LatencyRecorders.record("operation:" + getScenarioName() + ":" + getOperationGroup(),
+        LatencyRecorders.STEADY, durationInMicros);
     }
   }
 }

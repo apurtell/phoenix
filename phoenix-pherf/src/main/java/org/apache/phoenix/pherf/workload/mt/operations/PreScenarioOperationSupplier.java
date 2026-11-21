@@ -22,6 +22,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Ddl;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.TenantGroup;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -57,6 +58,7 @@ public class PreScenarioOperationSupplier extends BaseOperationSupplier {
           (tenantGroup.compareTo(TenantGroup.DEFAULT_GLOBAL_ID) == 0);
 
         long startTime = EnvironmentEdgeManager.currentTimeMillis();
+        long startMicros = Micros.now();
         int status = 0;
         if (!operation.getPreScenarioDdls().isEmpty()) {
           for (Ddl ddl : operation.getPreScenarioDdls()) {
@@ -82,9 +84,8 @@ public class PreScenarioOperationSupplier extends BaseOperationSupplier {
             }
           }
         }
-        long totalDuration = EnvironmentEdgeManager.currentTimeMillis() - startTime;
         return new OperationStats(input, startTime, status, operation.getPreScenarioDdls().size(),
-          totalDuration);
+          Micros.now() - startMicros);
       }
     };
   }

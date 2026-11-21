@@ -32,6 +32,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.LoadProfile;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.result.ResultUtil;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.QueryExecutor;
@@ -46,16 +47,21 @@ import org.apache.phoenix.util.EnvironmentEdgeManager;
  * By pinning the system clock to a constant timestamp, every execution produces deterministic,
  * reproducible output.
  * <p>
- * In "cli" mode, this runner invokes Pherf once for each distinct set of arguments delimited by
- * {@link #NEXT}. In "fixtures" mode, it parses and executes each scenario configuration file named
- * in the arguments. Upon completion, the child process records its final execution status in
- * {@link Records#OUTCOME} and terminates with exit code 0 when successful.
+ * When the {@link #ELAPSED_MICROS} system property is configured, the microsecond clock follows a
+ * predetermined script in which every second read advances the clock by the next value in the
+ * comma-separated list. Consequently, the start and end timestamps recorded for each operation
+ * yield those exact elapsed durations in sequential order.
+ * <p>
+ * In "cli" mode, the runner executes Pherf once for each argument set separated by {@link #NEXT}.
+ * In "fixtures" mode, it loads and executes each scenario file named by the arguments. Finally, the
+ * child process writes its result to {@link Records#OUTCOME} and exits with 0 upon success.
  */
 public final class ChildRun {
   public static final String NEXT = "--next";
   public static final String RAN = "ran";
   public static final String REJECTED = "rejected";
   public static final String FAILED = "failed";
+  public static final String ELAPSED_MICROS = "pherf.test.elapsedMicros";
   private static final long NOW = 1700000000000L;
   private static final long MAX_OPERATIONS = 20;
 
@@ -65,12 +71,13 @@ public final class ChildRun {
   public static void main(String[] args) {
     int exitCode = 1;
     try {
-      EnvironmentEdgeManager.injectEdge(new EnvironmentEdge() {
+      String script = System.getProperty(ELAPSED_MICROS);
+      EnvironmentEdgeManager.injectEdge(script == null ? new EnvironmentEdge() {
         @Override
         public long currentTime() {
           return NOW;
         }
-      });
+      } : new ScriptedEdge(script));
       FakePhoenixDriver.install();
       List<String> rest = Arrays.asList(args).subList(1, args.length);
       if ("cli".equals(args[0])) {
@@ -175,6 +182,33 @@ public final class ChildRun {
           workload.complete();
         }
       }
+    }
+  }
+
+  /** Provides a constant millisecond clock paired with a scripted microsecond clock. */
+  private static final class ScriptedEdge extends EnvironmentEdge implements Micros.Source {
+    private final List<Long> steps = new ArrayList<>();
+    private long micros = NOW * 1000;
+    private int reads;
+
+    ScriptedEdge(String script) {
+      for (String step : script.split(",")) {
+        steps.add(Long.parseLong(step.trim()));
+      }
+    }
+
+    @Override
+    public long currentTime() {
+      return NOW;
+    }
+
+    @Override
+    public synchronized long currentTimeMicros() {
+      reads++;
+      if (reads % 2 == 0 && reads / 2 <= steps.size()) {
+        micros += steps.get(reads / 2 - 1);
+      }
+      return micros;
     }
   }
 

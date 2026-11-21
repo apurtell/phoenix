@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.pherf;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -28,6 +29,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.jmx.MonitorManager;
+import org.apache.phoenix.pherf.latency.LatencyRecorders;
 import org.apache.phoenix.pherf.result.ResultUtil;
 import org.apache.phoenix.pherf.schema.SchemaReader;
 import org.apache.phoenix.pherf.util.GoogleChartGenerator;
@@ -256,6 +258,7 @@ public class Pherf {
     MonitorManager monitorManager = null;
     List<Workload> workloads = new ArrayList<>();
     workloadExecutor = new WorkloadExecutor(properties, workloads, !isFunctional);
+    boolean completed = false;
     try {
       if (listFiles) {
         ResourceList list = new ResourceList(PherfConstants.RESOURCE_DATAMODEL);
@@ -302,6 +305,7 @@ public class Pherf {
       }
 
       XMLConfigParser parser = new XMLConfigParser(scenarioFile);
+      LatencyRecorders.begin(properties);
       if (monitor) {
         monitorManager = new MonitorManager(
           Integer.parseInt(globalProperties.getProperty("pherf.default.monitorFrequency")));
@@ -368,11 +372,21 @@ public class Pherf {
 
       // Collect any final jobs
       workloadExecutor.get();
-
+      completed = true;
     } finally {
       if (workloadExecutor != null) {
         LOGGER.info("Run completed. Shutting down thread pool.");
         workloadExecutor.shutdown();
+      }
+      try {
+        LatencyRecorders.finish();
+      } catch (IOException e) {
+        if (completed) {
+          throw e;
+        }
+        // The run failed before this error occurred, so log this failure without rethrowing it to
+        // ensure that the caller receives the original exception.
+        LOGGER.error("Cannot write the latency report", e);
       }
     }
   }

@@ -19,6 +19,7 @@ package org.apache.phoenix.pherf.workload.mt.operations;
 
 import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Scenario;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -43,8 +44,8 @@ public class UserDefinedOperationSupplier extends BaseOperationSupplier {
         Preconditions.checkNotNull(input);
         // TODO : implement user defined operation invocation.
         long startTime = EnvironmentEdgeManager.currentTimeMillis();
-        long duration = EnvironmentEdgeManager.currentTimeMillis() - startTime;
-        return new OperationStats(input, startTime, 0, 0, duration);
+        long startMicros = Micros.now();
+        return new OperationStats(input, startTime, 0, 0, Micros.now() - startMicros);
       }
     };
   }

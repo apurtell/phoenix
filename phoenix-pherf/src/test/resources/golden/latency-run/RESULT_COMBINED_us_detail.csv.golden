@@ -1,0 +1,18 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+BASE_TABLE_NAME,SCENARIO_NAME,ZOOKEEPER,ROW_COUNT,EXECUTION_COUNT,EXECUTION_TYPE,PHOENIX_PROPERTIES,START_TIME,QUERY_GROUP,QUERY_ID,QUERY,TENANT_ID,THREAD_NUMBER,CONCURRENCY_LEVEL,RESULT_ROW_COUNT,RUN_TIME_MS,TIMED_OUT
+PHERF.TEST_VIEW,testTenantBinding,golden,10,1,SERIAL,phoenix.query.threadPoolSize=128,<TIME>,null,q1,select count(*) from PHERF.TEST_VIEW,TENANT_A,1,1,0,3,false
+PHERF.TEST_VIEW,testTenantBinding,golden,10,1,SERIAL,phoenix.query.threadPoolSize=128,<TIME>,null,q2,select count(*) from PHERF.TEST_VIEW,TENANT_B,1,1,0,1,false
+PHERF.TEST_VIEW,testTenantBinding,golden,10,1,SERIAL,phoenix.query.threadPoolSize=128,<TIME>,null,q3,select count(*) from PHERF.TEST_TABLE,null,1,1,0,0,false

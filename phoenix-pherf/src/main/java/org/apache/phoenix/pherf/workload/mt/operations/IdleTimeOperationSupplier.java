@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.IdleTime;
 import org.apache.phoenix.pherf.configuration.Scenario;
+import org.apache.phoenix.pherf.latency.Micros;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
@@ -60,6 +61,7 @@ public class IdleTimeOperationSupplier extends BaseOperationSupplier {
           String.format("%s:%s:%s:%s:%s", scenarioName, tableName, opGroup, tenantGroup, tenantId);
 
         long startTime = EnvironmentEdgeManager.currentTimeMillis();
+        long startMicros = Micros.now();
         int status = 0;
 
         // Sleep for the specified time to simulate idle time.
@@ -69,8 +71,7 @@ public class IdleTimeOperationSupplier extends BaseOperationSupplier {
           LOGGER.error("Operation " + opName + " failed with exception ", ie);
           status = -1;
         }
-        long duration = EnvironmentEdgeManager.currentTimeMillis() - startTime;
-        return new OperationStats(input, startTime, status, 0, duration);
+        return new OperationStats(input, startTime, status, 0, Micros.now() - startMicros);
       }
     };
   }

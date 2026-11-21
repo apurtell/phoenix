@@ -161,6 +161,10 @@
       <version>${gson.version}</version>
     </dependency>
     <dependency>
+      <groupId>org.hdrhistogram</groupId>
+      <artifactId>HdrHistogram</artifactId>
+    </dependency>
+    <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-server</artifactId>
     </dependency>
@@ -381,6 +385,7 @@
                   <include>commons-lang:commons-lang</include>
                   <include>commons-io:commons-io</include>
                   <include>com.lmax:disruptor</include>
+                  <include>org.hdrhistogram:HdrHistogram</include>
                 </includes>
               </artifactSet>
               <filters>
