@@ -41,6 +41,7 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.phoenix.coprocessor.TaskRegionObserver;
 import org.apache.phoenix.mapreduce.index.automation.PhoenixMRJobSubmitter;
 import org.apache.phoenix.pherf.PherfConstants;
@@ -561,12 +562,47 @@ public class PhoenixUtil {
             statement.setTimestamp(count, ts);
           }
           break;
-        default:
+        case FLOAT_ARRAY:
+        case DOUBLE_ARRAY:
+          if (dataValue.getValue().equals("")) {
+            statement.setNull(count, Types.ARRAY);
+          } else {
+            statement.setArray(count,
+              createNumberArray(statement, column.getType(), dataValue.getValue().split(",")));
+          }
           break;
+        case VARBINARY_ENCODED:
+          // Decode the hexadecimal string produced by the data generator into raw bytes.
+          if (dataValue.getValue().equals("")) {
+            statement.setNull(count, Types.VARBINARY);
+          } else {
+            statement.setBytes(count, Bytes.fromHex(dataValue.getValue()));
+          }
+          break;
+        default:
+          throw new IllegalArgumentException(String.format(
+            "No JDBC binding for column %s of type %s", column.getName(), column.getType()));
       }
       count++;
     }
     return statement;
+  }
+
+  /**
+   * Constructs a JDBC FLOAT or DOUBLE array from the serialized element strings. Elements are boxed
+   * specifically as Float or Double instances because Phoenix casts each element of a FLOAT array
+   * directly to Float.
+   */
+  private static Array createNumberArray(PreparedStatement statement, DataTypeMapping type,
+    String[] tokens) throws SQLException {
+    boolean f = type == DataTypeMapping.FLOAT_ARRAY;
+    Object[] elements = f ? new Float[tokens.length] : new Double[tokens.length];
+    for (int i = 0; i < tokens.length; i++) {
+      // Cast the Float branch to Object so the ternary expression does not widen the Float value
+      // to a primitive double.
+      elements[i] = f ? (Object) Float.valueOf(tokens[i]) : Double.valueOf(tokens[i]);
+    }
+    return statement.getConnection().createArrayOf(f ? "FLOAT" : "DOUBLE", elements);
   }
 
   public String buildSql(final List<Column> columns, final String tableName) {

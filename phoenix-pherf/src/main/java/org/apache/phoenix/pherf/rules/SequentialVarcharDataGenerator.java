@@ -64,8 +64,6 @@ public class SequentialVarcharDataGenerator implements RuleBasedDataGenerator {
     switch (mapping) {
       case VARCHAR:
       case VARBINARY:
-      case JSON:
-      case BSON:
       case CHAR:
         return true;
       default:

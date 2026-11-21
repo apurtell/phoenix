@@ -17,6 +17,8 @@
  */
 package org.apache.phoenix.pherf.rules;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -31,10 +33,12 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.math3.random.RandomDataGenerator;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.phoenix.pherf.PherfConstants;
 import org.apache.phoenix.pherf.configuration.Column;
 import org.apache.phoenix.pherf.configuration.DataModel;
@@ -239,6 +243,7 @@ public class RulesApplier {
       case JSON:
       case BSON:
       case CHAR:
+      case VARBINARY_ENCODED:
         // Use the specified data values from configs if they exist
         if (DataSequence.SEQUENTIAL.equals(column.getDataSequence())) {
           RuleBasedDataGenerator generator =
@@ -248,7 +253,31 @@ public class RulesApplier {
           data = pickDataValueFromList(dataValues);
         } else {
           Preconditions.checkArgument(length > 0, "length needs to be > 0");
-          data = getRandomDataValue(column);
+          DataTypeMapping type = column.getType();
+          if (type == DataTypeMapping.JSON || type == DataTypeMapping.BSON) {
+            data = randomDocument(column);
+          } else if (type == DataTypeMapping.VARBINARY_ENCODED) {
+            // Encode the generated random bytes as a hexadecimal string because DataValue
+            // represents all generated payloads as string values.
+            byte[] bytes = new byte[length];
+            rndVal.nextBytes(bytes);
+            data = new DataValue(type, Bytes.toHex(bytes));
+          } else {
+            data = getRandomDataValue(column);
+          }
+        }
+        break;
+      case FLOAT_ARRAY:
+      case DOUBLE_ARRAY:
+        if (DataSequence.SEQUENTIAL.equals(column.getDataSequence())) {
+          data = getRuleBasedDataGeneratorForColumn(column, generatorKey).getDataValue();
+        } else if ((dataValues != null) && !dataValues.isEmpty()) {
+          // Treat each configured entry in the data value list as an individual element of the
+          // resulting array.
+          data = new DataValue(column.getType(),
+            dataValues.stream().map(DataValue::getValue).collect(Collectors.joining(",")));
+        } else {
+          data = new DataValue(column.getType(), randomArray(column));
         }
         break;
       case VARCHAR_ARRAY:
@@ -601,6 +630,58 @@ public class RulesApplier {
     return new DataValue(column.getType(), varchar);
   }
 
+  /**
+   * Generates a sequence of random numeric elements whose count equals the configured column
+   * length, with each element bounded within [minValue, maxValue], and returns them as a
+   * comma-separated string that parses back to the identical numeric values.
+   */
+  private String randomArray(Column column) {
+    long min = column.getMinValue();
+    long max = column.getMaxValue();
+    Preconditions.checkArgument(column.getLength() > 0,
+      "length (the element count) needs to be > 0 for " + column.getName());
+    Preconditions.checkArgument(min != Long.MIN_VALUE && max != Long.MIN_VALUE && max >= min,
+      "minValue and maxValue need to be set, with maxValue >= minValue, for " + column.getName());
+    List<String> elements = new ArrayList<>();
+    for (int i = 0; i < column.getLength(); i++) {
+      double v = min + rndVal.nextDouble() * ((double) max - min);
+      elements.add(column.getType() == DataTypeMapping.FLOAT_ARRAY
+        ? Float.toString((float) v)
+        : Double.toString(v));
+    }
+    return String.join(",", elements);
+  }
+
+  /**
+   * Constructs a random document conforming to a fixed schema so that benchmark queries can target
+   * deterministic field paths. The generated structure is {"s": prefix and text, "n": int, "d":
+   * double, "b": boolean, "a": [3 ints], "o": {"s", "n"}}, where string fields are sized to the
+   * configured column length. BSON columns consume this same JSON text representation.
+   */
+  private DataValue randomDocument(Column column) {
+    int length = column.getLength();
+    String prefix = column.getPrefix() != null ? column.getPrefix() : "";
+    JsonObject doc = new JsonObject();
+    doc.addProperty("s", StringUtils.left(prefix + seededAlphanumeric(length), length));
+    doc.addProperty("n", rndVal.nextInt(1000000));
+    doc.addProperty("d", rndVal.nextDouble() * 1000);
+    doc.addProperty("b", rndVal.nextBoolean());
+    JsonArray a = new JsonArray();
+    for (int i = 0; i < 3; i++) {
+      a.add(rndVal.nextInt(1000));
+    }
+    doc.add("a", a);
+    JsonObject o = new JsonObject();
+    o.addProperty("s", seededAlphanumeric(length));
+    o.addProperty("n", rndVal.nextInt(1000000));
+    doc.add("o", o);
+    return new DataValue(column.getType(), doc.toString());
+  }
+
+  private String seededAlphanumeric(int length) {
+    return RandomStringUtils.random(length, 0, 0, true, true, null, rndVal);
+  }
+
   private RuleBasedDataGenerator getRuleBasedDataGeneratorForColumn(Column column,
     String generatorKey) {
     RuleBasedDataGenerator generator = columnRuleBasedDataGeneratorMap.get(generatorKey);
@@ -608,8 +689,6 @@ public class RulesApplier {
       // For now we only have couple of these, likely this should replace for all the methods
       switch (column.getType()) {
         case VARCHAR:
-        case JSON:
-        case BSON:
         case VARBINARY:
         case CHAR:
           if ((column.getDataValues() != null) && (column.getDataValues().size() > 0)) {
@@ -617,6 +696,15 @@ public class RulesApplier {
           } else {
             generator = new SequentialVarcharDataGenerator(column);
           }
+          break;
+        case JSON:
+        case BSON:
+          // Because a plain counter string is not a valid document, sequential generation for
+          // document columns requires an explicit list of configured values.
+          Preconditions.checkArgument(
+            (column.getDataValues() != null) && (column.getDataValues().size() > 0),
+            "SEQUENTIAL %s needs a value list on %s", column.getType(), column.getName());
+          generator = new SequentialListDataGenerator(column);
           break;
         case DATE:
         case TIMESTAMP:
