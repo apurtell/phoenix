@@ -17,6 +17,8 @@
  */
 package org.apache.phoenix.pherf.configuration;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -112,17 +114,40 @@ public class XMLConfigParser {
    *         configuration
    */
   // TODO Remove static calls
-  public static DataModel readDataModel(Path file) throws JAXBException, XMLStreamException {
+  public static DataModel readDataModel(Path file)
+    throws JAXBException, XMLStreamException, IOException {
     XMLInputFactory xif = XMLInputFactory.newInstance();
     xif.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
     xif.setProperty(XMLInputFactory.SUPPORT_DTD, false);
     JAXBContext jaxbContext = JAXBContext.newInstance(DataModel.class);
     Unmarshaller jaxbUnmarshaller = jaxbContext.createUnmarshaller();
-    String fName = PherfConstants.RESOURCE_SCENARIO + "/" + file.getFileName().toString();
-    LOGGER.info("Open config file: " + fName);
-    XMLStreamReader xmlReader =
-      xif.createXMLStreamReader(new StreamSource(XMLConfigParser.class.getResourceAsStream(fName)));
-    return (DataModel) jaxbUnmarshaller.unmarshal(xmlReader);
+    LOGGER.info("Open config file: " + file);
+    DataModel dataModel;
+    try (InputStream in = ResourceList.openResource(file)) {
+      XMLStreamReader xmlReader = xif.createXMLStreamReader(new StreamSource(in));
+      dataModel = (DataModel) jaxbUnmarshaller.unmarshal(xmlReader);
+    }
+    bindScenarioTenants(dataModel);
+    return dataModel;
+  }
+
+  /**
+   * Propagates the scenario tenant identifier down to any constituent query that does not define
+   * its own tenant and is not configured to execute over a global connection.
+   */
+  private static void bindScenarioTenants(DataModel dataModel) {
+    for (Scenario scenario : dataModel.getScenarios()) {
+      if (scenario.getTenantId() == null) {
+        continue;
+      }
+      for (QuerySet querySet : scenario.getQuerySet()) {
+        for (Query query : querySet.getQuery()) {
+          if (query.getTenantId() == null && !query.isUseGlobalConnection()) {
+            query.setTenantId(scenario.getTenantId());
+          }
+        }
+      }
+    }
   }
 
   // TODO Remove static calls

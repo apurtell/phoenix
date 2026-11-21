@@ -71,16 +71,16 @@ public class SchemaReader {
   }
 
   public String resourceToString(final Path file) throws Exception {
-    String fName = PherfConstants.RESOURCE_DATAMODEL + "/" + file.getFileName().toString();
-    BufferedReader br =
-      new BufferedReader(new InputStreamReader(this.getClass().getResourceAsStream(fName)));
-    StringBuffer sb = new StringBuffer();
-
-    String line;
-    while ((line = br.readLine()) != null) {
-      sb.append(line);
+    StringBuilder sb = new StringBuilder();
+    // Preserve newline delimiters while assembling the script because SQL line comments terminate
+    // at the end of their respective lines.
+    try (BufferedReader br =
+      new BufferedReader(new InputStreamReader(ResourceList.openResource(file)))) {
+      String line;
+      while ((line = br.readLine()) != null) {
+        sb.append(line).append('\n');
+      }
     }
-
     return sb.toString();
   }
 

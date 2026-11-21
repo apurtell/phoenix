@@ -333,22 +333,20 @@ public class PhoenixUtil {
   public void executeScenarioDdl(List<Ddl> ddls, String tenantId,
     DataLoadTimeSummary dataLoadTimeSummary) throws Exception {
     if (null != ddls) {
-      Connection conn = null;
-      try {
-        for (Ddl ddl : ddls) {
-          LOGGER.info("\nExecuting DDL:" + ddl + " on tenantId:" + tenantId);
-          long startTime = EnvironmentEdgeManager.currentTimeMillis();
-          executeStatement(ddl.toString(), conn = getConnection(tenantId));
-          if (ddl.getStatement().toUpperCase().contains(ASYNC_KEYWORD)) {
-            waitForAsyncIndexToFinish(ddl.getTableName());
-          }
-          dataLoadTimeSummary.add(ddl.getTableName(), 0,
-            (int) (EnvironmentEdgeManager.currentTimeMillis() - startTime));
+      for (Ddl ddl : ddls) {
+        // Execute DDL statements configured for a global connection without binding them to the
+        // scenario tenant context.
+        String ddlTenantId = ddl.isUseGlobalConnection() ? null : tenantId;
+        LOGGER.info("\nExecuting DDL:" + ddl + " on tenantId:" + ddlTenantId);
+        long startTime = EnvironmentEdgeManager.currentTimeMillis();
+        try (Connection conn = getConnection(ddlTenantId)) {
+          executeStatement(ddl.toString(), conn);
         }
-      } finally {
-        if (null != conn) {
-          conn.close();
+        if (ddl.getStatement().toUpperCase().contains(ASYNC_KEYWORD)) {
+          waitForAsyncIndexToFinish(ddl.getTableName());
         }
+        dataLoadTimeSummary.add(ddl.getTableName(), 0,
+          (int) (EnvironmentEdgeManager.currentTimeMillis() - startTime));
       }
     }
   }

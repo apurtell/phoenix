@@ -155,6 +155,8 @@ public class RulesApplier {
     List<Scenario> scenarios = dataModel != null ? dataModel.getScenarios() : parser.getScenarios();
     DataValue value = null;
     if (scenarios.contains(scenario)) {
+      // Maintain an independent value generation sequence for each column of each table.
+      String generatorKey = scenario.getTableName() + "." + phxMetaColumn.getName();
       LOGGER.debug("We found a correct Scenario" + scenario.getName() + "column "
         + phxMetaColumn.getName() + " " + phxMetaColumn.getType());
 
@@ -168,7 +170,8 @@ public class RulesApplier {
           LOGGER.debug("We found a correct override column rule" + overrideRuleList);
           Column columnRule = getColumnForRuleOverride(overrideRuleList, phxMetaColumn);
           if (columnRule != null) {
-            return getDataValue(columnRule);
+            // Allocate a separate sequence for rules overridden at the scenario level.
+            return getDataValue(columnRule, generatorKey + "#" + scenario.getName());
           }
         }
       }
@@ -178,16 +181,15 @@ public class RulesApplier {
       List<Column> ruleList = ruleMap.get(phxMetaColumn.getType());
 
       // Make sure Column from Phoenix Metadata matches a rule column
-      if (ruleList != null && ruleList.contains(phxMetaColumn)) {
+      Column columnRule = getColumnForRule(ruleList, phxMetaColumn);
+      if (columnRule != null) {
         // Generate some random data based on this rule
         LOGGER.debug("We found a correct column rule" + ruleList);
-        Column columnRule = getColumnForRule(ruleList, phxMetaColumn);
-
-        value = getDataValue(columnRule);
+        value = getDataValue(columnRule, generatorKey);
       } else {
-        LOGGER.warn(String.format(
-          "Attempted to apply rule to data, " + "but could not find a rule to match type %s on %s",
-          phxMetaColumn.getType(), phxMetaColumn.getName()));
+        throw new IllegalStateException(
+          String.format("No datamapping rule for column %s of type %s", phxMetaColumn.getName(),
+            phxMetaColumn.getType()));
       }
 
     }
@@ -202,6 +204,14 @@ public class RulesApplier {
    *         {@code Container Type --> Value mapping }
    */
   public DataValue getDataValue(Column column) throws Exception {
+    return getDataValue(column, column.getName());
+  }
+
+  /**
+   * Generates a data value according to the constraints of the supplied column rule.
+   * @param generatorKey This key identifies the sequence that a SEQUENTIAL rule continues.
+   */
+  private DataValue getDataValue(Column column, String generatorKey) throws Exception {
     DataValue data = null;
     String prefix = "";
     int length = column.getLength();
@@ -231,7 +241,8 @@ public class RulesApplier {
       case CHAR:
         // Use the specified data values from configs if they exist
         if (DataSequence.SEQUENTIAL.equals(column.getDataSequence())) {
-          RuleBasedDataGenerator generator = getRuleBasedDataGeneratorForColumn(column);
+          RuleBasedDataGenerator generator =
+            getRuleBasedDataGeneratorForColumn(column, generatorKey);
           data = generator.getDataValue();
         } else if ((column.getDataValues() != null) && (column.getDataValues().size() > 0)) {
           data = pickDataValueFromList(dataValues);
@@ -280,7 +291,8 @@ public class RulesApplier {
         if ((column.getDataValues() != null) && (column.getDataValues().size() > 0)) {
           data = pickDataValueFromList(dataValues);
         } else if (DataSequence.SEQUENTIAL.equals(column.getDataSequence())) {
-          RuleBasedDataGenerator generator = getRuleBasedDataGeneratorForColumn(column);
+          RuleBasedDataGenerator generator =
+            getRuleBasedDataGeneratorForColumn(column, generatorKey);
           data = generator.getDataValue();
         } else {
           int minInt = (int) column.getMinValue();
@@ -318,7 +330,8 @@ public class RulesApplier {
           // Check if date has right format or not
           data.setValue(checkDatePattern(data.getValue()));
         } else if (DataSequence.SEQUENTIAL.equals(column.getDataSequence())) {
-          RuleBasedDataGenerator generator = getRuleBasedDataGeneratorForColumn(column);
+          RuleBasedDataGenerator generator =
+            getRuleBasedDataGeneratorForColumn(column, generatorKey);
           data = generator.getDataValue();
         } else if (column.getUseCurrentDate() != true) {
           int minYear = (int) column.getMinValue();
@@ -547,22 +560,35 @@ public class RulesApplier {
     return null;
   }
 
+  /**
+   * Resolves the effective rule for a column by merging all general type rules in list order,
+   * followed by any user-defined rules that match the target column name. User-defined rules
+   * configured for other columns do not apply and are ignored.
+   * @return This method returns the merged column rule, or null when no rule applies.
+   */
   private Column getColumnForRule(List<Column> ruleList, Column phxMetaColumn) {
-
-    // Column pointer to head of list
-    Column ruleAppliedColumn = new Column(ruleList.get(0));
-
-    // Then we apply each rule override as a mutation to the column
-    for (Column columnRule : ruleList) {
-
-      // Check if user defined column rules match the column data type we are generating
-      // We don't want to apply the rule if name doesn't match the column from Phoenix
-      if (columnRule.isUserDefined() && !columnRule.getName().equals(phxMetaColumn.getName())) {
-        continue;
-      }
-      ruleAppliedColumn.mutate(columnRule);
+    if (ruleList == null) {
+      return null;
     }
+    Column ruleAppliedColumn = null;
+    for (Column columnRule : ruleList) {
+      if (!columnRule.isUserDefined()) {
+        ruleAppliedColumn = merge(ruleAppliedColumn, columnRule);
+      }
+    }
+    for (Column columnRule : ruleList) {
+      if (columnRule.isUserDefined() && columnRule.getName().equals(phxMetaColumn.getName())) {
+        ruleAppliedColumn = merge(ruleAppliedColumn, columnRule);
+      }
+    }
+    return ruleAppliedColumn;
+  }
 
+  private static Column merge(Column ruleAppliedColumn, Column columnRule) {
+    if (ruleAppliedColumn == null) {
+      return new Column(columnRule);
+    }
+    ruleAppliedColumn.mutate(columnRule);
     return ruleAppliedColumn;
   }
 
@@ -575,8 +601,9 @@ public class RulesApplier {
     return new DataValue(column.getType(), varchar);
   }
 
-  private RuleBasedDataGenerator getRuleBasedDataGeneratorForColumn(Column column) {
-    RuleBasedDataGenerator generator = columnRuleBasedDataGeneratorMap.get(column.getName());
+  private RuleBasedDataGenerator getRuleBasedDataGeneratorForColumn(Column column,
+    String generatorKey) {
+    RuleBasedDataGenerator generator = columnRuleBasedDataGeneratorMap.get(generatorKey);
     if (generator == null) {
       // For now we only have couple of these, likely this should replace for all the methods
       switch (column.getType()) {
@@ -607,7 +634,7 @@ public class RulesApplier {
               column.getType(), column.getName()));
       }
       RuleBasedDataGenerator oldGenerator =
-        columnRuleBasedDataGeneratorMap.putIfAbsent(column.getName(), generator);
+        columnRuleBasedDataGeneratorMap.putIfAbsent(generatorKey, generator);
       if (oldGenerator != null) {
         // Another thread succeeded in registering their generator first, so let's use that.
         generator = oldGenerator;

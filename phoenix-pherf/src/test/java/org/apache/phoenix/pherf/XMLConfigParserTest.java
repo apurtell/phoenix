@@ -17,22 +17,55 @@
  */
 package org.apache.phoenix.pherf;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.io.File;
+import java.io.InputStream;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import javax.xml.bind.UnmarshalException;
 import javax.xml.stream.XMLStreamException;
+import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class XMLConfigParserTest {
   private static final Logger LOGGER = LoggerFactory.getLogger(XMLConfigParserTest.class);
+
+  @Rule
+  public TemporaryFolder tmp = new TemporaryFolder();
+
+  @Test
+  public void testScenarioByAbsolutePath() throws Exception {
+    File f = new File(tmp.getRoot(), "outside_cp_scenario.xml");
+    try (InputStream in =
+      XMLConfigParserTest.class.getResourceAsStream("/scenario/test_evt_gen1.xml")) {
+      Files.copy(in, f.toPath());
+    }
+    DataModel expected = new XMLConfigParser(".*scenario/test_evt_gen1.xml").getDataModels().get(0);
+    XMLConfigParser parser = new XMLConfigParser(f.getAbsolutePath());
+    assertEquals(1, parser.getDataModels().size());
+    DataModel model = parser.getDataModels().get(0);
+    assertEquals(expected.getName(), model.getName());
+    assertEquals(expected.getScenarios().size(), model.getScenarios().size());
+    assertEquals(expected.getScenarios().size(), parser.getScenarios().size());
+  }
+
+  @Test
+  public void testScenarioFromClasspath() throws Exception {
+    XMLConfigParser parser = new XMLConfigParser(".*test_scenario.xml");
+    assertEquals(1, parser.getDataModels().size());
+    assertEquals(5, parser.getScenarios().size());
+  }
 
   @Test
   public void testDTDInScenario() throws Exception {

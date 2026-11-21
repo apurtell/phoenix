@@ -18,19 +18,20 @@
 package org.apache.phoenix.pherf.workload.mt.operations;
 
 import java.sql.SQLException;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Ddl;
 import org.apache.phoenix.pherf.configuration.IdleTime;
-import org.apache.phoenix.pherf.configuration.LoadProfile;
 import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.QuerySet;
 import org.apache.phoenix.pherf.configuration.Scenario;
-import org.apache.phoenix.pherf.configuration.TenantGroup;
 import org.apache.phoenix.pherf.configuration.Upsert;
 import org.apache.phoenix.pherf.configuration.UserDefined;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
@@ -43,14 +44,10 @@ import org.apache.phoenix.pherf.workload.mt.handlers.TenantOperationWorkHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.phoenix.thirdparty.com.google.common.base.Charsets;
 import org.apache.phoenix.thirdparty.com.google.common.base.Function;
 import org.apache.phoenix.thirdparty.com.google.common.base.Supplier;
 import org.apache.phoenix.thirdparty.com.google.common.collect.Lists;
 import org.apache.phoenix.thirdparty.com.google.common.collect.Maps;
-import org.apache.phoenix.thirdparty.com.google.common.hash.BloomFilter;
-import org.apache.phoenix.thirdparty.com.google.common.hash.Funnel;
-import org.apache.phoenix.thirdparty.com.google.common.hash.PrimitiveSink;
 
 /**
  * Factory class for operation suppliers. The class is responsible for creating new instances of
@@ -100,13 +97,19 @@ public class TenantOperationFactory {
   private final XMLConfigParser parser;
 
   private final RulesApplier rulesApplier;
-  private final LoadProfile loadProfile;
   private final List<Operation> operationList = Lists.newArrayList();
   private final Map<Operation.OperationType,
     Supplier<Function<TenantOperationInfo, OperationStats>>> operationSuppliers =
       Maps.newEnumMap(Operation.OperationType.class);
 
-  private final BloomFilter<TenantView> tenantsLoaded;
+  // A tenant view that fails pre-run DDL initialization this many times aborts the workload.
+  private static final int MAX_PRE_RUN_ATTEMPTS = 3;
+
+  // Tracks the tenant views successfully initialized by pre-run DDLs alongside the failure counts
+  // for views still pending initialization. Both collections are guarded by the view creation
+  // write lock.
+  private final Set<TenantView> tenantsLoaded = new HashSet<>();
+  private final Map<TenantView, Integer> preRunFailures = new HashMap<>();
   private final ReentrantReadWriteLock viewCreationLock = new ReentrantReadWriteLock();
 
   public TenantOperationFactory(PhoenixUtil phoenixUtil, DataModel model, Scenario scenario) {
@@ -115,8 +118,6 @@ public class TenantOperationFactory {
     this.scenario = scenario;
     this.parser = null;
     this.rulesApplier = new RulesApplier(model);
-    this.loadProfile = this.scenario.getLoadProfile();
-    this.tenantsLoaded = createTenantsLoadedFilter(loadProfile);
 
     // Read the scenario definition and load the various operations.
     // Case : Operation.OperationType.PRE_RUN
@@ -156,24 +157,6 @@ public class TenantOperationFactory {
       operationSuppliers.put(Operation.OperationType.USER_DEFINED,
         new UserDefinedOperationSupplier(phoenixUtil, model, scenario));
     }
-  }
-
-  private BloomFilter createTenantsLoadedFilter(LoadProfile loadProfile) {
-    Funnel<TenantView> tenantViewFunnel = new Funnel<TenantView>() {
-      @Override
-      public void funnel(TenantView tenantView, PrimitiveSink into) {
-        into.putString(tenantView.getTenantId(), Charsets.UTF_8).putString(tenantView.getViewName(),
-          Charsets.UTF_8);
-      }
-    };
-
-    int numTenants = 0;
-    for (TenantGroup tg : loadProfile.getTenantDistribution()) {
-      numTenants += tg.getNumTenants();
-    }
-
-    // This holds the info whether the tenant view was created (initialized) or not.
-    return BloomFilter.create(tenantViewFunnel, numTenants, 0.0000001);
   }
 
   private List<Operation> getUpsertOperationsForScenario(Scenario scenario) {
@@ -296,12 +279,23 @@ public class TenantOperationFactory {
     // Check if pre run ddls are needed.
     viewCreationLock.writeLock().lock();
     try {
-      if (!tenantsLoaded.mightContain(tenantView)) {
-        executePreRunOpsForTenant(tenantView, input);
-        boolean updated = tenantsLoaded.put(tenantView);
-        if (updated) {
+      // Mark a tenant view as initialized only after its pre-run DDLs complete without error,
+      // allowing failed tenants to be retried on subsequent operations.
+      if (!tenantsLoaded.contains(tenantView)) {
+        int failures = preRunFailures.getOrDefault(tenantView, 0);
+        if (failures < MAX_PRE_RUN_ATTEMPTS && executePreRunOpsForTenant(tenantView, input)) {
+          tenantsLoaded.add(tenantView);
+          preRunFailures.remove(tenantView);
           LOGGER.info(String.format("Successfully initialized tenant. [%s, %s] ",
             tenantView.tenantId, tenantView.viewName));
+        } else {
+          failures = Math.min(failures + 1, MAX_PRE_RUN_ATTEMPTS);
+          preRunFailures.put(tenantView, failures);
+          if (failures == MAX_PRE_RUN_ATTEMPTS) {
+            throw new IllegalStateException(
+              String.format("Could not initialize tenant after %d attempts. [%s, %s]",
+                MAX_PRE_RUN_ATTEMPTS, tenantView.tenantId, tenantView.viewName));
+          }
         }
       }
     } finally {
@@ -320,7 +314,11 @@ public class TenantOperationFactory {
     return opSupplier;
   }
 
-  private void executePreRunOpsForTenant(TenantView tenantView, TenantOperationInfo input)
+  /**
+   * Executes the configured pre-run DDL statements required to initialize a tenant view.
+   * @return This method returns true when the tenant is initialized without error.
+   */
+  private boolean executePreRunOpsForTenant(TenantView tenantView, TenantOperationInfo input)
     throws Exception {
 
     Supplier<Function<TenantOperationInfo, OperationStats>> preRunOpSupplier =
@@ -354,6 +352,7 @@ public class TenantOperationFactory {
         // Run the initialization operation.
         OperationStats stats = preRunOpSupplier.get().apply(preRunSample);
         LOGGER.info(phoenixUtil.getGSON().toJson(stats));
+        return stats.getStatus() == 0;
       } catch (Exception e) {
         LOGGER.error(String.format("Failed to initialize tenant. [%s, %s] ", tenantView.tenantId,
           tenantView.viewName), e);
@@ -369,6 +368,7 @@ public class TenantOperationFactory {
         }
       }
     }
+    return true;
   }
 
 }

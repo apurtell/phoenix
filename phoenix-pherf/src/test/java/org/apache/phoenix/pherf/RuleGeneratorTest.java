@@ -22,13 +22,17 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.sql.PreparedStatement;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
@@ -37,12 +41,14 @@ import java.util.TreeSet;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.phoenix.pherf.configuration.Column;
 import org.apache.phoenix.pherf.configuration.DataModel;
+import org.apache.phoenix.pherf.configuration.DataOverride;
 import org.apache.phoenix.pherf.configuration.DataSequence;
 import org.apache.phoenix.pherf.configuration.DataTypeMapping;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.rules.DataValue;
 import org.apache.phoenix.pherf.rules.RulesApplier;
+import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.WriteWorkload;
 import org.junit.Test;
 
@@ -438,6 +444,105 @@ public class RuleGeneratorTest {
     simPhxCol.setType(DataTypeMapping.VARCHAR);
     DataValue value = rulesApplier.getDataForRule(scenario, simPhxCol);
     assertEquals("Override rule should contain field length of 5", 5, value.getValue().length());
+  }
+
+  private static Column column(String name, DataTypeMapping type) {
+    Column column = new Column();
+    column.setName(name);
+    column.setType(type);
+    return column;
+  }
+
+  @Test
+  public void testRuleDoesNotLeakFromAnotherColumn() throws Exception {
+    Column userDefined = column("A", DataTypeMapping.VARCHAR);
+    userDefined.setUserDefined(true);
+    userDefined.setDataSequence(DataSequence.SEQUENTIAL);
+    userDefined.setLength(6);
+    userDefined.setPrefix("#P");
+    Column general = column("GENERAL_VARCHAR", DataTypeMapping.VARCHAR);
+    general.setDataSequence(DataSequence.RANDOM);
+    general.setLength(15);
+    Scenario scenario = new Scenario();
+    scenario.setName("leak");
+    scenario.setTableName("PHERF.LEAK");
+    DataModel model = new DataModel();
+    model.setName("leak");
+    model.setDataMappingColumns(new ArrayList<>(Arrays.asList(userDefined, general)));
+    model.setScenarios(new ArrayList<>(Arrays.asList(scenario)));
+    RulesApplier rulesApplier = new RulesApplier(model, 1L);
+
+    assertEquals("#Pxxx0",
+      rulesApplier.getDataForRule(scenario, column("A", DataTypeMapping.VARCHAR)).getValue());
+    String b =
+      rulesApplier.getDataForRule(scenario, column("B", DataTypeMapping.VARCHAR)).getValue();
+    assertEquals(15, b.length());
+    assertFalse("Rule of column A leaked into column B: " + b, b.startsWith("#"));
+
+    XMLConfigParser parser = new XMLConfigParser(matcherScenario);
+    RulesApplier fixtureRules = new RulesApplier(parser);
+    PreparedStatement statement = mock(PreparedStatement.class);
+    try {
+      PhoenixUtil.create().buildStatement(fixtureRules, parser.getScenarios().get(0),
+        Collections.singletonList(column("OTHER_BIN", DataTypeMapping.VARBINARY)), statement,
+        new SimpleDateFormat(PherfConstants.DEFAULT_DATE_PATTERN));
+      fail("Expected no rule for OTHER_BIN");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage(),
+        e.getMessage().contains("OTHER_BIN") && e.getMessage().contains("VARBINARY"));
+    }
+    verifyNoInteractions(statement);
+  }
+
+  @Test
+  public void testOverrideSequenceIsSeparateFromGeneralRule() throws Exception {
+    Column general = column("GENERAL_VARCHAR", DataTypeMapping.VARCHAR);
+    general.setDataSequence(DataSequence.SEQUENTIAL);
+    general.setLength(5);
+    general.setPrefix("G");
+    Column override = column("C", DataTypeMapping.VARCHAR);
+    override.setDataSequence(DataSequence.SEQUENTIAL);
+    override.setLength(5);
+    override.setPrefix("O");
+    Scenario withOverride = new Scenario();
+    withOverride.setName("withOverride");
+    withOverride.setTableName("PHERF.SEQ");
+    DataOverride dataOverride = new DataOverride();
+    dataOverride.setColumn(new ArrayList<>(Arrays.asList(override)));
+    withOverride.setDataOverride(dataOverride);
+    Scenario withoutOverride = new Scenario();
+    withoutOverride.setName("withoutOverride");
+    withoutOverride.setTableName("PHERF.SEQ");
+    DataModel model = new DataModel();
+    model.setName("seq");
+    model.setDataMappingColumns(new ArrayList<>(Arrays.asList(general)));
+    model.setScenarios(new ArrayList<>(Arrays.asList(withOverride, withoutOverride)));
+    RulesApplier rulesApplier = new RulesApplier(model, 1L);
+    Column c = column("C", DataTypeMapping.VARCHAR);
+
+    assertEquals("Oxxx0", rulesApplier.getDataForRule(withOverride, c).getValue());
+    assertEquals("Gxxx0", rulesApplier.getDataForRule(withoutOverride, c).getValue());
+    assertEquals("Oxxx1", rulesApplier.getDataForRule(withOverride, c).getValue());
+  }
+
+  @Test
+  public void testSequencesAreIndependentPerColumn() throws Exception {
+    XMLConfigParser parser = new XMLConfigParser(matcherScenario);
+    RulesApplier rulesApplier = new RulesApplier(parser);
+    Scenario rw = parser.getScenarioByName("testScenarioRW");
+    Scenario mt = parser.getScenarioByName("testMTWriteScenario");
+    Column tenantId = column("TENANT_ID", DataTypeMapping.CHAR);
+    Column otherChar = column("OTHER_CHAR", DataTypeMapping.CHAR);
+    List<String> tenantValues = new ArrayList<>();
+    List<String> otherValues = new ArrayList<>();
+    for (int i = 0; i < 3; i++) {
+      tenantValues.add(rulesApplier.getDataForRule(rw, tenantId).getValue());
+    }
+    for (int i = 0; i < 3; i++) {
+      otherValues.add(rulesApplier.getDataForRule(rw, otherChar).getValue());
+    }
+    assertEquals(tenantValues, otherValues);
+    assertEquals("xxxxxxxxxxxxxx0", rulesApplier.getDataForRule(mt, tenantId).getValue());
   }
 
   /**
