@@ -25,8 +25,10 @@
 #      document declares unsupported receives a SKIP row.
 #   2. Run validate, capture the pre-run snapshot, run the quiet-host check, perform the sizing
 #      check for a measurement run, and run the fetch-data plug-in hook.
-#   3. Run prepare, the pre-workload hook, run (which px-run monitors), and the post-workload
-#      hook. Scheduled disruptions fire during the verbs, and px-run waits for each one to recover.
+#   3. Run prepare, execute the pre-workload hook, start the collectors configured in
+#      PX_COLLECTORS, execute run (which px-run monitors), stop the collectors, and run the
+#      post-workload hook. Scheduled disruptions fire during the verbs, and px-run waits for each
+#      one to recover.
 #   4. Capture the post-run snapshot and compare it against the pre-run snapshot.
 #   5. Run restore whenever prepare ran, run report whenever validate ran, execute the cluster
 #      checks, and run the collect hook.
@@ -99,6 +101,9 @@ Options:
                           run needs one.
   -D, --disrupt SPEC      one disruption, repeatable. Several specifications
                           in one value are separated by a semicolon.
+  --collect NAME          start one collector around the run verb,
+                          repeatable; it replaces PX_COLLECTORS. A value can
+                          hold several names separated by a comma.
   -t, --timeout SECONDS   the bound that prepare and run share, default
                           PX_TIMEOUT_DEFAULT. Each other verb has the bound
                           PX_TIMEOUT_VERB.
@@ -145,6 +150,16 @@ host stayed busy and the run requires a quiet host.
 Time verdicts are ADVISORY unless the run is of the measurement class on a
 quiet host with the measurement sizing: a host that is busy or not checked,
 and a sizing that is not the measurement table, tag the run contaminated.
+
+The collectors are profile (px-profile), jfr (px-jfr), hiccup, host and
+container (px-collect) and trace (px-trace-count). PX_COLLECTORS is none or
+a comma list of them; the measurement class starts all six and the
+validation class none, and the HDR histograms of a driver stay on in both.
+px-run starts them after the pre-workload hook and right before the run
+verb, and stops them right after it, also at a failure or an interrupt.
+Each start and stop has the bound PX_TIMEOUT_VERB, and each remote session
+ends by itself one verb bound after the deadline of the run verb. Their
+files go into the bundle; a collector that fails gives ADVISORY.
 
 The run holds the host awake. When it ends, also by a failure or an
 interrupt, it tears the cluster down with px-cluster down, unless --keep,
@@ -208,8 +223,9 @@ DISRUPT_STATE=()
 DISRUPT_INJECTED=()
 DISRUPT_REGIONS=()
 DRIVER_ARGS=()
-CONFIG_FILES=()
-SET_PAIRS=()
+COLLECTORS=""
+COLLECT_LIVE=0
+COLLECT_DUR=0
 
 # ---------------------------------------------------------------------------
 # Run record emission
@@ -1370,6 +1386,70 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Diagnostic collectors
+# ---------------------------------------------------------------------------
+# px-collect serves as the unified entry point for all telemetry collectors. px-run invokes
+# px-collect once on its bundle immediately before the run verb to start collection and once
+# immediately afterward to stop it; px-collect starts collectors in PB_COLLECTORS order—launching
+# trace last so that its counters span the workload—and stops them in reverse order. Each call is
+# allotted one verb timeout bound per synchronous px-collect step (pb_collect_steps), matching the
+# time budget that px-suite reserves for a test's collectors.
+
+# Any px-collect exit status other than 0 or 1 is recorded as an ADVISORY verdict for each active
+# collector of the run, ensuring that telemetry loss never causes a test run to fail.
+## @description  Invokes px-collect (action, option...) on the run bundle within its timeout bound.
+## @return       Exits 0.
+collect_call() {
+  local action=$1 status=0 name
+  shift
+  px_timeout "$((VERB_TIMEOUT * $(pb_collect_steps "$COLLECTORS")))" "$PX_HOME/bin/px-collect" \
+    "$action" "$RUN_DIR" "$@" </dev/null >/dev/null 2>>"$RUN_DIR/logs/px-collect.log" ||
+    status=$?
+  case "$status" in
+  0 | 1) ;;
+  *)
+    for name in $COLLECTORS; do
+      sx_verdict "collector.$name" ADVISORY "px-collect $action ended with exit $status," \
+        "output in logs/px-collect.log"
+    done
+    ;;
+  esac
+}
+
+# Each remote collection session is configured to self-terminate one verb timeout bound after the
+# run verb's execution deadline. Setting COLLECT_LIVE prior to the invocation ensures that if a
+# signal arrives while startup is in progress, the exit hook still executes the corresponding stop.
+## @description  Starts all enabled telemetry collectors for the run via px-collect start.
+## @return       Exits 0.
+collectors_start() {
+  local name
+  [ -n "$COLLECTORS" ] || return 0
+  if [ -z "$SCOPE" ]; then
+    record_row skip run collectors "no scope id"
+    for name in $COLLECTORS; do
+      sx_verdict "collector.$name" SKIP "the run has no cluster"
+    done
+    return 0
+  fi
+  COLLECT_DUR=$((SHARED_DEADLINE - $(px_epoch_s) + VERB_TIMEOUT))
+  [ "$COLLECT_DUR" -ge 1 ] || COLLECT_DUR=1
+  COLLECT_LIVE=1
+  collect_call start --collect "${COLLECTORS// /,}" --targets "${PX_COLLECT_TARGETS:-all}" \
+    --duration "$COLLECT_DUR"
+}
+
+# This function also serves as the process exit hook. Invoking stop a second time against the same
+# bundle writes nothing because px-collect stops only collectors whose collection window remains
+# open.
+## @description  Stops all active telemetry collectors for the run via px-collect stop.
+## @return       Exits 0.
+collectors_stop() {
+  [ "$COLLECT_LIVE" = 1 ] || return 0
+  collect_call stop
+  COLLECT_LIVE=0
+}
+
+# ---------------------------------------------------------------------------
 # Bundle finalization and run completion
 # ---------------------------------------------------------------------------
 
@@ -1471,6 +1551,11 @@ plan_print() {
   record_row plan driver_timeout_s "$DRIVER_TIMEOUT"
   record_row plan verb_timeout_s "$VERB_TIMEOUT"
   record_row plan plugins "${PX_PLUGINS:-none}"
+  record_row plan collectors "${COLLECTORS:-none}"
+  if [ -n "$COLLECTORS" ]; then
+    record_row plan collect_targets "${PX_COLLECT_TARGETS:-all}"
+    record_row plan collect_bound_s "$((DRIVER_TIMEOUT + VERB_TIMEOUT))"
+  fi
   record_row plan snapshot_pre \
     "sb_list sb_restart_count sb_image_ref sb_version_info sb_sample_resources"
   record_row plan quiet_host_wait_s "${PX_QUIET_HOST_WAIT_S:-0}"
@@ -1490,47 +1575,10 @@ plan_print() {
 # Command-line argument parsing and configuration
 # ---------------------------------------------------------------------------
 
-while [ $# -gt 0 ]; do
-  px_cli_common "$1" || case "$1" in
-  -d | --driver) px_cli_need_value "$@" && DRIVER_SPEC=$2 && shift ;;
-  -s | --scope) px_cli_need_value "$@" && px_config_set PX_SCOPE_ID "$2" cli && shift ;;
-  -b | --backend) px_cli_need_value "$@" && px_config_set PX_BACKEND "$2" cli && shift ;;
-  -c | --class) px_cli_need_value "$@" && px_config_set PX_RUN_CLASS "$2" cli && shift ;;
-  -D | --disrupt)
-    px_cli_need_value "$@"
-    DISRUPT_INPUT="${DISRUPT_INPUT:+$DISRUPT_INPUT;}$2"
-    shift
-    ;;
-  -t | --timeout)
-    px_cli_need_value "$@"
-    [[ $2 =~ $PX_RE_INT ]] || px_usage_error "$1 needs a whole number of seconds"
-    px_config_set PX_TIMEOUT_DEFAULT "$2" cli
-    shift
-    ;;
-  -e | --set) px_cli_need_value "$@" && SET_PAIRS+=("$2") && shift ;;
-  -f | --config) px_cli_need_value "$@" && CONFIG_FILES+=("$2") && shift ;;
-  -k | --keep) px_config_set PX_KEEP 1 cli ;;
-  --)
-    shift
-    DRIVER_ARGS=("$@")
-    break
-    ;;
-  -*) px_usage_error "unknown option $1" ;;
-  *) px_usage_error "px-run takes no positional argument, got '$1'" ;;
-  esac
-  shift
-done
-
-# The configuration loader preserves the first value assigned to each variable; register all
-# command-line overrides first so that the highest-precedence origin wins.
-if [ -n "$DRIVER_SPEC" ]; then
-  px_config_set PX_DRIVER "$DRIVER_SPEC" cli
-fi
-if [ -n "$DISRUPT_INPUT" ]; then
-  px_config_set PX_DISRUPT_SPEC "$DISRUPT_INPUT" cli
-fi
-px_config_set_cli -- ${SET_PAIRS[@]+"${SET_PAIRS[@]}"}
-px_config_load ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}
+px_cli_parse "$@"
+DRIVER_SPEC=${PX_CLI_ARGS[0]}
+DRIVER_ARGS=(${PX_CLI_REST[@]+"${PX_CLI_REST[@]}"})
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 
 # Resolve the target scope from PX_SCOPE_ID or from the scope recorded by px-cluster for the active
 # cluster. Running without a provisioned cluster is a supported mode that skips cluster snapshots;
@@ -1551,6 +1599,7 @@ PLUGINS_ENABLED="$(pl_enabled || exit "$?")" || exit "$?"
 DRIVER_PATH="$(pl_driver_resolve "$DRIVER_SPEC")" || exit "$?"
 DRIVER_NAME="$(pl_driver_name "$DRIVER_SPEC" "$DRIVER_PATH")" || exit "$?"
 disrupt_parse "${PX_DISRUPT_SPEC:-}"
+COLLECTORS="$(pb_collectors_parse "${PX_COLLECTORS:-none}")" || exit "$?"
 if [ "$DISRUPT_COUNT" -gt 0 ] && [ -z "$SCOPE" ]; then
   px_die "$PX_EXIT_USAGE" "a disruption needs a cluster, and no cluster" \
     "${PX_CLUSTER_ID:-default} is recorded: $PX_HINT_NO_CLUSTER"
@@ -1622,12 +1671,13 @@ printf '%s\n' "$RUN_DIR"
 px_info "run $RUN_ID in $RUN_DIR"
 
 # Exit hooks run in reverse registration order on every exit: the active verb is terminated and
-# any open stage anchors are closed first, the cluster is torn down next, and the host sleep
-# inhibitor is released last. Converting INT and TERM signals into normal exits ensures that
-# interrupted runs execute the full cleanup sequence.
+# any open stage anchors are closed first, active telemetry collectors are stopped next, and the
+# host sleep inhibitor is released last, while the cluster itself remains running. Converting INT
+# and TERM signals into normal process exits guarantees that interrupted runs execute the complete
+# cleanup sequence.
 px_inhibit_start "run-$RUN_ID" "$$"
 px_on_exit px_guard_release inhibit "run-$RUN_ID"
-px_on_exit run_teardown
+px_on_exit collectors_stop
 px_on_exit verb_terminate
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -1700,7 +1750,9 @@ if [ -z "$BLOCKED" ]; then
     hook_run pre-workload || block "the pre-workload hook failed"
   fi
   if [ -z "$BLOCKED" ]; then
+    collectors_start
     verb_run run "$SHARED_DEADLINE"
+    collectors_stop
     hook_run post-workload || true
   fi
 fi

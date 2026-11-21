@@ -27,9 +27,9 @@
 #   2. Every metric record embeds the active run class and contamination state at write time. This
 #      prevents downstream consumers from treating timing metrics from a validation run or a noisy
 #      host as authoritative evidence, even if the consumer overlooks the run-class policy.
-#   3. Append-only streams (run-record.tsv, stages.tsv, and verdicts.tsv) omit header lines,
-#      whereas structured exports (metric exports, image and table records, and report tables)
-#      begin with a single header line.
+#   3. Append-only streams (run-record.tsv, stages.tsv, verdicts.tsv, and the collector index
+#      metrics/index.tsv) omit header lines, whereas structured exports (metric exports, image and
+#      table records, and report tables) begin with a single header line.
 #   4. The harness operates without a jq dependency. JSON output is produced using the writers in
 #      lib/common.sh and parsed via pb_json_flat, an awk-based parser that flattens a document
 #      into one row per value.
@@ -100,7 +100,16 @@ PB_REQUIRED_CLUSTER="cluster/topology.env cluster/services.tsv"
 # instance after the run finishes.
 PB_REQUIRED_DAEMON="logs/instance/"
 PB_OPTIONAL="breach.tsv tables.tsv thresholds.properties cluster/plugins/ logs/gc/
-metrics/index.tsv profiles/ jfr/ traces/ oplog/ host/ meta/"
+metrics/index.tsv collect/started.tsv profiles/ jfr/ traces/ oplog/ meta/"
+
+# Telemetry collectors started by px-run around the run verb, listed in their startup order. They
+# are implemented by lib/collect.sh and bin/px-collect, and the "The collectors" section of
+# docs/bundle-format.md specifies the underlying tool and output files for each collector.
+PB_COLLECTORS="profile jfr hiccup host container trace"
+# The sampler collectors share a single background process for each invocation of px-collect start,
+# allowing them to start and stop as a single step, whereas each remaining collector is a session
+# collector that executes as its own individual step.
+PB_SAMPLERS="hiccup host container"
 
 # Top-level subdirectories created when initializing a new bundle directory.
 PB_DIRS="drivers metrics logs cluster plugins report"
@@ -454,6 +463,33 @@ pb_table() {
   pb_header "$file" "$PB_TABLE_FIELDS" || return
   px_tsv_row "$(px_tsv_clean "${schema:-default}")" "$(px_tsv_clean "$table")" \
     "$(px_tsv_clean "${value:-default}")" >>"$file" || return "$PX_EXIT_FAIL"
+}
+
+## @description  Appends a target row (collector, target, status, file, detail...) to the collector
+##               index metrics/index.tsv in PX_RUN_DIR, requiring a bundle path when status is ok.
+## @return       Exits 0 on success, 1 on write failure, or 2 on a bad collector, status, or path.
+pb_collector() {
+  local name=${1:-} target=${2:-} status=${3:-} artifact=${4:-} detail="${*:5}" dir
+  case " $PB_COLLECTORS " in
+  *" $name "*) [ -n "$name" ] || px_die "$PX_EXIT_USAGE" "an index row needs a collector" ;;
+  *) px_die "$PX_EXIT_USAGE" "'$name' is not a collector of $PB_COLLECTORS" ;;
+  esac
+  case "$status" in
+  ok | skip | fail) ;;
+  *) px_die "$PX_EXIT_USAGE" "collector $name: the status is ok, skip or fail, got '$status'" ;;
+  esac
+  case "$artifact" in
+  /* | *..* | *"$PX_TAB"* | *"$PX_NL"*)
+    px_die "$PX_EXIT_USAGE" "collector $name: '$artifact' is not a path inside the bundle"
+    ;;
+  esac
+  if [ -z "$target" ] || { [ "$status" = ok ] && [ -z "$artifact" ]; }; then
+    px_die "$PX_EXIT_USAGE" "collector $name: a row needs a target, and an ok row a file"
+  fi
+  dir="$(sx_run_dir)" || return $?
+  mkdir -p "$dir/metrics" || return "$PX_EXIT_FAIL"
+  px_tsv_row "$name" "$(px_tsv_clean "$target")" "$status" "$artifact" \
+    "$(px_tsv_clean "$detail")" >>"$dir/metrics/index.tsv" || return "$PX_EXIT_FAIL"
 }
 
 # ---------------------------------------------------------------------------
@@ -948,6 +984,19 @@ EOF
     pb_artifact_row "$dir" "$path" no absent
   done
   [ -z "$declared" ] || printf '%s\n' "$declared"
+  # Emit an inventory row for every file listed in the collector index. Files recorded under an ok
+  # status are marked required so that any missing collector artifact fails bundle validation.
+  while IFS="$PB_US" read -r path status name target; do
+    [ -n "$path" ] || continue
+    if [ "$status" = ok ]; then
+      pb_artifact_row "$dir" "$path" yes "collector $name of $target"
+    else
+      pb_artifact_row "$dir" "$path" no "collector $name of $target: $status"
+    fi
+  done <<EOF
+$(awk -F '\t' -v us="$PB_US" '$4 != "" { print $4 us $3 us $1 us $2 }' \
+    "$dir/metrics/index.tsv" 2>/dev/null || true)
+EOF
 }
 
 ## @description  Enumerates optional artifacts declared by the bundle driver or enabled plug-ins

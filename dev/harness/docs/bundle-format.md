@@ -59,11 +59,16 @@ runs/<run-id>/
   thresholds.properties         the cluster-check thresholds in force              optional
   metrics/timeline.tsv          the timeline metric export
   metrics/aggregate.tsv         the aggregate metric export
-  metrics/<collector>.csv       px-collect samples, with metrics/index.tsv          optional
+  metrics/index.tsv             the collector index                                optional
+  metrics/host.tsv              the host samples of px-collect                     optional
+  metrics/container/<role>-<index>.tsv  the samples of one instance               optional
+  metrics/hiccup/<role>-<index>.hlog    the jHiccup log of one target JVM         optional
+  metrics/hiccup/control.hlog   the jHiccup log of the idle control JVM            optional
   cluster/images.tsv            the image of each instance
   cluster/topology.env          the topology and version record of the deployment
   cluster/services.tsv          the services, sizing and JDK of the deployment
   cluster/plugins/<id>/         the render-time hook records of each plug-in         optional
+  collect/started.tsv           the collectors that px-collect start started       optional
   drivers/<name>/describe.json  the describe document of the driver
   drivers/<name>/...            the private files of the driver
   logs/<verb>.log               the output of each verb that ran
@@ -71,6 +76,8 @@ runs/<run-id>/
   logs/check-cluster.log        the output of suites/check-cluster.sh               optional
   logs/px-report.log            the output of px-report                            optional
   logs/px-bundle.log            the output of px-bundle write and validate         optional
+  logs/px-collect.log           the stderr of px-collect start and stop under px-run  optional
+  logs/collect.log              the remote tool output and the sampler log         optional
   logs/instance/<role>-<index>.log  the daemon log of each instance
   logs/gc/<role>-<index>.log    the garbage-collection log of each JVM instance     optional
   plugins/<id>/                 the output of each plug-in, its hooks.tsv           optional
@@ -78,19 +85,23 @@ runs/<run-id>/
   report/verdicts.tsv           the effective verdict rows
   report/run-summary.tsv        the run summary table
   report/cluster-summary.tsv    the cluster summary table
-  profiles/ jfr/ traces/        px-profile, px-jfr and px-trace-count artifacts     optional
+  profiles/<role>-<index>.jfr   the async-profiler recording of one target JVM     optional
+  jfr/<role>-<index>.jfr        the Java Flight Recorder recording of one target   optional
+  traces/start.tsv stop.tsv     the Phoenix trace counters before and after run    optional
+  traces/counters.tsv           the change of each trace counter over the run      optional
   oplog/                        sampled operation logs                             optional
-  host/                         host telemetry                                     optional
   meta/                         run metadata of any shape, read by no gate         optional
 ```
 
 Tabular files in the bundle fall into two categories that share a uniform field-encoding rule. A
 stream file contains no header line because either its first column or its column count identifies
-each row: `run-record.tsv`, `stages.tsv`, `verdicts.tsv`, and `plugins/<id>/hooks.tsv`. An export
-file begins with a single header line listing its column names: the metric exports,
-`cluster/images.tsv`, `tables.tsv`, `plugins/<id>/manifest.tsv`, and the report tables. A field
-never contains a tab or a newline character; the writers either reject such values or replace those
-characters with spaces, and an empty field remains in its column position.
+each individual row (`run-record.tsv`, `stages.tsv`, `verdicts.tsv`, `metrics/index.tsv`,
+`collect/started.tsv`, and `plugins/<id>/hooks.tsv`). By contrast, an export file opens with a
+single header row declaring its column names (the metric exports, `cluster/images.tsv`,
+`tables.tsv`, `plugins/<id>/manifest.tsv`, the report tables, the collector sample files, and the
+`traces/` files). No field may contain a tab or a newline
+character; the writers either reject it or replace it with a space, and an empty field remains in
+its column position.
 
 ## Required paths
 
@@ -200,8 +211,9 @@ the same anchor.
 | Anchor | Writer | Window |
 |---|---|---|
 | `verb@<verb>` | `px-run` | one verb invocation of the driver |
+| `collector@<name>` | the collector | the active collection window of a single collector |
 | `steady@<name>` | the driver, during `run` | the steady-state measurement window |
-| any other `<kind>@<name>` | the driver | a custom phase declared in the describe document |
+| any other `<kind>@<name>` | the driver | a phase declared in the describe document |
 
 Only the `steady` anchor kind carries special meaning to the harness. A `steady@<name>` window
 represents the half-open time interval from its `begin` event to its `end` event during which the
@@ -222,8 +234,9 @@ The verdict stream records one row per evaluation verdict in the format
   any other column.
 * `class`: the evidence classification, which is `count`, `share`, `duration`, or `none`. The value
   `none` designates a functional or structural check. Only `duration` verdicts are ever demoted.
-* `source`: the emitting component taken from `PX_RECORD_SOURCE`—such as `px-run`, `driver:<name>`,
-  `check:cluster`, or `plugin:<id>`—or `action` when no writer identifies itself.
+* `source`: the emitting component taken from `PX_RECORD_SOURCE`—`px-run`, `driver:<name>`,
+  `check:cluster`, `plugin:<id>`, or `collector:<name>`—or `action` when no writer identifies
+  itself.
 * `detail`: human-readable diagnostic text for an operator. Every `SKIP` row states the reason why
   the check did not run.
 
@@ -297,6 +310,69 @@ reads the newest finished bundle. For example, invoking
   written by the plug-in loader, plus one row with the hook name `check` for each check script
   executed by `suites/check-cluster.sh`. Alongside it, `plugins/<id>/manifest.tsv` uses the columns
   `path description` to list the output files written by the plug-in relative to `plugins/<id>/`.
+
+## The collectors
+
+`px-run` starts the telemetry collectors configured in `PX_COLLECTORS` (either `none` or a
+comma-separated list) immediately before the `run` verb and stops them immediately after it
+completes. Passing `px-run --collect NAME`, which may be repeated, overrides that setting for a
+single run. The variable `PB_COLLECTORS` in `lib/bundle.sh` defines the six collector names in their
+startup order:
+
+| Collector | Tool | Files |
+|---|---|---|
+| `profile` | `px-profile`: async-profiler, CPU and alloc, 7919 us, all frames | `profiles/*.jfr` |
+| `jfr` | `px-jfr`: Java Flight Recorder via `jcmd` using the `profile` settings | `jfr/*.jfr` |
+| `hiccup` | `px-collect`: jHiccup in each target and an idle JVM in tooling 0 | `metrics/hiccup/` |
+| `host` | `px-collect`: host load and memory utilization samples | `metrics/host.csv` |
+| `container` | `px-collect`: instance samples in the sample schema | `metrics/container/*.csv` |
+| `trace` | `px-trace-count`: Phoenix trace counters from every RegionServer | `traces/*.tsv` |
+
+By default, the measurement run class enables all six collectors, whereas the validation class
+enables none. Driver HDR histogram logs are not managed as collectors, and `px-run` never disables
+them. The target instances for `profile`, `jfr`, and `hiccup` are the instances listed in
+`cluster/services.tsv` whose roles match `PX_COLLECT_TARGETS`, which defaults to `all`. Collectors
+interact with the cluster exclusively through `sb_exec` and retrieve remote files by streaming the
+output of `cat`. Each CSV row records a single sampling pass taken at the interval
+`PX_COLLECT_INTERVAL_S`, ending with the `run_class` and `contamination` columns; because the
+initial pass executes before the run verb starts and the final pass executes after it finishes, the
+sample series spans the entire workload execution.
+
+**The index.** The file `metrics/index.tsv` is an unheadered stream recording one row per collection
+target with the fields `collector target status
+file detail`. The status is `ok`, `skip` (when the target instance is not running, does not run a
+JVM, or lacks the tool required by `jfr` or `trace`), or `fail` (for any other fault, including a
+missing async-profiler or jHiccup binary). The output file named by an `ok` row becomes a required
+path in the artifact inventory, so any missing file from a successful collection causes
+`px-bundle validate` to fail. For any other status, the artifact file is treated as optional: if
+stopping a `profile` or `jfr` session fails, the collector still retrieves whatever partial
+recording was produced and logs it under a `fail` row.
+
+**The verdict.** Each collector emits a single verdict row under `collector.<name>` with evidence
+class `none` and source `collector:<name>`, recording `ADVISORY` if any target row failed, `PASS` if
+no row failed and at least one row succeeded with `ok`, or `SKIP` otherwise. A sampler that fails to
+start or stop within its timeout bound likewise records `ADVISORY`, and `px-run` emits an `ADVISORY`
+verdict for each configured collector whenever `px-collect start` or `stop` exits with a status code
+other than 0 or 1. Collectors never emit `FAIL` or `ERROR` verdicts, ensuring that lost telemetry
+never causes a workload run to fail.
+
+**The bounds.** Every `px-collect` invocation launched by `px-run` budgets one `PX_TIMEOUT_VERB`
+interval per synchronous step: one each for `profile`, `jfr`, and `trace`, plus one shared interval
+for the background sampler process. In addition, every collector is bounded by `--duration` (at
+least 1 second and defaulting to `PX_TIMEOUT_RUN`); `px-run` sets this duration to expire one verb
+timeout bound after the deadline of the run verb so that each remote collection session (the asprof
+timeout, the JFR recording duration, and the jHiccup execution duration) as well as the local
+sampler process self-terminates cleanly. Collectors stop in reverse startup order (`trace`, followed
+by the background samplers, `jfr`, and `profile`), and the exit trap of `px-run` runs this shutdown
+sequence on any early termination once the active driver verb halts and before releasing the host
+sleep inhibitor; stopping an already-stopped collection is a no-op that writes no additional rows.
+During shutdown, `px-collect stop` sends TERM to the sampler process and escalates to KILL across
+its process tree if it does not exit within half of `PX_TIMEOUT_VERB` (at least 1 s), while
+`px-collect start` waits up to that same half-bound for the sampler stage windows to open, ensuring
+that forced termination and closing rows complete within the overall call timeout. Each collector
+brackets its active execution with a `collector@<name>` stage window; if `px-run` terminates the
+driver upon an interrupt, it closes all open driver stage windows before the closing collector stage
+rows are written.
 
 ## manifest.json
 
@@ -472,6 +548,10 @@ finished bundle exists. The validator enforces the following rules:
     a run class matching the manifest, and a contamination field set to `none` when the run is
     clean. Every row in `verdicts.tsv` carries a valid severity from the lattice and a recognized
     evidence class.
+12. Every row in `metrics/index.tsv` contains five fields, a collector name from `PB_COLLECTORS`, a
+    status of `ok`, `skip`, or `fail`, and, when the status is `ok`, a valid relative path inside
+    the bundle. Rule 9 fails validation if the artifact file referenced by an `ok` row is missing,
+    whereas an absent index file is reported as a `skip` row.
 
 The command `px-bundle write BUNDLE` generates the bundle manifest via `pb_manifest_write`. It exits
 with code 0 on success, 1 if the manifest cannot be written, 2 on a usage error or a bundle path

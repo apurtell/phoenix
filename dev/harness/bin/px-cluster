@@ -159,9 +159,11 @@ pc_sub_usage() {
   build) cat <<'EOF'
 Usage: px-cluster [--config FILE] [-e NAME=VALUE] build
   Builds the image PX_IMAGE_TAG: scripts/build-phoenix.sh builds the
-  Phoenix jars of this tree, then scripts/stage-artifacts.sh stages the
-  pinned distributions and builds the image through the backend. Each step
-  reads the configuration files and values of this command.
+  Phoenix jars of this tree, scripts/build-jhiccup.sh builds jHiccup when
+  PX_DIST_ARTIFACTS lists jhiccup, then scripts/stage-artifacts.sh stages
+  the pinned distributions and the tools and builds the image through the
+  backend. Each step reads the configuration files and values of this
+  command.
 EOF
     ;;
   render) cat <<'EOF'
@@ -183,8 +185,9 @@ Usage: px-cluster up [--timeout S] [--ready-timeout S] [--no-wait] [DIR]
   The host preflight runs before the cluster is created: a deployment that
   the engine cannot hold is refused with the arithmetic, exit 3.
   The image PX_IMAGE_TAG must exist first: scripts/build-phoenix.sh builds
-  the Phoenix jars, then scripts/stage-artifacts.sh builds the image, and
-  px-cluster build runs both. An image that the host does not hold refuses
+  the Phoenix jars, scripts/build-jhiccup.sh builds jHiccup, then
+  scripts/stage-artifacts.sh builds the image, and px-cluster build runs
+  them. An image that the host does not hold refuses
   the bring-up before the preflight, exit 2, with those two commands.
   --timeout S        provision timeout, default PX_TIMEOUT_PROVISION
   --ready-timeout S  readiness timeout, default PX_TIMEOUT_READY
@@ -666,7 +669,7 @@ pc_image_check() {
   missing="$(printf '%s\n' "$rows" | awk -F '\t' '$2 == "" { print $1; exit }')"
   px_die "$PX_EXIT_USAGE" "the host holds no image $missing, which $1 names, so no" \
     "instance is created. Build it with the configuration of the render:" \
-    "$PX_HOME/scripts/build-phoenix.sh, then" \
+    "$PX_HOME/scripts/build-phoenix.sh, $PX_HOME/scripts/build-jhiccup.sh, then" \
     "$PX_HOME/scripts/stage-artifacts.sh --tag $missing"
 }
 
@@ -1176,19 +1179,29 @@ EOF
   fi
 }
 
-## @description  Builds the container image by invoking scripts/build-phoenix.sh followed by
-##               scripts/stage-artifacts.sh as child processes with this command's configuration.
-## @return       Exits 0, 2 on usage, or with the exit status of the build step that failed.
+# Invokes build-phoenix.sh, build-jhiccup.sh (when PX_DIST_ARTIFACTS includes jhiccup), and
+# stage-artifacts.sh as child processes inheriting this command's configuration.
+## @description  Builds the container image by running build-phoenix.sh, build-jhiccup.sh when
+##               PX_DIST_ARTIFACTS lists jhiccup, and stage-artifacts.sh as child processes.
+## @return       Exits 0, 2 on usage, or with the exit status of the step that failed.
 pc_build() {
-  local files=() file status=0
+  local files=() file status=0 jhiccup=""
   [ $# -eq 0 ] || pc_sub_usage_error build "unexpected argument: $*"
   for file in ${PC_FILES[@]+"${PC_FILES[@]}"}; do
     files+=(--config "$file")
   done
-  pc_plan "scripts/build-phoenix.sh, then scripts/stage-artifacts.sh" && return 0
+  case " ${PX_DIST_ARTIFACTS//,/ } " in
+  *" jhiccup "*) jhiccup="scripts/build-jhiccup.sh, " ;;
+  esac
+  pc_plan "scripts/build-phoenix.sh, ${jhiccup}then scripts/stage-artifacts.sh" && return 0
   px_config_child "$PX_HOME/scripts/build-phoenix.sh" ${files[@]+"${files[@]}"} >&2 ||
     status=$?
   [ "$status" = 0 ] || px_die "$status" "the Phoenix build failed, so no image is built"
+  if [ -n "$jhiccup" ]; then
+    px_config_child "$PX_HOME/scripts/build-jhiccup.sh" ${files[@]+"${files[@]}"} >&2 ||
+      status=$?
+    [ "$status" = 0 ] || px_die "$status" "the jHiccup build failed, so no image is built"
+  fi
   px_config_child "$PX_HOME/scripts/stage-artifacts.sh" ${files[@]+"${files[@]}"} >&2 ||
     status=$?
   [ "$status" = 0 ] || px_die "$status" "the image build failed"

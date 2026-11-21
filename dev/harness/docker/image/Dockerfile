@@ -21,8 +21,8 @@
 # working tree. The scripts/stage-artifacts.sh script populates the context layout as follows:
 #   - The context root holds every file from the image definition directory, including this
 #     Dockerfile, the lifecycle scripts, and the lib/, bin/, and conf/ subdirectories.
-#   - The dist/ directory holds the upstream distribution release archives after fetch-dist.sh
-#     has verified them against their pins.
+#   - The dist/ directory holds the upstream distribution release archives after fetch-dist.sh has
+#     verified them against their pins, together with the jHiccup JAR built by build-jhiccup.sh.
 #   - The phoenix/ directory holds the JAR artifacts produced by the local Phoenix build.
 # Each staged file is passed into the build via a PX_STAGED_* build argument naming its relative
 # path in the build context, so this file contains no hardcoded artifact version numbers or file
@@ -55,6 +55,7 @@ FROM ${PX_IMAGE_BASE_JDK17}@sha256:${PX_IMAGE_BASE_JDK17_SHA256} AS unpack
 ARG PX_STAGED_HADOOP
 ARG PX_STAGED_HBASE
 ARG PX_STAGED_ASYNC_PROFILER=
+ARG PX_STAGED_JHICCUP=
 ARG PX_STAGED_PHOENIX_SERVER
 ARG PX_STAGED_PHOENIX_CLIENT
 ARG PX_STAGED_PHOENIX_PHERF
@@ -76,7 +77,9 @@ COPY phoenix/ /stage/phoenix/
 
 # The ZooKeeper service runs using the ZooKeeper JAR bundled within the HBase distribution. That
 # bundled release version may differ from the ZooKeeper client version against which Phoenix is
-# compiled.
+# compiled. The profiling tools are installed at the well-known paths
+# /opt/px-tools/async-profiler/bin/asprof and /opt/px-tools/jhiccup/jHiccup.jar, where the harness
+# collectors locate them.
 RUN set -eu; \
     for name in PX_STAGED_HADOOP PX_STAGED_HBASE PX_STAGED_PHOENIX_SERVER \
       PX_STAGED_PHOENIX_CLIENT PX_STAGED_PHOENIX_PHERF PX_HADOOP_VERSION PX_HBASE_VERSION \
@@ -93,7 +96,12 @@ RUN set -eu; \
     if [ -n "$PX_STAGED_ASYNC_PROFILER" ]; then \
       mkdir -p /out/px-tools/async-profiler; \
       tar -xzf "/stage/$PX_STAGED_ASYNC_PROFILER" -C /out/px-tools/async-profiler \
-        --strip-components=1; fi; \
+        --strip-components=1; \
+      test -x /out/px-tools/async-profiler/bin/asprof; fi; \
+    if [ -n "$PX_STAGED_JHICCUP" ]; then \
+      mkdir -p /out/px-tools/jhiccup; \
+      cp "/stage/$PX_STAGED_JHICCUP" /out/px-tools/jhiccup/jHiccup.jar; \
+      test -s /out/px-tools/jhiccup/jHiccup.jar; fi; \
     test -x /out/hadoop/bin/hdfs; \
     test -f "/out/hadoop/share/hadoop/common/hadoop-common-$PX_HADOOP_VERSION.jar" || \
       { echo "the staged Hadoop is not $PX_HADOOP_VERSION" >&2; exit 1; }; \

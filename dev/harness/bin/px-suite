@@ -998,7 +998,7 @@ px_suite_dump_s() {
 ##               (index).
 ## @return       Writes the computed timeout in whole seconds to stdout and exits 0.
 px_suite_run_limit() {
-  local index=$1 dump wait poll whole file verb drain ready fetch plugins count
+  local index=$1 dump wait poll whole file verb drain ready fetch plugins count collectors
   local -a args=()
   if [ -n "${TEST_CLASS[$index]}" ]; then
     args=(--class "${TEST_CLASS[$index]}")
@@ -1024,19 +1024,28 @@ px_suite_run_limit() {
   fetch="$(px_suite_dump_s PX_TIMEOUT_FETCH "$dump" 1800)"
   plugins="$(px_tsv_get PX_PLUGINS "$dump" || true)"
   plugins="$(printf '%s\n' "${plugins%%"$PX_TAB"*}" | awk '{ n += NF } END { print n + 0 }')"
+  # Budget one start and one stop timeout bound for each individual collector tool (profile, jfr,
+  # and trace) plus a single shared px-collect lifecycle for hiccup, host, and container together.
+  collectors="$(px_tsv_get PX_COLLECTORS "$dump" || true)"
+  collectors="$(printf '%s\n' "${collectors%%"$PX_TAB"*}" | awk -F ',' '{
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^(profile|jfr|trace)$/) n++
+      else if ($i ~ /^(hiccup|host|container)$/) s = 1
+    } } END { print n + s }')"
   # Combine the disrupt: directives declared on the test with any session-wide --disrupt setting,
-  # splitting on semicolons in the same manner as px-run.
+  # splitting semicolon-separated specifications in the same manner as px-run.
   count="$(px_tsv_get PX_DISRUPT_SPEC "$dump" || true)"
   count="$(printf '%s;%s\n' "${count%%"$PX_TAB"*}" "${TEST_DISRUPT[$index]}" |
     awk -F ';' '{ for (i = 1; i <= NF; i++) if ($i ~ /[^ \t]/) n++ } END { print n + 0 }')"
   # Sum the budget terms in order: the test's declared time limit (shared by prepare and run); the
   # fixed margin for snapshots and result recording; one verb bound for each of describe, validate,
   # restore, and report, plus two for cluster checks; the four bounded hooks (fetch-data,
-  # pre-workload, post-workload, and collect) for each enabled plug-in; the drain-aware restart plus
-  # the readiness and region waits of the recovery gate for each disruption; the quiet-host wait;
-  # and one poll interval.
+  # pre-workload, post-workload, and collect) for each enabled plug-in; the start and stop bounds
+  # for each collector tool; the drain-aware restart plus the readiness and region waits of the
+  # recovery gate for each disruption; the quiet-host wait; and one poll interval.
   printf '%s\n' "$((TEST_TIMEOUT[index] + SUITE_RUN_MARGIN_S + 6 * verb +
-    plugins * (3 * verb + fetch) + count * (drain + 2 * ready) + wait + 10#$whole))"
+    plugins * (3 * verb + fetch) + collectors * 2 * verb + count * (drain + 2 * ready) +
+    wait + 10#$whole))"
 }
 
 # Driver-backed tests are delegated to px-run, which owns the workload driver lifecycle.

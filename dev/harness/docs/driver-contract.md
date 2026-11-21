@@ -230,6 +230,12 @@ any open stage anchors so that the stage log remains structurally valid. Wheneve
 a non-zero code, it must emit an explanatory verdict row so that the downstream verdict merge never
 has to infer the failure reason from the process exit code alone.
 
+A driver that records HDR histograms writes each raw histogram log as a `.hlog` file beneath
+`drivers/<name>/` and declares each path in `artifacts` so that the run manifest includes it in the
+artifact inventory. Because this recording is intrinsic to the driver rather than an external
+collector, `px-run` never disables it in either run class. Milestones P4 and H2 add HDR histogram
+recording to the pherf driver.
+
 ### restore
 
 The `restore` verb drops or truncates the database objects created during `prepare`, reading the

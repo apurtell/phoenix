@@ -218,9 +218,9 @@ stores the active scope identifier. `px-cluster up` writes the file immediately 
 function returns exit code 0 on success, 2 if the cluster name is invalid or the state directory
 path is rejected, and 1 if the state directory cannot be created.
 
-`sb_scope_resolve` determines the target scope identifier for a command. All cluster-targeted
-commands (`px-cluster`, `px-run`, `px-suite`, `px-tool`, `px-collect`, and `px-pherf`) rely on this
-single resolution precedence:
+`sb_scope_resolve` determines the target scope identifier for a command. Every command that operates
+against a cluster (`px-cluster`, `px-run`, `px-suite`, `px-tool`, `px-collect`, and `px-pherf`)
+follows this unified resolution order:
 
 1. `PX_SCOPE_ID`, if explicitly set, allowing an operator to target a scope that was never recorded
    locally on the current host;

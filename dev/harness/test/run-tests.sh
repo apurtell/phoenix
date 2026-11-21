@@ -316,11 +316,12 @@ t_run_in() {
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_run() { t_run_in "$PWD" "$@"; }
 
-## @description  Executes a command with the fake runtime first on PATH and set in PX_DOCKER_BIN.
+## @description  Executes a command with the fake runtime first on PATH and set in PX_DOCKER_BIN,
+##               and with collectors disabled so runs of either class retain the A5 step sequence.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_with_shim() {
   t_run env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
-    "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" "$@"
+    "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" PX_COLLECTORS=none "$@"
 }
 
 ## @description  Executes a command (NAME=VALUE..., command...) against the fake sweep cluster.
@@ -1122,6 +1123,8 @@ compose)
       *) break ;;
       esac
     done
+    # The command learns its service, as a command of an instance would.
+    export PX_FAKE_SERVICE=${1:-}
     shift
     # The online regions of the cluster: one line of region-count per call,
     # the last line repeating, and 12 without the file. Each call appends its
@@ -2096,6 +2099,7 @@ t_setup() {
   t_fixtures_a2
   t_fixtures_a3
   t_fixtures_a5
+  t_fixtures_a6
 }
 
 # ---------------------------------------------------------------------------
@@ -2505,11 +2509,15 @@ t_group_commands() {
       own="$own $name"
     fi
   done
-  # Entry points deferred to a later implementation round must respond to --help and reject any
-  # other invocation with the unsupported exit code.
-  for name in px-profile px-jfr px-trace-count px-pherf px-k3d; do
+  # Entry points deferred to a later round must respond to --help and reject any other invocation
+  # with the unsupported exit code, whereas collector tools reject an unrecognized subcommand.
+  for name in px-pherf px-k3d; do
     t_run "$T_BASH" "$T_BIN/$name" run
     [ "$T_STATUS" = 5 ] || stub="$stub $name=$T_STATUS"
+  done
+  for name in px-profile px-jfr px-trace-count; do
+    t_run "$T_BASH" "$T_BIN/$name" run
+    [ "$T_STATUS" = 2 ] || stub="$stub $name=$T_STATUS"
   done
   t_empty twelve_entry_points_are_present "$missing"
   t_empty every_later_round_entry_point_is_unsupported "$stub"
@@ -3883,10 +3891,10 @@ t_group_sweep_teardown() {
 5 sb_sample_resources px-sweep"
   # When an unrecorded scope is queried while the runtime is unreachable, its absence cannot be
   # confirmed, so commands must report the runtime failure rather than a missing scope.
-  t_sweep "$T_BASH" "$T_BIN/px-tool" --scope px-other monitor
+  t_sweep "$T_BASH" "$T_BIN/px-tool" -e PX_SCOPE_ID=px-other monitor
   t_equals sweep_tool_on_an_unreachable_runtime_is_failure 1 "$T_STATUS"
-  t_sweep "$T_BASH" "$T_BIN/px-collect" --scope px-other --duration 1 \
-    --out "$T_SWEEP_OUT/collect"
+  t_sweep PX_RUN_CLASS=validation "$T_BASH" "$T_BIN/px-collect" start -e PX_SCOPE_ID=px-other \
+    --collect host --duration 1
   t_equals sweep_collect_on_an_unreachable_runtime_is_failure 1 "$T_STATUS"
   rm -f "$T_SWEEP_STATE/unreachable"
   t_sb_codes sweep_teardown_refusals "
@@ -5231,6 +5239,9 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     pins_env+=("PX_DIST_HBASE_2_6_7_SHA512_$line=$sum"
       "PX_DIST_HADOOP_3_4_3_SHA512_$line=$(px_sha512 "$hadoop")")
   done
+  # Seed the jHiccup build output produced by build-jhiccup.sh so artifact staging can consume it.
+  mkdir -p "$T_A2_OUT/build/jhiccup"
+  printf 'fake jHiccup\n' >"$T_A2_OUT/build/jhiccup/jHiccup.jar"
   t_a2 "${pins_env[@]:0:2}" "${pins_env[@]:3}" "$T_BASH" "$sa" --stage-only
   t_equals stage_artifacts_requires_every_digest 1 "$T_STATUS"
   t_contains stage_artifacts_names_the_missing_digest \
@@ -5244,15 +5255,35 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
   for line in Dockerfile entrypoint.sh healthcheck.sh render.sh lib/image.sh \
     bin/px-bootstrap-probe conf/hbase-site.xml.tmpl .dockerignore \
     dist/hbase-2.6.7-hadoop3-bin.tar.gz dist/hadoop-3.4.3-aarch64.tar.gz \
-    dist/async-profiler-4.1-linux-arm64.tar.gz \
+    dist/async-profiler-4.1-linux-arm64.tar.gz dist/jHiccup.jar \
     phoenix/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar \
     phoenix/phoenix-client-embedded-hbase-2.6-5.4.0-SNAPSHOT.jar \
     phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar; do
     [ -f "$ctx/$line" ] || bad="$bad $line"
   done
   t_empty stage_artifacts_context_holds_every_part "$bad"
-  # RQ-094: Any enabled plug-in is staged into the image build context and copied by the Dockerfile,
-  # whereas disabled plug-ins are omitted from the context.
+  # RQ-128: Verify that the image stages async-profiler and jHiccup and installs them at their
+  # well-known paths, and that the image build validates those installations.
+  t_equals image_stages_async_profiler_and_jhiccup "yes yes" "$(t_exists \
+    "$ctx/dist/async-profiler-4.1-linux-arm64.tar.gz") $(t_exists "$ctx/dist/jHiccup.jar")"
+  text="$(cat "$ctx/Dockerfile")"
+  bad=""
+  for line in 'ARG PX_STAGED_JHICCUP=' 'test -x /out/px-tools/async-profiler/bin/asprof' \
+    "cp \"/stage/\$PX_STAGED_JHICCUP\" /out/px-tools/jhiccup/jHiccup.jar" \
+    'COPY --from=unpack /out/ /opt/' 'PX_TOOLS_DIR=/opt/px-tools'; do
+    case "$text" in
+    *"$line"*) ;;
+    *) bad="$bad [$line]" ;;
+    esac
+  done
+  t_empty image_installs_the_tools_at_known_paths "$bad"
+  mv "$T_A2_OUT/build/jhiccup/jHiccup.jar" "$T_A2_OUT/build/jhiccup/away.jar"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  mv "$T_A2_OUT/build/jhiccup/away.jar" "$T_A2_OUT/build/jhiccup/jHiccup.jar"
+  t_equals stage_artifacts_requires_the_jhiccup_jar "1 yes" "$T_STATUS $(t_flag \
+    'run build-jhiccup.sh, or drop jhiccup from PX_DIST_ARTIFACTS' "$T_STDERR")"
+  # RQ-094: Any enabled plug-in is staged into the build context and copied by the image
+  # definition, whereas disabled plug-ins are omitted.
   t_equals stage_artifacts_without_a_plugin_stages_none "yes no" \
     "$(t_exists "$ctx/plugins") $(t_exists "$ctx/plugins/example")"
   t_a2 "${pins_env[@]}" PX_PLUGINS=example "$T_BASH" "$sa" --stage-only
@@ -5293,6 +5324,8 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     "--build-arg PX_IMAGE_BASE_JDK17_SHA256=$(printf '7%.0s' $(seq 1 64)) " "$text"
   t_contains image_build_passes_the_staged_paths \
     '--build-arg PX_STAGED_HBASE=dist/hbase-2.6.7-hadoop3-bin.tar.gz' "$text"
+  t_contains image_build_passes_the_staged_jhiccup \
+    '--build-arg PX_STAGED_JHICCUP=dist/jHiccup.jar' "$text"
   t_contains image_build_names_the_context "--file $ctx/Dockerfile $ctx" "$text"
   t_absent image_build_defaults_to_the_host_architecture '--platform' "$text"
   # R-066: When the container builder supports the provenance flag, image builds disable provenance
@@ -5496,7 +5529,7 @@ t_group_a2_cluster() {
   # the exact commands used to build it.
   t_a2 "$T_BASH" "$pc" up --help
   t_contains cluster_up_help_names_the_image_build \
-    'scripts/build-phoenix.sh builds the Phoenix jars, then scripts/stage-artifacts.sh' \
+    'The image PX_IMAGE_TAG must exist first; px-cluster build makes it.' \
     "$(printf '%s\n' "$T_STDOUT" | tr -s ' \n' ' ')"
   t_a2 "$T_BASH" "$pc" --cluster a2 up
   t_equals cluster_up_needs_a_class_or_a_directory 2 "$T_STATUS"
@@ -5544,27 +5577,46 @@ t_group_a2_cluster() {
   t_shim_log_reset
   t_a2 "$T_BASH" "$pc" --cluster a2 --class validation --config "$T_A2/topology.env" up
   rm -f "$T_A2_STATE/no-image"
-  t_equals missing_image_refuses_the_bring_up "2 yes yes" "$T_STATUS $(t_flag \
-    'scripts/build-phoenix.sh, then' "$T_STDERR") $(t_flag \
-    'scripts/stage-artifacts.sh --tag px-harness:hbase-2.6.7-hadoop-3.4.3-profile-2.6' \
+  t_equals missing_image_refuses_the_bring_up "6 yes" "$T_STATUS $(t_flag \
+    "run px-cluster build --cluster a2 --class validation --config $T_A2/topology.env" \
     "$T_STDERR")"
+  text="$(printf '%s\n' "$T_STDERR" | sed -n 's/.*: run px-cluster build \(.*\)$/\1/p' |
+    sed -n 1p)"
+  read -r -a words <<<"$text"
+  t_a2 "$T_BASH" "$pc" build ${words[@]+"${words[@]}"} -n
+  t_equals missing_image_hint_parses "0 yes" "$T_STATUS $(t_flag \
+    "plan${PX_TAB}build${PX_TAB}scripts/build-phoenix.sh" "$T_STDOUT")"
   t_absent missing_image_runs_no_preflight 'memory_fit' "$T_STDERR"
   t_absent missing_image_creates_nothing 'up --no-start' "$(cat "$T_SHIM_LOG")"
   t_shim_log_reset
   t_a2 "$T_BASH" "$pc" --cluster a2 --class validation --config "$T_A2/topology.env" up \
-    --timeout 5
+    --timeout 5 -e "PX_U3_QUOTED=a 'b' \"c\" # d = e"
   t_equals single_bring_up_from_class_and_topology 0 "$T_STATUS"
   t_contains single_bring_up_runs_the_preflight "memory_fit${PX_TAB}ok" "$T_STDERR"
   t_contains single_bring_up_provisions_the_render "compose -p px-a2 -f $dir/compose.yaml" \
     "$(cat "$T_SHIM_LOG")"
   t_equals single_bring_up_records_the_deployment "$dir" \
     "$(cat "$T_A2_OUT/state/deployment-compose-a2" 2>/dev/null)"
+  t_a2_record "$dir"
   # Because rendering overwrites the files in the target deployment directory, neither a second
   # bring-up nor a direct render call may modify the deployment directory of a cluster that is up.
   t_shim_log_reset
   t_a2 "$T_BASH" "$pc" --cluster a2 --class validation up
   t_equals cluster_up_refuses_to_render_over_a_cluster_that_is_up "2 yes" \
     "$T_STATUS $(t_flag 'run px-cluster down first' "$T_STDERR")"
+  t_equals up_refuses_an_existing_record "yes no" "$(t_flag \
+    "recorded in $T_A2_OUT/state/cluster-a2.env" "$T_STDERR") $(t_flag 'PX_FORCE=1' "$T_STDERR")"
+  # Setting PX_FORCE=1 marks a cluster record as stale only when its scope is gone, and never when
+  # the cluster is currently up.
+  text="$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation -e PX_FORCE=1 up --no-wait
+  t_equals up_force_refuses_a_cluster_that_is_up "2 yes yes no" "$T_STATUS $(t_flag \
+    'is up already' "$T_STDERR") $([ "$text" = "$(cat "$T_A2_OUT/state/cluster-a2.env" \
+    2>/dev/null)" ] && echo yes || echo no) $(t_flag ' up --no-start' "$(cat "$T_SHIM_LOG")")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation up "$dir" --no-wait
+  t_equals up_of_a_directory_refuses_an_existing_record 2 "$T_STATUS"
+  t_shim_log_reset
   t_a2 "$T_BASH" "$pc" --cluster a2 --class validation render
   t_equals cluster_render_refuses_the_deployment_of_a_cluster_that_is_up 2 "$T_STATUS"
   t_empty cluster_refused_render_calls_no_runtime "$(cat "$T_SHIM_LOG")"
@@ -5857,8 +5909,8 @@ t_group_a2_matrix() {
   # container image.
   : >"$T_A2_MVN_LOG"
   t_shim_log_reset
-  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$T_A2/jdk/17" "${pins_env[@]}" "$T_BASH" \
-    "$home/bin/px-cluster" --config "$b" build
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$T_A2/jdk/17" "${pins_env[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$home/bin/px-cluster" --config "$b" build
   t_equals cluster_build_builds_phoenix_then_the_image "0 2.5 1" "$T_STATUS $(sed -n \
     's/.*-Dhbase.profile=\([^ ]*\).*/\1/p' "$T_A2_MVN_LOG" | sed -n 1p) $(grep -c '^build --tag' \
     "$T_SHIM_LOG")"
@@ -7287,13 +7339,13 @@ t_group_a5_bundle() {
   copy="$(t_bundle_copy "$base" nooptional)"
   rm -rf "$copy/breach.tsv" "$copy/tables.tsv" "$copy/thresholds.properties" \
     "$copy/cluster/plugins" "$copy/logs/gc" "$copy/metrics/index.tsv" \
-    "$copy/profiles" "$copy/jfr" "$copy/traces" "$copy/oplog" "$copy/host" "$copy/meta" \
+    "$copy/profiles" "$copy/jfr" "$copy/traces" "$copy/oplog" "$copy/meta" \
     "$copy/plugins"
   t_validate "$copy"
   t_equals bundle_without_optional_artifacts_validates 0 "$T_STATUS"
   bad=""
   for path in breach.tsv tables.tsv thresholds.properties cluster/plugins/ logs/gc/ \
-    metrics/index.tsv profiles/ jfr/ traces/ host/ meta/; do
+    metrics/index.tsv profiles/ jfr/ traces/ meta/; do
     printf '%s\n' "$T_STDOUT" | grep -q "^path${PX_TAB}skip${PX_TAB}$path" || bad="$bad $path"
   done
   # Verify requirement R-064: the plugins context row in run-record.tsv lists the enabled plug-ins,
@@ -8880,6 +8932,860 @@ A5_EOF
 
 
 # ---------------------------------------------------------------------------
+# A6: Measurement toolkit verification
+# ---------------------------------------------------------------------------
+# Every test case in this section executes against synthetic fakes: a four-instance fake runtime,
+# a fake pgrep that discovers a JVM only in each RegionServer, fake shims for async-profiler,
+# jcmd, java, and the jHiccup jar, a fake trace counter reader, and the hdr.sh stub driver whose
+# run verb emits an HDR histogram log. Test cases referenced by requirement specifications retain
+# their required identifiers.
+
+## @description  Materializes the A6 test fixtures, including fake collector tools, fake JDKs,
+##               the hdr.sh stub driver, and the four-instance cluster deployment.
+## @return       Populates the A6 fixture directory. Exit 0.
+t_fixtures_a6() {
+  T_A6="$T_WORK/a6"
+  T_A6_STATE="$T_A6/state"
+  T_A6_OUT="$T_A6/out"
+  mkdir -p "$T_A6/bin" "$T_A6/tools/async-profiler/bin" "$T_A6/tools/jhiccup" \
+    "$T_A6/jdk/17/bin" "$T_A6/jdk-nojcmd/17/bin" "$T_A6/deploy" "$T_A6_STATE" "$T_A6_OUT"
+  # The fake runtime executes container commands on the host and exports the target service in
+  # PX_FAKE_SERVICE. Only RegionServer instances report a running JVM process.
+  cat >"$T_A6/bin/pgrep" <<'A6_EOF'
+#!/usr/bin/env bash
+case "${PX_FAKE_SERVICE:-}" in
+regionserver*) printf '4242\n' ;;
+*) exit 1 ;;
+esac
+A6_EOF
+  # Fake trace counter reader for client 0. Each invocation increments every counter by 10, a
+  # flag file simulates a missing reader binary, and a second flag causes the second invocation
+  # (the stop call) to record its start marker and sleep for two seconds.
+  cat >"$T_A6/bin/px-trace-counters" <<'A6_EOF'
+#!/usr/bin/env bash
+[ ! -e "$PX_FAKE_STATE_DIR/no-trace-reader" ] || exit 127
+calls=$(($(cat "$PX_FAKE_STATE_DIR/trace-calls" 2>/dev/null || echo 0) + 1))
+printf '%s\n' "$calls" >"$PX_FAKE_STATE_DIR/trace-calls"
+if [ "$calls" = 2 ] && [ -e "$PX_FAKE_STATE_DIR/slow-trace-stop" ]; then
+  : >"$PX_FAKE_STATE_DIR/trace-stopping"
+  sleep 2
+fi
+printf 'regionserver\t0\tServer\ttotalRequestCount\t%s\n' "$((calls * 10))"
+printf 'regionserver\t1\tPhoenixIndexer\tpreBatchMutate_num_ops\t%s\n' "$((calls * 10))"
+A6_EOF
+  # Fake async-profiler shim that logs the target service and argument list; on start, it writes
+  # the event list from the -e option into the output recording file.
+  cat >"$T_A6/tools/async-profiler/bin/asprof" <<'A6_EOF'
+#!/usr/bin/env bash
+printf '%s %s\n' "${PX_FAKE_SERVICE:-}" "$*" >>"$PX_FAKE_STATE_DIR/asprof.log"
+file="" events="" prev=""
+for arg in "$@"; do
+  [ "$prev" != -f ] || file=$arg
+  [ "$prev" != -e ] || events=$arg
+  prev=$arg
+done
+[ "${1:-}" != start ] || [ -z "$file" ] || printf '%s\n' "$events" >"$file"
+A6_EOF
+  printf 'fake jHiccup\n' >"$T_A6/tools/jhiccup/jHiccup.jar"
+  # Fake JDK binaries. The java shim logs its arguments; in attacher mode it writes the target
+  # histogram log, and in control-JVM mode it writes its log, records its PID, and stays alive.
+  cat >"$T_A6/jdk/17/bin/java" <<'A6_EOF'
+#!/usr/bin/env bash
+printf '%s %s\n' "${PX_FAKE_SERVICE:-}" "$*" >>"$PX_FAKE_STATE_DIR/java.log"
+log="" prev="" mode=""
+for arg in "$@"; do
+  [ "$prev" != -l ] || log=$arg
+  case "$arg" in
+  org.jhiccup.HiccupMeterAttacher) mode=attach ;;
+  -jar) mode=control ;;
+  esac
+  prev=$arg
+done
+[ -z "$log" ] || printf '#[Histogram log format version 1.3]\n' >"$log"
+if [ "$mode" = control ]; then
+  printf '%s\n' "$$" >"$PX_FAKE_STATE_DIR/control.pid"
+  exec sleep 30
+fi
+A6_EOF
+  cat >"$T_A6/jdk/17/bin/jcmd" <<'A6_EOF'
+#!/usr/bin/env bash
+printf '%s %s\n' "${PX_FAKE_SERVICE:-}" "$*" >>"$PX_FAKE_STATE_DIR/jcmd.log"
+for arg in "$@"; do
+  case "$arg" in
+  filename=*) printf 'jfr recording\n' >"${arg#filename=}" ;;
+  esac
+done
+A6_EOF
+  cp "$T_A6/jdk/17/bin/java" "$T_A6/jdk-nojcmd/17/bin/java"
+  chmod +x "$T_A6/bin"/* "$T_A6/tools/async-profiler/bin/asprof" "$T_A6/jdk/17/bin"/* \
+    "$T_A6/jdk-nojcmd/17/bin/java"
+  # Stub workload driver whose run verb writes an HDR log inside the steady@stub window and holds
+  # that window open for the requested duration in seconds. When passed regress, it also records
+  # both a counter regression and a latency regression.
+  cat >"$T_WORK/drivers/hdr.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+describe)
+  printf '{"contract": 1, "driver": "%s",\n' "${PX_DRIVER_NAME:-hdr}"
+  printf ' "phases": [{"anchor": "steady@stub", "verb": "run"}],\n'
+  printf ' "metrics": {"count": [], "share": [], "duration": []},\n'
+  printf ' "unsupported": {"checks": [\n'
+  printf '  {"key": "query_latency.p50_ms", "reason": "a stub"},\n'
+  printf '  {"key": "query_latency.p99_ms", "reason": "a stub"},\n'
+  printf '  {"key": "query_errors", "reason": "a stub"},\n'
+  printf '  {"key": "offered_rate", "reason": "a stub"},\n'
+  printf '  {"key": "achieved_qps", "reason": "a stub"}],\n'
+  printf '  "artifacts": []},\n'
+  printf ' "artifacts": [{"path": "drivers/hdr/run.hlog"}]}\n'
+  exit 0
+  ;;
+validate | prepare | restore | report) exit 0 ;;
+run) shift ;;
+*) exit 2 ;;
+esac
+. "$PX_HOME/lib/bundle.sh"
+hdr_sleep=1
+hdr_regress=0
+for hdr_arg in "$@"; do
+  case "$hdr_arg" in
+  regress) hdr_regress=1 ;;
+  *) hdr_sleep=$hdr_arg ;;
+  esac
+done
+pb_stage begin steady@stub
+printf '#[Histogram log format version 1.3]\n' >"$PX_DRIVER_DIR/run.hlog"
+sleep "$hdr_sleep"
+pb_stage end steady@stub
+if [ "$hdr_regress" = 1 ]; then
+  sx_verdict_row stub.counter_regression FAIL count "the scans rose from 10 to 12"
+  sx_verdict_row stub.latency_regression FAIL duration "the p99 rose from 5 ms to 9 ms"
+fi
+DRIVER_EOF
+  chmod +x "$T_WORK/drivers/hdr.sh"
+  printf '%s\n' "# Rendered by compose.gen.sh. Render again instead of editing." \
+    PX_CLUSTER_ID=selftest PX_RS_COUNT=2 >"$T_A6/deploy/topology.env"
+  {
+    printf '%s\n' "# service role index group start mem_limit_mib heap_mib direct_mib jdk"
+    t_rows 9 regionserver-0 regionserver 0 '' '' 2560 1792 256 17 \
+      regionserver-1 regionserver 1 '' '' 2560 1792 256 17 \
+      client-0 client 0 '' '' 1536 1024 128 17 tooling-0 tooling 0 '' '' 512 256 64 17
+  } >"$T_A6/deploy/services.tsv"
+  printf 'PX_PORT_REGIONSERVER_RPC_0=16020\n' >"$T_A6/deploy/ports.generated.env"
+  # Default environment variables for all A6 commands and base CLI options for px-run invocations.
+  T_A6_ENV=("PATH=$T_A6/bin:$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker"
+    "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_A6_STATE" "PX_OUT=$T_A6_OUT"
+    "PX_TOOLS_DIR=$T_A6/tools" "PX_JDK_ROOT=$T_A6/jdk" PX_COLLECT_INTERVAL_S=1
+    PX_POLL_INTERVAL_S=0.2 PX_CLUSTER_ID=selftest)
+  T_A6_RUN=(-e PX_SCOPE_ID=px-selftest -e PX_REQUIRE_QUIET_HOST=0
+    -e PX_QUIET_HOST_WAIT_S=0 "$T_WORK/drivers/hdr.sh")
+  t_a6_state_reset
+}
+
+## @description  Resets the A6 fake cluster to running regionserver 0 and 1, client 0, and
+##               tooling 0 instances under scope px-selftest and cluster selftest.
+## @return       Reinitializes the A6 fake cluster state. Exit 0.
+t_a6_state_reset() {
+  local line n=0
+  rm -rf "${T_A6_STATE:?}"/*
+  for line in regionserver:0 regionserver:1 client:0 tooling:0; do
+    n=$((n + 1))
+    printf 'c0ffee00a60%s|%s|px-selftest-%s-%s-1|running|Up 3 minutes (healthy)|%s|%s|1|%s|||\n' \
+      "$n" "${line%:*}" "${line%:*}" "${line#*:}" phoenix-harness:selftest \
+      "${line%:*}-${line#*:}" "${line#*:}"
+  done >"$T_A6_STATE/instances.txt"
+  printf '0\n' >"$T_A6_STATE/restart-count"
+  printf 'sha256:f00dfeed00a6\n' >"$T_A6_STATE/image-id"
+  mkdir -p "$T_A6_OUT/state"
+  printf 'px-selftest\n' >"$T_A6_OUT/state/scope-compose-selftest"
+  printf '%s\n' "$T_A6/deploy" >"$T_A6_OUT/state/deployment-compose-selftest"
+}
+
+## @description  Executes a command against the A6 fake cluster with the fake tools first on PATH
+##               and PX_COLLECTORS unset so the run class determines active collectors.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a6() {
+  t_run env "${T_A6_ENV[@]}" "$@"
+}
+
+## @description  Executes px-run with hdr.sh against the A6 fake cluster (class, option...);
+##               measurement runs require no quiet host, and the cluster remains running.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a6_run() {
+  local class=$1
+  shift
+  t_a6 "$T_BASH" "$T_BIN/px-run" --class "$class" "${T_A6_RUN[@]}" "$@"
+}
+
+## @description  Extracts unique runtime verbs from a fake runtime log (file), emitting
+##               compose:<verb> for compose calls or the first word while skipping remote scripts.
+## @return       Writes the sorted verbs, one per line, to stdout. Exit 0.
+t_runtime_verbs() {
+  awk '
+    skip { if ($0 ~ / px-(collect|fetch)( |$)/) skip = 0; next }
+    $1 == "compose" && $2 == "-p" { i = 4; if ($i == "-f") i += 4; print "compose:" $i }
+    $1 == "compose" && $2 != "-p" { print "compose:" $2 }
+    $1 != "compose" { print $1 }
+    / bash -c / && $0 !~ / px-(collect|fetch)( |$)/ { skip = 1 }' "$1" | LC_ALL=C sort -u
+}
+
+## @description  Lists the collector stage anchors recorded in a run bundle (bundle), sorted and
+##               joined by spaces.
+## @return       Writes the space-separated collector anchors to stdout. Exit 0.
+t_collector_anchors() {
+  awk -F '\t' '$2 == "begin" && $3 ~ /^collector@/ { print $3 }' "$1/stages.tsv" |
+    LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+## @description  Extracts the first time window (bundle, anchor) from stages.tsv as tab-separated
+##               start_ms and end_ms values, or two empty fields when no closed window exists.
+## @return       Writes the tab-separated window timestamps to stdout. Exit 0.
+t_a6_window() {
+  awk -F '\t' -v a="$2" '$3 == a && $2 == "begin" && b == "" { b = $1 }
+    $3 == a && $2 == "end" && b != "" && e == "" { e = $1 } END { print b "\t" e }' \
+    "$1/stages.tsv"
+}
+
+# Because a collection executes each collector at most once, this helper duplicates a bundle under
+# the A6 output root and strips the collector index, the collector stage rows, collect/started.tsv,
+# and the target artifact subdirectory.
+## @description  Copies a run bundle (source, case, directory) to <A6 out>/copies/<case>/<run-id>
+##               while omitting the collector index, collector stage rows, and specified directory.
+## @return       Writes the copied bundle path to stdout. Exit 0.
+t_a6_copy() {
+  local target="$T_A6_OUT/copies/$2/${1##*/}"
+  rm -rf "$target"
+  mkdir -p "${target%/*}"
+  cp -R "$1" "$target"
+  rm -rf "$target/metrics/index.tsv" "$target/collect" "${target:?}/$3"
+  awk -F '\t' '$3 !~ /^collector@/' "$1/stages.tsv" >"$target/stages.tsv"
+  printf '%s\n' "$target"
+}
+
+## @description  Executes px-collect start then stop for one collector (name, bundle, env...) with
+##               its env pairs in scope px-selftest, passing --duration 60 for profile and jfr.
+## @return       Sets T_CYCLE to the two exit statuses formatted as "start stop". Exit 0.
+t_a6_cycle() {
+  local name=$1 run=$2 got dur=()
+  shift 2
+  [ "$name" = trace ] || dur=(--duration 60)
+  t_a6 "$@" "$T_BASH" "$T_BIN/px-collect" start "$run" --collect "$name" --class validation \
+    -e PX_SCOPE_ID=px-selftest ${dur[@]+"${dur[@]}"}
+  got=$T_STATUS
+  t_a6 "$@" "$T_BASH" "$T_BIN/px-collect" stop "$run" -e PX_SCOPE_ID=px-selftest
+  T_CYCLE="$got $T_STATUS"
+}
+
+## @description  Lists all collection directories under the A6 output root, one directory per line.
+## @return       Writes the sorted directory paths to stdout. Exit 0.
+t_a6_collections() {
+  find "$T_A6_OUT/collect" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort
+}
+
+## @description  Determines whether a collection process (pid) is still alive.
+## @return       Writes yes when the process is alive, or no otherwise, to stdout. Exit 0.
+t_a6_alive() { kill -s 0 "${1:-x}" 2>/dev/null && echo yes || echo no; }
+
+## @description  Extracts the sampler pid for a collector (bundle, collector) from
+##               collect/started.tsv.
+## @return       Writes the pid to stdout, or nothing if not found. Exit 0.
+t_a6_sampler_pid() {
+  awk -F '\t' -v c="$2" '$1 == c { p = $3 } END { print p }' "$1/collect/started.tsv" 2>/dev/null
+}
+
+# Confirms that a time-series TSV file starts with a ts_ms header, holds at least 3 sample rows,
+# maintains inter-sample intervals of 500 to 2000 ms (except for the final stop-triggered sample),
+# and spans the target window with its first row at or before begin_ms and last at or after end_ms.
+## @description  Validates the header, row count, sampling cadence, and window coverage of a
+##               time-series sample TSV file (file, begin ms, end ms).
+## @return       Writes yes when valid, or the detected defects, to stdout. Exit 0.
+t_a6_series() {
+  awk -F '\t' -v b="$2" -v e="$3" 'NR == 1 { if ($1 != "ts_ms") bad = bad " header"; next }
+    { ts[++n] = $1 }
+    END { if (n < 3) bad = bad " rows=" n
+      for (i = 2; i <= n; i++) { gap = ts[i] - ts[i - 1]
+        if (gap > 2000 || gap < 0 || (i < n && gap < 500)) bad = bad " gap" i "=" gap }
+      if (n == 0 || ts[1] > b) bad = bad " first=" ts[1] ">" b
+      if (n == 0 || ts[n] < e) bad = bad " last=" ts[n] "<" e
+      print (bad == "" ? "yes" : substr(bad, 2)) }' "$1" 2>/dev/null || printf 'no file\n'
+}
+
+## @description  Queries the manifest artifact inventory of a bundle (bundle, path) for the
+##               entry's status and required flag.
+## @return       Writes "status required" to stdout, or nothing when the path is absent. Exit 0.
+t_inventory() {
+  t_lib t_a5_json_rows "$1/manifest.json" /artifacts path status required
+  printf '%s\n' "$T_STDOUT" | awk -F '\t' -v p="$2" '$1 == p { print $2 " " $3 }'
+}
+
+## @description  Lists any processes that outlive a run (run dir), matching processes whose
+##               arguments contain the run id as well as any live fake jHiccup control JVM.
+## @return       Writes one line per lingering process to stdout. Exit 0.
+t_a6_leftovers() {
+  local pid=""
+  ps -A -o args= 2>/dev/null | awk -v id="${1##*/}" 'index($0, id) && $1 != "awk"' || true
+  pid="$(cat "$T_A6_STATE/control.pid" 2>/dev/null)" || pid=""
+  [ -z "$pid" ] || ! kill -s 0 "$pid" 2>/dev/null || printf 'control JVM %s\n' "$pid"
+}
+
+## @description  Verifies the run-class collector defaults and opt-in flags (RQ-127) together with
+##               the five-RegionServer topology recipe in override-24gib.env (RQ-135).
+## @return       Records assertions. Exit 0.
+t_group_a6_classes() {
+  local run name bad="" got="" five="$T_A6/override-5rs.env" line
+  printf '# A6: the class defaults of the collectors\n'
+  # RQ-127: By default, a validation run launches no background collectors while still preserving
+  # the workload driver's HDR histogram log in the run bundle.
+  t_a6_state_reset
+  t_shim_log_reset
+  t_a6_run validation
+  run="$(t_bundle)"
+  T_A6_BASE=$run
+  t_equals validation_run_starts_no_collector "0||no|no|no|no||||" "$T_STATUS|$(
+    t_collector_anchors "$run")|$(t_exists "$run/metrics/index.tsv")|$(t_exists \
+      "$run/metrics/host.tsv")|$(t_exists "$run/metrics/container")|$(t_exists \
+      "$run/logs/px-collect.log")|$(cat "$T_A6_STATE/asprof.log" 2>/dev/null)|$(cat \
+      "$T_A6_STATE/jcmd.log" 2>/dev/null)|$(cat "$T_A6_STATE/java.log" 2>/dev/null)|$(cat \
+      "$T_A6_STATE/trace-calls" 2>/dev/null)"
+  got="$(t_inventory "$run" drivers/hdr/run.hlog)"
+  # RQ-127: Each individual collector opt-in flag activates only that requested collector.
+  for line in profile:profiles/regionserver-0.jfr jfr:jfr/regionserver-0.jfr \
+    hiccup:metrics/hiccup/control.hlog host:metrics/host.tsv; do
+    name=${line%%:*}
+    t_a6_state_reset
+    t_a6_run validation --collect "$name"
+    run="$(t_bundle)"
+    [ "$T_STATUS $(t_collector_anchors "$run")" = "0 collector@$name" ] ||
+      bad="$bad $name:$T_STATUS:$(t_collector_anchors "$run")"
+    [ -s "$run/${line#*:}" ] || bad="$bad $name:no-${line#*:}"
+    [ "$(t_inventory "$run" "${line#*:}")" = "present true" ] || bad="$bad $name:not-listed"
+    got="$got,$(t_inventory "$run" drivers/hdr/run.hlog)"
+  done
+  t_empty validation_opt_in_starts_each_collector "$bad"
+  t_equals hdr_output_stays_in_both_cases \
+    "present false,present false,present false,present false,present false" "$got"
+  # The run-class configuration files define the default collector sets, as reported by a dry run.
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation
+  got="$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "collectors" { print $3 }')"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class measurement
+  got="$got|$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "collectors" { print $3 }')"
+  t_equals class_files_set_the_collector_defaults \
+    "none|profile jfr hiccup host container trace" "$got"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --collect gc
+  got=$T_STATUS
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --collect none,host
+  t_equals unknown_collector_is_a_usage_error "2 2" "$got $T_STATUS"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --timeout 7
+  got="$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "driver_timeout_s" { print $3 }')"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation
+  t_equals run_timeout_sets_px_timeout_run "7 3600" "$got $(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' '$2 == "driver_timeout_s" { print $3 }')"
+  # Verify that diagnostic messages for invalid flag values name the option supplied by the
+  # operator.
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --timeout 0
+  got="$T_STATUS $(t_flag "--timeout needs a whole number of at least 1, got '0'" "$T_STDERR")"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --collect host,bogus
+  t_equals run_errors_name_the_option "2 yes 2 yes" "$got $T_STATUS $(t_flag \
+    "--collect: 'bogus' is no collector" "$T_STDERR")"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --collect host,trace --targets regionserver --timeout 60 -e PX_TIMEOUT_VERB=10
+  t_equals run_dry_run_plans_the_collection "regionserver 70" "$(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' '$2 == "collect_targets" { t = $3 } $2 == "collect_bound_s" { b = $3 }
+      END { print t " " b }')"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --strict -e PX_COLLECT_DURATION_S=1
+  t_equals px_collect_duration_s_is_undeclared "2 yes" "$T_STATUS $(t_flag \
+    "undeclared name 'PX_COLLECT_DURATION_S'" "$T_STDERR")"
+  # RQ-135: The five-RegionServer topology recipe is shipped commented out; when uncommented, it
+  # renders a 19328 MiB footprint that the reference engine admits with 577 MiB to spare.
+  bad=""
+  for line in PX_RS_COUNT=5 PX_YARN=0 PX_RS_MEM_MIB=2432 PX_RS_HEAP_MIB=1664 \
+    PX_RS_DIRECT_MIB=256 PX_CLIENT_MEM_MIB=1536 PX_CLIENT_HEAP_MIB=1024 \
+    PX_CLIENT_DIRECT_MIB=128; do
+    grep -qx "# $line" "$T_ENVD/override-24gib.env" || bad="$bad $line"
+  done
+  t_empty override_24gib_ships_the_5rs_variant_commented "$bad"
+  sed 's/^# \(PX_[A-Z0-9_]*=[0-9]*\)$/\1/' "$T_ENVD/override-24gib.env" >"$five"
+  t_gen --class measurement --config "$five" --check
+  t_equals uncommented_5rs_variant_renders_19328 "0 5 19328" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c '^regionserver-') $(t_mem_sum "$T_STDOUT")"
+  t_gen --class measurement --cluster five --config "$five"
+  printf '25167863808\n' >"$T_A2_STATE/mem-total"
+  t_a2 PX_CLUSTER_ID=five "$T_BASH" "$PX_HOME/scripts/preflight.sh" --phase memory
+  t_equals uncommented_5rs_variant_is_admitted_with_577_spare "0 yes yes" "$T_STATUS $(t_flag \
+    '19328 MiB (18.88 GiB)' "$T_STDOUT") $(t_flag '577 MiB (0.56 GiB) to spare' "$T_STDOUT")"
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+# Exercises the session collectors through px-collect to verify async-profiler invocation flags
+# (RQ-129), JFR and trace file generation with SKIP handling (RQ-130), and exec-only cluster access
+# (RQ-128).
+## @description  Verifies session collector execution and cluster access boundaries via px-collect.
+## @return       Records assertions. Exit 0.
+t_group_a6_tools() {
+  local run copy bad="" verbs line tool got
+  printf '# A6: the collector tools\n'
+  run=$T_A6_BASE
+  t_a6_state_reset
+  t_shim_log_reset
+  for tool in profile jfr trace; do
+    t_a6_cycle "$tool" "$run"
+    [ "$T_CYCLE" = "0 0" ] || bad="$bad $tool:$T_CYCLE"
+  done
+  t_empty collector_tools_start_and_stop "$bad"
+  t_equals collector_tools_are_gone "no no no" "$(t_exists "$T_BIN/px-profile") $(t_exists \
+    "$T_BIN/px-jfr") $(t_exists "$T_BIN/px-trace-count")"
+  # Aside from exec calls, the only backend runtime invocation is the label-filtered ps lookup
+  # used for scope resolution.
+  verbs="$(t_runtime_verbs "$T_SHIM_LOG")"
+  t_equals collector_tools_reach_the_cluster_by_exec_only "compose:exec ps|" \
+    "$(printf '%s\n' "$verbs" | tr '\n' ' ' | sed 's/ $//')|$(awk \
+      '$1 == "ps" && $0 !~ /^ps -a --filter label=/' "$T_SHIM_LOG")"
+  bad=""
+  for line in asprof.log jcmd.log trace-calls; do
+    [ -s "$T_A6_STATE/$line" ] || bad="$bad $line"
+  done
+  t_empty collector_tools_each_ran_their_tool "$bad"
+  t_empty collector_tools_call_no_other_contract_function "$(grep -ho 'sb_[a-z_]*' \
+    "$PX_HOME/lib/collect.sh" | LC_ALL=C sort -u | grep -vx -e sb_exec -e sb_load \
+    -e sb_scope_require)"
+  # RQ-129: Profiling captures cpu and alloc together in a single session at a 7919 us interval
+  # on each RegionServer without frame-filtering or stack-truncation options, ensuring zero frames
+  # are skipped. Client 0 and tooling 0 have no target JVM and are recorded as skipped.
+  bad=""
+  while IFS= read -r line; do
+    case "$line" in
+    *" --minwidth"* | *" -j "* | *" --jstackdepth"*) bad="$bad [$line]" ;;
+    "regionserver-"*" stop "*) ;;
+    "regionserver-"*" start -e cpu,alloc -i 7919us --timeout "*) ;;
+    *) bad="$bad [$line]" ;;
+    esac
+  done <"$T_A6_STATE/asprof.log"
+  t_equals profile_command_has_interval_7919us_and_skip_0_for_cpu_and_alloc "4 yes skip skip" \
+    "$(grep -c '^regionserver-' "$T_A6_STATE/asprof.log") $([ -z "$bad" ] && echo yes ||
+      echo "$bad") $(awk -F '\t' '$1 == "profile" && $2 == "client-0" { print $3 }' \
+      "$run/metrics/index.tsv") $(awk -F '\t' '$1 == "profile" && $2 == "tooling-0" { print $3 }' \
+      "$run/metrics/index.tsv")"
+  # RQ-130: Both the JFR recording and the trace counter delta file are written into the bundle.
+  t_equals jfr_writes_a_recording_into_the_bundle "yes ok PASS" "$(t_exists \
+    "$run/jfr/regionserver-0.jfr") $(awk -F '\t' '$1 == "jfr" && $2 == "regionserver-0" {
+      print $3 }' "$run/metrics/index.tsv") $(t_severity_of "$run" collector.jfr)"
+  t_equals trace_count_writes_a_counter_file "yes 2 10 PASS" "$(t_exists \
+    "$run/traces/counters.tsv") $(awk 'NR > 1' "$run/traces/counters.tsv" | grep -c .) $(awk \
+    -F '\t' 'NR == 2 { print $7 }' "$run/traces/counters.tsv") $(t_severity_of "$run" \
+    collector.trace)"
+  # RQ-130: A missing jcmd binary or absent trace reader produces a SKIP verdict rather than a
+  # run failure.
+  copy="$(t_a6_copy "$run" nojcmd jfr)"
+  t_a6_cycle px-jfr "$copy" "PX_JDK_ROOT=$T_A6/jdk-nojcmd"
+  t_equals jfr_without_jcmd_skips "0 0 SKIP no" "$T_CYCLE $(t_severity_of "$copy" \
+    collector.jfr) $(t_exists "$copy/jfr/regionserver-0.jfr")"
+  copy="$(t_a6_copy "$run" noreader traces)"
+  : >"$T_A6_STATE/no-trace-reader"
+  t_a6_cycle px-trace-count "$copy"
+  rm -f "$T_A6_STATE/no-trace-reader"
+  t_equals trace_count_without_its_reader_skips "0 0 SKIP no" "$T_CYCLE $(t_severity_of \
+    "$copy" collector.trace) $(t_exists "$copy/traces/counters.tsv")"
+  # RQ-130: Only JFR and trace collection skip when their tool is absent; a missing async-profiler
+  # binary or jHiccup jar records a failed target with an ADVISORY verdict so lost telemetry never
+  # fails the overall run.
+  copy="$(t_a6_copy "$run" noasprof profiles)"
+  t_a6_cycle profile "$copy" "PX_TOOLS_DIR=$T_A6/no-tools"
+  got="$T_CYCLE $(awk -F '\t' '$1 == "profile" && $2 == "regionserver-0" { print $3 }' \
+    "$copy/metrics/index.tsv") $(t_severity_of "$copy" collector.profile)"
+  t_a6_state_reset
+  t_a6_run validation -e "PX_TOOLS_DIR=$T_A6/no-tools" --collect hiccup
+  t_equals only_jfr_and_trace_skip_an_absent_tool "1 1 fail ADVISORY|0 ADVISORY fail" \
+    "$got|$T_STATUS $(t_severity_of "$(t_bundle)" collector.hiccup) $(awk -F '\t' \
+      '$1 == "hiccup" && $2 == "regionserver-0" { print $3 }' "$(t_bundle)/metrics/index.tsv")"
+  # RQ-130: The in-image trace counter reader emits counters only from the targeted Phoenix JMX
+  # beans, remains silent when an optional bean is absent, and exits with a failure if a server
+  # does not respond.
+  line='/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub='
+  for tool in 0 1; do
+    t_curl_body "http://regionserver-$tool:16030${line}Server" \
+      '{"beans" : [ {"name" : "Hadoop:service=HBase,name=RegionServer,sub=Server",
+    "totalRequestCount" : 7'"$tool"', "blockCacheHitPercent" : 3, "Get_num_ops" : 4,
+    "tag.x" : "a,b"} ]}'
+    for got in PhoenixIndexer GlobalIndexChecker PhoenixMetadata MetadataCaching; do
+      t_curl_body "http://regionserver-$tool:16030$line$got" '{"beans" : [ ]}'
+    done
+  done
+  t_curl_body "http://regionserver-1:16030${line}PhoenixIndexer" \
+    '{"beans":[{"preBatchMutateTimeNumOps":2,"indexWriteCount":5}]}'
+  t_image PX_ROLE=client PX_RS_COUNT=2 PX_PORT_REGIONSERVER_HTTP=16030 -- "$T_BASH" \
+    "$T_IMG/bin/px-trace-counters"
+  got="$T_STATUS|$T_STDOUT"
+  t_image PX_ROLE=client PX_RS_COUNT=3 PX_PORT_REGIONSERVER_HTTP=16030 -- "$T_BASH" \
+    "$T_IMG/bin/px-trace-counters"
+  t_equals trace_counters_read_the_phoenix_beans "0|$(t_rows 5 \
+    regionserver 0 Server totalRequestCount 70 regionserver 0 Server Get_num_ops 4 \
+    regionserver 1 Server totalRequestCount 71 regionserver 1 Server Get_num_ops 4 \
+    regionserver 1 PhoenixIndexer indexWriteCount 5)|1" "$got|$T_STATUS"
+  t_a6_front_door
+}
+
+# Exercises the px-collect front door across collector listing, starting into a new or active
+# collection, optionless stop, validation refusals, sampler duration bounds, and teardown via
+# px-cluster down.
+## @description  Verifies the px-collect lifecycle, validation refusals, sampler bounds, and down.
+## @return       Records test assertions. Exit 0.
+t_a6_front_door() {
+  local dir copy got before line pid
+  t_a6_state_reset
+  t_a6 "$T_BASH" "$T_BIN/px-collect" list
+  t_equals collect_list_names_the_six "0 profile jfr hiccup host container trace" \
+    "$T_STATUS $(printf '%s\n' "$T_STDOUT" | cut -f 1 | tr '\n' ' ' | sed 's/ $//')"
+  before="$(t_a6_collections)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host,container --class validation -n
+  t_equals collect_start_dry_run_writes_nothing "0 2 yes $before" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c "^plan${PX_TAB}start$PX_TAB") $(t_flag \
+    "plan${PX_TAB}start${PX_TAB}host - 3600 <new collection>" "$T_STDOUT") $(t_a6_collections)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation --duration 60
+  dir="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  t_equals collect_start_prints_the_directory "0 1 yes" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c .) $([ -d "$dir" ] && echo yes || echo no)"
+  t_equals collect_start_without_bundle_creates_a_collection "$T_A6_OUT/collect yes yes yes" \
+    "${dir%/*} $([[ ${dir##*/} =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-z]{4}$ ]] && echo yes ||
+      echo no) $(cmp -s "$T_A6/deploy/services.tsv" "$dir/cluster/services.tsv" && echo yes ||
+      echo no) $(t_flag "$dir" "$(cat "$T_A6_OUT/state/collect-selftest.tsv" 2>/dev/null)")"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect container --class validation --duration 60
+  t_equals collect_second_start_joins "0 $dir 2" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    sed -n 1p) $(grep -c . "$dir/collect/started.tsv" 2>/dev/null)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation
+  t_equals collect_refuses_a_collector_that_ran "2 yes" "$T_STATUS $(t_flag \
+    "collector host already ran in $dir" "$T_STDERR")"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop -n
+  t_equals collect_stop_dry_run_plans_each_collector "0 $(t_rows 3 plan stop "host $dir" \
+    plan stop "container $dir")" "$T_STATUS $T_STDOUT"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop
+  t_equals collect_stop_needs_no_options "0 $(t_rows 4 result ok 0 "$dir") yes yes no" \
+    "$T_STATUS $(t_last_line "$T_STDOUT") $(printf '%s\n' "$T_STDOUT" |
+      awk -F '\t' '$1 == "host" && $3 == "ok" { f = 1 } END { print f ? "yes" : "no" }') \
+$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "container" && $3 == "ok" { f = 1 }
+      END { print f ? "yes" : "no" }') $(t_flag "$dir" \
+      "$(cat "$T_A6_OUT/state/collect-selftest.tsv" 2>/dev/null)")"
+  t_equals collect_stop_ends_the_sampler "no 2" "$(t_a6_alive "$(t_a6_sampler_pid "$dir" \
+    host)") $(awk -F '\t' '$2 == "end" && $3 ~ /^collector@/' "$dir/stages.tsv" | grep -c .)"
+  got="$(cksum "$dir/stages.tsv" "$dir/metrics/index.tsv" "$dir/verdicts.tsv")"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop "$dir"
+  t_equals collect_stop_twice_writes_no_row_twice "0 yes 1" "$T_STATUS $([ "$got" = "$(cksum \
+    "$dir/stages.tsv" "$dir/metrics/index.tsv" "$dir/verdicts.tsv")" ] && echo yes ||
+      echo no) $(printf '%s\n' "$T_STDOUT" | grep -c .)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop
+  t_equals collect_stop_without_active_collection_is_6 "6 yes" "$T_STATUS $(t_flag \
+    'no collection of cluster selftest is active' "$T_STDERR")"
+  before="$(t_a6_collections)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect gc --class validation
+  t_equals collect_refuses_an_unknown_collector_with_2 "2 yes yes" "$T_STATUS $([ "$before" = \
+    "$(t_a6_collections)" ] && echo yes || echo no) $(t_flag "--collect: 'gc' is no collector" \
+    "$T_STDERR")"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --class validation
+  t_equals collect_needs_collectors "2 yes" "$T_STATUS $(t_flag \
+    'name the collectors with --collect' "$T_STDERR")"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation --duration 0
+  t_equals collect_duration_needs_at_least_1 "2 yes" "$T_STATUS $(t_flag \
+    "--duration needs whole seconds above zero, got '0'" "$T_STDERR")"
+  rm -f "$T_A6_OUT/state/scope-compose-selftest"
+  t_a6 PX_RUN_CLASS= "$T_BASH" "$T_BIN/px-collect" start --collect host -n
+  t_equals collect_without_a_cluster_is_6_before_the_class "6 yes" "$T_STATUS $(t_flag \
+    'no cluster selftest is recorded' "$T_STDERR")"
+  printf 'px-selftest\n' >"$T_A6_OUT/state/scope-compose-selftest"
+  rm -f "$T_A6_OUT/state/deployment-compose-selftest"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation
+  t_equals collect_without_deployment_record_is_6 "6 yes yes" "$T_STATUS $(t_flag \
+    'no deployment record of cluster selftest' "$T_STDERR") $([ "$before" = \
+    "$(t_a6_collections)" ] && echo yes || echo no)"
+  t_a6_state_reset
+  # Verify that the "all" target selector resolves to every service role except setup and the pherf
+  # group.
+  copy="$T_A6_OUT/copies/alltargets/20991231T000000Z-0all"
+  mkdir -p "$copy/cluster"
+  {
+    printf '%s\n' "# service role index group start mem_limit_mib heap_mib direct_mib jdk"
+    t_rows 9 regionserver-0 regionserver 0 '' '' 2560 1792 256 17 \
+      client-0 client 0 '' '' 1536 1024 128 17 setup-0 setup 0 '' '' 512 256 64 17 \
+      pherf-agent-0 pherf-agent 0 pherf '' 1024 512 64 17
+  } >"$copy/cluster/services.tsv"
+  printf '. "%s/lib/common.sh"\n. "%s/lib/collect.sh"\nck_targets all\n' "$PX_HOME" "$PX_HOME" \
+    >"$T_A6/targets.sh"
+  t_run env "PX_OUT=$T_A6_OUT" "PX_RUN_DIR=$copy" "$T_BASH" "$T_A6/targets.sh"
+  t_equals collect_all_excludes_setup_and_pherf "0 regionserver|client" "$T_STATUS $(printf \
+    '%s\n' "$T_STDOUT" | cut -f 1 | paste -sd '|' -)"
+  # Verify that a sampler terminates automatically upon reaching its duration bound, and that stop
+  # forcibly kills any sampler that fails to terminate on its own.
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation --duration 2
+  dir="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  pid="$(t_a6_sampler_pid "$dir" host)"
+  sleep 5
+  t_equals collect_sampler_ends_at_its_duration "yes no yes PASS" "${pid:+yes} $(t_a6_alive \
+    "$pid") $(t_flag "${PX_TAB}end${PX_TAB}collector@host$PX_TAB" "$(cat "$dir/stages.tsv" \
+    2>/dev/null)") $(t_severity_of "$dir" collector.host)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop "${dir##*/}"
+  t_equals collect_stop_takes_the_run_id_of_a_collection "0 $(t_rows 4 result skip 0 "$dir")" \
+    "$T_STATUS $T_STDOUT"
+  # Verify that invoking stop against a bundle with no active collectors leaves the bundle
+  # contents unchanged.
+  copy="$T_A6_OUT/copies/finished/20991231T000000Z-0fin"
+  rm -rf "$copy"
+  mkdir -p "$copy/metrics"
+  printf '{}\n' >"$copy/manifest.json"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop "$copy"
+  t_equals collect_stop_of_a_finished_bundle_creates_nothing \
+    "0 $(t_rows 4 result skip 0 "$copy") manifest.json metrics" "$T_STATUS $T_STDOUT $(
+      find "$copy" -mindepth 1 -maxdepth 1 | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ' ' |
+      sed 's/ $//')"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect container --class validation --duration 60
+  dir="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  pid="$(t_a6_sampler_pid "$dir" container)"
+  printf '30\n' >"$T_A6_STATE/stats-sleep"
+  sleep 2
+  t_a6 PX_TIMEOUT_VERB=1 "$T_BASH" "$T_BIN/px-collect" stop "$dir"
+  t_equals collect_stop_kills_a_stuck_sampler "0 ADVISORY yes no" "$T_STATUS $(t_severity_of \
+    "$dir" collector.container) $(t_flag 'the sampler did not stop within 1s and was killed' \
+    "$(cat "$dir/verdicts.tsv")") $(t_a6_alive "$pid")"
+  rm -f "$T_A6_STATE/stats-sleep"
+  # Verify that px-cluster down stops every recorded active collection before tearing down the
+  # cluster.
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation --duration 60
+  dir="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  pid="$(t_a6_sampler_pid "$dir" host)"
+  t_a6 "$T_BASH" "$T_BIN/px-cluster" down -n
+  t_contains down_dry_run_plans_the_collection_stop \
+    "plan${PX_TAB}collect${PX_TAB}px-collect stop $dir" "$T_STDOUT"
+  t_a6 "$T_BASH" "$T_BIN/px-cluster" down
+  t_equals down_stops_a_recorded_collection "0 no yes no" "$T_STATUS $(t_a6_alive "$pid") \
+$(t_flag "${PX_TAB}end${PX_TAB}collector@host$PX_TAB" "$(cat "$dir/stages.tsv" 2>/dev/null)") \
+$(t_exists "$T_A6_OUT/state/collect-selftest.tsv")"
+  t_a6_state_reset
+}
+
+## @description  Verifies measurement-run collectors: jHiccup (RQ-131), samplers (RQ-132), bundle
+##               archiving (RQ-133), start/stop lifecycle ordering (RQ-134), and verdicts (RQ-126).
+## @return       Records assertions. Exit 0.
+t_group_a6_run() {
+  local run host copy bad="" got line begin end first last name pid before sampler
+  local -a envs=()
+  printf '# A6: the collectors of a run\n'
+  # A measurement-class run launches all six collectors bracketing the workload driver's run verb.
+  t_a6_state_reset
+  t_a6_run measurement -- 3
+  run="$(t_bundle)"
+  t_equals measurement_run_with_every_collector_passes 0 "$T_STATUS"
+  # RQ-134: Every active collector's stage window must completely enclose the run verb's window.
+  IFS="$PX_TAB" read -r begin end <<EOF
+$(t_a6_window "$run" verb@run)
+EOF
+  bad=""
+  for name in profile jfr hiccup host container trace; do
+    IFS="$PX_TAB" read -r first last <<EOF
+$(t_a6_window "$run" "collector@$name")
+EOF
+    if [ -z "$first" ] || [ -z "$last" ] || [ "$first" -gt "${begin:-0}" ] ||
+      [ "$last" -lt "${end:-0}" ]; then
+      bad="$bad $name"
+    fi
+  done
+  t_equals collectors_start_before_the_run_verb_and_stop_after "6 yes" \
+    "$(t_collector_anchors "$run" | wc -w | tr -d ' ') $([ -z "$bad" ] && echo yes ||
+      echo "$bad")"
+  t_empty no_collector_process_outlives_px_run "$(t_a6_leftovers "$run")"
+  # RQ-131: jHiccup produces one histogram log per targeted daemon JVM plus one log for the idle
+  # control JVM running inside tooling 0, while skipping client 0 and tooling 0 as target daemons.
+  t_equals hiccup_writes_one_log_per_target_instance "yes yes no no|skip skip" \
+    "$(t_exists "$run/metrics/hiccup/regionserver-0.hlog") $(t_exists \
+      "$run/metrics/hiccup/regionserver-1.hlog") $(t_exists \
+      "$run/metrics/hiccup/client-0.hlog") $(t_exists "$run/metrics/hiccup/tooling-0.hlog")|$(
+      awk -F '\t' '$1 == "hiccup" && ($2 == "client-0" || $2 == "tooling-0") &&
+        $5 ~ /no JVM/ { printf "%s%s", s, $3; s = " " }' "$run/metrics/index.tsv")"
+  t_equals hiccup_runs_an_idle_control_jvm_in_tooling "yes 1" \
+    "$(t_exists "$run/metrics/hiccup/control.hlog") $(grep -c '^tooling-0 .* -jar ' \
+      "$T_A6_STATE/java.log")"
+  t_equals run_collects_through_px_collect "yes 6 0" "$(t_exists "$run/logs/px-collect.log") \
+$(grep -c . "$run/collect/started.tsv" 2>/dev/null) $(find "$run/logs" -name 'collector-*.log' |
+    grep -c .)"
+  # RQ-132: Resource sampling emits one TSV file per container instance and a single host TSV file,
+  # recording one row per sampling pass across the entire run window.
+  bad=""
+  for name in regionserver-0 regionserver-1 client-0 tooling-0; do
+    got="$(t_a6_series "$run/metrics/container/$name.tsv" "$begin" "$end")"
+    [ "$got" = yes ] || bad="$bad $name: $got"
+  done
+  t_equals sampled_run_writes_one_tsv_per_container "4 yes" "$(find \
+    "$run/metrics/container" -name '*.tsv' | grep -c .) $([ -z "$bad" ] && echo yes ||
+      echo "$bad")"
+  t_equals samples_span_the_run yes "$(t_a6_series "$run/metrics/host.tsv" "$begin" "$end")"
+  # RQ-133: All HDR histogram logs and trace counter outputs reside under the run bundle directory,
+  # are registered as required artifacts in the manifest, and pass bundle validation.
+  bad=""
+  got=""
+  for line in metrics/hiccup/regionserver-0.hlog metrics/hiccup/regionserver-1.hlog \
+    metrics/hiccup/control.hlog drivers/hdr/run.hlog traces/start.tsv traces/stop.tsv \
+    traces/counters.tsv profiles/regionserver-0.jfr jfr/regionserver-1.jfr; do
+    [ -s "$run/$line" ] || bad="$bad $line"
+    got="$got $(t_inventory "$run" "$line")"
+  done
+  t_empty collector_artifacts_are_under_the_run_directory "$bad"
+  t_equals collector_artifacts_are_listed_in_the_manifest \
+    " present true present true present true present false present true present true\
+ present true present true present true" "$got"
+  t_validate "$run"
+  t_equals bundle_with_collector_artifacts_validates "0 ok" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" collectors)"
+  copy="$(t_bundle_copy "$run" lostlog)"
+  rm -f "$copy/metrics/hiccup/control.hlog"
+  t_validate "$copy"
+  t_equals missing_collector_artifact_fails_validation "1 yes" "$T_STATUS $(t_flag \
+    "path${PX_TAB}fail${PX_TAB}metrics/hiccup/control.hlog is absent" "$T_STDOUT")"
+  printf 'gc\tx\tok\t../out\t\n' >>"$copy/metrics/index.tsv"
+  t_validate "$copy"
+  t_equals bundle_refuses_a_bad_collector_row fail "$(t_check_status "$T_STDOUT" collectors)"
+  # RQ-132: A validation run with the host sampler opted in records one row per second, tagging
+  # every sample row with the run class and host contamination state.
+  t_a6_state_reset
+  t_a6_run validation --collect host -- 3
+  host="$(t_bundle)/metrics/host.tsv"
+  IFS="$PX_TAB" read -r begin end <<EOF
+$(t_a6_window "$(t_bundle)" verb@run)
+EOF
+  # Because the final sampling pass is triggered immediately by the stop signal, its interval
+  # since the preceding sample may be shorter than the nominal cadence.
+  t_equals sampled_run_writes_host_tsv_per_interval yes "$(t_a6_series "$host" "$begin" "$end")"
+  t_equals sample_rows_carry_class_and_contamination "validation,quiet-host" \
+    "$(awk -F '\t' 'NR > 1 { print $(NF - 1) "," $NF }' "$host" | sort -u)"
+  t_a6_state_reset
+  t_a6_run validation --collect host,container --targets regionserver -- 1
+  t_equals run_collect_takes_a_list "0 collector@container collector@host" \
+    "$T_STATUS $(t_collector_anchors "$(t_bundle)")"
+  t_equals run_targets_option_reaches_the_collectors "regionserver-0 regionserver-1" \
+    "$(awk -F '\t' '$1 == "container" { print $2 }' "$(t_bundle)/metrics/index.tsv" |
+      LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+  # Verify that the timeout bound applied by px-run when invoking stop accommodates the px-collect
+  # wait window, ensuring a hung sampler is killed and its ADVISORY verdict is recorded in the run.
+  t_a6_state_reset
+  before=" $(find "$T_A6_OUT/runs" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' |
+    tr '\n' ' ') "
+  env "${T_A6_ENV[@]}" PX_TIMEOUT_VERB=8 "$T_BASH" "$T_BIN/px-run" --class validation \
+    --collect container "${T_A6_RUN[@]}" -- 4 </dev/null >"$T_OUT" 2>"$T_ERR" &
+  pid=$!
+  run=""
+  got=0
+  while [ "$got" -lt 300 ] && [ -z "$run" ]; do
+    for line in "$T_A6_OUT"/runs/*; do
+      case "$before" in
+      *" ${line##*/} "*) continue ;;
+      esac
+      ! grep -q "${PX_TAB}begin${PX_TAB}collector@container$PX_TAB" "$line/stages.tsv" \
+        2>/dev/null || run=$line
+    done
+    [ -n "$run" ] || sleep 0.1
+    got=$((got + 1))
+  done
+  printf '30\n' >"$T_A6_STATE/stats-sleep"
+  wait "$pid" 2>/dev/null || true
+  rm -f "$T_A6_STATE/stats-sleep"
+  sampler="$(t_a6_sampler_pid "$run" container)"
+  t_equals run_stop_kills_a_stuck_sampler "ADVISORY yes no" "$(t_severity_of "$run" \
+    collector.container) $(t_flag 'the sampler did not stop within 4s and was killed' \
+    "$(cat "$run/verdicts.tsv" 2>/dev/null)") $(t_a6_alive "$sampler")"
+  # Verify that all child processes spawned by px-run inherit its resolved output root even when
+  # PX_OUT is configured through a --config file.
+  t_a6_state_reset
+  printf 'PX_OUT=%s\n' "$T_A6_OUT" >"$T_A6/out.env"
+  for line in "${T_A6_ENV[@]}"; do
+    case "$line" in
+    PX_OUT=*) ;;
+    *) envs+=("$line") ;;
+    esac
+  done
+  rm -rf "${T_A6:?}/user"
+  mkdir -p "$T_A6/user"
+  t_run env -u PX_OUT "${envs[@]}" "HOME=$T_A6/user" "$T_BASH" "$T_BIN/px-run" \
+    --config "$T_A6/out.env" --class validation "${T_A6_RUN[@]}" -- 1
+  run="$(t_bundle)"
+  t_equals run_children_keep_the_output_root_of_a_config_file "0 $T_A6_OUT/runs yes yes no" \
+    "$T_STATUS ${run%/*} $(t_exists "$run/manifest.json") $(t_exists \
+      "$run/report/run-summary.tsv") $(t_exists "$T_A6/user/phoenix-harness")"
+  got="$(t_a6_collections)"
+  t_a6 PX_RUN_CLASS= "$T_BASH" "$T_BIN/px-collect" start --collect host --duration 1 \
+    -e PX_SCOPE_ID=px-selftest
+  t_equals collect_refuses_a_run_without_a_class "2 yes" \
+    "$T_STATUS $([ "$got" = "$(t_a6_collections)" ] && echo yes || echo no)"
+  # RQ-126: In a host-contaminated measurement bundle exhibiting both a counter regression and a
+  # latency regression, the deterministic counter check still fails the run whereas the latency
+  # check is downgraded to ADVISORY, and the bundle retains both trace counters and allocation
+  # profiles for diagnosis.
+  t_a6_state_reset
+  t_a6_run measurement --collect trace,profile -- regress 1
+  run="$(t_bundle)"
+  t_equals contaminated_counter_regression_fails "1 FAIL" \
+    "$T_STATUS $(awk -F '\t' '$1 == "stub.counter_regression" { print $2 }' \
+      "$run/report/verdicts.tsv")"
+  t_equals contaminated_latency_regression_is_advisory "ADVISORY quiet-host" \
+    "$(awk -F '\t' '$1 == "stub.latency_regression" { print $2 }' "$run/report/verdicts.tsv") \
+$(t_manifest "$run" /quiet_host/tags/0)"
+  t_equals regression_bundle_carries_trace_counters_and_allocations \
+    "yes yes present true present true" "$(awk -F '\t' 'NR > 1 && $7 > 0 { f = 1 }
+      END { print (f ? "yes" : "no") }' "$run/traces/counters.tsv") $(grep -q alloc \
+      "$run/profiles/regionserver-0.jfr" && echo yes || echo no) $(t_inventory "$run" \
+      traces/counters.tsv) $(t_inventory "$run" profiles/regionserver-0.jfr)"
+  # RQ-134: Interrupting px-run with a signal still stops all active collectors cleanly.
+  t_a6_state_reset
+  t_run_interrupted TERM env "${T_A6_ENV[@]}" "$T_BASH" "$T_BIN/px-run" --class measurement \
+    "${T_A6_RUN[@]}" -- 30
+  run="$(t_bundle)"
+  t_equals interrupted_run_stops_its_collectors "143 6 none" "$T_STATUS $(awk -F '\t' \
+    '$2 == "end" && $3 ~ /^collector@/ && $4 ~ /^collector:/ { print $3 }' "$run/stages.tsv" |
+    sort -u | grep -c .) $(t_a6_leftovers "$run" | sed -n 1p | grep . || echo none)"
+  # RQ-134: Receiving SIGTERM while collector shutdown is already in progress (simulated here
+  # during trace collector stop) hands the remaining teardown to the exit hook, ensuring every
+  # collector is stopped and no collector stop record is written twice.
+  t_a6_state_reset
+  : >"$T_A6_STATE/slow-trace-stop"
+  env "${T_A6_ENV[@]}" "$T_BASH" "$T_BIN/px-run" --class measurement "${T_A6_RUN[@]}" -- 1 \
+    </dev/null >"$T_OUT" 2>"$T_ERR" &
+  line=$!
+  got=0
+  while [ "$got" -lt 300 ] && [ ! -e "$T_A6_STATE/trace-stopping" ]; do
+    sleep 0.1
+    got=$((got + 1))
+  done
+  kill -s TERM "$line" 2>/dev/null || true
+  T_STATUS=0
+  wait "$line" 2>/dev/null || T_STATUS=$?
+  run="$(sed -n 1p "$T_OUT")"
+  t_equals term_during_the_stop_stops_every_collector "143 ok ok 6 1 none" "$T_STATUS $(awk \
+    -F '\t' '($1 == "profile" || $1 == "jfr") && $2 == "regionserver-0" { printf "%s ", $3 }' \
+    "$run/metrics/index.tsv")$(awk -F '\t' '$2 == "end" && $3 ~ /^collector@/ { print $3 }' \
+    "$run/stages.tsv" | sort -u | grep -c .) $(awk -F '\t' '$1 == "trace" && $2 == "stop"' \
+    "$run/metrics/index.tsv" | grep -c .) $(t_a6_leftovers "$run" | sed -n 1p | grep . ||
+      echo none)"
+  # RQ-134: The per-test timeout bound computed by px-suite counts one start and one stop bound
+  # for each active collector tool, plus one start and one stop bound for the single shared
+  # px-collect lifecycle.
+  printf 'suite: c\nclass: validation\ntimeout: 60\n\ntest: one\n  driver: %s\n  args: 0\n' \
+    "$T_WORK/drivers/exit-code.sh" >"$T_A6/bound.suite"
+  t_a6 PX_COLLECTORS=profile,host PX_SESSION_ID=a6-bound PX_SCOPE_ID=px-selftest \
+    PX_TIMEOUT_VERB=10 "$T_BASH" "$T_BIN/px-suite" -v "$T_A6/bound.suite"
+  # The expected 461-second bound is the sum 60 + 300 + 6 x 10 + 2 x 2 x 10 + 0 + 1.
+  t_contains suite_bound_counts_the_collectors 'px-run gets a bound of 461s' "$T_STDERR"
+}
+
+## @description  Executes the A6 test groups in sequence: class defaults, collector tools, and
+##               run-lifecycle collection.
+## @return       Records assertions. Exit 0.
+t_group_a6() {
+  t_group_a6_classes
+  t_group_a6_tools
+  t_group_a6_run
+  t_a6_state_reset
+}
+
+# ---------------------------------------------------------------------------
 # Command-line option parsing and test suite execution
 # ---------------------------------------------------------------------------
 
@@ -8954,6 +9860,7 @@ t_group_a5_checks
 t_group_a5_plugins
 t_group_a5_fixes
 t_group_a5_closure
+t_group_a6
 t_group_tree
 
 t_daemons_stop

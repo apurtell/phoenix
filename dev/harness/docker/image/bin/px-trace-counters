@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Collects the Phoenix trace counters across the cluster. For each of the PX_RS_COUNT
+# RegionServers, this script queries the JMX beans for the Phoenix metric sources along with the
+# server bean and emits one row per integer counter, defined as any attribute whose name ends in
+# Count or _num_ops. During a workload run, the trace collector in px-collect invokes this reader
+# inside client 0 immediately before and after the run verb executes.
+#
+# Two design rules govern this script:
+#   1. It launches no JVM, making it safe to execute inside any instance—even alongside a tightly
+#      sized daemon—because it queries JMX exclusively over HTTP.
+#   2. A bean that a server does not publish simply emits no rows, whereas a server that fails to
+#      respond is treated as a failure so that its counters cannot be lost silently.
+
+TC_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/image.sh
+. "$TC_HOME/lib/image.sh"
+
+set -euo pipefail
+
+# Lists the HBase Server bean and the Phoenix RegionServer,sub=<name> metric source beans
+# registered by MetricsIndexerSource, GlobalIndexCheckerSource, MetricsMetadataSource, and
+# MetricsMetadataCachingSource.
+TC_BEANS="Server PhoenixIndexer GlobalIndexChecker PhoenixMetadata MetadataCaching"
+TC_QUERY='/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub='
+
+## @description  Prints the command-line usage summary for the trace counter reader.
+## @return       Writes the usage text to stdout and exits 0.
+usage() {
+  cat <<'EOF'
+Usage: px-trace-counters
+
+Prints one row per integer counter of the PX_RS_COUNT RegionServers:
+regionserver, index, bean, counter and value, tab separated. The beans are
+Server, PhoenixIndexer, GlobalIndexChecker, PhoenixMetadata and
+MetadataCaching of RegionServer; a counter is an attribute whose name ends
+in Count or _num_ops.
+
+Exit codes: 0 every RegionServer answered, 1 a RegionServer does not answer,
+2 usage or an incomplete environment.
+EOF
+}
+
+case "${1:-}" in
+'') ;;
+-h | --help)
+  usage
+  exit 0
+  ;;
+*)
+  img_error "px-trace-counters takes no argument, got '$1'"
+  usage >&2
+  exit "$IMG_EXIT_USAGE"
+  ;;
+esac
+
+TC_COUNT="$(img_count PX_RS_COUNT)" || exit "$IMG_EXIT_USAGE"
+TC_INDEX=0
+while [ "$TC_INDEX" -lt "$TC_COUNT" ]; do
+  for TC_BEAN in $TC_BEANS; do
+    TC_STATUS=0
+    img_fetch regionserver "$TC_INDEX" "$TC_QUERY$TC_BEAN" || TC_STATUS=$?
+    if [ "$TC_STATUS" != 0 ]; then
+      img_error "$IMG_REASON"
+      exit "$TC_STATUS"
+    fi
+    # Splitting on JSON delimiters places at most one JSON member on each line, ensuring that any
+    # string value containing an embedded comma breaks into fragments that cannot match a counter.
+    printf '%s\n' "$IMG_BODY" | tr ',{}[]' '\n' |
+      awk -v i="$TC_INDEX" -v b="$TC_BEAN" '
+        /^[ \t]*"[A-Za-z0-9_.]+"[ \t]*:[ \t]*[0-9]+[ \t]*$/ {
+          name = $0; sub(/^[ \t]*"/, "", name); sub(/".*/, "", name)
+          value = $0; sub(/.*:[ \t]*/, "", value); sub(/[ \t]*$/, "", value)
+          if (name ~ /(Count|_num_ops)$/) print "regionserver\t" i "\t" b "\t" name "\t" value
+        }'
+  done
+  TC_INDEX=$((TC_INDEX + 1))
+done

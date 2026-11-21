@@ -14,314 +14,743 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Coordinates metric collection for an execution run. This initial implementation round defines
-# three core components: the collector registry, the metric output contract, and the periodic
-# sampling loop that drives the resource collector through the substrate contract. Round A6 later
-# attaches the host samplers, the jHiccup idle control collector, and the garbage-collection log
-# collectors to the topology, while preserving the registry entries and the output contract
-# established here.
+# Provides the unified command interface for telemetry collectors through px-collect start, stop,
+# and list. The px-run orchestrator invokes start on its bundle immediately before the run verb and
+# invokes stop immediately after it, while operators can run the same two commands manually. The
+# session collectors (profile, jfr, and trace) live in lib/collect.sh, whereas the periodic samplers
+# (per-container and host resource sampling, together with jHiccup attached to the target JVMs and
+# paired with an idle control JVM running in tooling 0) reside here and execute within a single
+# background process per start invocation that stop terminates with a TERM signal. See the
+# "The collectors" section of docs/bundle-format.md for the specification of the output files.
 #
-# OUTPUT CONTRACT
-#   <out>/metrics/<collector>.csv   Produces one file per collector whose first line contains the
-#                                   column header. For the resource collector, this header is
-#                                   derived directly from the sample schema in the substrate
-#                                   contract, ensuring that one schema definition governs both the
-#                                   columns emitted by a backend and the columns read by consumers.
-#   <out>/metrics/index.tsv         Records one row per selected collector containing the columns
-#                                   tool, target, status, artifact, and detail. The bundle reads
-#                                   this index so that a skipped collector is always recorded and
-#                                   never silently omitted.
-# Any field containing a comma, a quote, or a space is enclosed in double quotes with internal
-# quotes doubled, matching the standard format expected by spreadsheets and data frames.
+# Every collection is structured as a bundle: either the explicit BUNDLE operand, the active
+# collection for the cluster, or a new directory $PX_OUT/collect/<run-id> initialized with the
+# services from the deployment record. The cluster records its collections in the state directory so
+# that running stop without an operand locates the active collection and px-cluster down stops all
+# of them.
 #
 # The sampling cadence is always a whole number of seconds. Sub-second sampling acts as a profiling
-# operation rather than metric collection, so px-profile owns that faster cadence.
+# operation rather than metric collection, so the profile collector handles that faster cadence.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/collect.sh
+. "$SELF/../lib/collect.sh"
 
 set -euo pipefail
 px_trap_enable
 
-# ---------------------------------------------------------------------------
-# Collector registry
-# ---------------------------------------------------------------------------
-# The registry is stored in parallel indexed arrays to maintain compatibility with bash 3.2, which
-# lacks associative arrays. The owner column identifies the implementation round that provides the
-# collector, while the tool column identifies the host dependency required to run it; "contract"
-# denotes the substrate contract, and an empty value indicates that nothing outside the harness is
-# needed.
-
-COLLECT_NAMES=(container host hiccup gc)
-COLLECT_OWNERS=(A1 A6 A6 A6)
-COLLECT_TOOLS=(contract "" jhiccup "")
+# Holds one summary description per collector in PB_COLLECTORS, ordered to match that list.
 COLLECT_SUMMARIES=(
-  "per-instance processor, memory, network and block samples"
-  "host processor, memory and load samples"
-  "JVM pause measurement against an idle control runtime"
-  "garbage-collection logs staged from the target roles"
+  "async-profiler, cpu and alloc in one session, 7919 us, in the target JVMs"
+  "Java Flight Recorder through jcmd, the settings profile, in the target JVMs"
+  "jHiccup in the target JVMs and in an idle control JVM in tooling 0"
+  "host load and memory samples to metrics/host.tsv"
+  "per-instance processor, memory, network and block samples to TSV"
+  "the Phoenix counters of every RegionServer, through client 0, start and stop"
 )
 
-COLLECT_SELECTED=()
-COLLECT_LIST=0
-COLLECT_OUT=""
-COLLECT_INTERVAL=""
+# Remote execution scripts for jHiccup. Each script accepts the target JDK, the output log file or
+# log directory, the reporting interval in milliseconds, and the run duration in milliseconds.
+# Because both the attacher utility and the control JVM execute as standalone JVMs in their own
+# right, each is constrained to a small heap.
+HICCUP_ATTACH_SCRIPT="$(
+  cat <<'SCRIPT_EOF'
+jar="$PX_TOOLS_DIR/jhiccup/jHiccup.jar"
+java="$PX_JDK_ROOT/$1/bin/java"
+[ -f "$jar" ] && [ -x "$java" ] || exit 5
+mkdir -p "${2%/*}" || exit 1
+limit=()
+[ "$4" = 0 ] || limit=(-t "$4")
+"$java" -Xmx32m -cp "$jar" org.jhiccup.HiccupMeterAttacher -j "$jar" -p "$pid" -d 0 \
+  -i "$3" "${limit[@]}" -l "$2" || exit 1
+SCRIPT_EOF
+)"
+HICCUP_CONTROL_SCRIPT="$(
+  cat <<'SCRIPT_EOF'
+jar="$PX_TOOLS_DIR/jhiccup/jHiccup.jar"
+java="$PX_JDK_ROOT/$1/bin/java"
+[ -f "$jar" ] && [ -x "$java" ] || exit 5
+mkdir -p "$2" || exit 1
+limit=()
+[ "$4" = 0 ] || limit=(-t "$4")
+nohup "$java" -Xmx32m -jar "$jar" -d 0 -i "$3" "${limit[@]}" -l "$2/control.hlog" \
+  </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >"$2/control.pid"
+SCRIPT_EOF
+)"
+# Delivers a TERM signal to the control JVM, waits up to 5 s for it to terminate, and then sends
+# a KILL signal if the process remains alive.
+HICCUP_KILL_SCRIPT="$(
+  cat <<'SCRIPT_EOF'
+pid=$(cat "$1" 2>/dev/null) || exit 0
+rm -f "$1"
+kill -0 "$pid" 2>/dev/null || exit 0
+kill -TERM "$pid" 2>/dev/null || exit 0
+for second in 1 2 3 4 5; do
+  kill -0 "$pid" 2>/dev/null || exit 0
+  sleep 1
+done
+kill -KILL "$pid" 2>/dev/null || true
+exit 0
+SCRIPT_EOF
+)"
+
 COLLECT_DURATION=""
+COLLECT_INTERVAL=""
 COLLECT_TARGETS=""
+COLLECT_SAMPLERS=""
+COLLECT_PAIRS=""
 COLLECT_STOP=0
-COLLECT_AT=""
+COLLECT_NAP=""
+COLLECT_TAIL=""
+COLLECT_HEADER=""
+COLLECT_FAILED=""
+COLLECT_VERB=0
+COLLECT_WAIT=0
+HICCUP_LIVE=""
+HICCUP_CONTROL=0
 
-## @description  Prints the command-line usage reference and collector registry documentation.
-## @return       Writes usage text to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: px-collect [option...]
+px_cli_spec <<'EOF'
+about Collects profiles, recordings, counters and samples by hand: the collectors
++ that px-run starts around its run verb.
+about BUNDLE is a path, or a run id of a collection under $PX_OUT/collect or else of
++ a run under $PX_OUT/runs; it must lie under PX_OUT.
+exits 1 also means that a target failed; 2 also an unknown collector or one that
++ already ran in the collection; 6 also no active collection, no deployment
++ record or no cluster.
+example px-collect start --collect profile,jfr,trace --targets regionserver
+example px-collect start --collect host,container -e PX_COLLECT_INTERVAL_S=2
+example px-collect stop
+sub start [BUNDLE]
+shared --cluster --class --backend
+about start collectors in a bundle or a collection
+about Without BUNDLE, start joins the active collection of the cluster, or creates
++ $PX_OUT/collect/<run id>. It records what it started in collect/started.tsv and
++ returns; the samplers run in the background until stop or --duration.
+opt --collect LIST PX_COLLECTORS | the collectors to start, comma separated,
++ required unless PX_COLLECTORS is set
+opt --targets LIST PX_COLLECT_TARGETS | the roles to target, comma separated, default
++ all: every service role except setup and the
++ pherf group
+opt --duration SECONDS COLLECT_DURATION | the bound of every collector, at least 1,
++ default PX_TIMEOUT_RUN (3600)
+output the collection directory.
+sub stop [BUNDLE]
+shared --cluster
+about stop what start recorded and copy the files in
+about Without BUNDLE, stop stops the active collection of the cluster. Each
++ collector stops with the targets and the bound that start recorded.
+output the index rows of what it stopped, then result, ok|fail|skip, the code
++ and the directory.
+sub list
+about list the collectors
+output one row per collector: name and summary.
+EOF
 
-Options:
-  --list              print the collector registry and stop
-  --collector NAME    collect this metric source, repeatable, default container
-  --interval S        seconds between two samples, default PX_COLLECT_INTERVAL_S
-  --duration S        seconds to sample, 0 runs until a signal arrives
-  --targets LIST      the roles to sample, comma separated, default all
-  --scope ID          the scope to sample, default PX_SCOPE_ID, else the scope
-                      that px-cluster up recorded for PX_CLUSTER_ID
-  --out DIR           the output directory, default the run directory
-  --config FILE       an extra configuration file, repeatable
-  -v, --verbose       report detail
-  -h, --help          show this text
+# ---------------------------------------------------------------------------
+# Periodic sampler execution
+# ---------------------------------------------------------------------------
 
-Exit codes: 0 ok or skipped, 1 failure, 2 usage, 4 timeout, 5 a collector a
-later round owns, 6 no such collector or scope.
+## @description  Determines whether a space-delimited word list (word, list) contains the word.
+## @return       Returns exit code 0 when the word is present, or 1 otherwise.
+collect_in() {
+  case " $2 " in
+  *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+## @description  Sleeps for the given number of milliseconds so that a TERM or INT signal ends the
+##               wait immediately.
+## @return       Returns exit code 0.
+collect_nap() {
+  [ "$COLLECT_STOP" = 0 ] && [ "$1" -gt 0 ] || return 0
+  sleep "$(($1 / 1000)).$(printf '%03d' "$(($1 % 1000))")" &
+  COLLECT_NAP=$!
+  [ "$COLLECT_STOP" = 0 ] || kill "$COLLECT_NAP" 2>/dev/null || true
+  wait "$COLLECT_NAP" 2>/dev/null || true
+  COLLECT_NAP=""
+}
+
+## @description  Appends a host sample row to metrics/host.tsv, leaving the value empty whenever a
+##               metric source is unavailable.
+## @return       Returns exit code 0.
+collect_host_pass() {
+  local load avail total
+  load="$(px_load_pct 2>/dev/null)" || load=""
+  avail="$(px_mem_available_bytes 2>/dev/null)" || avail=""
+  total="$(px_mem_total_bytes 2>/dev/null)" || total=""
+  printf '%s\t%s\t%s\t%s%s\n' "$(px_epoch_ms)" "$load" "$avail" "$total" "$COLLECT_TAIL" \
+    >>"$PX_RUN_DIR/metrics/host.tsv"
+}
+
+# When a sampling pass fails or is unsupported by the active backend, the container collector stops
+# sampling and records a fail or skip row in the collector index. Sampling is restricted to the
+# configured target instances so that the all target resolves identically across every collector.
+## @description  Writes one sample row per target instance to metrics/container/<role>-<index>.tsv,
+##               or ends the container collector with a fail or skip row if the pass cannot run.
+## @return       Returns exit code 0.
+collect_container_pass() {
+  local rows status=0 key line file
+  rows="$(sb_sample_resources "$CK_SCOPE" || exit "$?")" || status=$?
+  case "$status" in
+  0) ;;
+  "$PX_EXIT_UNSUPPORTED")
+    pb_collector container all skip "" "the backend reports no resource metrics"
+    COLLECT_FAILED="$COLLECT_FAILED container"
+    return 0
+    ;;
+  *)
+    pb_collector container all fail "" "a sampling pass failed with exit $status"
+    COLLECT_FAILED="$COLLECT_FAILED container"
+    return 0
+    ;;
+  esac
+  while IFS="$PB_US" read -r key line; do
+    [ -n "$key" ] || continue
+    file="$PX_RUN_DIR/metrics/container/$key.tsv"
+    [ -f "$file" ] || printf '%s\n' "$COLLECT_HEADER" >"$file"
+    printf '%s%s\n' "$line" "$COLLECT_TAIL" >>"$file"
+  done <<EOF
+$(printf '%s\n' "$rows" | awk -F '\t' -v want="$COLLECT_PAIRS" -v us="$PB_US" \
+    -v rc="$(sb_schema_index sample role)" -v ic="$(sb_schema_index sample index)" '
+    NF == 0 || index(want, "," $rc "-" $ic ",") == 0 { next }
+    { print $rc "-" $ic us $0 }')
 EOF
 }
 
-# Evaluates collector readiness: reports "ready" when implemented in this round and its required
-# host tool is available, "absent" when the tool is missing, and "deferred" when a later round owns
-# the implementation.
-## @description  Reports the availability state of a single collector.
-## @return       Writes the state to stdout and exits with status 0.
-collect_state() {
-  local tool="${COLLECT_TOOLS[$1]}"
-  if [ "${COLLECT_OWNERS[$1]}" != A1 ]; then
-    printf 'deferred\n'
-  elif [ -z "$tool" ] || [ "$tool" = contract ]; then
-    printf 'ready\n'
-  elif command -v "$tool" >/dev/null 2>&1; then
-    printf 'ready\n'
-  else
-    printf 'absent\n'
+## @description  Executes a single sampling pass across every active periodic sampler.
+## @return       Returns exit code 0.
+collect_pass() {
+  if collect_in host "$COLLECT_SAMPLERS"; then
+    collect_host_pass
+  fi
+  if collect_in container "$COLLECT_SAMPLERS"; then
+    case " $COLLECT_FAILED " in
+    *" container "*) ;;
+    *) collect_container_pass ;;
+    esac
   fi
 }
 
-# Emits one tab-separated row per collector containing the collector, owning round, required tool,
-# current availability state, and summary description columns.
-## @description  Outputs the collector registry table.
-## @return       Writes TSV rows to stdout and exits with status 0.
-collect_list() {
-  local i=0
-  while [ "$i" -lt "${#COLLECT_NAMES[@]}" ]; do
-    px_tsv_row "${COLLECT_NAMES[$i]}" "${COLLECT_OWNERS[$i]}" \
-      "${COLLECT_TOOLS[$i]:--}" "$(collect_state "$i")" "${COLLECT_SUMMARIES[$i]}"
-    i=$((i + 1))
-  done
-}
-
-## @description  Converts the space-separated field names of a substrate schema into a CSV header.
-## @return       Writes the header to stdout and exits with 0, or returns 6 on an unknown schema.
-collect_csv_header() {
-  local fields
-  fields="$(sb_schema_fields "$1")" || return "$PX_EXIT_NO_OBJECT"
-  printf '%s\n' "${fields// /,}"
-}
-
-## @description  Converts a single TSV row into a formatted CSV row.
-## @return       Writes the CSV row to stdout and exits with status 0.
-collect_csv_row() {
-  local row=$1 count=$2 i=1 field out=""
-  while [ "$i" -le "$count" ]; do
-    field="$(px_tsv_field "$i" "$row")" || field=""
-    case "$field" in
-    *,* | *'"'* | *' '*)
-      field=${field//\"/\"\"}
-      field=\"$field\"
-      ;;
-    esac
-    if [ "$i" = 1 ]; then
-      out=$field
+## @description  Attaches jHiccup to the daemon JVM of each target instance and starts the idle
+##               control JVM in tooling 0, bounding both by the collection duration.
+## @return       Returns exit code 0, or exits with code 6 when the bundle has no services.tsv.
+collect_hiccup_start() {
+  local rows role index jdk status interval=$((COLLECT_INTERVAL * 1000))
+  local limit=$((COLLECT_DURATION * 1000))
+  rows="$(ck_targets "$COLLECT_TARGETS")" || exit "$?"
+  while IFS="$PX_TAB" read -r role index jdk; do
+    [ -n "$role" ] || continue
+    status=0
+    ck_jvm_exec "$role" "$index" "$HICCUP_ATTACH_SCRIPT" "$jdk" \
+      "$CK_REMOTE/hiccup/$role-$index.hlog" "$interval" "$limit" || status=$?
+    if [ "$status" = 0 ]; then
+      HICCUP_LIVE="$HICCUP_LIVE$role$PX_TAB$index$PX_NL"
     else
-      out="$out,$field"
+      ck_outcome hiccup "$role-$index" "$status" "" "the jHiccup attach" || true
     fi
-    i=$((i + 1))
+  done <<EOF
+$rows
+EOF
+  jdk="$(ck_targets tooling | awk -F '\t' '$2 == 0 { print $3 }')" || jdk=""
+  status=$PX_EXIT_NO_OBJECT
+  if [ -n "$jdk" ]; then
+    status=0
+    ck_exec tooling 0 "$HICCUP_CONTROL_SCRIPT" "$jdk" "$CK_REMOTE/hiccup" "$interval" \
+      "$limit" || status=$?
+  fi
+  if [ "$status" = 0 ]; then
+    HICCUP_CONTROL=1
+  else
+    ck_outcome hiccup control "$status" "" "the idle control JVM" || true
+  fi
+}
+
+## @description  Terminates the idle control JVM, copies each jHiccup log into metrics/hiccup/, and
+##               records its entry in the collector index.
+## @return       Returns exit code 0.
+collect_hiccup_stop() {
+  local role index status file
+  if [ "$HICCUP_CONTROL" = 1 ]; then
+    ck_exec tooling 0 "$HICCUP_KILL_SCRIPT" "$CK_REMOTE/hiccup/control.pid" || true
+    file=metrics/hiccup/control.hlog
+    status=0
+    ck_fetch tooling 0 hiccup/control.hlog "$file" || status=$?
+    ck_outcome hiccup control "$status" "$file" "the idle control JVM" || true
+  fi
+  while IFS="$PX_TAB" read -r role index; do
+    [ -n "$role" ] || continue
+    file="metrics/hiccup/$role-$index.hlog"
+    status=0
+    ck_fetch "$role" "$index" "hiccup/$role-$index.hlog" "$file" || status=$?
+    ck_outcome hiccup "$role-$index" "$status" "$file" "the jHiccup log" || true
+  done <<EOF
+$HICCUP_LIVE
+EOF
+}
+
+## @description  Records the collector index rows for the active samplers, emitting one entry per
+##               produced sample file along with its total sample row count.
+## @return       Returns exit code 0.
+collect_sampler_rows() {
+  local file
+  if collect_in host "$COLLECT_SAMPLERS" && [ -f "$PX_RUN_DIR/metrics/host.tsv" ]; then
+    PX_RECORD_SOURCE=collector:host
+    pb_collector host host ok metrics/host.tsv \
+      "$(($(wc -l <"$PX_RUN_DIR/metrics/host.tsv") - 1)) samples"
+  fi
+  collect_in container "$COLLECT_SAMPLERS" || return 0
+  PX_RECORD_SOURCE=collector:container
+  for file in "$PX_RUN_DIR"/metrics/container/*.tsv; do
+    [ -f "$file" ] || continue
+    file=${file##*/}
+    pb_collector container "${file%.tsv}" ok "metrics/container/$file" \
+      "$(($(wc -l <"$PX_RUN_DIR/metrics/container/$file") - 1)) samples"
   done
-  printf '%s\n' "$out"
 }
 
-# Records the outcome of a collector execution in the collector index consumed by the result bundle
-# to determine whether a collector ran, was skipped, or failed.
-## @description  Appends a status row to the collector index.
-## @return       Exits with status 0.
-collect_record() {
-  px_tsv_row "$1" "$2" "$3" "$4" "$(px_tsv_clean "$5")" >>"$COLLECT_INDEX"
+# Executes within a background subshell launched by start, with all output directed to
+# logs/collect.log. Receiving a stop signal immediately interrupts any active sleep and exits the
+# loop after one final sampling pass, because an interrupted collection still yields useful
+# diagnostic evidence. The loop also terminates on its own once the configured duration expires.
+# The stage end row for each sampler is written last, after its collector index rows and verdict.
+## @description  Executes the periodic samplers for a start invocation until TERM, INT, or the
+##               configured collection duration expires.
+## @return       Returns exit code 0.
+collect_sampler_main() {
+  local name tick=0 start_ms
+  trap 'COLLECT_STOP=1; [ -z "$COLLECT_NAP" ] || kill "$COLLECT_NAP" 2>/dev/null || true' INT TERM
+  if collect_in hiccup "$COLLECT_SAMPLERS"; then
+    PX_RECORD_SOURCE=collector:hiccup
+    collect_hiccup_start
+  fi
+  if collect_in host "$COLLECT_SAMPLERS"; then
+    printf 'ts_ms\tload_pct\tmem_available_bytes\tmem_total_bytes\trun_class\tcontamination\n' \
+      >"$PX_RUN_DIR/metrics/host.tsv"
+  fi
+  collect_pass
+  for name in $COLLECT_SAMPLERS; do
+    PX_RECORD_SOURCE="collector:$name"
+    pb_stage begin "collector@$name" "px-collect every ${COLLECT_INTERVAL}s"
+  done
+  px_info "collecting $COLLECT_SAMPLERS every ${COLLECT_INTERVAL}s into $PX_RUN_DIR/metrics"
+  start_ms="$(px_epoch_ms)"
+  while :; do
+    tick=$((tick + 1))
+    [ "$((tick * COLLECT_INTERVAL))" -le "$COLLECT_DURATION" ] || break
+    collect_nap "$((start_ms + tick * COLLECT_INTERVAL * 1000 - $(px_epoch_ms)))"
+    # Performing one final sampling pass after a stop signal arrives ensures that the recorded
+    # time series captures the end of the workload run.
+    collect_pass
+    [ "$COLLECT_STOP" = 0 ] || break
+  done
+  if collect_in hiccup "$COLLECT_SAMPLERS"; then
+    PX_RECORD_SOURCE=collector:hiccup
+    collect_hiccup_stop
+  fi
+  collect_sampler_rows
+  for name in $COLLECT_SAMPLERS; do
+    PX_RECORD_SOURCE="collector:$name"
+    ck_verdict "$name" || true
+    pb_stage end "collector@$name"
+  done
 }
 
-## @description  Checks whether a given role is included in the target list.
-## @return       Exits with 0 when the role is selected, or 1 otherwise.
-collect_wanted() {
-  local want
-  case "$COLLECT_TARGETS" in
-  "" | all) return 0 ;;
+# Redirects all three standard file descriptors for the background sampler subshell so that a caller
+# reading the standard output of start returns immediately. The subshell inherits the command line
+# of this start invocation, which stop verifies before delivering a termination signal. Waits up to
+# COLLECT_WAIT seconds for every requested sampler to open its collection window.
+## @description  Launches the requested samplers (names...) in a single background process and
+##               waits up to COLLECT_WAIT for each to open its collection window.
+## @return       Returns exit code 0, or 1 when any sampler fails to start.
+collect_samplers_start() {
+  local name pid deadline missing failed=0
+  COLLECT_SAMPLERS="$*"
+  if collect_in container "$*"; then
+    mkdir -p "$PX_RUN_DIR/metrics/container" ||
+      px_die "$PX_EXIT_FAIL" "cannot create $PX_RUN_DIR/metrics/container"
+    COLLECT_PAIRS="$(ck_targets "$COLLECT_TARGETS" |
+      awk -F '\t' '{ s = s "," $1 "-" $2 } END { print s "," }')" || exit "$?"
+  fi
+  COLLECT_TAIL="$PX_TAB$PX_RUN_CLASS$PX_TAB$(px_tsv_clean "${PX_CONTAMINATION:-none}")"
+  COLLECT_HEADER="$(sb_schema_fields sample | tr ' ' '\t')${PX_TAB}run_class${PX_TAB}contamination"
+  (collect_sampler_main) </dev/null >>"$PX_RUN_DIR/logs/collect.log" 2>&1 &
+  pid=$!
+  for name in "$@"; do
+    collect_started "$name" "$pid"
+  done
+  deadline=$(($(px_epoch_s) + COLLECT_WAIT))
+  while :; do
+    missing=""
+    for name in "$@"; do
+      ck_begun "$PX_RUN_DIR" "$name" || missing="$missing $name"
+    done
+    [ -n "$missing" ] || return 0
+    kill -0 "$pid" 2>/dev/null && [ "$(px_epoch_s)" -lt "$deadline" ] || break
+    sleep 0.1
+  done
+  for name in $missing; do
+    PX_RECORD_SOURCE="collector:$name"
+    sx_verdict "collector.$name" ADVISORY "the sampler did not start $name within" \
+      "${COLLECT_WAIT}s, output in logs/collect.log"
+    failed=1
+  done
+  return "$failed"
+}
+
+# Delivers a TERM signal to each sampler process and waits up to COLLECT_WAIT before forcibly
+# killing its process tree, allowing the sampler to trap TERM and finish its final pass through
+# sb_exec. A PID whose command line no longer contains px-collect is never signaled, because the
+# sampler has already exited and the PID may have been reused. Any sampler that did not close its
+# collection window receives an ADVISORY verdict and its closing stage end row here.
+## @description  Terminates the live periodic samplers (names...) for the currently bound bundle.
+## @return       Returns exit code 0.
+collect_samplers_stop() {
+  local name pid child pids="" left polls=0 killed=0 why
+  for name in "$@"; do
+    pid="$(ck_started "$name" 3)"
+    case " $pids " in
+    *" $pid "*) ;;
+    *) pids="$pids $pid" ;;
+    esac
+  done
+  for pid in $pids; do
+    case "$(ps -o args= -p "$pid" 2>/dev/null)" in
+    *px-collect*) kill -s TERM "$pid" 2>/dev/null || true ;;
+    esac
+  done
+  while :; do
+    left=""
+    for pid in $pids; do
+      ! kill -0 "$pid" 2>/dev/null || left="$left $pid"
+    done
+    [ -n "$left" ] && [ "$polls" -lt $((COLLECT_WAIT * 10)) ] || break
+    sleep 0.1
+    polls=$((polls + 1))
+  done
+  for pid in $left; do
+    case "$(ps -o args= -p "$pid" 2>/dev/null)" in
+    *px-collect*) ;;
+    *) continue ;;
+    esac
+    for child in $(px_child_pids "$pid") "$pid"; do
+      kill -s KILL "$child" 2>/dev/null || true
+    done
+    killed=1
+  done
+  why="the sampler ended before it closed its window"
+  [ "$killed" = 0 ] || why="the sampler did not stop within ${COLLECT_WAIT}s and was killed"
+  for name in "$@"; do
+    ck_live "$PX_RUN_DIR" "$name" || continue
+    PX_RECORD_SOURCE="collector:$name"
+    sx_verdict "collector.$name" ADVISORY "$why, output in logs/collect.log"
+    pb_stage end "collector@$name" "px-collect stop"
+  done
+}
+
+## @description  Emits the target list recorded in the started row for a collector (name), printing
+##               - for host and trace (which lack target instances) or COLLECT_TARGETS otherwise.
+## @return       Writes the target field to standard output and exits with code 0.
+collect_targets_of() {
+  case "$1" in
+  host | trace) printf -- '-\n' ;;
+  *) printf '%s\n' "$COLLECT_TARGETS" ;;
   esac
-  for want in ${COLLECT_TARGETS//,/ }; do
-    if [ "$want" = "$1" ]; then
-      return 0
-    fi
+}
+
+## @description  Appends a collector start entry (name, pid or -) to collect/started.tsv in the
+##               bound bundle, recording its targets, duration bound, and start timestamp.
+## @return       Exits with code 0.
+collect_started() {
+  px_tsv_row "$1" "$(collect_targets_of "$1")" "$2" "$COLLECT_DURATION" "$(px_epoch_ms)" \
+    >>"$PX_RUN_DIR/collect/started.tsv"
+}
+
+## @description  Stops a session collector (name) using the target list and duration bound recorded
+##               in its started row.
+## @return       Exits with code 0.
+collect_session_stop() {
+  CK_TARGETS="$(ck_started "$1" 2)"
+  CK_DURATION="$(ck_started "$1" 4)"
+  ck_stop "$1" || true
+}
+
+# ---------------------------------------------------------------------------
+# Collection lifecycle and state management
+# ---------------------------------------------------------------------------
+
+# Standalone collections follow the run ID grammar under collect/, so a bare run ID resolves to a
+# collection directory under collect/ when one exists and otherwise falls back to a workload run
+# bundle under runs/.
+## @description  Resolves the BUNDLE operand (operand) for start or stop to a bundle directory.
+## @return       Writes the path to stdout and exits 0, or exits 1, 2, or 6 per pb_bundle_resolve.
+collect_resolve() {
+  local root
+  root="$(px_out_root)" || exit "$?"
+  if [[ $1 =~ $PB_RUN_ID_RE ]] && [ -d "$root/collect/$1" ]; then
+    pb_bundle_resolve "$root/collect/$1"
+  else
+    pb_bundle_resolve "$1"
+  fi
+}
+
+## @description  Registers a collection (directory) in the collection record for the active cluster.
+## @return       Exits with code 0, or exits with code 1 when the record file cannot be written.
+collect_record_add() {
+  local record
+  record="$(pb_collect_record)" || exit "$?"
+  if [ ! -f "$record" ] || ! grep -qxF -- "$1" "$record"; then
+    printf '%s\n' "$1" >>"$record" || px_die "$PX_EXIT_FAIL" "cannot write $record"
+  fi
+}
+
+## @description  Removes a collection (directory) from the cluster collection record, deleting the
+##               record file itself when no other recorded collections remain.
+## @return       Exits with code 0.
+collect_record_remove() {
+  local record
+  record="$(pb_collect_record)" || exit "$?"
+  [ -f "$record" ] || return 0
+  grep -vxF -- "$1" "$record" >"$record.tmp" || true
+  if [ -s "$record.tmp" ]; then
+    mv -f "$record.tmp" "$record"
+  else
+    rm -f "$record.tmp" "$record"
+  fi
+}
+
+## @description  Determines whether any collector in the given collection (directory) is still live.
+## @return       Returns exit code 0 if at least one collector is live, or 1 otherwise.
+collect_any_live() {
+  local name
+  for name in $PB_COLLECTORS; do
+    ! ck_live "$1" "$name" || return 0
   done
   return 1
 }
 
-## @description  Sleeps for the specified duration in milliseconds.
-## @return       Exits with status 0 and sets COLLECT_STOP when interrupted by a signal.
-collect_sleep_ms() {
-  local ms=$1
-  if [ "$ms" -le 0 ]; then
-    return 0
-  fi
-  sleep "$((ms / 1000)).$(printf '%03d' "$((ms % 1000))")" || COLLECT_STOP=1
+# Run bundles created by px-run are also tracked in the collection record so that px-cluster down
+# can stop them, whereas only standalone collections under $PX_OUT/collect can be joined by default.
+## @description  Locates the active collection for the cluster by selecting the newest recorded
+##               directory under $PX_OUT/collect that has a live collector.
+## @return       Writes the directory path to stdout when found, or nothing, and exits with code 0.
+collect_active() {
+  local root record line
+  root="$(px_out_root)" || exit "$?"
+  record="$(pb_collect_record)" || exit "$?"
+  [ -f "$record" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+    "$root/collect/"*)
+      if [ -d "$line" ] && collect_any_live "$line"; then
+        printf '%s\n' "$line"
+      fi
+      ;;
+    esac
+  done <"$record" | LC_ALL=C sort | tail -n 1
 }
 
-# Exits with status 0 when collection completes or is skipped, status 1 on a sampling failure or
-# when the runtime does not respond, and status 6 when the target scope is absent.
-## @description  Samples every instance in the scope on a fixed cadence and writes the CSV output.
-## @return       Exits with 0 when run or skipped, 1 on sampling or runtime failure, or 6 if absent.
-collect_container() {
-  local csv=$1 columns role_col header rows row role tick=0 samples=0
-  local start_ms due_ms now_ms status=0
-  sb_scope_check "$COLLECT_SCOPE"
-  header="$(collect_csv_header sample)"
-  columns="$(sb_schema_count sample)"
-  # Resolve the role column index once before entering the sampling loop so that filtering rows by
-  # target role does not spawn a subprocess for every sample.
-  role_col="$(sb_schema_index sample role)"
-  printf '%s\n' "$header" >"$csv"
-  px_info "container: every $COLLECT_INTERVAL s into $csv"
-  start_ms="$(px_epoch_ms)"
-  while [ "$COLLECT_STOP" = 0 ]; do
-    status=0
-    rows="$(sb_sample_resources "$COLLECT_SCOPE")" || status=$?
-    if [ "$status" = "$PX_EXIT_UNSUPPORTED" ]; then
-      collect_record container "$COLLECT_TARGETS" skip "$csv" \
-        "the backend reports no resource metrics"
-      return 0
+# Uses the cluster deployment record only when the cluster scope record matches the bound scope,
+# matching the validation performed by px-run. Because the new directory follows the run ID grammar
+# outside runs/, reader commands that default to the newest run bundle never select it accidentally.
+## @description  Creates a new collection under $PX_OUT/collect with the cluster service inventory.
+## @return       Writes the path to stdout and exits 0, exits 6 when no deployment record exists,
+##               or exits 1 when the collection directory cannot be created.
+collect_new() {
+  local file recorded="" deploy="" dir
+  file="$(sb_scope_record || true)"
+  if [ -n "$file" ] && [ -f "$file" ]; then
+    IFS= read -r recorded <"$file" || true
+  fi
+  if [ "$recorded" = "$CK_SCOPE" ]; then
+    file="$(sb_deployment_record || true)"
+    if [ -n "$file" ] && [ -f "$file" ]; then
+      IFS= read -r deploy <"$file" || true
     fi
-    if [ "$status" != 0 ]; then
-      collect_record container "$COLLECT_TARGETS" fail "$csv" \
-        "a sampling pass failed with status $status"
-      px_error "container: a sampling pass failed with status $status"
-      return "$PX_EXIT_FAIL"
+  fi
+  if [ -z "$deploy" ] || [ ! -f "$deploy/services.tsv" ]; then
+    px_die "$PX_EXIT_NO_OBJECT" "no deployment record of cluster ${PX_CLUSTER_ID:-default}:" \
+      "px-cluster up writes one"
+  fi
+  dir="$(px_run_dir collect)" || exit "$?"
+  if ! mkdir -p "$dir/cluster" || ! cp "$deploy/services.tsv" "$dir/cluster/"; then
+    rm -rf "$dir"
+    px_die "$PX_EXIT_FAIL" "cannot create the collection $dir"
+  fi
+  [ ! -f "$deploy/topology.env" ] || cp "$deploy/topology.env" "$dir/cluster/" || true
+  printf '%s\n' "$dir"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers for start, stop, and list
+# ---------------------------------------------------------------------------
+
+# Launches collectors in the same sequence as px-run (profile, jfr, the periodic samplers, and then
+# trace) so that the counter snapshots cover the workload run. Validating and binding the cluster
+# scope before creating any output directory ensures that a failed lookup against an absent cluster
+# never leaves an empty collection directory behind.
+## @description  Starts the collectors listed in PX_COLLECTORS within an explicit bundle, the
+##               active collection, or a new collection, and prints the collection directory.
+## @return       Exits 0, 1 when a target fails to start, 2 on usage errors, or 6 as documented.
+collect_start() {
+  local names name dir="" failed=0
+  local -a samplers=()
+  names="$(pb_collectors_parse "${PX_COLLECTORS:-none}")" || exit "$?"
+  case "$names:${PX_COLLECTORS:-}" in
+  :) px_die "$PX_EXIT_USAGE" "name the collectors with --collect: PX_COLLECTORS is unset" ;;
+  :*) px_die "$PX_EXIT_USAGE" "name the collectors with --collect: none starts no collector" ;;
+  esac
+  # Resolving the cluster scope first loads the run class from the cluster record, ensuring that a
+  # missing cluster is reported before a missing class. Because every emitted sample row carries the
+  # run class, collecting without one would produce rows that downstream readers cannot classify
+  # (G23).
+  ck_scope
+  px_run_class_require
+  COLLECT_DURATION=${COLLECT_DURATION:-${PX_TIMEOUT_RUN:-3600}}
+  if ! [[ $COLLECT_DURATION =~ $PX_RE_INT ]] || [ "$COLLECT_DURATION" -lt 1 ]; then
+    px_die "$PX_EXIT_USAGE" "--duration needs whole seconds above zero, got '$COLLECT_DURATION'"
+  fi
+  COLLECT_INTERVAL="$(px_int_setting PX_COLLECT_INTERVAL_S 5 1)" || exit "$?"
+  COLLECT_TARGETS=${PX_COLLECT_TARGETS:-all}
+  if [ "${#PX_CLI_ARGS[@]}" -gt 0 ]; then
+    dir="$(collect_resolve "${PX_CLI_ARGS[0]}")" || exit "$?"
+  else
+    dir="$(collect_active)" || exit "$?"
+  fi
+  if [ -n "$dir" ]; then
+    for name in $names; do
+      ! ck_ran "$dir" "$name" || px_die "$PX_EXIT_USAGE" "collector $name already ran in $dir"
+    done
+  fi
+  if px_is_dry_run; then
+    for name in $names; do
+      px_plan start "$name" "$(collect_targets_of "$name")" "$COLLECT_DURATION" \
+        "${dir:-<new collection>}"
+    done
+    exit "$PX_EXIT_OK"
+  fi
+  # A live start verifies that the target scope responds before creating or joining any collection,
+  # ensuring that an absent cluster exits with code 6 and an unresponsive engine exits with code 1.
+  sb_scope_check "$CK_SCOPE"
+  [ -n "$dir" ] || dir="$(collect_new)" || exit "$?"
+  ck_bind "$dir"
+  case " $names " in
+  *" profile "* | *" jfr "* | *" hiccup "* | *" container "*)
+    [ -f "$dir/cluster/services.tsv" ] ||
+      px_die "$PX_EXIT_NO_OBJECT" "the bundle $dir holds no cluster/services.tsv"
+    ;;
+  esac
+  collect_record_add "$dir"
+  CK_TARGETS=$COLLECT_TARGETS
+  CK_DURATION=$COLLECT_DURATION
+  for name in $names; do
+    if collect_in "$name" "$PB_SAMPLERS"; then
+      samplers+=("$name")
+    elif [ "$name" != trace ]; then
+      collect_started "$name" -
+      ck_start "$name" || failed=1
     fi
-    while IFS= read -r row; do
-      [ -n "$row" ] || continue
-      role="$(px_tsv_field "$role_col" "$row")" || role=""
-      if collect_wanted "$role"; then
-        collect_csv_row "$row" "$columns" >>"$csv"
-        samples=$((samples + 1))
-      fi
-    done <<EOF
-$rows
-EOF
-    tick=$((tick + 1))
-    if [ "$COLLECT_DURATION" != 0 ] &&
-      [ "$((tick * COLLECT_INTERVAL))" -ge "$COLLECT_DURATION" ]; then
-      break
-    fi
-    now_ms="$(px_epoch_ms)"
-    due_ms=$((start_ms + tick * COLLECT_INTERVAL * 1000))
-    collect_sleep_ms "$((due_ms - now_ms))"
   done
-  collect_record container "$COLLECT_TARGETS" ok "$csv" \
-    "$samples sample rows in $tick passes"
-  px_info "container: $samples sample rows in $tick passes"
+  if [ "${#samplers[@]}" -gt 0 ]; then
+    collect_samplers_start "${samplers[@]}" || failed=1
+  fi
+  if collect_in trace "$names"; then
+    collect_started trace -
+    ck_start trace || failed=1
+  fi
+  printf '%s\n' "$dir"
+  return "$failed"
+}
+
+# Stops collectors in the reverse order of start: trace first, followed by the periodic samplers
+# (which share a single background process per start invocation), and finally jfr and profile so
+# that the JVM PID lookup performed by profile and jfr never matches the hiccup control JVM. Each
+# session collector stops with the targets and duration bound recorded in its started row, so stop
+# requires no collector options. A collection with no live collectors is not an error and is left
+# untouched, allowing the exit hooks of px-run and px-cluster down to invoke stop twice while
+# leaving a completed bundle unchanged.
+## @description  Stops all live collectors in a bundle or the active collection, then prints their
+##               collector index rows followed by the summary result row.
+## @return       Exits 0, 1 when a target fails, or 6 when no collection is active.
+collect_stop() {
+  local dir names="" name status=0
+  local -a samplers=()
+  if [ "${#PX_CLI_ARGS[@]}" -gt 0 ]; then
+    dir="$(collect_resolve "${PX_CLI_ARGS[0]}")" || exit "$?"
+  else
+    dir="$(collect_active)" || exit "$?"
+    [ -n "$dir" ] || px_die "$PX_EXIT_NO_OBJECT" "no collection of cluster" \
+      "${PX_CLUSTER_ID:-default} is active: name its directory"
+  fi
+  for name in $PB_COLLECTORS; do
+    ! ck_live "$dir" "$name" || names="${names:+$names }$name"
+  done
+  if px_is_dry_run; then
+    for name in $names; do
+      px_plan stop "$name" "$dir"
+    done
+    exit "$PX_EXIT_OK"
+  fi
+  if [ -z "$names" ]; then
+    px_result_row skip 0 "$dir"
+    return 0
+  fi
+  ck_bind "$dir"
+  case " $names " in
+  *" profile "* | *" jfr "* | *" trace "*) ck_scope ;;
+  esac
+  ! collect_in trace "$names" || collect_session_stop trace
+  for name in $names; do
+    ! collect_in "$name" "$PB_SAMPLERS" || samplers+=("$name")
+  done
+  [ "${#samplers[@]}" = 0 ] || collect_samplers_stop "${samplers[@]}"
+  for name in jfr profile; do
+    ! collect_in "$name" "$names" || collect_session_stop "$name"
+  done
+  collect_any_live "$dir" || collect_record_remove "$dir"
+  # Emits the collector index rows for the stopped collectors and determines their aggregate status:
+  # 0 for ok, 1 when any row reports fail, or 2 when every row is a skip row or no rows exist.
+  awk -F '\t' -v names=" $names " 'index(names, " " $1 " ") { print
+      if ($3 == "fail") f = 1; else if ($3 != "skip") o = 1 }
+    END { exit f ? 1 : o ? 0 : 2 }' "$dir/metrics/index.tsv" 2>/dev/null || status=$?
+  case "$status" in
+  0) px_result_row ok 0 "$dir" ;;
+  1)
+    px_result_row fail "$PX_EXIT_FAIL" "$dir"
+    return "$PX_EXIT_FAIL"
+    ;;
+  *) px_result_row skip 0 "$dir" ;;
+  esac
+}
+
+## @description  Lists all available collectors in start order together with their summaries.
+## @return       Writes one tab-separated row per collector to standard output and exits 0.
+collect_list() {
+  local name at=0
+  for name in $PB_COLLECTORS; do
+    px_tsv_row "$name" "${COLLECT_SUMMARIES[$at]}"
+    at=$((at + 1))
+  done
 }
 
 px_cli_parse "$@"
-
-if [ "$COLLECT_LIST" = 1 ]; then
+if [ "$PX_CLI_SUB" = list ]; then
   collect_list
   exit 0
 fi
-
 px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
-
-if [ "${#COLLECT_SELECTED[@]}" = 0 ]; then
-  COLLECT_SELECTED=(container)
-fi
-if [ -z "$COLLECT_INTERVAL" ]; then
-  COLLECT_INTERVAL="${PX_COLLECT_INTERVAL_S:-5}"
-fi
-if [ -z "$COLLECT_DURATION" ]; then
-  COLLECT_DURATION="${PX_COLLECT_DURATION_S:-0}"
-fi
-if [ -z "$COLLECT_TARGETS" ]; then
-  COLLECT_TARGETS="${PX_COLLECT_TARGETS:-all}"
-fi
-if ! [[ $COLLECT_INTERVAL =~ $PX_RE_INT ]] || [ "$COLLECT_INTERVAL" -lt 1 ]; then
-  px_usage_error "--interval needs a whole number of seconds, got '$COLLECT_INTERVAL'"
-fi
-if ! [[ $COLLECT_DURATION =~ $PX_RE_INT ]]; then
-  px_usage_error "--duration needs a whole number of seconds, got '$COLLECT_DURATION'"
-fi
-
-# Validate every selected collector before starting any sampling run so that an operator learns
-# about an unknown or deferred collector immediately rather than after a long collection period.
-COLLECT_POSITIONS=()
-for COLLECT_NAME in "${COLLECT_SELECTED[@]}"; do
-  px_word_at "$COLLECT_NAME" "${COLLECT_NAMES[@]}" ||
-    px_die "$PX_EXIT_NO_OBJECT" "no such collector: $COLLECT_NAME"
-  if [ "${COLLECT_OWNERS[$PX_AT]}" != A1 ]; then
-    px_die "$PX_EXIT_UNSUPPORTED" \
-      "the $COLLECT_NAME collector arrives with round ${COLLECT_OWNERS[$PX_AT]}"
-  fi
-  COLLECT_POSITIONS+=("$PX_AT")
-done
-
-# Bind the substrate contract here rather than at the top of the script because listing the registry
-# or reporting a usage error does not require a backend. Resolve the active scope before creating
-# any output files so that a missing cluster never leaves an empty index behind.
-# shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
-. "$SELF/../lib/backend/contract.sh"
-sb_load
-sb_scope_require >/dev/null
-if px_is_dry_run; then
-  for COLLECT_NAME in "${COLLECT_SELECTED[@]}"; do
-    px_plan collect "$COLLECT_NAME" "$COLLECT_DURATION" \
-      "${COLLECT_OUT:-${PX_RUN_DIR:-a new run directory}}"
-  done
-  exit "$PX_EXIT_OK"
-fi
-
-# Execute each step of the output directory policy at the top level of the script so that any path
-# refusal terminates the main process directly rather than exiting only a subshell.
-if [ -n "$COLLECT_OUT" ]; then
-  COLLECT_DIR="$(px_out_subdir "$COLLECT_OUT/metrics")" || exit $?
-elif [ -n "${PX_RUN_DIR:-}" ]; then
-  COLLECT_DIR="$(px_out_subdir "$PX_RUN_DIR/metrics")" || exit $?
-else
-  COLLECT_DIR="$(px_run_dir)" || exit $?
-  COLLECT_DIR="$(px_out_subdir "$COLLECT_DIR/metrics")" || exit $?
-fi
-COLLECT_INDEX="$COLLECT_DIR/index.tsv"
-: >>"$COLLECT_INDEX"
-
-# Catch termination signals to stop the sampling loop gracefully while preserving the collected
-# files, because a partially completed collection still provides diagnostic evidence. Because the
-# shared library owns the EXIT trap, this command registers handlers only for INT and TERM.
-trap 'COLLECT_STOP=1' INT TERM
-
+COLLECT_VERB="$(px_int_setting PX_TIMEOUT_VERB 300 1)" || exit "$?"
+# Bounds any wait on the background sampler process to half of the verb timeout so that a fallback
+# kill and the writing of closing rows complete within the single-step timeout budget that a caller
+# allocates to start or stop.
+COLLECT_WAIT=$((COLLECT_VERB / 2))
+[ "$COLLECT_WAIT" -ge 1 ] || COLLECT_WAIT=1
 COLLECT_STATUS=0
-for COLLECT_AT in "${COLLECT_POSITIONS[@]}"; do
-  case "${COLLECT_NAMES[$COLLECT_AT]}" in
-  container) collect_container "$COLLECT_DIR/container.csv" || COLLECT_STATUS=$? ;;
-  esac
-done
+case "$PX_CLI_SUB" in
+start) collect_start || COLLECT_STATUS=$? ;;
+stop) collect_stop || COLLECT_STATUS=$? ;;
+esac
 exit "$COLLECT_STATUS"

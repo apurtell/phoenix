@@ -65,8 +65,10 @@ During staging, `stage-artifacts.sh` pins each base image by digest through
 every subsequent build uses that record:
 
 ```sh
-px-cluster build                           # build-phoenix.sh, then stage-artifacts.sh
+px-cluster build                           # the Phoenix jars, jHiccup and the image
+px-cluster up -n --class measurement --config dev/harness/docker/env/override-24gib.env
 px-cluster --class measurement --config dev/harness/docker/env/override-24gib.env up
+px-cluster down                            # idempotent: exits 0 when nothing is recorded
 ```
 
 When invoked without a directory argument, `px-cluster up` first renders the deployment for the
@@ -93,22 +95,51 @@ directory printed by the command, as nothing useful is left inside the repositor
 
 | Command | Purpose |
 |---|---|
-| `px-cluster` | Manages lifecycle: image build, provision, scale, faults, teardown, and matrix. |
+| `px-cluster` | Runs cluster lifecycle: image build, provision, scale, faults, teardown, matrix. |
 | `px-suite` | Executes a declarative suite file: dependencies, boundaries, filters, and dry run. |
 | `px-run` | Executes one test: one run directory, one driver, snapshots, disruptions, exit code. |
-| `px-tool` | Runs host safeguards: the health monitor and the quiet-host check. |
-| `px-collect` | Samples host and container resource utilization to CSV. |
-| `px-profile` | Runs sampling profiler sessions against selected roles; implemented in A6. |
-| `px-jfr` | Captures Java Flight Recorder sessions against selected roles; implemented in A6. |
-| `px-trace-count` | Archives trace counter outputs into the result bundle; implemented in A6. |
-| `px-bundle` | Packages and validates the result bundle produced by a run. |
-| `px-report` | Merges verdict streams into a single run verdict and exit code. |
+| `px-tool` | Enforces host safeguards: the health monitor and the quiet-host check. |
+| `px-collect` | Collects host and container samples to CSV and jHiccup with its idle control JVM. |
+| `px-profile` | Runs async-profiler sessions, cpu and alloc, against the target JVMs. |
+| `px-jfr` | Captures Java Flight Recorder recordings of the target JVMs. |
+| `px-trace-count` | Reads Phoenix trace counters of every RegionServer, before and after the run. |
+| `px-bundle` | Writes and validates the result bundle produced by a run. |
+| `px-report` | Merges verdict streams into a single run verdict and a single exit code. |
 | `px-pherf` | Manages the Pherf controller and its agents on either backend; implemented in H3. |
 | `px-k3d` | Manages the local k3d cluster for the Kubernetes backend proofs; implemented in K2. |
 
 Every command responds to `--help` with exit code 0 and rejects any unrecognized flag with exit
 code 2. Commands scheduled for implementation in a later round exit with code 5 on any other
 invocation.
+
+**Output conventions.** Every standard output stream is formatted as TSV. Any stream of checks or
+verdicts concludes with a single `result STATUS CODE OBJECT` summary row reporting the outcome in
+the stream's status vocabulary (either the `ok|warn|fail|skip` check status or the verdict severity
+lattice), the numeric exit code, and the target object of the stream. This convention governs the
+output of `px-report`, `px-bundle validate`, `px-suite`, `px-cluster matrix`, `px-cluster up -n`,
+`px-collect stop`, `px-tool quiet-host`, and `px-k3d check`. A BUNDLE operand accepts either a
+directory path or a run id resolved beneath `$PX_OUT/runs` (or for `px-collect`, resolved under
+`$PX_OUT/collect` first); the resolved path must reside under PX_OUT (otherwise exiting with code 2)
+and must already exist (otherwise exiting with code 6), as a missing bundle is never created
+automatically. When invoked without an explicit bundle operand, `px-report`, `px-bundle validate`,
+and `px-bundle metrics` default to the newest completed bundle—defined as the most recent run id
+whose directory contains `manifest.json`, breaking ties between two run ids from the same second by
+selecting the newer manifest. Passing `-n` always emits execution plan rows without executing any
+actions, including for the read-only `px-report`, `px-bundle validate`, `px-bundle metrics`, and
+`px-tool quiet-host` commands.
+
+**Collectors.** `px-collect` serves as the unified entry point for all six telemetry collectors:
+`profile`, `jfr`, `hiccup`, `host`, `container`, and `trace`. During a test run, `px-run` invokes
+`px-collect start` on its result bundle for the collectors configured in `PX_COLLECTORS` immediately
+before launching the `run` verb, and invokes `px-collect stop` immediately after the verb completes.
+By default, the measurement run class starts all six collectors while the validation class starts
+none; `px-run --collect LIST` selects the collectors to run and `--targets LIST` selects their
+target roles, whereas a driver's HDR histograms remain enabled across both run classes. When invoked
+manually, `px-collect start` either attaches to the cluster's active collection or initializes a new
+collection directory at `$PX_OUT/collect/<run-id>`, and `px-collect stop` terminates the collectors
+and retrieves their output artifacts into the bundle. Every collector writes exclusively within its
+assigned bundle, and any collector failure yields an `ADVISORY` verdict rather than failing the run.
+See the "The collectors" section of `docs/bundle-format.md` for the artifact file specifications.
 
 ## Policy
 

@@ -420,6 +420,33 @@ v_verdicts() {
   fi
 }
 
+## @description  Validates that each row of the collector index metrics/index.tsv has five fields, a
+##               known collector, an ok, skip, or fail status, and for ok a relative bundle path.
+## @return       Returns exit code 0.
+v_collectors() {
+  local file="$BUNDLE_RUN/metrics/index.tsv" bad
+  if [ ! -f "$file" ]; then
+    v_row collectors skip "metrics/index.tsv is absent: no collector ran"
+    return 0
+  fi
+  bad="$(awk -F '\t' -v names=" $PB_COLLECTORS " '
+    $0 == "" { next }
+    {
+      why = ""
+      if (NF != 5) why = NF " fields"
+      else if ($1 == "" || index(names, " " $1 " ") == 0) why = "collector \"" $1 "\""
+      else if ($3 !~ /^(ok|skip|fail)$/) why = "status \"" $3 "\""
+      else if ($3 == "ok" && ($4 == "" || $4 ~ /^\// || $4 ~ /\.\./)) why = "file \"" $4 "\""
+      if (why != "") { bad++; if (first == "") first = "line " NR ": " why }
+    }
+    END { if (bad) print bad " bad rows, first " first }' "$file")"
+  if [ -n "$bad" ]; then
+    v_row collectors fail "metrics/index.tsv: $bad"
+  else
+    v_row collectors ok "metrics/index.tsv rows name a collector, a status and their files"
+  fi
+}
+
 ## @description  Executes every validation check specified in docs/bundle-format.md, section
 ##               "Validation", against the bundle.
 ## @return       Writes the check rows to stdout. Exits 0 when no check failed, or 1 otherwise.
@@ -441,6 +468,7 @@ bundle_validate() {
   v_describe
   v_metrics "$class"
   v_verdicts
+  v_collectors
   [ "$FAILED" = 0 ] || return "$PX_EXIT_FAIL"
 }
 

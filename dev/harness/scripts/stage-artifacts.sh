@@ -23,8 +23,9 @@
 #   <root>        Every file and directory from the layout's image directory, along with its
 #                 ignore file when one is present.
 #   dist/         The release archives for HBase and Hadoop, plus the async-profiler archive when
-#                 PX_DIST_ARTIFACTS lists it. Because jHiccup is distributed as a source release
-#                 that build-jhiccup.sh compiles, a subsequent round stages it.
+#                 PX_DIST_ARTIFACTS lists it. Because jHiccup is distributed as a source release,
+#                 dist/jHiccup.jar is the tool compiled by build-jhiccup.sh and staged when
+#                 PX_DIST_ARTIFACTS lists jhiccup.
 #   phoenix/      The Phoenix server, client, and Pherf JARs recorded in the build record.
 #   plugins/<id>/ Every file belonging to each plug-in enabled by PX_PLUGINS; the plugins/
 #                 directory remains present and empty when no plug-in is enabled.
@@ -497,6 +498,20 @@ for SA_NAME in "${SA_DISTS[@]}"; do
     sa_shipped hadoop-common SA_HBASE_HADOOP
   fi
 done
+# Stage the jHiccup artifact from its build record at $PX_OUT/build/jhiccup/jHiccup.jar.
+case " ${PX_DIST_ARTIFACTS//,/ } " in
+*" jhiccup "*)
+  SA_PATH="$SA_ROOT/build/jhiccup/jHiccup.jar"
+  if [ -s "$SA_PATH" ]; then
+    sa_stage "$SA_PATH" dist/jHiccup.jar
+  else
+    SA_EXPECTED="${SA_EXPECTED}dist/jHiccup.jar$PX_NL"
+    sa_fail "presence: $SA_PATH is absent: run build-jhiccup.sh, or drop jhiccup from" \
+      "PX_DIST_ARTIFACTS"
+  fi
+  SA_STAGED="${SA_STAGED}PX_STAGED_JHICCUP${PX_TAB}dist/jHiccup.jar$PX_NL"
+  ;;
+esac
 # Reject a build record compiled for a different HBase profile because its JARs target a different
 # compatibility module.
 if [ "$SA_PROFILE" != "$PX_PHOENIX_HBASE_PROFILE" ]; then

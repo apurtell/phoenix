@@ -14,35 +14,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Front end for capturing Java Flight Recorder sessions against selected cluster roles and staging
-# the resulting recordings alongside the run artifacts. Because round A6 implements the recording
-# workflow and its command-line options, this entry point responds to --help and rejects every
-# other invocation with the unsupported exit code.
+# This script implements the Java Flight Recorder collector. The start action begins a single
+# recording in the daemon JVM of each target instance using the jcmd utility from that instance's
+# JDK, and the stop action ends the recording and copies it into jfr/<role>-<index>.jfr within the
+# bundle.
+#
+# If an instance's JDK lacks jcmd, that target is skipped. This collector and px-trace-count are
+# the two collectors that report SKIP when a required tool is absent. The shared rules that every
+# collector follows are defined in lib/collect.sh.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/collect.sh
+. "$SELF/../lib/collect.sh"
 
 set -euo pipefail
+px_trap_enable
 
-## @description  Outputs the command-line usage documentation.
-## @return       Writes usage information to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: px-jfr [-h|--help]
+# These remote scripts are executed by ck_session_start and ck_session_stop. They accept the JDK,
+# the recording file path, the recording duration in seconds, and the recording name as positional
+# arguments. Because jcmd is a JVM process itself, its heap is kept small alongside the daemon.
+JFR_START_SCRIPT="$(
+  cat <<'SCRIPT_EOF'
+jcmd="$PX_JDK_ROOT/$1/bin/jcmd"
+[ -x "$jcmd" ] || exit 5
+mkdir -p "${2%/*}" || exit 1
+"$jcmd" -J-Xmx16m "$pid" JFR.start "name=$4" settings=profile "duration=${3}s" \
+  "filename=$2" || exit 1
+SCRIPT_EOF
+)"
+JFR_STOP_SCRIPT="$(
+  cat <<'SCRIPT_EOF'
+jcmd="$PX_JDK_ROOT/$1/bin/jcmd"
+[ -x "$jcmd" ] || exit 5
+"$jcmd" -J-Xmx16m "$pid" JFR.stop "name=$4" "filename=$2" || exit 1
+SCRIPT_EOF
+)"
 
-Takes Java Flight Recorder sessions against selected roles.
-Round A6 implements it.
-
-Exit codes: 0 help, 2 usage, 5 unsupported until round A6.
+px_cli_spec <<'EOF'
+about Records the daemon JVM of each target instance with Java Flight Recorder, the
++ settings profile, through jcmd of the JDK of the instance.
+about start begins the recordings; stop ends them and copies each one to
++ jfr/<role>-<index>.jfr of the bundle, with one row per target in
++ metrics/index.tsv and the verdict collector.jfr. A JDK without jcmd skips its
++ target.
+shared --cluster
+opt --run DIR CK_RUN | the bundle, default PX_RUN_DIR
+opt --targets LIST CK_TARGETS | the roles to record, comma separated, default
++ PX_COLLECT_TARGETS, else all
+opt --duration SECONDS CK_DURATION | the longest recording, default PX_TIMEOUT_DEFAULT
+sub start
+about begin one recording in each target
+sub stop
+about end the recordings and copy them into the bundle
+exits 0 also means skipped, 6 also no bundle, no services.tsv or no scope.
+example px-jfr start --run "$PX_RUN_DIR" --targets regionserver
 EOF
-}
 
-case "${1:-}" in
--h | --help)
-  usage
-  exit 0
-  ;;
--*) px_usage_error "unknown option: $1" ;;
-esac
-px_die "$PX_EXIT_UNSUPPORTED" "px-jfr arrives with round A6"
+px_cli_parse "$@"
+ck_main jfr
+JFR_STATUS=0
+if [ "$CK_ACTION" = start ]; then
+  ck_session_start jfr jfr "$JFR_START_SCRIPT" "Java Flight Recorder, settings profile" \
+    "px-$CK_RUN_ID" || JFR_STATUS=$?
+else
+  ck_session_stop jfr jfr "$JFR_STOP_SCRIPT" "px-$CK_RUN_ID" || JFR_STATUS=$?
+fi
+exit "$JFR_STATUS"

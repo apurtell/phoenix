@@ -130,10 +130,11 @@ PX_REQUIRE_QUIET_HOST    # 1 fails a run when the host is still busy after the w
 PX_QUIET_HOST_LOAD_PCT   # the load, a percent of the processors, of a quiet host
 PX_CONTAMINATION         # the causes that make the time results of a run ADVISORY
 
-# --- Resource collector -----------------------------------------------------
+# --- Collectors -------------------------------------------------------------
+PX_COLLECTORS            # the collectors px-run and px-collect start: none or a comma list
 PX_COLLECT_INTERVAL_S    # sampling interval of the resource collector
-PX_COLLECT_DURATION_S    # how long the collector samples, 0 means until stopped
-PX_COLLECT_TARGETS       # the roles the collector samples
+PX_COLLECT_TARGETS       # the roles the collectors target, comma separated, or all (every
+                         # service role except setup and the pherf group)
 
 # --- Test fixtures ----------------------------------------------------------
 # The self-test sets these. No shipped component reads them.
