@@ -22,6 +22,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.phoenix.pherf.PherfConstants;
@@ -34,6 +35,7 @@ import org.apache.phoenix.pherf.result.ResultManager;
 import org.apache.phoenix.pherf.result.RunTime;
 import org.apache.phoenix.pherf.result.ThreadTime;
 import org.apache.phoenix.pherf.rules.RulesApplier;
+import org.apache.phoenix.pherf.spi.Extensions;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.slf4j.Logger;
@@ -57,6 +59,7 @@ class MultiThreadedRunner implements Callable<Void> {
   private final WorkloadExecutor workloadExecutor;
   private final XMLConfigParser parser;
   private final boolean writeRuntimeResults;
+  private final Map<String, String> connectionProperties;
 
   /**
    * MultiThreadedRunner
@@ -65,6 +68,17 @@ class MultiThreadedRunner implements Callable<Void> {
     ThreadTime threadTime, long numberOfExecutions, long executionDurationInMs,
     boolean writeRuntimeResults, RulesApplier ruleApplier, Scenario scenario,
     WorkloadExecutor workloadExecutor, XMLConfigParser parser) {
+    this(threadName, query, dataModelResult, threadTime, numberOfExecutions, executionDurationInMs,
+      writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser,
+      scenario.getPhoenixProperties());
+  }
+
+  /** Constructs a runner that configures its query connections with the provided properties. */
+  MultiThreadedRunner(String threadName, Query query, DataModelResult dataModelResult,
+    ThreadTime threadTime, long numberOfExecutions, long executionDurationInMs,
+    boolean writeRuntimeResults, RulesApplier ruleApplier, Scenario scenario,
+    WorkloadExecutor workloadExecutor, XMLConfigParser parser,
+    Map<String, String> connectionProperties) {
     this.query = query;
     this.threadName = threadName;
     this.threadTime = threadTime;
@@ -77,6 +91,7 @@ class MultiThreadedRunner implements Callable<Void> {
     this.workloadExecutor = workloadExecutor;
     this.parser = parser;
     this.writeRuntimeResults = writeRuntimeResults;
+    this.connectionProperties = connectionProperties;
   }
 
   /**
@@ -145,12 +160,13 @@ class MultiThreadedRunner implements Callable<Void> {
     Long queryStartTime = EnvironmentEdgeManager.currentTimeMillis();
     Date startDate = Calendar.getInstance().getTime();
     String exception = null;
+    boolean failed = false;
     Long resultRowCount = 0L;
     String queryIteration = threadName + ":" + iterationNumber;
     Long queryElapsedTime = 0L;
 
     try {
-      conn = pUtil.getConnection(query.getTenantId(), scenario.getPhoenixProperties());
+      conn = pUtil.getConnection(query.getTenantId(), connectionProperties);
       conn.setAutoCommit(true);
       final String statementString = query.getDynamicStatement(ruleApplier, scenario);
       statement = conn.prepareStatement(statementString);
@@ -175,6 +191,7 @@ class MultiThreadedRunner implements Callable<Void> {
     } catch (Exception e) {
       LOGGER.error("Exception while executing query iteration " + queryIteration, e);
       exception = e.getMessage();
+      failed = true;
       throw e;
     } finally {
       getThreadTime().getRunTimesInMs().add(new RunTime(exception, startDate, resultRowCount,
@@ -183,6 +200,14 @@ class MultiThreadedRunner implements Callable<Void> {
       if (rs != null) rs.close();
       if (statement != null) statement.close();
       if (conn != null) conn.close();
+      // Close the connection first to ensure that a failure in a metrics sink cannot leak it.
+      if (Extensions.hasMetricsSinks()) {
+        String outcome =
+          failed ? "error" : queryElapsedTime > query.getTimeoutDuration() ? "timeout" : "ok";
+        Extensions.record("query", Extensions.tags("scenario", scenario.getName(), "query",
+          query.getId(), "tenant", query.getTenantId(), "outcome", outcome), queryElapsedTime,
+          resultRowCount);
+      }
     }
     return true;
   }

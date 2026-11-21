@@ -352,6 +352,7 @@ public class TenantOperationFactory {
         // Run the initialization operation.
         OperationStats stats = preRunOpSupplier.get().apply(preRunSample);
         LOGGER.info(phoenixUtil.getGSON().toJson(stats));
+        stats.recordMetrics();
         return stats.getStatus() == 0;
       } catch (Exception e) {
         LOGGER.error(String.format("Failed to initialize tenant. [%s, %s] ", tenantView.tenantId,

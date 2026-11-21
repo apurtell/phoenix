@@ -19,6 +19,7 @@ package org.apache.phoenix.pherf.result;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import javax.xml.bind.annotation.XmlAttribute;
 import javax.xml.bind.annotation.XmlRootElement;
 import org.apache.phoenix.pherf.configuration.DataModel;
@@ -27,6 +28,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 public class DataModelResult extends DataModel {
   private List<ScenarioResult> scenarioResult = new ArrayList<ScenarioResult>();
   private String zookeeper;
+  private Map<String, String> sections;
 
   public List<ScenarioResult> getScenarioResult() {
     return scenarioResult;
@@ -68,5 +70,18 @@ public class DataModelResult extends DataModel {
 
   public void setZookeeper(String zookeeper) {
     this.zookeeper = zookeeper;
+  }
+
+  /**
+   * Returns the entries produced by all registered report sections, keyed as NAME.KEY. This value
+   * remains null when no report section is registered so that the serialized report omits the
+   * sections element entirely.
+   */
+  public Map<String, String> getSections() {
+    return sections;
+  }
+
+  public void setSections(Map<String, String> sections) {
+    this.sections = sections;
   }
 }

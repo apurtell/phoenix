@@ -19,6 +19,7 @@ package org.apache.phoenix.pherf.result;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.phoenix.pherf.spi.Extensions;
 
 public class DataLoadTimeSummary {
   private List<TableLoadTime> tableLoadTime = new ArrayList<TableLoadTime>();
@@ -29,6 +30,9 @@ public class DataLoadTimeSummary {
 
   public void add(String tableName, int rowCount, int durationInMs) {
     tableLoadTime.add(new TableLoadTime(tableName, rowCount, durationInMs));
+    if (Extensions.hasMetricsSinks()) {
+      Extensions.record("load", Extensions.tags("table", tableName), durationInMs, rowCount);
+    }
   }
 }
 

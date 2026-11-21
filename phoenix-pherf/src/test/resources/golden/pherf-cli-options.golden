@@ -1,0 +1,42 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+disableSchemaApply|disableSchemaApply|false|false|Set to disable schema from being applied.
+disableRuntimeResult|disableRuntimeResult|false|false|Set to disable writing detailed CSV file during query execution. Those will eventually get written at the end of query execution.
+z|zookeeper|true|false|HBase Zookeeper address for connection. Default: localhost
+q|query|false|false|Executes multi-threaded query sets
+listFiles|listFiles|false|false|List available resource files
+mt|multi-tenant|false|false|Multi tenanted workloads based on load profiles.
+l|load|false|false|Pre-loads data according to specified configuration values.
+scenarioFile|scenarioFile|true|false|Regex or file name for the Test Scenario configuration .xml file to use.
+scenarioName|scenarioName|true|false|Regex or scenario name from the Test Scenario configuration .xml file to use.
+drop|drop|true|false|Regex drop all tables with schema name as PHERF. \nExample drop Event tables: -drop .*(EVENT).* Drop all: -drop .* or -drop all
+schemaFile|schemaFile|true|false|Regex or file name for the Test phoenix table schema .sql to use.
+m|monitor|false|false|Launch the stats profilers
+monitorFrequency|monitorFrequency|true|false|Override for frequency in Ms for which monitor should log stats. \n See pherf.default.monitorFrequency in pherf.properties
+rowCountOverride|rowCountOverride|true|false|Row count override to use instead of one specified in scenario.
+hint|hint|true|false|Executes all queries with specified hint. Example SMALL
+log_per_nrows|log_per_nrows|true|false|Default value to display log line after every 'N' row load
+diff|diff|false|false|Run pherf in verification mode and diff with exported results
+export|export|false|false|Exports query results to CSV files in CSV_EXPORT directory
+writerThreadSize|writerThreadSize|true|false|Override the default number of writer threads. See pherf.default.dataloader.threadpool in Pherf.properties.
+h|help|false|false|Get help on using this utility.
+d|debug|false|false|Put tool in debug mode
+stats|stats|false|false|Update Phoenix Statistics after data is loaded with -l argument
+label|label|true|false|Label a run. Result file name will be suffixed with specified label
+compare|compare|true|false|Specify labeled run(s) to compare
+useAverageCompareType|useAverageCompareType|false|false|Compare results with Average query time instead of default is Minimum query time.
+t|thin|false|false|Use the Phoenix Thin Driver
+s|server|true|false|The URL for the Phoenix QueryServer
+b|batchApi|false|false|Use JDBC Batch API for writes

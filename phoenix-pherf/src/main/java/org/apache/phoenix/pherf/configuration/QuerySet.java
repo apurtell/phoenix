@@ -19,6 +19,7 @@ package org.apache.phoenix.pherf.configuration;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import javax.xml.bind.annotation.XmlAttribute;
 import org.apache.phoenix.pherf.PherfConstants;
 
@@ -28,6 +29,7 @@ public class QuerySet {
   private long numberOfExecutions = PherfConstants.DEFAULT_NUMBER_OF_EXECUTIONS;
   private long executionDurationInMs = PherfConstants.DEFAULT_THREAD_DURATION_IN_MS;
   private ExecutionType executionType = ExecutionType.SERIAL;
+  private Map<String, String> phoenixProperties;
 
   /**
    * List of queries in each query set
@@ -123,5 +125,19 @@ public class QuerySet {
       stringBuilder.append(q.getStatement() + ",");
     }
     return stringBuilder.toString();
+  }
+
+  /**
+   * Returns the connection properties configured for this query set, which apply exclusively to its
+   * query connections. These properties override any scenario-level properties that share the same
+   * key. They are only applied during performance runs executed by MultiThreadedRunner using the
+   * thick driver, whereas -diff runs and the thin driver ignore them.
+   */
+  public Map<String, String> getPhoenixProperties() {
+    return phoenixProperties;
+  }
+
+  public void setPhoenixProperties(Map<String, String> phoenixProperties) {
+    this.phoenixProperties = phoenixProperties;
   }
 }

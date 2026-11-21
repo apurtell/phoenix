@@ -24,6 +24,7 @@ import org.apache.phoenix.pherf.result.file.ResultFileDetails;
 import org.apache.phoenix.pherf.result.impl.CSVFileResultHandler;
 import org.apache.phoenix.pherf.result.impl.XMLResultHandler;
 import org.apache.phoenix.pherf.rules.RulesApplier;
+import org.apache.phoenix.pherf.spi.Extensions;
 import org.apache.phoenix.util.InstanceResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,6 +95,7 @@ public class ResultManager {
     try {
       util.ensureBaseResultDirExists();
       final DataModelResult dataModelResultCopy = new DataModelResult(result);
+      dataModelResultCopy.setSections(Extensions.reportEntries(dataModelResultCopy));
       for (ResultHandler handler : resultHandlers) {
         util.write(handler, dataModelResultCopy, ruleApplier);
       }

@@ -26,7 +26,6 @@ import java.sql.Array;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.Date;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -54,6 +53,7 @@ import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.result.DataLoadTimeSummary;
 import org.apache.phoenix.pherf.rules.DataValue;
 import org.apache.phoenix.pherf.rules.RulesApplier;
+import org.apache.phoenix.pherf.spi.Extensions;
 import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.slf4j.Logger;
@@ -137,7 +137,7 @@ public class PhoenixUtil {
         LOGGER.debug("\nSetting tenantId to " + tenantId);
       }
       String url = "jdbc:phoenix:thin:url=" + queryServerUrl + ";serialization=PROTOBUF";
-      return DriverManager.getConnection(url, props);
+      return Extensions.connectionProvider().getConnection(url, props);
     } else {
       if (null == zookeeper) {
         throw new IllegalArgumentException("Zookeeper must be set before initializing connection!");
@@ -157,7 +157,7 @@ public class PhoenixUtil {
       }
 
       String url = "jdbc:phoenix:" + zookeeper + (testEnabled ? ";test=true" : "");
-      return DriverManager.getConnection(url, props);
+      return Extensions.connectionProvider().getConnection(url, props);
     }
   }
 

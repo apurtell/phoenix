@@ -61,6 +61,7 @@ public class TenantOperationWorkHandler
     stats.setHandlerId(handlerId);
     // TODO need to handle asynchronous result publishing
     LOGGER.info(operationFactory.getPhoenixUtil().getGSON().toJson(stats));
+    stats.recordMetrics();
   }
 
   @Override

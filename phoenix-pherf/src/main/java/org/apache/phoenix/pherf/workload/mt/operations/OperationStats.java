@@ -20,6 +20,7 @@ package org.apache.phoenix.pherf.workload.mt.operations;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.phoenix.pherf.result.ResultValue;
+import org.apache.phoenix.pherf.spi.Extensions;
 import org.apache.phoenix.pherf.workload.mt.generators.TenantOperationInfo;
 
 /**
@@ -109,5 +110,20 @@ public class OperationStats {
 
   public void setHandlerId(String handlerId) {
     this.handlerId = handlerId;
+  }
+
+  /**
+   * Publishes this operation to the active metrics sinks. This method should be invoked at the
+   * point where Pherf logs the operation as JSON; because it introduces no additional fields, the
+   * serialized JSON output remains unchanged.
+   */
+  public void recordMetrics() {
+    if (Extensions.hasMetricsSinks()) {
+      Extensions.record("operation",
+        Extensions.tags("scenario", getScenarioName(), "operation", getOperationGroup(), "type",
+          getOpType().name(), "tenant", getTenantId(), "tenant_group", getTenantGroup(), "status",
+          String.valueOf(status)),
+        durationInMs, rowCount);
+    }
   }
 }

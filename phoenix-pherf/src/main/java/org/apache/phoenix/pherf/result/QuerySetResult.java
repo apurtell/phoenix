@@ -30,6 +30,7 @@ public class QuerySetResult extends QuerySet {
     this.setNumberOfExecutions(querySet.getNumberOfExecutions());
     this.setExecutionDurationInMs(querySet.getExecutionDurationInMs());
     this.setExecutionType(querySet.getExecutionType());
+    this.setPhoenixProperties(querySet.getPhoenixProperties());
   }
 
   public QuerySetResult() {

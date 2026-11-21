@@ -18,6 +18,7 @@
 package org.apache.phoenix.pherf.workload;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -236,11 +237,29 @@ public class QueryExecutor implements Workload {
     if (workloadExecutor.isPerformance()) {
       thread = new MultiThreadedRunner(threadTime.getThreadName(), queryResult, dataModelResult,
         threadTime, querySet.getNumberOfExecutions(), querySet.getExecutionDurationInMs(),
-        writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser);
+        writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser,
+        connectionProperties(scenario, querySet));
     } else {
       thread = new MultithreadedDiffer(threadTime.getThreadName(), queryResult, threadTime,
         querySet.getNumberOfExecutions(), querySet.getExecutionDurationInMs());
     }
     return thread;
+  }
+
+  /**
+   * Resolves the effective connection properties for the query connections of a given query set.
+   * Any property defined on the query set overrides the corresponding scenario property sharing the
+   * same key, while leaving the underlying source maps unmodified.
+   */
+  static Map<String, String> connectionProperties(Scenario scenario, QuerySet querySet) {
+    if (querySet.getPhoenixProperties() == null) {
+      return scenario.getPhoenixProperties();
+    }
+    Map<String, String> properties = new HashMap<>();
+    if (scenario.getPhoenixProperties() != null) {
+      properties.putAll(scenario.getPhoenixProperties());
+    }
+    properties.putAll(querySet.getPhoenixProperties());
+    return properties;
   }
 }

@@ -81,6 +81,7 @@ public class RendezvousingWorkHandler
       rendezvousPoints.get(PherfConstants.MT_HANDLER_RESULTS_RENDEZVOUS_PROP_KEY).await();
     }
     LOGGER.info(operationFactory.getPhoenixUtil().getGSON().toJson(stats));
+    stats.recordMetrics();
   }
 
   @Override
