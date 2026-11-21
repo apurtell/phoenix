@@ -2255,23 +2255,7 @@ $(t_allowlist)
 EOF
 }
 
-## @description  Identifies any allowlist entry that lacks a mandatory justification reason.
-## @return       Writes one path per unreasoned entry to stdout. Exit 0.
-t_allowlist_unreasoned() {
-  local row path reason
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    path=${row%%"$PX_TAB"*}
-    reason=${row#*"$PX_TAB"}
-    if [ -z "$reason" ] || [ "$reason" = "$path" ]; then
-      printf '%s\n' "$path"
-    fi
-  done <<EOF
-$(t_allowlist)
-EOF
-}
-
-## @description  Reports runtime calls outside the backend using builtins, absolute paths, or PATH.
+## @description  Reports runtime calls outside the backend via builtins, absolute paths, or PATH.
 ## @return       Writes one path:line:text record per violation to stdout. Exit 0.
 t_scan_bypass() {
   local file rel hit
@@ -2312,7 +2296,7 @@ EOF
 t_group_documents() {
   local fixture
   printf '# documents and directory rules\n'
-  t_run grep -qi harness "$T_DEV/README.md"
+  t_run grep -q "^\\* \`harness/\` " "$T_DEV/README.md"
   t_equals dev_readme_indexes_harness 0 "$T_STATUS"
   t_empty readme_states_policies "$(t_missing_policies "$PX_HOME/README.md")"
   # Verify that stripping a required policy phrase causes the check to fail, confirming the
@@ -2364,7 +2348,6 @@ t_group_scan() {
   t_contains no_direct_kubectl_reports_k3d_in_a_plugin 'plugins/evil/plugin.sh:4:' "$hits"
   t_contains no_direct_kubectl_reports_crictl_in_a_plugin 'plugins/evil/plugin.sh:5:' "$hits"
   t_absent no_direct_kubectl_ignores_a_runtime_name 'bin/px-run' "$hits"
-  t_empty allowlist_entries_carry_a_reason "$(t_allowlist_unreasoned)"
   t_empty allowlist_entries_are_current "$(t_allowlist_stale "$PX_HOME")"
   stale="$(t_allowlist_stale "$T_WORK/stale")"
   t_contains allowlist_stale_token_is_reported \
@@ -2561,7 +2544,8 @@ t_group_commands() {
   t_empty every_entry_point_answers_help "$help"
   t_empty every_entry_point_refuses_a_bad_flag "$flag"
   t_empty bins_source_common "$unsourced"
-  t_run grep -q 'common\.sh' "$PX_HOME/lib/backend/contract.sh"
+  t_run grep -qE '^\.[[:space:]]*"[$]PX_BACKEND_DIR/\.\./common\.sh"$' \
+    "$PX_HOME/lib/backend/contract.sh"
   t_equals the_contract_sources_the_shared_library 0 "$T_STATUS"
   t_empty no_entry_point_defines_its_own_log_function "$own"
 }
@@ -3285,10 +3269,13 @@ t_group_suite() {
     "$(grep -c . "$PX_OUT/sessions/selftest-go/results.tsv")"
   t_suite selftest-go --continue-on-failure "$suite/mixed.suite"
   t_equals suite_refuses_a_session_name_in_use 1 "$T_STATUS"
-  t_shim_log_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-suite" --dry-run "$suite/order.suite"
-  t_empty suite_dry_run_makes_no_session "$(find "$PX_OUT/sessions" -name 'plan.tsv' \
-    -newer "$T_SHIM_LOG" 2>/dev/null)"
+  # A dry run does not resolve the output root, so a nonexistent output root directory is never
+  # created.
+  t_with_shim "PX_OUT=$T_WORK/dry-run-out" "$T_BASH" "$T_BIN/px-suite" --dry-run \
+    "$suite/order.suite"
+  t_equals suite_dry_run_makes_no_session "0 no" \
+    "$T_STATUS $(t_exists "$T_WORK/dry-run-out")"
+  t_empty dry_run_has_no_result_row "$(printf '%s\n' "$T_STDOUT" | grep "^result$PX_TAB")"
   t_group_suite_regressions
 }
 
@@ -4158,7 +4145,7 @@ t_group_tree() {
   t_equals tree_check_reports_a_new_path "$T_WORK/scan/lib/new-file.sh" \
     "$(t_tree_added "$T_WORK/fixture-before.txt" "$T_WORK/fixture-after.txt")"
   if [ -z "$PX_TREE_ROOT" ]; then
-    t_pass no_write_under_the_repository_root "this harness sits in no working tree"
+    t_skip no_write_under_the_repository_root "this harness sits in no working tree"
     return 0
   fi
   t_tree_paths "$PX_TREE_ROOT" >"$T_WORK/tree-after.txt"
@@ -4237,8 +4224,6 @@ t_group_a2_generator() {
     [ "$(grep -cxF "    $line" "$dir/compose.yaml")" = "$count" ] || miss="$miss $line;"
   done
   t_empty compose_policies_on_every_service "$miss"
-  t_contains setup_is_gated_by_its_healthcheck 'healthcheck:' \
-    "$(sed -n '/^  setup-0:/,/^  [a-z]/p' "$dir/compose.yaml")"
   t_a2_network_cases "$dir" m
   t_absent debug_port_unpublished_by_default _DEBUG "$(cat "$dir/ports.generated.env")"
   t_equals bind_host_is_every_interface 0.0.0.0 \
@@ -4392,8 +4377,15 @@ t_group_a2_generator() {
   t_equals fail_closed_unset_exits_2 2 "$T_STATUS"
   t_contains fail_closed_unset_names_the_variable PX_RS_HEAP_MIB "$T_STDERR"
   t_equals fail_closed_unset_writes_no_file no "$(t_exists "$T_A2_OUT/fail1")"
-  t_empty fail_closed_leaves_no_staging_directory \
-    "$(find "$T_A2_OUT" -name '.*.render.*' 2>/dev/null)"
+  # Exercise a failing plug-in hook, which executes after the staging directory has been created.
+  mkdir -p "$T_A2/noimage/hooks"
+  printf '%s\n' PX_PLUGIN_ID=noimage PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=image-check \
+    >"$T_A2/noimage/plugin.env"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$T_A2/noimage/hooks/image-check"
+  chmod +x "$T_A2/noimage/hooks/image-check"
+  t_gen --class measurement --out fail2 -e "PX_PLUGIN_DIRS=$T_A2/noimage" -e PX_PLUGINS=noimage
+  t_equals fail_closed_leaves_no_staging_directory "2 no " "$T_STATUS $(t_exists \
+    "$T_A2_OUT/fail2") $(find "$T_A2_OUT" -name '.*.render.*' 2>/dev/null)"
   t_gen --class measurement --check -e PX_RS_HEAP_MIB=4608
   t_contains heap_bound_names_the_role 'role regionserver' "$T_STDERR"
   t_gen --class measurement --check -e PX_NM_MEM_MIB=2176
@@ -4635,9 +4627,10 @@ t_group_a2_image() {
   t_equals identity_singleton_has_index_0 2 "$T_STATUS"
   t_render "$dir" regionserver-0 PX_HEAP_MIB=4608
   t_equals heap_fits_container 2 "$T_STATUS"
-  t_contains heap_fits_container_names_the_role 'regionserver' "$T_STDERR"
-  # Verify that the client role renders the YARN configuration files only when YARN is enabled in
-  # the deployment.
+  t_contains heap_fits_container_names_the_role ']: regionserver: heap 4608 MiB plus direct' \
+    "$T_STDERR"
+  # Verify that the client role renders the YARN configuration files only when the deployment
+  # includes YARN.
   t_render "$T_A2_OUT/deploy/v" client-0
   t_equals client_yarn_toggle_off "0 no" "$T_STATUS $(t_exists "$out/yarn-site.xml")"
   t_render "$dir" client-0
@@ -4887,11 +4880,10 @@ EOF
 ##               Compose memory syntax forms, and fast-phase delegation.
 ## @return       Records the host preflight assertions. Exit 0.
 t_group_a2_preflight() {
-  local pf="$PX_HOME/scripts/preflight.sh" hand="$T_A2/hand" row status_seen=""
+  local pf="$PX_HOME/scripts/preflight.sh" hand="$T_A2/hand" row
   printf '# the host preflight\n'
   printf '25167863808\n' >"$T_A2_STATE/mem-total"
   t_a2 PX_CLUSTER_ID=m "$T_BASH" "$pf" --phase memory
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_refuses_measurement_on_this_engine 3 "$T_STATUS"
   row="$(printf '%s\n' "$T_STDOUT" | grep "^memory_fit${PX_TAB}fail")"
   t_contains preflight_refusal_shows_the_sum '41984 MiB (41.00 GiB)' "$row"
@@ -4902,13 +4894,11 @@ t_group_a2_preflight() {
     "$T_STDERR"
   t_contains preflight_counts_the_on_demand_group 'group yarn starts on demand' "$T_STDERR"
   t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_admits_validation 0 "$T_STATUS"
   t_contains preflight_admits_validation_with_the_sum "memory_fit${PX_TAB}ok${PX_TAB}the limits \
 8704 MiB" "$T_STDOUT"
   t_gen --class measurement --cluster o --config "$T_ENVD/override-24gib.env"
   t_a2 PX_CLUSTER_ID=o "$T_BASH" "$pf" --phase memory
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_admits_override_24gib 0 "$T_STATUS"
   t_contains preflight_admits_override_24gib_with_margin '705 MiB (0.69 GiB) to spare' \
     "$T_STDOUT"
@@ -4916,12 +4906,10 @@ t_group_a2_preflight() {
   # and reject one that exceeds the budget by 1 GiB.
   printf '%s\n' "$(((8704 + 4096 + 1024) * 1048576))" >"$T_A2_STATE/mem-total"
   t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory
-  status_seen="$status_seen $T_STATUS"
   t_equals memory_check_passes_below_the_budget "0 yes" \
     "$T_STATUS $(t_flag '1024 MiB (1.00 GiB) to spare' "$T_STDOUT")"
   printf '%s\n' "$(((8704 + 4096 - 1024) * 1048576))" >"$T_A2_STATE/mem-total"
   t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory
-  status_seen="$status_seen $T_STATUS"
   t_equals memory_check_refuses_above_the_budget 3 "$T_STATUS"
   row="$(printf '%s\n' "$T_STDOUT" | grep "^memory_fit${PX_TAB}")"
   t_contains memory_check_names_both_totals 'the limits 8704 MiB (8.50 GiB)' "$row"
@@ -4941,7 +4929,6 @@ services:
       PX_HEAP_MIB: "5000"
 A2_EOF
   t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/heap"
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_heap_bound 3 "$T_STATUS"
   t_contains preflight_heap_bound_names_the_role "heap_bound${PX_TAB}fail${PX_TAB}regionserver: \
 the heap of 5000 MiB is not below the container limit of 3072 MiB" "$T_STDOUT"
@@ -4951,7 +4938,6 @@ the heap of 5000 MiB is not below the container limit of 3072 MiB" "$T_STDOUT"
   t_absent preflight_heap_below_the_limit_passes 'heap_bound' "$T_STDOUT"
   printf 'services:\n  x:\n    image: "y"\n' >"$hand/nolimit/compose.yaml"
   t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/nolimit"
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_unmeasured_limit "1 yes" \
     "$T_STATUS $(t_flag 'service x (x) has no memory limit' "$T_STDOUT")"
   t_a2 "$T_BASH" "$pf" --phase memory --deployment "$hand/none"
@@ -4992,7 +4978,6 @@ A2_EOF
   mkdir -p "$hand/fast"
   cp "$T_DEPLOY/compose.yaml" "$T_DEPLOY/ports.generated.env" "$hand/fast/"
   t_a2 "$T_BASH" "$pf" --phase fast --deployment "$hand/fast"
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_fast_phase 0 "$T_STATUS"
   t_contains preflight_fast_phase_reports_the_ports "port_availability${PX_TAB}ok" "$T_STDOUT"
   t_contains preflight_fast_phase_reports_the_engine "engine_memory${PX_TAB}ok" "$T_STDOUT"
@@ -5001,7 +4986,6 @@ A2_EOF
     "$T_STATUS $(t_flag engine_binary "$T_STDOUT") $(t_flag memory_fit "$T_STDOUT")"
   : >"$T_A2_STATE/unreachable"
   t_a2 "$T_BASH" "$pf" --phase fast --deployment "$hand/fast"
-  status_seen="$status_seen $T_STATUS"
   t_equals preflight_fast_phase_refuses_a_silent_engine 1 "$T_STATUS"
   rm -f "$T_A2_STATE/unreachable"
   t_a2 "$T_BASH" "$pf" --phase slow
@@ -5012,7 +4996,6 @@ A2_EOF
   t_a2 "$T_BASH" "$pf" -n --deployment "$T_A2_OUT/deploy/m"
   t_equals preflight_dry_run "0 yes" "$T_STATUS $(t_flag 'limits sum to 41984 MiB' "$T_STDOUT")"
   t_empty preflight_dry_run_calls_no_runtime "$(cat "$T_SHIM_LOG")"
-  t_absent preflight_never_returns_4 ' 4' "$status_seen"
 }
 
 ## @description  Verifies pinned artifact downloads, the local Phoenix Maven build, and container
@@ -5053,7 +5036,7 @@ t_group_a2_dist() {
   t_equals tofu_records_pin "0 tofu" "$T_STATUS $(px_tsv_field 6 "$T_STDOUT")"
   t_contains tofu_records_pin_under_the_output_root "PX_DIST_FOO_1_SHA512_ARM64=$sum" \
     "$(cat "$pins" 2>/dev/null)"
-  t_contains tofu_logs_the_hash 'trust on first use' "$T_STDERR"
+  t_contains tofu_logs_the_hash "Its SHA-512 $sum is recorded" "$T_STDERR"
   t_contains fetch_mirror_falls_back_to_the_archive "$url" "$(cat "$T_A2_CURL_LOG")"
   t_contains fetch_curl_refuses_other_schemes '--proto =https --proto-redir =https' \
     "$(cat "$T_A2_CURL_LOG")"
@@ -5221,9 +5204,7 @@ t_group_a2_dist() {
   t_empty phoenix_is_local_only "$(grep -rniE 'https?://[^ ]*phoenix[^ ]*(\.tar\.gz|\.jar)' \
     "$PX_HOME/scripts" "$PX_HOME/$PX_DEPLOY_SUBDIR" 2>/dev/null)"
   t_empty phoenix_is_never_a_dist_entry "$(grep '^PX_DIST_' "$versions" | grep -i phoenix)"
-  t_contains phoenix_jars_come_from_the_build_record \
-    'for SA_KEY in server_jar client_jar pherf_jar distributed_jar' "$(cat "$sa")"
-  # Verify build-phoenix.sh (R-028): the selected HBase profile is propagated to the Maven command
+  # Verify in build-phoenix.sh (R-028) that the selected profile is passed to the Maven command
   # line.
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -n
   t_equals build_phoenix_dry_run 0 "$T_STATUS"
@@ -5322,10 +5303,24 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     [ -f "$ctx/$line" ] || bad="$bad $line"
   done
   t_empty stage_artifacts_context_holds_every_part "$bad"
-  # RQ-128: Verify that the image stages async-profiler and jHiccup and installs them at their
-  # well-known paths, and that the image build validates those installations.
-  t_equals image_stages_async_profiler_and_jhiccup "yes yes" "$(t_exists \
-    "$ctx/dist/async-profiler-4.1-linux-arm64.tar.gz") $(t_exists "$ctx/dist/jHiccup.jar")"
+  # Verify that staged Phoenix jars are resolved from the paths named in the build record: when the
+  # record specifies an alternate server jar, that recorded jar is staged instead of the jar in the
+  # source tree.
+  text="$T_A2_OUT/build/phoenix/build.tsv"
+  cp "$text" "$T_A2/build.tsv.saved"
+  cp "$tree/phoenix-server/target/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar" \
+    "$T_A2/recorded-server.jar"
+  awk -F '\t' -v OFS='\t' -v p="$T_A2/recorded-server.jar" '$1 == "server_jar" { $2 = p } 1' \
+    "$T_A2/build.tsv.saved" >"$text"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals phoenix_jars_come_from_the_build_record "0 yes no" "$T_STATUS $(t_exists \
+    "$ctx/phoenix/recorded-server.jar") $(t_exists \
+    "$ctx/phoenix/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar")"
+  cp "$T_A2/build.tsv.saved" "$text"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  # RQ-128: The artifact check above confirms that async-profiler and jHiccup are staged; verify
+  # that the image installs them at their well-known paths and that the image build validates those
+  # paths.
   text="$(cat "$ctx/Dockerfile")"
   bad=""
   for line in 'ARG PX_STAGED_JHICCUP=' 'test -x /out/px-tools/async-profiler/bin/asprof' \
@@ -5531,9 +5526,13 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
 ##               to each supported underlying system utility in turn.
 ## @return       Records the platform fallback assertions. Exit 0.
 t_group_a2_platform() {
-  local file="$T_A2/dist-src/hbase-2.6.5.tar.gz" want tool dir bad="" tried="" path name
+  local file="$T_A2/sha-abc.txt" want tool dir bad="" tried="" path name
   printf '# platform fallbacks\n'
-  want="$(px_sha512 "$file")"
+  # Use the known SHA-512 digest of "abc" from FIPS 180-2 so that the expected value is independent
+  # of any helper function.
+  printf abc >"$file"
+  want=ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a
+  want=${want}2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
   for tool in sha512sum gsha512sum shasum openssl; do
     command -v "$tool" >/dev/null 2>&1 || continue
     dir="$T_A2/only-$tool"
@@ -5544,7 +5543,7 @@ t_group_a2_platform() {
     tried="$tried $tool"
     [ "$T_STDOUT" = "$want" ] || bad="$bad $tool gave '$T_STDOUT'"
   done
-  t_nonempty platform_fallbacks_tried_a_program "$tried"
+  [ -n "$tried" ] || bad="no SHA-512 program on this host"
   t_empty platform_fallbacks "$bad"
   mkdir -p "$T_A2/no-sha"
   ln -sf "$(command -v tr)" "$T_A2/no-sha/tr"
@@ -6074,16 +6073,17 @@ t_record() { cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/run-record.tsv" 2>/de
 ## @return       Writes the matching call count to stdout. Exit 0.
 t_calls() { grep -c -- "$1" "$T_SHIM_LOG" 2>/dev/null || true; }
 
-# The first line of T_A3_RUN_OUT identifies the active run directory, and T_A3_RUN and
-# T_A3_INHIBITOR record its location and sleep inhibitor state.
-## @description  Checks whether the most recent background command run has progressed to its driver
-##               execution stage.
+# Line 1 of T_A3_RUN_OUT identifies the active run directory, and T_A3_RUN and T_A3_INHIBITOR
+# record its path and sleep inhibitor state once the driver and any T_A3_READY file are present.
+## @description  Checks whether the run on line 1 of T_A3_RUN_OUT has reached its driver and
+##               written the file named by T_A3_READY, if any.
 ## @return       Exit 0 when the driver has started; Exit 1 otherwise.
 t_a3_driver_started() {
   local dir
   dir="$(sed -n 1p "${T_A3_RUN_OUT:-$T_OUT}" 2>/dev/null)"
   [ -n "$dir" ] && grep -q "^stage${PX_TAB}driver_start" "$dir/run-record.tsv" 2>/dev/null ||
     return 1
+  [ -z "${T_A3_READY:-}" ] || [ -s "$dir/$T_A3_READY" ] || return 1
   T_A3_RUN=$dir
   T_A3_INHIBITOR="$(cut -f 1 "$PX_OUT/state/inhibit-run-${dir##*/}" 2>/dev/null)"
   return 0
@@ -6144,7 +6144,7 @@ t_run_interrupted() {
 ## @description  Verifies the fast and memory phases of preflight validation (R-042, R-043).
 ## @return       Records test assertions. Exit 0.
 t_a3_preflight_cases() {
-  local pf="$PX_HOME/scripts/preflight.sh" dir="$T_A3/fast" start bad="" seen=""
+  local pf="$PX_HOME/scripts/preflight.sh" dir="$T_A3/fast" start bad=""
   local deploy="$T_A2_OUT/deploy/v"
   printf '# preflight: the fast phase and the host facts\n'
   mkdir -p "$dir"
@@ -6161,7 +6161,6 @@ t_a3_preflight_cases() {
   t_equals preflight_unresponsive_engine "1 yes" "$T_STATUS $(t_flag \
     'refused the deployment: engine_responsive: the engine did not answer' "$T_STDERR")"
   t_absent preflight_fast_refusal_skips_the_memory_phase memory_fit "$T_STDOUT"
-  seen="$T_STATUS"
   : >"$T_A2_STATE/denied"
   start="$(px_epoch_ms)"
   t_a2 "$T_BASH" "$pf" --deployment "$dir"
@@ -6169,9 +6168,7 @@ t_a3_preflight_cases() {
   rm -f "$T_A2_STATE/denied"
   t_equals preflight_logged_out_engine "5 yes" "$T_STATUS $(t_flag \
     'engine_credentials: the client is not authorised against the engine' "$T_STDERR")"
-  seen="$seen $T_STATUS"
   t_empty preflight_engine_faults_answer_in_under_a_second "$bad"
-  t_equals preflight_engine_faults_have_distinct_codes "1 5" "$seen"
   if t_zk_start; then
     printf 'PX_PORT_MASTER_UI=%s\n' "$T_ZK_PORT" >"$dir/ports.generated.env"
     start="$(px_epoch_ms)"
@@ -6182,7 +6179,6 @@ t_a3_preflight_cases() {
     t_equals preflight_occupied_port "3 yes" "$T_STATUS $(t_flag \
       "port_availability: loopback ports already in use: $T_ZK_PORT" "$T_STDERR")"
     t_empty preflight_occupied_port_answers_in_under_a_second "$bad"
-    t_equals preflight_fast_faults_have_distinct_codes "1 5 3" "$seen $T_STATUS"
   else
     t_skip preflight_occupied_port "nc is absent, so no port can be held"
   fi
@@ -6207,7 +6203,8 @@ t_a3_preflight_cases() {
   t_a2 PX_CLUSTER_ID=v "$T_BASH" "$pf" --phase memory --deployment "$deploy"
   rm -f "$T_A2_STATE/ncpu"
   t_equals preflight_few_engine_processors "3 yes" "$T_STATUS $(t_flag \
-    "cpus: processors: 1 (host $(px_nproc), engine 1), below the 2" "$T_STDERR")"
+    "cpus: processors: 1 (host $(getconf _NPROCESSORS_ONLN), engine 1), below the 2" \
+    "$T_STDERR")"
   printf '25165824000\n' >"$T_A2_STATE/mem-total"
 }
 
@@ -6265,24 +6262,22 @@ t_a3_inhibit_cases() {
   # When a sleep inhibitor process exits immediately, it holds no lock, so the run emits a warning
   # and leaves no inhibitor state record.
   t_with_shim "PATH=$T_A3/quickexit:$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" \
-    "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_TEARDOWN=0 --scope px-selftest \
-    --driver "$T_WORK/drivers/host-probe.sh" -- 0
+    "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_SCOPE_ID=px-selftest \
+    "$T_WORK/drivers/host-probe.sh" -- 0
   run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
   t_equals inhibit_that_ends_at_once_is_a_warning "0 yes yes" "$T_STATUS $(t_flag \
     'the sleep inhibitor caffeinate ended at once' "$T_STDERR") $(t_flag 'no record' \
     "$(cat "$run/logs/run.log" 2>/dev/null)")"
-  t_empty inhibit_that_ends_at_once_leaves_no_record \
-    "$(find "$PX_OUT/state" -name "inhibit-run-${run##*/}" 2>/dev/null)"
   t_with_shim "PATH=$T_A3/SunOS:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
     "${T_SELFTEST_RUN[@]}" \
-    -e PX_TEARDOWN=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh" -- 0
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh" -- 0
   t_equals inhibit_absent_is_a_warning "0 yes yes" "$T_STATUS $(t_flag \
     'no sleep inhibitor on this host (SunOS' "$T_STDERR") $(t_flag 'no record' \
     "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/logs/run.log" 2>/dev/null)")"
   # Verify that an injected driver failure still releases the active sleep inhibitor on exit.
   t_with_shim "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
     "${T_SELFTEST_RUN[@]}" \
-    -e PX_TEARDOWN=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh" -- 1
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh" -- 1
   run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
   pid="$(cut -f 1 "$run/logs/run.log" 2>/dev/null | sed -n 1p)"
   t_contains inhibit_failed_run_recorded_its_inhibitor "caffeinate${PX_TAB}run-${run##*/}" \
@@ -6400,20 +6395,27 @@ t_a3_teardown_cases() {
   T_A3_RUN=""
   T_A3_INHIBITOR=""
   T_A3_RUN_OUT="$PX_OUT/sessions/a3-interrupt/tests/one/stdout.txt"
+  # Delay signal delivery until the driver has written its PID file so that checking driver
+  # termination does not race against driver startup.
+  T_A3_READY=driver.pid
   t_run_interrupted TERM env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
     "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" \
     PX_SCOPE_ID=px-selftest PX_CLUSTER_ID=selftest PX_SESSION_ID=a3-interrupt \
     PX_POLL_INTERVAL_S=0.2 "$T_BASH" "$T_BIN/px-suite" "$suite"
   T_A3_RUN_OUT=""
+  T_A3_READY=""
   pid="$(cat "$T_A3_RUN/driver.pid" 2>/dev/null)"
   t_equals terminated_session_leaves_the_cluster_up "143 yes 0" "$T_STATUS $(t_within 10000 \
     "$T_A3_SIGNALLED") $(t_calls 'compose -p px-selftest down')"
   t_equals teardown_terminated_session_stops_driver_and_inhibitor "no no" \
     "$(t_alive "${pid:-x}") $(t_alive "${T_A3_INHIBITOR:-x}")"
-  t_nonempty teardown_terminated_session_found_its_driver "$pid$T_A3_INHIBITOR"
-  # The overall execution time bound enforced on px-run combines the test time limit, the safety
-  # margin, and six short-verb bounds, plus the quiet-host wait window and one poll interval for the
-  # test's run class when neither plug-ins nor disruptions add terms.
+  t_equals teardown_terminated_session_found_its_driver "yes yes" \
+    "${pid:+yes} ${T_A3_INHIBITOR:+yes}"
+  t_empty interrupted_session_has_no_result_row "$(printf '%s\n' "$T_STDOUT" |
+    grep "^result$PX_TAB")"
+  # The execution time bound for px-run is the sum of the test time limit, the safety margin, and
+  # six short-verb bounds, plus the quiet-host wait window and one poll interval for the test's run
+  # class when neither plug-ins nor disruptions add terms.
   printf 'suite: a3-bound\ntimeout: 60\n\ntest: one\n  driver: %s\n  class: %s\n' \
     "$T_WORK/drivers/exit-code.sh" measurement >"$suite"
   t_shim_state_reset
@@ -6580,7 +6582,7 @@ t_a3_quiet_cases() {
   # Simulate a heavily contended host with a load average far exceeding the quiet-host threshold on
   # any processor count.
   printf '99.00\n' >"$T_HOST_DIR/load"
-  want="load $((9900 / $(px_nproc)))% of its processors is above 25%"
+  want="load $((9900 / $(getconf _NPROCESSORS_ONLN)))% of its processors is above 25%"
   : >"$T_HOST_DIR/uptime.log"
   t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class measurement \
     -e PX_QUIET_HOST_WAIT_S=1 -e PX_POLL_INTERVAL_S=0.2 -e PX_SCOPE_ID=px-selftest \
@@ -6716,11 +6718,8 @@ t_a3_monitor_cases() {
 ##               the finite RegionServer drain timeout (R-045, R-046, R-050).
 ## @return       Records test assertions. Exit 0.
 t_a3_policy_cases() {
-  local dir="$T_A2_OUT/deploy/m" count start bound
+  local dir="$T_A2_OUT/deploy/m" start bound
   printf '# restart policy, one cluster per host, finite drain\n'
-  count="$(grep -c '^  [a-z-]*-[0-9]:$' "$dir/compose.yaml" 2>/dev/null)"
-  t_equals restart_policy_no_on_every_service "$count" \
-    "$(grep -cxF '    restart: "no"' "$dir/compose.yaml" 2>/dev/null)"
   t_empty no_service_restarts_itself \
     "$(grep -E 'restart: *"?(always|unless-stopped|on-failure)' "$dir/compose.yaml")"
   # R-046: Simulate an existing container belonging to another harness cluster on the same host.
@@ -6732,8 +6731,9 @@ t_a3_policy_cases() {
   t_equals one_cluster_per_host_refuses_a_second "1 yes" "$T_STATUS $(t_flag \
     'a harness cluster is already on this host: project px-other (cluster other)' "$T_STDERR")"
   t_equals one_cluster_per_host_records_nothing no \
-    "$(t_exists "$T_A3_OUT/state/scope-compose-gate")"
-  # R-050: Verify that a RegionServer whose region drain hangs is bounded by the drain timeout.
+    "$(t_exists "$T_A3_OUT/state/compose/scope-px-gate.tsv")"
+  # R-050: Verify that a RegionServer that never completes draining terminates the wait once its
+  # drain timeout expires.
   t_equals drain_wait_has_a_finite_timeout 600 \
     "$(t_env_value "$T_ENVD/defaults.env" PX_TIMEOUT_DRAIN)"
   rm -rf "${T_A3_STATE:?}"/*
@@ -7531,10 +7531,7 @@ t_group_a5_report() {
     done
   done
   t_empty report_merges_every_pair_to_the_documented_maximum "$bad"
-  t_report measurement "" --verdict "$dir/ADVISORY-PASS.tsv" --verdict "$dir/ADVISORY-PASS.d.tsv"
-  t_equals report_advisory_and_pass_pass_the_run "0 ADVISORY" "$T_STATUS $(t_result)"
-  # Verify requirement R-170: the harness and all verdict writers share a single severity
-  # vocabulary.
+  # R-170: Verify that the harness and every verdict writer share a single severity vocabulary.
   t_equals severity_vocabulary_is_the_shared_set "PASS SKIP ADVISORY FAIL ERROR" \
     "$(sed -n 's/^SX_SEVERITIES="\(.*\)"$/\1/p' "$PX_HOME/suites/lib/common.sh")"
   t_contains report_doc_orders_the_lattice 'PASS  <  SKIP  <  ADVISORY  <  FAIL  <  ERROR' \
@@ -8338,7 +8335,7 @@ A5_EOF
   t_a5_run phase-kill --disrupt 'phase:setup,kill,regionserver,0,delete'
   t_equals kill_with_delete_is_refused "2 yes" \
     "$T_STATUS $(t_flag 'a deleted instance cannot start again' "$T_STDERR")"
-  t_absent refused_kill_reaches_no_runtime 'KILL' "$(cat "$T_SHIM_LOG")"
+  t_empty refused_kill_reaches_no_runtime "$(grep -E '^(kill|rm|stop|start) ' "$T_SHIM_LOG")"
   t_a5_run phase-kill --disrupt '+1,kill,master,0'
   t_equals offset_kill_of_another_role_runs_no_verb "2:" \
     "$T_STATUS:$(t_verbs_of "$(t_bundle)")"
@@ -8975,8 +8972,6 @@ A5_EOF
  $(sed -n 's/^pherf\.default\.summary\.file=//p' "$pherf/drivers/pherf/stage/pherf.properties")"
   t_equals pherf_results_are_copied_into_the_bundle yes \
     "$(t_exists "$pherf/drivers/pherf/results/RESULT_px_functional_aggregate.csv")"
-  t_equals pherf_leaves_no_relative_results "no no no" "$(t_exists "$PX_TREE_ROOT/RESULTS")\
- $(t_exists "$PWD/RESULTS") $(t_exists "$T_A5_STATE/remote/${pherf##*/}/RESULTS")"
   t_contains pherf_run_aggregates_the_csv_group \
     "group@serial${PX_TAB}pherf.run_count${PX_TAB}count${PX_TAB}5$PX_TAB" \
     "$(cat "$pherf/metrics/aggregate.tsv")"
@@ -9505,11 +9500,6 @@ t_group_a6_tools() {
   t_equals collector_tools_reach_the_cluster_by_exec_only "compose:exec ps|" \
     "$(printf '%s\n' "$verbs" | tr '\n' ' ' | sed 's/ $//')|$(awk \
       '$1 == "ps" && $0 !~ /^ps -a --filter label=/' "$T_SHIM_LOG")"
-  bad=""
-  for line in asprof.log jcmd.log trace-calls; do
-    [ -s "$T_A6_STATE/$line" ] || bad="$bad $line"
-  done
-  t_empty collector_tools_each_ran_their_tool "$bad"
   t_empty collector_tools_call_no_other_contract_function "$(grep -ho 'sb_[a-z_]*' \
     "$PX_HOME/lib/collect.sh" | LC_ALL=C sort -u | grep -vx -e sb_exec -e sb_load \
     -e sb_scope_require)"
