@@ -35,6 +35,8 @@
         <include>io.opentelemetry:opentelemetry-context</include>
         <include>io.opentelemetry:opentelemetry-semconv</include>
         <include>io.opentelemetry.semconv:opentelemetry-semconv</include>
+        <!-- The client jars do not bundle BSON, so ship it here. -->
+        <include>org.mongodb:bson</include>
       </includes>
     </dependencySet>
   </dependencySets>

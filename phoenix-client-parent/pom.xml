@@ -154,6 +154,9 @@
                   <!-- Phoenix classes -->
                   <exclude>org/apache/phoenix/**</exclude>
                   <exclude>org/apache/omid/**</exclude>
+                  <!-- Do not relocate BSON. BSON columns take and return org.bson types through
+                       the JDBC API, so Phoenix and the application must use the same classes. -->
+                  <exclude>org/bson/**</exclude>
                 </excludes>
               </relocation>
               <relocation>

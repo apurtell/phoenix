@@ -132,6 +132,9 @@
                        splits the io.opentelemetry packages across two jars. -->
                   <exclude>io.opentelemetry:*</exclude>
                   <exclude>io.opentelemetry.semconv:*</exclude>
+                  <!-- Do not bundle BSON. The application supplies it, and BSON values pass
+                       between Phoenix and the application, so both must use one copy. -->
+                  <exclude>org.mongodb:bson</exclude>
                 </excludes>
               </artifactSet>
             </configuration>
