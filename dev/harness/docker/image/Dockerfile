@@ -23,7 +23,8 @@
 #     Dockerfile, the lifecycle scripts, and the lib/, bin/, and conf/ subdirectories.
 #   - The dist/ directory holds the upstream distribution release archives after fetch-dist.sh has
 #     verified them against their pins, together with the jHiccup JAR built by build-jhiccup.sh.
-#   - The phoenix/ directory holds the JAR artifacts produced by the local Phoenix build.
+#   - The phoenix/ directory holds the JAR artifacts produced by the local Phoenix build, together
+#     with the bson JAR required by the client.
 # Each staged file is passed into the build via a PX_STAGED_* build argument naming its relative
 # path in the build context, so this file contains no hardcoded artifact version numbers or file
 # names.
@@ -59,6 +60,7 @@ ARG PX_STAGED_JHICCUP=
 ARG PX_STAGED_PHOENIX_SERVER
 ARG PX_STAGED_PHOENIX_CLIENT
 ARG PX_STAGED_PHOENIX_PHERF
+ARG PX_STAGED_PHOENIX_BSON
 ARG PX_STAGED_PHOENIX_DISTRIBUTED=
 # Declare the expected component versions for the active version set, covering the standalone
 # Hadoop and HBase distributions as well as the ZooKeeper and Hadoop client JARs bundled under
@@ -82,15 +84,16 @@ COPY phoenix/ /stage/phoenix/
 # collectors locate them.
 RUN set -eu; \
     for name in PX_STAGED_HADOOP PX_STAGED_HBASE PX_STAGED_PHOENIX_SERVER \
-      PX_STAGED_PHOENIX_CLIENT PX_STAGED_PHOENIX_PHERF PX_HADOOP_VERSION PX_HBASE_VERSION \
-      PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION; do \
+      PX_STAGED_PHOENIX_CLIENT PX_STAGED_PHOENIX_PHERF PX_STAGED_PHOENIX_BSON \
+      PX_HADOOP_VERSION PX_HBASE_VERSION PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION; do \
       if [ -z "${!name:-}" ]; then echo "the build argument $name is required" >&2; exit 1; fi; \
     done; \
     mkdir -p /out/hadoop /out/hbase /out/phoenix/server /out/phoenix/client /out/px-tools; \
     tar -xzf "/stage/$PX_STAGED_HADOOP" -C /out/hadoop --strip-components=1; \
     tar -xzf "/stage/$PX_STAGED_HBASE" -C /out/hbase --strip-components=1; \
     cp "/stage/$PX_STAGED_PHOENIX_SERVER" /out/phoenix/server/; \
-    cp "/stage/$PX_STAGED_PHOENIX_CLIENT" "/stage/$PX_STAGED_PHOENIX_PHERF" /out/phoenix/client/; \
+    cp "/stage/$PX_STAGED_PHOENIX_CLIENT" "/stage/$PX_STAGED_PHOENIX_PHERF" \
+      "/stage/$PX_STAGED_PHOENIX_BSON" /out/phoenix/client/; \
     if [ -n "$PX_STAGED_PHOENIX_DISTRIBUTED" ]; then \
       cp "/stage/$PX_STAGED_PHOENIX_DISTRIBUTED" /out/phoenix/client/; fi; \
     if [ -n "$PX_STAGED_ASYNC_PROFILER" ]; then \

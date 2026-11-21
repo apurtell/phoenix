@@ -1633,7 +1633,10 @@ A2_EOF
 # A fixture that stands in for Maven. It records the JDK and the argument
 # list, and it writes the jar of each module of -pl under its real name, so a
 # build record names files that exist. With PX_FAKE_MVN_NO_SHADED set, it
-# writes no module jar. Without -pl it writes the product that the case names.
+# writes no module jar. With -pl it also writes the class path of
+# phoenix-core-client, which names an old bson jar of a local repository and
+# a jar with a similar name. With PX_FAKE_MVN_NO_BSON set, the class path names
+# no bson jar. Without -pl it writes the product that the case names.
 [ -z "${PX_FAKE_MVN_LOG:-}" ] || printf 'JAVA_HOME=%s %s\n' "${JAVA_HOME:-}" "$*" \
   >>"$PX_FAKE_MVN_LOG"
 printf '[INFO] fake build\n'
@@ -1658,6 +1661,23 @@ for module in ${list//,/ }; do
   [ -n "${PX_FAKE_MVN_NO_SHADED:-}" ] ||
     printf 'fake jar %s\n' "$module" >"$tree/$module/target/$jar"
 done
+if [ -n "$list" ]; then
+  repo=${tree%/*}/m2/org/mongodb
+  mkdir -p "$repo/bson/5.3.1" "$tree/phoenix-core-client/target"
+  printf 'fake bson\n' >"$repo/bson/5.3.1/bson-5.3.1.jar"
+  touch -t 201901010000 "$repo/bson/5.3.1/bson-5.3.1.jar"
+  cp="$repo/bson-record-codec/5.3.1/bson-record-codec-5.3.1.jar"
+  [ -n "${PX_FAKE_MVN_NO_BSON:-}" ] || cp="$cp:$repo/bson/5.3.1/bson-5.3.1.jar"
+  printf '%s\n' "$cp" >"$tree/phoenix-core-client/target/cached_classpath.txt"
+  # The root pom writes the test class path of every module, as build-classpath does: one line,
+  # no newline at its end. The test jars on it carry a log4j2-test configuration.
+  mkdir -p "$tree/phoenix-pherf/target/classes"
+  rm -f "$tree/phoenix-pherf/target/classes/mrapp-generated-classpath"
+  [ -n "${PX_FAKE_MVN_NO_PHERF_CP:-}" ] || printf '%s' "${tree%/*}/m2/javax/jaxb-api-2.3.1.jar:\
+$tree/phoenix-core/target/phoenix-core-5.4.0-SNAPSHOT-tests.jar:\
+${tree%/*}/m2/log4j/log4j-slf4j-impl-2.25.5.jar:${tree%/*}/m2/hbase/hbase-server-2.6.5-tests.jar" \
+    >"$tree/phoenix-pherf/target/classes/mrapp-generated-classpath"
+fi
 if [ -z "$list" ] && [ -n "${PX_FAKE_MVN_PRODUCT:-}" ]; then
   mkdir -p "$tree/${PX_FAKE_MVN_PRODUCT%/*}"
   printf 'fake product\n' >"$tree/$PX_FAKE_MVN_PRODUCT"
@@ -5230,6 +5250,10 @@ t_group_a2_dist() {
   t_equals build_phoenix_refuses_a_missing_jar "1 yes no" "$T_STATUS $(t_flag \
     "made no $tree/phoenix-server/target/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar" \
     "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/build.tsv")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_FAKE_MVN_NO_BSON=1 "$T_BASH" "$bp" --tree "$tree"
+  t_equals build_phoenix_refuses_a_class_path_without_bson "1 yes no" "$T_STATUS $(t_flag \
+    "$tree/phoenix-core-client/target/cached_classpath.txt does not name exactly one bson jar" \
+    "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/build.tsv")"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
   t_equals build_phoenix_builds_and_records 0 "$T_STATUS"
   t_contains build_phoenix_runs_maven_with_the_jdk "JAVA_HOME=$jdk " "$(cat "$T_A2_MVN_LOG")"
@@ -5242,6 +5266,17 @@ $tree/phoenix-client-parent/phoenix-client-embedded/target/\
 phoenix-client-embedded-hbase-2.6-5.4.0-SNAPSHOT.jar \
 $tree/phoenix-pherf/target/phoenix-pherf-5.4.0-SNAPSHOT.jar" \
     "$(t_build_record server_jar client_jar pherf_jar)"
+  # Because the shaded client JARs leave org.bson to the external classpath, the build record must
+  # capture the bson JAR resolved during the Maven build.
+  t_equals build_phoenix_records_the_bson_jar "$T_A2/m2/org/mongodb/bson/5.3.1/bson-5.3.1.jar" \
+    "$(t_build_record bson_jar)"
+  t_equals build_phoenix_records_the_java_home "$jdk" "$(t_build_record java_home)"
+  t_equals build_phoenix_records_the_pherf_classpath \
+    "$tree/phoenix-pherf/target/phoenix-pherf-5.4.0-SNAPSHOT.jar:$T_A2/m2/javax/jaxb-api-2.3.1.jar:\
+$T_A2/m2/log4j/log4j-slf4j-impl-2.25.5.jar" "$(t_build_record pherf_classpath)"
+  # Test JARs on the classpath place the log4j2-test configuration ahead of Pherf's configuration.
+  t_equals build_phoenix_leaves_out_the_test_jars no \
+    "$(t_flag '-tests.jar' "$(t_build_record pherf_classpath)")"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_BUILD_JDK=8
   t_equals build_phoenix_refuses_jdk_8 2 "$T_STATUS"
   t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_BUILD_JDK=11
@@ -5299,7 +5334,7 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     dist/async-profiler-4.1-linux-arm64.tar.gz dist/jHiccup.jar \
     phoenix/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar \
     phoenix/phoenix-client-embedded-hbase-2.6-5.4.0-SNAPSHOT.jar \
-    phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar; do
+    phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar phoenix/bson-5.3.1.jar; do
     [ -f "$ctx/$line" ] || bad="$bad $line"
   done
   t_empty stage_artifacts_context_holds_every_part "$bad"
@@ -5316,8 +5351,18 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
   t_equals phoenix_jars_come_from_the_build_record "0 yes no" "$T_STATUS $(t_exists \
     "$ctx/phoenix/recorded-server.jar") $(t_exists \
     "$ctx/phoenix/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar")"
+  # Reject any stale build record created prior to bson JAR tracking, because it cannot supply the
+  # client with its required bson JAR.
+  grep -v '^bson_jar' "$T_A2/build.tsv.saved" >"$text"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_refuses_a_record_without_bson "1 yes" "$T_STATUS $(t_flag \
+    "has no bson_jar. Run build-phoenix.sh again." "$T_STDERR")"
   cp "$T_A2/build.tsv.saved" "$text"
   t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  # Verify that the image installs the staged bson JAR alongside the Phoenix client JARs in the
+  # directory included on every driver's classpath.
+  t_contains image_puts_the_bson_jar_with_the_client_jars \
+    "\"/stage/\$PX_STAGED_PHOENIX_BSON\" /out/phoenix/client/" "$(cat "$ctx/Dockerfile")"
   # RQ-128: The artifact check above confirms that async-profiler and jHiccup are staged; verify
   # that the image installs them at their well-known paths and that the image build validates those
   # paths.
@@ -5381,6 +5426,8 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     '--build-arg PX_STAGED_HBASE=dist/hbase-2.6.7-hadoop3-bin.tar.gz' "$text"
   t_contains image_build_passes_the_staged_jhiccup \
     '--build-arg PX_STAGED_JHICCUP=dist/jHiccup.jar' "$text"
+  t_contains image_build_passes_the_staged_bson \
+    '--build-arg PX_STAGED_PHOENIX_BSON=phoenix/bson-5.3.1.jar' "$text"
   t_contains image_build_names_the_context "--file $ctx/Dockerfile $ctx" "$text"
   t_absent image_build_defaults_to_the_host_architecture '--platform' "$text"
   # R-066: When the container builder supports the provenance flag, image builds disable provenance

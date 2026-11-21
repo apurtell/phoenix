@@ -64,13 +64,15 @@ DV_STATUS=0
 DV_START=""
 DV_END=""
 
-# Remote shell script that launches a Java main class inside client 0. The remote child shell
-# expands the instance environment variables for the JDK, the client configuration directory, and
-# the JAR directories. It accepts positional arguments for the remote working directory, the extra
-# classpath prefix, the count of additional JVM options, those JVM options, and finally the main
-# class followed by its arguments. Before replacing itself via exec, the shell writes its PID to
-# java.pid so that the Java process inherits that PID and DV_STOP_SCRIPT can stop it. Consistent
-# with "hbase classpath", the classpath concludes with HBase's lib/jdk11 directory and
+# Remote shell script that launches a single Java main class inside client 0. The remote child
+# shell expands the instance environment variables for the JDK, the client configuration directory,
+# and the JAR directories. It accepts positional arguments for the remote working directory, the
+# extra classpath prefix, the count of additional JVM options, those JVM options, and finally the
+# main class followed by its arguments. Before replacing itself via exec, the shell writes its PID
+# to java.pid so that the Java process inherits that PID and DV_STOP_SCRIPT can stop it. The client
+# directory contains one bson JAR alongside the client JARs: a client JAR that does not bundle
+# org.bson requires it, whereas a client JAR that packages a relocated copy does not use it.
+# Consistent with "hbase classpath", the classpath concludes with HBase's lib/jdk11 directory and
 # commons-codec JAR: JDK 11 removed JAXB, which Pherf requires to read its scenario files, and the
 # commons-csv library bundled in the Pherf JAR depends on commons-codec, which the client JARs
 # package only under a relocated package name.

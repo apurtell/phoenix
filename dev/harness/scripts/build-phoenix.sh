@@ -22,8 +22,13 @@
 # along with all of their required reactor dependencies: phoenix-server produces the shaded server
 # JAR deployed on the HBase master and RegionServers, phoenix-client-parent/phoenix-client-embedded
 # produces the shaded client JAR used by the workload client and command-line tools, and
-# phoenix-pherf produces the load generation engine. Passing the --distributed flag also includes
-# the phoenix-pherf-distributed module whenever it is present in the source tree.
+# phoenix-pherf builds the load-generation engine. Setting PX_PHERF=1 additionally compiles the
+# phoenix-pherf-distributed module when present in the source tree. Furthermore, the resulting
+# build record captures the bson JAR resolved during the build; because the shaded client JAR from
+# the source tree does not bundle org.bson, the runtime client requires that external JAR on its
+# classpath. In addition, the build record stores the JDK home used for compilation and the host
+# execution classpath for Pherf, which combines the built pherf JAR with the dependency classpath
+# generated for phoenix-pherf by the root POM with all test JARs excluded.
 #
 # The PX_PHOENIX_HBASE_PROFILE setting governs the active HBase build profile passed to Maven via
 # -Dhbase.profile. That profile determines the compatibility module as well as the specific HBase
@@ -75,10 +80,11 @@ Usage: build-phoenix.sh [option...]
 
 Cleans and builds phoenix-server, phoenix-client-embedded and phoenix-pherf
 with their dependencies from the local tree, with the HBase profile
-PX_PHOENIX_HBASE_PROFILE and no tests, and records the jars, the profile, its
-compatibility module and the HBase and Hadoop that Phoenix compiles against
-in $PX_OUT/build/phoenix/build.tsv. The clean empties target/ of every module
-that the build selects, the dependencies included.
+PX_PHOENIX_HBASE_PROFILE and no tests, and records the jars, the bson jar
+that the client needs, the profile, its compatibility module and the HBase
+and Hadoop that Phoenix compiles against in $PX_OUT/build/phoenix/build.tsv.
+The clean empties target/ of every module that the build selects, the
+dependencies included.
 
 Options:
   --jdk N             the JDK major version of the build: 11, 17 or 21,
@@ -257,6 +263,32 @@ for BP_JAR in "${BP_JARS[@]}"; do
     px_die "$PX_EXIT_FAIL" "the build reported success but made no $BP_JAR"
   fi
 done
+# Read the resolved bson JAR path from the cached classpath written during the phoenix-core-client
+# module build so that the script does not assume a hardcoded local Maven repository location.
+BP_CLASSPATH="$BP_TREE/phoenix-core-client/target/cached_classpath.txt"
+BP_BSON_JAR="$(tr ':' '\n' <"$BP_CLASSPATH" 2>/dev/null |
+  grep -E '/org/mongodb/bson/[^/]+/bson-[^/]+\.jar$' || true)"
+case "$BP_BSON_JAR" in
+'' | *"$PX_NL"*)
+  px_die "$PX_EXIT_FAIL" "the build class path $BP_CLASSPATH does not name exactly one bson jar"
+  ;;
+esac
+if [ ! -s "$BP_BSON_JAR" ]; then
+  px_die "$PX_EXIT_FAIL" "the build class path names $BP_BSON_JAR, which is absent or empty"
+fi
+# The create-mrapp-generated-classpath execution defined in the root POM writes each module's
+# test-scoped classpath during the generate-test-resources lifecycle phase, which still executes
+# when -DskipTests is passed. Pherf's runtime execution classpath is constructed by stripping all
+# test JARs from that generated classpath: the phoenix-core test JAR bundles a log4j2-test
+# configuration that takes precedence in Log4j over the pherf JAR's log4j2.properties file and
+# emits Log4j status and DEBUG lines to stderr. A runtime-scoped classpath alone is insufficient
+# because phoenix-pherf declares log4j-core at test scope.
+BP_PHERF_CP_FILE="$BP_TREE/phoenix-pherf/target/classes/mrapp-generated-classpath"
+BP_PHERF_CP=""
+[ ! -f "$BP_PHERF_CP_FILE" ] || BP_PHERF_CP="$(tr ':' '\n' <"$BP_PHERF_CP_FILE" |
+  { grep -v -e '-tests\.jar$' || true; } | paste -s -d : -)"
+[ -n "$BP_PHERF_CP" ] ||
+  px_die "$PX_EXIT_FAIL" "the build wrote no class path of phoenix-pherf: $BP_PHERF_CP_FILE"
 
 BP_TMP="$BP_RECORD.tmp.$$"
 px_on_exit "rm -f $(printf '%q' "$BP_TMP")"
@@ -272,6 +304,9 @@ px_on_exit "rm -f $(printf '%q' "$BP_TMP")"
   px_tsv_row server_jar "$BP_SERVER_JAR"
   px_tsv_row client_jar "$BP_CLIENT_JAR"
   px_tsv_row pherf_jar "$BP_PHERF_JAR"
+  px_tsv_row bson_jar "$BP_BSON_JAR"
+  px_tsv_row java_home "$PX_BUILD_HOME"
+  px_tsv_row pherf_classpath "$BP_PHERF_JAR:$BP_PHERF_CP"
   if [ -n "$BP_DIST_JAR" ]; then
     px_tsv_row distributed_jar "$BP_DIST_JAR"
   fi

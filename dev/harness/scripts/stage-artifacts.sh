@@ -26,7 +26,8 @@
 #                 PX_DIST_ARTIFACTS lists it. Because jHiccup is distributed as a source release,
 #                 dist/jHiccup.jar is the tool compiled by build-jhiccup.sh and staged when
 #                 PX_DIST_ARTIFACTS lists jhiccup.
-#   phoenix/      The Phoenix server, client, and Pherf JARs recorded in the build record.
+#   phoenix/      The Phoenix server, client, and Pherf JARs recorded in the build record, along
+#                 with the bson JAR required by the client.
 #   plugins/<id>/ Every file belonging to each plug-in enabled by PX_PLUGINS; the plugins/
 #                 directory remains present and empty when no plug-in is enabled.
 # Immediately before the script copies any archive, fetch-dist.sh verifies it against its declared
@@ -390,7 +391,7 @@ if [ ! -f "$SA_RECORD_FILE" ]; then
 fi
 SA_RECORD="$(cat "$SA_RECORD_FILE")"
 for SA_KEY in tree phoenix_version hbase_profile compat_module hbase_version hadoop_version \
-  server_jar client_jar pherf_jar; do
+  server_jar client_jar pherf_jar bson_jar; do
   if ! sa_record_get "$SA_KEY" >/dev/null; then
     px_die "$PX_EXIT_FAIL" "the build record $SA_RECORD_FILE has no $SA_KEY." \
       "Run build-phoenix.sh again."
@@ -528,6 +529,12 @@ for SA_KEY in server_jar client_jar pherf_jar distributed_jar; do
   SA_STAGED="$SA_STAGED$SA_ARG${PX_TAB}phoenix/${SA_PATH##*/}$PX_NL"
   SA_JARS+=("$SA_PATH")
 done
+# Stage the bson JAR separately from the SNAPSHOT artifact list; because it is a third-party release
+# JAR resolved from the local Maven repository, the source-tree freshness check does not apply to
+# it.
+SA_PATH="$(sa_record_get bson_jar)"
+sa_stage "$SA_PATH" "phoenix/${SA_PATH##*/}"
+SA_STAGED="${SA_STAGED}PX_STAGED_PHOENIX_BSON${PX_TAB}phoenix/${SA_PATH##*/}$PX_NL"
 case "$SA_PHOENIX_VERSION" in
 *-SNAPSHOT) sa_check_fresh "$SA_TREE" "${SA_JARS[@]}" ;;
 esac

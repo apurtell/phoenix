@@ -352,11 +352,11 @@ in `lib/common.sh` intercepts any unauthorized substrate call and terminates the
 2.
 
 All client workloads execute inside the `client` instance at index 0, which is guaranteed to exist
-in every deployment topology. Within the container image, Phoenix client JARs reside in
-`$PX_PHOENIX_HOME/client`, rendered client configuration files reside in `$PX_CONF_DIR`, and
-role-specific JVM flags are listed one per line in `$PX_CONF_DIR/jvm.opts`. The cluster JDBC URL is
-defined by the `phoenix.jdbc.url` property inside `$PX_CONF_DIR/phoenix-client.properties`; a
-driver must always read this property rather than constructing hostnames or ports on its own.
+in every deployment topology. Within the container image, the Phoenix client JARs and the one bson
+JAR that they require reside in `$PX_PHOENIX_HOME/client`, rendered client configuration files
+reside in `$PX_CONF_DIR`, and the JVM options for the client role are listed one per line in
+`$PX_CONF_DIR/jvm.opts`. The cluster JDBC URL is defined by the `phoenix.jdbc.url` property inside
+`$PX_CONF_DIR/phoenix-client.properties`; a driver must never construct a host or port on its own.
 
 Drivers invoke Java main classes directly rather than calling wrapper scripts such as `bin/psql.py`
 or `bin/pherf-standalone.py`, eliminating any dependency on Python inside the container image and
