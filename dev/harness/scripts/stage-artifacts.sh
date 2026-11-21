@@ -26,6 +26,8 @@
 #                 PX_DIST_ARTIFACTS lists it. Because jHiccup is distributed as a source release
 #                 that build-jhiccup.sh compiles, a subsequent round stages it.
 #   phoenix/      The Phoenix server, client, and Pherf JARs recorded in the build record.
+#   plugins/<id>/ Every file belonging to each plug-in enabled by PX_PLUGINS; the plugins/
+#                 directory remains present and empty when no plug-in is enabled.
 # Immediately before the script copies any archive, fetch-dist.sh verifies it against its declared
 # pin. The image definition unpacks the archives inside a dedicated build stage so that no archive
 # reaches the final runtime image.
@@ -65,6 +67,8 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/../lib/common.sh"
 # shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
 . "$SELF/../lib/backend/contract.sh"
+# shellcheck source=SCRIPTDIR/../lib/plugin.sh
+. "$SELF/../lib/plugin.sh"
 
 set -euo pipefail
 
@@ -314,7 +318,7 @@ sa_base_digest() {
     done <"$SA_PINS"
   fi
   if [ -z "$value" ] && [ "$SA_STAGE_ONLY" = 0 ] && [ -n "${!base:-}" ] &&
-    row="$(sb_call sb_image_base_digest "${!base}" "$SA_ARCH")"; then
+    row="$(sb_image_base_digest "${!base}" "$SA_ARCH")"; then
     value="$(px_tsv_field 2 "$row")"
     printf '%s=%s\n' "$pin" "$value" >>"$SA_PINS" ||
       px_warn "cannot record the digest of ${!base} in $SA_PINS"
@@ -462,6 +466,24 @@ if [ -f "$SA_IGNORE" ]; then
   sa_stage "$SA_IGNORE" .dockerignore image
 fi
 
+# Stage the enabled plug-ins. Because the image installs each plug-in under /opt/px/plugins, a
+# plug-in enters the image exclusively through the staged build context. If the configured plug-in
+# set fails to load, the script aborts the staging process immediately.
+mkdir -p "$SA_CTX/plugins" || sa_fail "presence: cannot create the directory plugins/"
+SA_PLUGINS="$(pl_enabled || exit "$?")" ||
+  px_die "$PX_EXIT_USAGE" "the plug-ins of PX_PLUGINS do not load, so nothing is staged"
+while IFS="$PX_TAB" read -r SA_ID SA_DIR; do
+  [ -n "$SA_ID" ] || continue
+  while IFS= read -r SA_PATH; do
+    [ -n "$SA_PATH" ] || continue
+    sa_stage "$SA_PATH" "plugins/$SA_ID/${SA_PATH#"$SA_DIR"/}" image
+  done <<EOF
+$(find "$SA_DIR" -type f 2>/dev/null | LC_ALL=C sort)
+EOF
+done <<EOF
+$SA_PLUGINS
+EOF
+
 # Stage the distribution archives, each of which was just verified against its declared pin.
 for SA_NAME in "${SA_DISTS[@]}"; do
   SA_ROW="$(px_tsv_get "$SA_NAME" "$SA_ROWS")" || continue
@@ -527,7 +549,7 @@ fi
 
 px_debug "build arguments: ${SA_BUILD_ARGS[*]}"
 SA_STATUS=0
-sb_call sb_image_build "$SA_CTX" "$SA_TAG" ${SA_BUILD_ARGS[@]+"${SA_BUILD_ARGS[@]}"} ||
+sb_image_build "$SA_CTX" "$SA_TAG" ${SA_BUILD_ARGS[@]+"${SA_BUILD_ARGS[@]}"} ||
   SA_STATUS=$?
 case "$SA_STATUS" in
 0) px_info "built the image $SA_TAG from $SA_CTX" ;;

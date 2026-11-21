@@ -14,22 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This module implements the Docker Compose backend for the substrate contract. It provides all 35
+# This module implements the Docker Compose backend for the substrate contract. It provides all 32
 # sb_* contract functions and serves as the sole file in this repository permitted to invoke a
 # container runtime directly.
 #
 # Four architectural characteristics of the Compose runtime govern this implementation:
-#   1. Compose has no native scope object. Scope is represented by a combination of a project name
-#      and a label set, so every resource selection in this file operates as a label filter.
+#   1. Compose has no native scope object. Scope is represented by a project name paired with a
+#      label set, so every resource selection in this file operates as a label filter.
 #   2. Compose addresses a service rather than an individual instance. Because the instance index
 #      is derived from the container number, this module translates between the contract's
-#      zero-based instance index and Compose's one-based container number.
-#   3. Compose retains no record of a replaced container. Previous container logs and previous
-#      termination reasons are therefore unsupported, as declared by sb_capabilities, and callers
-#      must rely on the restart count together with the current termination reason instead.
+#      zero-based index and Compose's one-based container number.
+#   3. Compose retains no record of a previous container. Retrieving the previous log or previous
+#      termination reason is therefore unsupported and returns exit code 5; callers inspect the
+#      restart count and the current termination reason instead.
 #   4. The container runtime reports health rather than readiness. Readiness is derived from the
-#      health state produced by the image healthcheck defined in A2, so this module inspects only
-#      the reported health status.
+#      health state produced by the image healthcheck defined by A2, so this module inspects only
+#      the reported health status and nothing else.
 #
 # All interaction with the container runtime passes through a single choke point, px_compose_call.
 # Dry-run execution performs no state mutations: operations that create, remove, stop, or copy
@@ -54,13 +54,8 @@ PX_COMPOSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 # 1. Backend Identity and Versioning
 # ---------------------------------------------------------------------------
-# The contract revision is intentionally defined as a distinct literal both here and in
-# contract.sh. Having two independent literals enables sb_load to compare them at binding time,
-# ensuring that an out-of-date backend fails to bind rather than operating against a mismatched
-# contract revision.
-
-# The minimum Docker engine version floor corresponds to the first release supporting the Compose v2
-# flags required by this module: the cp subcommand, the index selector on exec and cp, and project
+# The minimum Docker engine version floor is the first release supporting the Compose v2 flags
+# required by this module: the cp subcommand, the index selector on exec and cp, and project
 # selection without an explicit compose file. The minimum Compose version floor is set to the v2
 # release series for the same reason.
 PX_COMPOSE_ENGINE_FLOOR_MAJOR=20
@@ -82,10 +77,6 @@ PX_COMPOSE_MOVER="$PX_COMPOSE_MOVER --filename {file}"
 ## @description  Report the backend identifier recorded in the bundle manifest.
 ## @return       Write compose to stdout and exit 0.
 sb_backend_id() { printf 'compose\n'; }
-
-## @description  Report the substrate contract revision implemented by this backend.
-## @return       Write the contract revision to stdout and exit 0.
-sb_contract_version() { printf '1\n'; }
 
 # ---------------------------------------------------------------------------
 # 2. Container Runtime Resolution and Invocation
@@ -573,25 +564,9 @@ sb_scope_exists() {
   return "$SB_EXIT_NO_OBJECT"
 }
 
-## @description  Report the resolved scoping parameters so no caller composes a backend command.
-## @param        scope_id: the scope ID returned by sb_scope_create
-## @return       Write key-value TSV rows to stdout and exit 0, exit 6 when the scope is unknown,
-##               exit 1 when the runtime does not respond, or exit 2 on invalid usage.
-sb_scope_args() {
-  local scope=${1:-} selector
-  px_compose_scope_load "$scope" || return $?
-  sb_scope_exists "$scope" || return $?
-  selector="$(px_compose_selector "$scope")" || return $?
-  px_tsv_row project "$PX_COMPOSE_PROJECT"
-  px_tsv_row label_selector "$selector"
-  px_tsv_row compose_file "$PX_COMPOSE_FILE"
-  px_tsv_row network "$PX_COMPOSE_NETWORK"
-}
-
 ## @description  Remove the project network, volumes, and state record that outlive the containers.
 ## @param        scope_id: the scope ID returned by sb_scope_create
-## @return       Exit 0 on complete removal, exit 1 when any resource could not be removed, or
-##               exit 2 on invalid usage.
+## @return       Exit 0 on success, exit 1 when a resource could not be removed, or exit 2 on usage.
 sb_scope_delete() {
   local scope=${1:-} timeout failed=0 name out
   px_compose_scope_load "$scope" || return $?
@@ -674,7 +649,6 @@ PX_PS_IMAGE=""
 PX_PS_SERVICE=""
 PX_PS_NUMBER=""
 PX_PS_INDEX=""
-PX_PS_INDEX_LABEL=""
 PX_PS_GROUP=""
 PX_PS_START=""
 PX_PS_DRAIN=""
@@ -759,7 +733,6 @@ px_compose_ps_split() {
   PX_PS_START="${line%%|*}" && line="${line#*|}"
   PX_PS_DRAIN="${line%%|*}"
   [ -n "$PX_PS_ID" ] || return 1
-  PX_PS_INDEX_LABEL="$PX_PS_INDEX"
   if [ -z "$PX_PS_ROLE" ]; then
     PX_PS_ROLE="$PX_PS_SERVICE"
   fi
@@ -888,7 +861,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 6. Runtime Versions, Backend Capabilities, and Host Preflight
+# 6. Runtime Version Checks and Host Preflight Validation
 # ---------------------------------------------------------------------------
 
 ## @description  Report the container runtime client and server versions and the Compose version.
@@ -947,74 +920,6 @@ px_compose_version_at_least() {
     return 0
   fi
   return 1
-}
-
-## @description  Report the backend capability table, caching the result under PX_OUT when the
-##               container engine responds.
-## @return       Write capability TSV rows to stdout and exit 0.
-sb_capabilities() {
-  local dir cache="" table status=0
-  dir="$(px_compose_state_dir)" || dir=""
-  if [ -n "$dir" ]; then
-    cache="$dir/capabilities.tsv"
-  fi
-  if [ -n "$cache" ] && [ -f "$cache" ] && ! px_is_true "${PX_FORCE:-0}"; then
-    cat "$cache"
-    return 0
-  fi
-  table="$(px_compose_capability_table 2>/dev/null || exit "$?")" || status=$?
-  # Caching is purely an optimization; an unwritable output directory must never prevent a caller
-  # from querying backend capabilities.
-  if [ "$status" = 0 ] && [ -n "$cache" ] &&
-    printf '%s\n' "$table" >"$cache.$$" 2>/dev/null &&
-    mv -f "$cache.$$" "$cache" 2>/dev/null; then
-    :
-  else
-    rm -f "$cache.$$" 2>/dev/null
-  fi
-  printf '%s\n' "$table"
-  return 0
-}
-
-# Assemble the complete backend capability table. Every unsupported (no) capability follows directly
-# from the architecture of Docker Compose rather than a missing CLI flag.
-## @description  Write the full backend capability table, including dynamically probed entries.
-## @return       Write capability TSV rows to stdout and exit 0, or exit 1 when the container
-##               engine does not respond.
-px_compose_capability_table() {
-  local status=0
-  px_tsv_row logs_previous no \
-    "Compose keeps no previous container log, use sb_restart_count"
-  px_compose_probe_capabilities || status=$?
-  px_tsv_row signal_delivery yes "the runtime kill verb delivers a named signal"
-  px_tsv_row previous_termination no \
-    "Compose keeps no previous container, use sb_restart_count and the current reason"
-  px_tsv_row events yes "runtime events filtered by the scope label"
-  px_tsv_row drain_restart yes "the region mover runs through sb_exec on a drain role"
-  px_tsv_row port_forward no "the deployment publishes the port, sb_endpoint reads the map"
-  px_tsv_row scale yes \
-    "compose up --scale, 1 to 9, only for a role without the index label (hand-written)"
-  px_tsv_row group_switch yes "compose stop and start selected by the group label"
-  px_tsv_row oom_evidence yes "State.OOMKilled from inspection"
-  px_tsv_row image_digest no "a local image carries an image id, not a registry digest"
-  px_tsv_row node_placement no "one host, so the node column is localhost"
-  return "$status"
-}
-
-# Probe a one-shot stats pass to determine resource_sampling support, then query the engine server
-# version to confirm the daemon is reachable before trusting a negative probe result.
-## @description  Probe the runtime for resource_sampling support and verify engine reachability.
-## @return       Write one capability TSV row to stdout and exit 0, or exit 1 when the engine does
-##               not respond.
-px_compose_probe_capabilities() {
-  if px_compose_engine 20 stats --no-stream --format '{{.ID}}' >/dev/null 2>&1; then
-    px_tsv_row resource_sampling yes "one stats pass per sample, limits from inspection"
-  else
-    px_tsv_row resource_sampling no "the runtime refused a stats pass"
-  fi
-  px_compose_engine 20 version --format '{{.Server.Version}}' >/dev/null 2>&1 ||
-    return "$SB_EXIT_FAIL"
-  return 0
 }
 
 _PXC_PORTS_FROM=""
@@ -1350,7 +1255,7 @@ EOF
     px_compose_ps_split "$line" || continue
     px_compose_role_selected "$PX_PS_ROLE" "$roles" || continue
     key="$PX_PS_ROLE/$PX_PS_INDEX"
-    if out_elapsed="$(sb_row_get "$key" "$seen")"; then
+    if out_elapsed="$(sb_row_get "$key" "$seen" || exit "$?")"; then
       out="$out$(px_tsv_row "$PX_PS_ROLE" "$PX_PS_INDEX" ready "$out_elapsed")$PX_NL"
     elif px_compose_parked "$roles" "$up"; then
       out="$out$(px_tsv_row "$PX_PS_ROLE" "$PX_PS_INDEX" stopped "$elapsed")$PX_NL"
@@ -1367,11 +1272,11 @@ EOF
 # ---------------------------------------------------------------------------
 # 8. Cluster Lifecycle: Provisioning, Teardown, and Horizontal Scaling
 # ---------------------------------------------------------------------------
-# The rendered deployment directory is the sole integration boundary between the deployment
-# generator and this backend. As specified in docs/backends.md, the backend consumes only
-# `compose.yaml`, the service metadata labels declared within it, and `ports.generated.env` from
-# that directory without assuming any generator-internal structure. Consequently, a hand-written
-# test fixture provisions identically to a generator-rendered deployment.
+# The rendered deployment directory is the sole integration seam between the deployment generator
+# and this backend. As specified in docs/backends.md, the backend reads only compose.yaml, the
+# labels declared on its services, ports.generated.env, and services.tsv from that directory, and
+# assumes nothing else about its contents. Scaling operations consult services.tsv because each
+# instance of a role is rendered as an individual service.
 #
 # Provisioning first creates every container in the deployment and then starts all services except
 # those carrying the start=on-demand label. On-demand services remain created in the stopped state
@@ -1498,16 +1403,20 @@ sb_teardown() {
   [ "$status" = 0 ] || return "$SB_EXIT_FAIL"
 }
 
-## @description  Adjust the replica count (1 to 9) of a role whose instances carry no index label.
+# Reconcile the live instances of a role with its target count in the recorded deployment after the
+# caller has re-rendered the deployment directory, modifying only the instances added or removed by
+# the count change.
+## @description  Reconcile a role's instances to the target count in the re-rendered deployment.
 ## @param        scope_id: the scope ID returned by sb_scope_create
-## @param        role: target role name without an index label (such as a hand-written deployment)
-## @param        count: target instance count between 1 and 9 inclusive
+## @param        role: target role name in the rendered deployment
+## @param        count: new instance count from 1 to 9, matching the rendered deployment count
 ## @param        timeout_s: whole seconds above zero; empty uses PX_TIMEOUT_SCALE (default 600)
 ## @return       Write role instance TSV rows to stdout and exit 0, exit 1 on scale failure or no
-##               runtime answer, 2 if count is outside 1..9 or the role cannot scale, or 4 timeout.
+##               runtime answer, 2 if count is outside 1..9 or mismatches the render, or 4 timeout.
 sb_scale() {
-  local scope=${1:-} role=${2:-} count=${3:-} timeout=${4:-} service="" indexed=""
-  local rows line status=0
+  local scope=${1:-} role=${2:-} count=${3:-} timeout=${4:-} file rows line grace
+  local wanted service index start present=" " remove="" volumes volume running=0 status=0
+  local -a add=()
   if [ -z "$role" ]; then
     px_error "sb_scale needs a scope, a role and a count"
     return "$SB_EXIT_USAGE"
@@ -1521,40 +1430,86 @@ sb_scale() {
   esac
   timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_SCALE 600)" || return $?
   px_compose_scope_load "$scope" || return $?
+  file="$PX_COMPOSE_DEPLOY_DIR/services.tsv"
+  # The rendered service table enumerates each instance with columns for service, role, index,
+  # group, and start policy.
+  wanted="$(awk -F '\t' -v r="$role" '!/^#/ && $2 == r { print $3 "\t" $1 "\t" $5 }' \
+    "$file" 2>/dev/null)" || wanted=""
+  if [ -z "$wanted" ]; then
+    px_error "the deployment of $scope renders no instance of role '$role'"
+    return "$SB_EXIT_USAGE"
+  fi
+  if [ "$(printf '%s\n' "$wanted" | grep -c .)" != "$count" ]; then
+    px_error "the deployment of $scope renders a different count of $role than $count:" \
+      "render it with the new count first"
+    return "$SB_EXIT_USAGE"
+  fi
   rows="$(px_compose_ps "$scope")" || return "$SB_EXIT_FAIL"
   while IFS= read -r line; do
     px_compose_ps_split "$line" || continue
     [ "$PX_PS_ROLE" = "$role" ] || continue
-    service="${service:-${PX_PS_SERVICE:-$role}}"
-    [ -z "$PX_PS_INDEX_LABEL" ] || indexed=1
+    [ "$PX_PS_STATE" != running ] || running=1
+    if [ "$PX_PS_INDEX" -ge "$count" ]; then
+      remove="$remove $PX_PS_ID"
+    else
+      present="$present$PX_PS_INDEX "
+    fi
   done <<EOF
 $rows
 EOF
-  if [ -z "$service" ]; then
-    px_error "role '$role' has no service in $PX_COMPOSE_PROJECT, so it cannot scale"
-    return "$SB_EXIT_USAGE"
-  fi
-  # A role whose instances carry an explicit index label is rendered as a distinct Compose service
-  # per instance with dedicated host port bindings. Scaling such a service via Compose replicas
-  # would duplicate both its index label and its published ports, so changing the instance count of
-  # an indexed role requires re-rendering the deployment.
-  if [ -n "$indexed" ]; then
-    px_error "role '$role' has one service for each instance in $PX_COMPOSE_PROJECT," \
-      "so it cannot scale in place. Render the deployment with the new count and" \
-      "bring the cluster up again"
-    return "$SB_EXIT_USAGE"
-  fi
+  start="$(printf '%s\n' "$wanted" | awk -F '\t' 'NR == 1 { print $3 }')"
+  while IFS="$PX_TAB" read -r index service _; do
+    case "$present" in
+    *" $index "*) ;;
+    *) add+=("$service") ;;
+    esac
+  done <<EOF
+$wanted
+EOF
   if px_compose_dry_run "scale $role to $count in $scope"; then
     return 0
   fi
-  # Compose removes the highest-numbered containers first when scaling down, keeping zero-based
-  # instance indices contiguous without manual reindexing. Passing the target service name with
-  # --no-deps ensures all other services, including intentionally stopped groups, remain untouched.
-  px_compose_project "$scope" "$timeout" up -d --no-recreate --no-build --no-deps \
-    --scale "$service=$count" "$service" >&2 || status=$?
-  px_compose_outcome "$status" "$timeout" "scale of $role" \
-    "compose could not scale $role to $count" || return $?
-  sb_wait_ready "$scope" "$timeout" "$role" >/dev/null || status=$?
+  # Reload the generated port map from the updated render so that port bindings for newly added
+  # instances are available in the environment.
+  px_config_load_ports "$PX_COMPOSE_DEPLOY_DIR"
+  _PXC_PORTS_FROM="$PX_COMPOSE_DEPLOY_DIR|${PX_PORT_MAP_ENV:-}"
+  # Because scaled-down instances are absent from the updated render, stop and remove them directly
+  # by container ID along with any project volumes they mount; leaving mounted project volumes
+  # behind would cause the teardown verification check to fail.
+  grace="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  for line in $remove; do
+    volumes="$(px_compose_engine 60 inspect --format \
+      '{{range .Mounts}}{{.Name}} {{end}}' "$line")" || volumes=""
+    px_compose_engine "$timeout" stop --time "$grace" "$line" >/dev/null || status=$?
+    px_compose_engine "$timeout" rm -f "$line" >/dev/null || status=$?
+    for volume in $volumes; do
+      case "$volume" in
+      "${PX_COMPOSE_PROJECT}_"*)
+        px_compose_engine 60 volume rm "$volume" >/dev/null || status=$?
+        ;;
+      esac
+    done
+  done
+  if [ "$status" != 0 ]; then
+    px_error "compose could not remove the instances of $role above $count"
+    return "$SB_EXIT_FAIL"
+  fi
+  if [ "${#add[@]}" -gt 0 ]; then
+    # When an on-demand role has no running instances, its role group is intentionally parked, so
+    # create the new container instances without starting them.
+    if [ "$start" = on-demand ] && [ "$running" = 0 ]; then
+      px_compose_project "$scope" "$timeout" up --no-start --no-build --no-deps \
+        "${add[@]}" >&2 || status=$?
+    else
+      px_compose_project "$scope" "$timeout" up -d --no-recreate --no-build --no-deps \
+        "${add[@]}" >&2 || status=$?
+    fi
+    px_compose_outcome "$status" "$timeout" "scale of $role" \
+      "compose could not scale $role to $count" || return $?
+    if [ "$start" != on-demand ] || [ "$running" = 1 ]; then
+      sb_wait_ready "$scope" "$timeout" "$role" >/dev/null || status=$?
+    fi
+  fi
   if [ "$status" = "$SB_EXIT_TIMEOUT" ]; then
     sb_list "$scope" "$role"
     px_error "the new instances of $role did not become ready in ${timeout}s"
@@ -2312,55 +2267,8 @@ sb_oom_killed() {
   px_tsv_row no "$(px_tsv_clean "$evidence")"
 }
 
-## @description  Report lifecycle events for a scope over a lookback window closing at the call.
-## @param        scope_id: the scope ID returned by sb_scope_create
-## @param        since_s: required lookback window in whole seconds prior to the call
-## @return       Write event TSV rows to stdout (oldest first) and exit 0, exit 2 on invalid usage,
-##               or exit 5 when runtime events are unavailable.
-sb_events() {
-  local scope=${1:-} since=${2:-} selector prefix fmt now out line status=0
-  local nanos role label number index type reason message
-  case "$since" in
-  '' | *[!0-9]*)
-    px_error "sb_events needs a window in whole seconds, got '${2:-}'"
-    return "$SB_EXIT_USAGE"
-    ;;
-  esac
-  selector="$(px_compose_selector "$scope")" || return $?
-  prefix="$(px_compose_label_prefix)"
-  now="$(px_epoch_s)"
-  fmt="{{.TimeNano}}|{{index .Actor.Attributes \"$prefix.role\"}}"
-  fmt="$fmt|{{index .Actor.Attributes \"$prefix.index\"}}"
-  fmt="$fmt|{{index .Actor.Attributes \"com.docker.compose.container-number\"}}"
-  fmt="$fmt|{{.Type}}|{{.Action}}|{{index .Actor.Attributes \"name\"}}"
-  out="$(px_compose_engine 60 events --since "${since}s" --until "$now" \
-    --filter "label=$selector" --format "$fmt")" || status=$?
-  if [ "$status" != 0 ]; then
-    px_error "the runtime did not report its events"
-    return "$SB_EXIT_UNSUPPORTED"
-  fi
-  while IFS= read -r line; do
-    IFS='|' read -r nanos role label number type reason message <<<"$line"
-    case "$nanos" in
-    '' | *[!0-9]*) continue ;;
-    esac
-    # Container events correspond to a specific instance and resolve their zero-based index through
-    # the same parser used by inventory queries, whereas network and volume events carry no index.
-    index=""
-    if [ "$type" = container ]; then
-      px_compose_index_of "$label" "$number"
-      index="$PX_COMPOSE_INDEX"
-    fi
-    px_tsv_row "$((nanos / 1000000))" "$role" "$index" "$type" "$reason" \
-      "$(px_tsv_clean "$message")"
-  done <<EOF
-$out
-EOF
-  return 0
-}
-
-## @description  Convert a binary or decimal human-readable size (such as 1.5GiB or 1.2kB) into
-##               an integer byte count.
+## @description  Convert a binary or decimal human-readable size (such as 1.5GiB or 1.2kB) into an
+##               integer byte count.
 ## @return       Write the whole number of bytes to stdout and exit 0.
 px_compose_bytes() {
   local text=${1:-} number unit whole frac scale=1
@@ -2558,7 +2466,7 @@ sb_image_ref() {
 ## @return       Write one image TSV row (tag, image ID) and exit 0, exit 1 if the build fails or
 ##               yields no ID, 2 on bad context, tag, or arg, or 4 if PX_TIMEOUT_BUILD expires.
 sb_image_build() {
-  local ctx=${1:-} tag=${2:-} arg timeout status=0 id
+  local ctx=${1:-} tag=${2:-} arg timeout status=0 id help
   local args=()
   if [ $# -lt 2 ] || [ -z "$ctx" ] || [ -z "$tag" ]; then
     px_error "sb_image_build needs a context directory and a tag"
@@ -2584,6 +2492,13 @@ sb_image_build() {
   if px_compose_dry_run "build of $tag from $ctx"; then
     return 0
   fi
+  # Attaching a provenance attestation causes the containerd image store to assign a new image ID
+  # on every build of identical content, so disable provenance when the builder supports the option
+  # to keep image IDs in cluster/images.tsv comparable across builds.
+  help="$(px_compose_engine 30 build --help 2>/dev/null || true)"
+  case "$help" in
+  *--provenance*) args+=(--provenance=false) ;;
+  esac
   px_compose_engine "$timeout" build --tag "$tag" ${args[@]+"${args[@]}"} \
     --file "$ctx/Dockerfile" "$ctx" >&2 || status=$?
   px_compose_outcome "$status" "$timeout" "the build of $tag" \

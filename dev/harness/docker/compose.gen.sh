@@ -46,6 +46,10 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # contacts a container runtime.
 # shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
 . "$SELF/../lib/backend/contract.sh"
+# The plug-in loader executes the render hooks, including conf-overlay and jvm-opts, without
+# contacting any container runtime.
+# shellcheck source=SCRIPTDIR/../lib/plugin.sh
+. "$SELF/../lib/plugin.sh"
 
 set -euo pipefail
 
@@ -91,6 +95,9 @@ PXG_DATA_DIR=/data
 # Read-only container mount point where the setup role mounts the host state directory so the
 # bootstrap probe can inspect the health monitor heartbeat.
 PXG_STATE_MOUNT=/var/lib/px/state
+# Every service instance mounts the merged plug-in overlay templates at this read-only container
+# path.
+PXG_OVERLAY_MOUNT=/opt/px/conf-overlay
 
 # Header marker written as the first line of topology.env. A target directory whose topology.env
 # begins with this marker is recognized as a rendered deployment that the generator may safely
@@ -123,6 +130,9 @@ PXG_RENDERED=""
 PXG_YARN_ROLES=""
 PXG_STATE_HOST=""
 PXG_HEARTBEAT=""
+PXG_HOOK_OPTS=""
+PXG_OVERLAY_HOST=""
+PXG_STAGING=""
 PXG_SERVICES=0
 PXG_MEM_TOTAL=0
 PXG_MEM_EAGER=0
@@ -154,6 +164,8 @@ Options.
                          repeatable
   -e, --set NAME=VALUE   set one configuration value, repeatable, for example
                          PX_RS_COUNT=5 or PX_CLIENT_JDK=21
+      --scale ROLE=COUNT set the count of one scaled role: datanode,
+                         nodemanager or regionserver. px-cluster scale uses it
       --check            validate and write the service table to stdout, but
                          write no file
 
@@ -198,9 +210,21 @@ pxg_is_scaled() {
   return 1
 }
 
+## @description  Translates a --scale ROLE=COUNT argument into the role's NAME=VALUE count setting.
+## @return       Writes PX_<KEY>_COUNT=COUNT to stdout and exits 0, or exits 2 for a role that does
+##               not scale.
+pxg_scale_set() {
+  local role=${1%%=*}
+  if [ "$role" = "$1" ] || ! pxg_is_scaled "$role"; then
+    px_die "$PX_EXIT_USAGE" "--scale needs ROLE=COUNT with a scaled role of: $PXG_SCALED," \
+      "got '$1'"
+  fi
+  printf 'PX_%s_COUNT=%s\n' "$(pxg_role "$role" key)" "${1#*=}"
+}
+
 # Only the YARN tier forms a role group because it is the only tier that starts and stops on demand
-# while the cluster is running.
-## @description  Reports the lifecycle group associated with a role.
+# while a cluster is running.
+## @description  Reports the role group associated with a given role.
 ## @return       Writes the group name to stdout (or nothing if ungrouped) and exits 0.
 pxg_role_group() {
   case "${1:-}" in
@@ -324,6 +348,103 @@ pxg_check_role() {
   fi
   [ "$need" -lt "${!mem}" ] || px_die "$PX_EXIT_USAGE" "role $role: $detail = $need MiB" \
     "must stay below the container limit $mem=${!mem} MiB"
+  name="PX_${key}_JVM_OPTS"
+  pxg_check_jvm_opts "$name" "${!name:-}"
+}
+
+# Memory sizing flags are rejected here because only the dedicated sizing variable names may set
+# memory sizes.
+## @description  Aborts rendering if a JVM option string (name, value) contains characters outside
+##               the value grammar or sets a size option.
+## @return       Exits 0 when valid, or exits 2 if the option string is rejected.
+pxg_check_jvm_opts() {
+  local name=$1 value=${2:-} word
+  if [[ $value == *[\$\"\'\\#]* ]] || [[ $value == *$'\t'* ]]; then
+    px_die "$PX_EXIT_USAGE" "$name holds a dollar sign, a quote, a backslash, a hash or a" \
+      "tab, which the value grammar refuses: $value"
+  fi
+  for word in $value; do
+    case "$word" in
+    -Xms* | -Xmx* | -Xmn* | -XX:MaxDirectMemorySize* | -XX:MaxRAM* | -XX:MaxHeapSize* | \
+      -XX:InitialHeapSize* | -XX:MinHeapSize* | -XX:InitialRAM* | -XX:MinRAM*)
+      px_die "$PX_EXIT_USAGE" "$name sets the size option $word. Only the sizing names" \
+        "PX_<KEY>_HEAP_MIB, PX_<KEY>_DIRECT_MIB and PX_<KEY>_MEM_MIB set a size"
+      ;;
+    esac
+  done
+}
+
+## @description  Assembles the effective JVM options for a role key by combining PX_<KEY>_JVM_OPTS
+##               with each line emitted for that key by the jvm-opts hook.
+## @return       Writes the combined options to stdout (or an empty line if none) and exits 0.
+pxg_jvm_opts_of() {
+  local key=$1 var="PX_${1}_JVM_OPTS" opts row_key row
+  opts=${!var:-}
+  while IFS="$PX_TAB" read -r row_key row; do
+    [ "$row_key" = "$key" ] || continue
+    opts="${opts:+$opts }$row"
+  done <<EOF
+$PXG_HOOK_OPTS
+EOF
+  printf '%s\n' "$opts"
+}
+
+# Executes image-check against the configured image, collects jvm-opts hook lines, and copies
+# conf-overlay templates into conf-overlay/.
+## @description  Runs the render hooks for all enabled plug-ins (staging dir, target).
+## @return       Exits 0 on success, or exits 2 on a failed hook, a rejected option line, or a
+##               template name collision.
+pxg_plugins() {
+  local staging=$1 target=$2 rows out line id key opts dir file name keys
+  PXG_HOOK_OPTS="" PXG_OVERLAY_HOST=""
+  [ -n "${PX_PLUGINS:-}" ] || return 0
+  rows="$(pl_enabled || exit "$?")" || px_die "$PX_EXIT_USAGE" "the plug-ins do not load"
+  # Abort rendering immediately if any enabled plug-in rejects the target image so that the backend
+  # never provisions an incompatible deployment instance.
+  pl_hook_run image-check "$staging" "$PX_IMAGE_TAG" >/dev/null ||
+    px_die "$PX_EXIT_USAGE" "the image-check hook of a plug-in refused the image" \
+      "$PX_IMAGE_TAG, so the render stops"
+  out="$(pl_hook_run jvm-opts "$staging" || exit "$?")" ||
+    px_die "$PX_EXIT_USAGE" "the jvm-opts hook of a plug-in failed, so the render stops"
+  keys=" $(printf '%s\n' "$PXG_TABLE" | awk '{ printf "%s ", $2 }') "
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    id=${line%%"$PX_TAB"*}
+    line=${line#*"$PX_TAB"}
+    key=${line%% *}
+    opts=${line#"$key"}
+    px_trim_var opts
+    case "$keys" in
+    *" $key "*) ;;
+    *) px_die "$PX_EXIT_USAGE" "the jvm-opts hook of plug-in $id names no role key: $line" ;;
+    esac
+    pxg_check_jvm_opts "the jvm-opts hook of plug-in $id for $key" "$opts"
+    [ -z "$opts" ] || PXG_HOOK_OPTS="$PXG_HOOK_OPTS$key$PX_TAB$opts$PX_NL"
+  done <<EOF
+$out
+EOF
+  pl_hook_run conf-overlay "$staging" >/dev/null ||
+    px_die "$PX_EXIT_USAGE" "the conf-overlay hook of a plug-in failed, so the render stops"
+  while IFS="$PX_TAB" read -r id dir; do
+    [ -n "$id" ] || continue
+    for file in "$staging/plugins/$id/conf-overlay"/*.tmpl; do
+      [ -f "$file" ] || continue
+      name=${file##*/}
+      if [ -e "$staging/conf-overlay/$name" ]; then
+        px_die "$PX_EXIT_USAGE" "two plug-ins write the overlay template $name; plug-in $id" \
+          "in $dir is the second"
+      fi
+      { mkdir -p "$staging/conf-overlay" && cp "$file" "$staging/conf-overlay/$name"; } ||
+        px_die "$PX_EXIT_FAIL" "cannot copy the overlay template $file"
+      PXG_OVERLAY_HOST="$target/conf-overlay"
+    done
+  done <<EOF
+$rows
+EOF
+  if [ -n "$PXG_OVERLAY_HOST" ] && ! [[ $PXG_OVERLAY_HOST =~ $PXG_PATH_RE ]]; then
+    px_die "$PX_EXIT_USAGE" "the deployment directory '$target' must hold letters, digits," \
+      "spaces and . _ / + @ - only, because every instance mounts its conf-overlay/"
+  fi
 }
 
 ## @description  Converts a two-decimal-place fraction variable (0.d or 0.dd) into hundredths.
@@ -497,7 +618,7 @@ pxg_render_ports() {
 ## @return       Exits 0.
 pxg_render_service() {
   local role=$1 index=$2 key service mem heap direct jdk group start
-  local prefix=$PX_LABEL_PREFIX var volume port
+  local prefix=$PX_LABEL_PREFIX var volume port opts
   key="$(pxg_role "$role" key)"
   service="$role-$index"
   var="PX_${key}_MEM_MIB" && mem=${!var}
@@ -506,6 +627,7 @@ pxg_render_service() {
   var="PX_${key}_JDK" && jdk=${!var}
   group="$(pxg_role_group "$role")"
   volume="$(pxg_volume_of "$role" "$index")"
+  opts="$(pxg_jvm_opts_of "$key")"
   start=""
   if [ -n "$group" ]; then
     start=on-demand
@@ -541,6 +663,9 @@ pxg_render_service() {
   pxg_y "      - ports.generated.env"
   pxg_y "      - topology.env"
   pxg_y "    environment:"
+  if [ -n "$PXG_OVERLAY_HOST" ]; then
+    pxg_y "      PX_CONF_OVERLAY_DIR: \"$PXG_OVERLAY_MOUNT\""
+  fi
   if [ -n "$volume" ]; then
     pxg_y "      PX_DATA_DIR: \"$PXG_DATA_DIR\""
   fi
@@ -549,6 +674,11 @@ pxg_render_service() {
   pxg_y "      PX_HOSTNAME: \"$service\""
   pxg_y "      PX_INSTANCE_INDEX: \"$index\""
   pxg_y "      PX_JDK: \"$jdk\""
+  # Role-specific JVM options and jvm-opts hook flags are appended last so that they follow the
+  # baseline flags derived from the memory sizing parameters by the container image.
+  if [ -n "$opts" ]; then
+    pxg_y "      PX_JVM_OPTS_EXTRA: \"$opts\""
+  fi
   pxg_y "      PX_MEM_MIB: \"$mem\""
   if [ "$role" = setup ]; then
     pxg_y "      PX_MONITOR_HEARTBEATS: \"$PXG_HEARTBEAT\""
@@ -573,14 +703,19 @@ pxg_render_service() {
       pxg_y "      - \"$PXG_PUBLISH_HOST:$port:$port\""
     done
   fi
-  if [ -n "$volume" ]; then
+  if [ -n "$volume" ] || [ -n "$PXG_OVERLAY_HOST" ]; then
     pxg_y "    volumes:"
+  fi
+  if [ -n "$volume" ]; then
     pxg_y "      - $volume:$PXG_DATA_DIR"
     if [ "$role" = setup ]; then
       pxg_y "      - \"$PXG_STATE_HOST:$PXG_STATE_MOUNT:ro\""
     fi
   fi
-  # Each persistent volume is declared once in the top-level volumes section by its owning instance.
+  if [ -n "$PXG_OVERLAY_HOST" ]; then
+    pxg_y "      - \"$PXG_OVERLAY_HOST:$PXG_OVERLAY_MOUNT:ro\""
+  fi
+  # Each persistent volume is declared only once, by the service instance that owns it.
   if [ "$volume" = "$service-data" ]; then
     PXG_VOLUMES="$PXG_VOLUMES  $volume:$PX_NL"
     PXG_VOLUMES="$PXG_VOLUMES    labels:$PX_NL"
@@ -657,8 +792,11 @@ $PXG_MARKER
 # the staging record of the image names. Before the image is staged, the two
 # read unstaged. Every daemon binds PX_BIND_HOST, every interface of its own
 # container. PX_JVM_DEBUG=1 adds the debug agent and publishes its port.
+# PX_SIZING_OVERRIDES names each sizing value that differs from the file of
+# PX_RUN_CLASS, so a measurement run on this cluster is tagged contaminated.
 PX_CLUSTER_ID=$PX_CLUSTER_ID
 PX_RUN_CLASS=$PX_RUN_CLASS
+PX_SIZING_OVERRIDES=$(px_sizing_overrides)
 PX_IMAGE_TAG=$PX_IMAGE_TAG
 PX_BIND_HOST=$PXG_BIND_HOST
 PX_JVM_DEBUG=$PX_JVM_DEBUG
@@ -716,11 +854,13 @@ pxg_write_file() {
   printf '%s' "$2" >"$1" || px_die "$PX_EXIT_FAIL" "cannot write $1"
 }
 
-## @description  Atomically writes the target deployment directory through a sibling staging path.
-## @return       Exits 0 on success, exits 1 if a write fails or a dollar sign survives rendering,
-##               or exits 2 if the target exists and is neither empty nor a rendered deployment.
-pxg_write() {
-  local target=$1 parent name staging file hit first=""
+# Rendered files and plug-in hook outputs are written to this staging directory first so that the
+# target deployment directory is updated atomically.
+## @description  Creates the PXG_STAGING directory beside the target deployment directory.
+## @return       Exits 0 on success, 1 if the staging directory cannot be created, or 2 if the
+##               target exists and is neither empty nor a rendered deployment.
+pxg_stage() {
+  local target=$1 parent name first=""
   parent=${target%/*}
   name=${target##*/}
   if [ -e "$target" ]; then
@@ -734,10 +874,17 @@ pxg_write() {
     fi
   fi
   mkdir -p "$parent" || px_die "$PX_EXIT_FAIL" "cannot create $parent"
-  staging="$parent/.$name.render.$$"
-  rm -rf "$staging"
-  mkdir "$staging" || px_die "$PX_EXIT_FAIL" "cannot create $staging"
-  px_on_exit "rm -rf $(printf '%q' "$staging")"
+  PXG_STAGING="$parent/.$name.render.$$"
+  rm -rf "$PXG_STAGING"
+  mkdir "$PXG_STAGING" || px_die "$PX_EXIT_FAIL" "cannot create $PXG_STAGING"
+  px_on_exit "rm -rf $(printf '%q' "$PXG_STAGING")"
+}
+
+## @description  Populates the staging directory with the rendered deployment files and atomically
+##               moves it into place at the target deployment directory path.
+## @return       Exits 0 on success, or exits 1 if a file write fails or a dollar sign survives.
+pxg_write() {
+  local target=$1 staging=$PXG_STAGING file hit
   pxg_write_file "$staging/compose.yaml" "$(pxg_compose_text)$PX_NL"
   pxg_write_file "$staging/ports.generated.env" "$(pxg_ports_text)$PX_NL"
   pxg_write_file "$staging/topology.env" "$(pxg_topology_text)$PX_NL"
@@ -760,7 +907,7 @@ pxg_write() {
 ## @return       Writes the deployment directory path (or the service table under --check) to stdout
 ##               and exits 0, or exits 1, 2, or 6 as documented in the usage text.
 pxg_main() {
-  local strict="" check=0 out="" target files=() sets=()
+  local strict="" check=0 out="" scale target files=() sets=()
   while [ $# -gt 0 ]; do
     px_cli_common "$1" || case "$1" in
     --strict) strict=--strict ;;
@@ -769,6 +916,12 @@ pxg_main() {
     --out) px_cli_need_value "$@" && out=$2 && shift ;;
     --config) px_cli_need_value "$@" && files+=("$2") && shift ;;
     -e | --set) px_cli_need_value "$@" && sets+=("$2") && shift ;;
+    --scale)
+      px_cli_need_value "$@"
+      scale="$(pxg_scale_set "$2")" || exit "$?"
+      sets+=("$scale")
+      shift
+      ;;
     --check) check=1 ;;
     *) px_usage_error "unknown argument $1" ;;
     esac
@@ -788,9 +941,9 @@ pxg_main() {
   esac
   px_config_load ${strict:+"$strict"} -- ${files[@]+"${files[@]}"}
   pxg_configure
-  pxg_build
 
   if [ "$check" = 1 ]; then
+    pxg_build
     printf '%s' "$PXG_TSV"
     return 0
   fi
@@ -800,10 +953,16 @@ pxg_main() {
     px_die "$PX_EXIT_USAGE" "the deployment directory must be below PX_OUT, not PX_OUT itself"
   fi
   if px_is_dry_run; then
+    pxg_build
     px_info "dry run: $PXG_SERVICES services, $PXG_MEM_TOTAL MiB, not written to $target"
     printf '%s\n' "$target"
     return 0
   fi
+  # Plug-in render hooks write their outputs directly into the staging directory so that their
+  # generated records move atomically into the final deployment directory alongside the render.
+  pxg_stage "$target"
+  pxg_plugins "$PXG_STAGING" "$target"
+  pxg_build
   pxg_write "$target"
   px_info "rendered $PXG_SERVICES services for cluster $PX_CLUSTER_ID, class" \
     "$PX_RUN_CLASS: $PXG_MEM_TOTAL MiB of container limits, $PXG_MEM_YARN MiB" \

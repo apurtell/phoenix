@@ -14,103 +14,325 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This command performs the verdict merge by reading the verdict records from every driver and
-# every cluster component of a single run to produce one consolidated result.
+# This command performs the verdict merge by reading the verdict streams of a single run from every
+# driver, every cluster check, and every plug-in to report one consolidated result. The governing
+# specification is the "Verdict severity" section of docs/bundle-format.md.
 #
-# The severity lattice and its governing rules are documented in the "Verdict severity" section of
-# the README, and suites/lib/common.sh provides the canonical lattice definition.
+# The merge proceeds through four stages:
+#   1. Collection: Read verdicts.tsv from the target bundle together with each --verdict file. The
+#      bundle is resolved from the BUNDLE operand (a path or a run id under $PX_OUT/runs) or
+#      defaults to the newest completed bundle, whereas supplying --verdict without a BUNDLE merges
+#      only the specified verdict files. Any row containing
+#      an unknown severity or class is converted to ERROR so that a misspelled FAIL cannot pass. A
+#      bundle also contributes one SKIP row for each optional artifact that its driver or a plug-in
+#      declares but the run did not write, as reported by px-bundle validate.
+#   2. Demotion: The pb_effective_severity function in lib/bundle.sh demotes a duration FAIL to
+#      ADVISORY whenever the time evidence of the run is not authoritative. The run class and the
+#      contamination state are loaded from the run record, or otherwise from PX_RUN_CLASS and
+#      PX_CONTAMINATION.
+#   3. Joining: Compute the overall result as the highest effective severity in the lattice defined
+#      by suites/lib/common.sh. A stream with no rows, or with only SKIP rows, yields INCONCLUSIVE.
+#   4. Output: Emit the effective verdict rows and the closing result row to stdout, and whenever a
+#      bundle was read, write the three generated report files into its report directory.
 #
-# Round A5 implements the core behavior, encompassing the merge logic, the severity check, and the
-# report packaged into the result bundle. The current round establishes the command name, the
-# complete option surface, and the argument validation checks, while every execution path that
-# requires the merge returns the unsupported exit code and identifies round A5.
+# Resolved bundle operands are collected in the REPORT_BUNDLES array so that the command can be
+# extended to accept multiple bundles without modifying the operand resolver or the result row.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/bundle.sh
+. "$SELF/../lib/bundle.sh"
 
 set -euo pipefail
 px_trap_enable
 
-REPORT_FORMATS="tsv json"
+# Define the column headers for the generated report files as specified in docs/bundle-format.md.
+REPORT_VERDICT_FIELDS="check severity class source detail written"
+REPORT_RUN_FIELDS="run_id class backend driver suite test result rows pass skip advisory"
+REPORT_RUN_FIELDS="$REPORT_RUN_FIELDS fail error contamination"
+REPORT_CLUSTER_FIELDS="role index image_id state_pre state_post restarts_pre restarts_post"
+REPORT_CLUSTER_FIELDS="$REPORT_CLUSTER_FIELDS change oom"
 
 REPORT_RUN=""
 REPORT_BUNDLES=()
-REPORT_FORMAT="tsv"
 REPORT_VERDICTS=()
 
-## @description  Prints the command-line usage and option reference for the report generator.
-## @return       Writes the usage message to stdout and exits 0.
-usage() {
-  cat <<'EOF'
-Usage: px-report [option...]
+# Track the execution context of the run, populated either from its record or from the environment.
+RUN_ID=""
+RUN_CLASS=""
+RUN_BACKEND=""
+RUN_DRIVER=""
+RUN_SUITE=""
+RUN_TEST=""
+CONTAMINATION=""
 
-Options:
-  --run DIR         the run whose verdict records to merge, default PX_RUN_DIR
-  --verdict FILE    one verdict record, repeatable. It adds to the records
-                    the run directory already holds
-  --format NAME     tsv or json, default tsv
-  --out FILE        write the report to this file instead of stdout
-  --config FILE     an extra configuration file, repeatable
-  -v, --verbose     report detail
-  -h, --help        show this text
+# Store the collected verdict rows with columns check, severity, class, source, detail, and written.
+# The effective rows retain the same column structure, placing the effective severity second.
+COLLECTED=""
+EFFECTIVE=""
+RESULT=""
+RESULT_CODE=0
+COUNT_ROWS=0
+COUNT_PASS=0
+COUNT_SKIP=0
+COUNT_ADVISORY=0
+COUNT_FAIL=0
+COUNT_ERROR=0
 
-Severity order, lowest first: PASS SKIP ADVISORY FAIL ERROR. The merge takes
-the highest. Only FAIL and ERROR fail a run.
-
-Exit codes: 0 every verdict passed, 1 a FAIL verdict, 2 usage, 3 an ERROR
-verdict, 5 a behaviour round A5 owns, 6 no such run or record.
+px_cli_spec <<'EOF'
+about Merges the verdict streams of one run and reports one result.
+about Severity order, lowest first: PASS SKIP ADVISORY FAIL ERROR. The merge takes the
++ highest. A duration FAIL is ADVISORY unless the run is of the measurement class
++ on a host that is not contaminated. No row, or only SKIP rows, is INCONCLUSIVE.
+about BUNDLE is a path or a run id under $PX_OUT/runs, default the newest finished
++ bundle. px-report rewrites report/ from the streams it merged, a --verdict
++ stream included; manifest.json keeps the result of the run. With --verdict and
++ no BUNDLE it merges only those streams, under PX_RUN_CLASS and PX_CONTAMINATION.
+operands [BUNDLE]
+opt --verdict FILE REPORT_VERDICTS+ | one more verdict stream (repeatable)
+output the effective verdict rows, then one row: result, verdict, code and the
++ bundle, or - when no bundle was read.
+verdicts The merged verdict decides the code:
+exits 2 also means a bundle outside PX_OUT or an unreadable record, 6 no such
++ bundle, record or verdict stream.
+example px-report
+example px-report 20261124T003648Z-dc1i --verdict extra.tsv
 EOF
+
+# ---------------------------------------------------------------------------
+# Resolve and load the execution context of the run.
+# ---------------------------------------------------------------------------
+
+## @description  Loads the execution context of the run from its record by reading the run row, the
+##               context rows, and the contamination rows.
+## @return       Exits 0 on success, 6 without a record, or 2 on a record without a valid run row.
+report_context_load() {
+  local record="$REPORT_RUN/run-record.tsv" run context
+  [ -f "$record" ] || px_die "$PX_EXIT_NO_OBJECT" "no run record: $record"
+  run="$(pb_record_rows run "$record" | tail -n 1)"
+  [ -n "$run" ] || px_die "$PX_EXIT_USAGE" "the run record $record holds no run row"
+  RUN_ID="$(px_tsv_field 1 "$run" || true)"
+  RUN_CLASS="$(px_tsv_field 2 "$run" || true)"
+  RUN_BACKEND="$(px_tsv_field 3 "$run" || true)"
+  case "$RUN_CLASS" in
+  validation | measurement) ;;
+  *) px_die "$PX_EXIT_USAGE" "the run record $record names no run class, got '$RUN_CLASS'" ;;
+  esac
+  context="$(pb_record_rows context "$record")"
+  RUN_DRIVER="$(px_tsv_get driver "$context" || true)"
+  RUN_SUITE="$(px_tsv_get suite "$context" || true)"
+  RUN_TEST="$(px_tsv_get test "$context" || true)"
+  # Assemble the contamination summary as a deduplicated list of causes in their original record
+  # order.
+  CONTAMINATION="$(pb_record_rows contamination "$record" | cut -f1 |
+    awk 'NF && !seen[$0]++ { s = s (s == "" ? "" : ",") $0 } END { print s }')"
 }
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
-  --run) px_cli_need_value "$@" && REPORT_RUN="$2" && shift ;;
-  --format) px_cli_need_value "$@" && REPORT_FORMAT="$2" && shift ;;
-  --out) px_cli_need_value "$@" && REPORT_OUT="$2" && shift ;;
-  --verdict) px_cli_need_value "$@" && REPORT_VERDICTS+=("$2") && shift ;;
-  --config) px_cli_need_value "$@" && REPORT_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *) px_usage_error "unexpected argument: $1" ;;
-  esac
-  shift
+# ---------------------------------------------------------------------------
+# Collect verdict streams and declared artifact status rows.
+# ---------------------------------------------------------------------------
+
+## @description  Appends the rows from a single verdict stream (file) to COLLECTED, promoting any
+##               row with an unknown severity or class to ERROR and recording the reason in detail.
+## @return       Exits 0.
+report_collect() {
+  local rows
+  rows="$(awk -F '\t' -v OFS='\t' -v severities="$SX_SEVERITIES" -v classes="$SX_CLASSES" '
+    BEGIN {
+      n = split(severities, s, " "); for (i = 1; i <= n; i++) sev[s[i]] = 1
+      n = split(classes, c, " "); for (i = 1; i <= n; i++) cls[c[i]] = 1
+    }
+    $0 == "" { next }
+    {
+      detail = $5
+      for (i = 6; i <= NF; i++) detail = detail " " $i
+      written = $2
+      severity = $2
+      class = $3
+      why = ""
+      if (!(severity in sev)) why = "unknown severity \"" $2 "\""
+      if (!(class in cls)) {
+        why = why (why == "" ? "" : ", ") "unknown class \"" $3 "\""
+        class = "none"
+      }
+      if (why != "") {
+        severity = "ERROR"
+        detail = "rejected, " why ": " detail
+      }
+      check = ($1 == "") ? "verdict.row" : $1
+      print check, severity, class, $4, detail, written
+    }' "$1")"
+  [ -n "$rows" ] || return 0
+  COLLECTED="$COLLECTED$rows$PX_NL"
+}
+
+## @description  Appends one SKIP row named artifact.<path> to COLLECTED for each optional artifact
+##               declared by the driver or a plug-in of the run that the run did not write.
+## @return       Exits 0.
+report_artifacts() {
+  local path status reason rows=""
+  while IFS="$PB_US" read -r path status _ reason; do
+    [ -n "$path" ] && [ "$status" != present ] || continue
+    rows="$rows$(px_tsv_row "artifact.$path" SKIP none px-report \
+      "$(px_tsv_clean "$path is $status: $reason")" SKIP)$PX_NL"
+  done <<EOF
+$(pb_declared_rows "$REPORT_RUN" | tr '\t' "$PB_US")
+EOF
+  COLLECTED="$COLLECTED$rows"
+}
+
+# ---------------------------------------------------------------------------
+# Demote non-authoritative duration failures and join effective severities.
+# ---------------------------------------------------------------------------
+
+## @description  Applies the severity demotion rule to every collected row, tallies the effective
+##               severities, and joins them into RESULT and RESULT_CODE.
+## @return       Exits 0.
+report_merge() {
+  local check severity class source detail written effective worst=PASS counter
+  while IFS="$PB_US" read -r check severity class source detail written; do
+    [ -n "$check" ] || continue
+    effective="$(pb_effective_severity "$severity" "$class" "$RUN_CLASS" "$CONTAMINATION")"
+    worst="$(sx_severity_worse "$worst" "$effective")"
+    counter="COUNT_$effective"
+    printf -v "$counter" '%s' "$((${!counter} + 1))"
+    COUNT_ROWS=$((COUNT_ROWS + 1))
+    EFFECTIVE="$EFFECTIVE$(px_tsv_row "$check" "$effective" "$class" "$source" "$detail" \
+      "$written")$PX_NL"
+  done <<EOF
+$(printf '%s' "$COLLECTED" | tr '\t' "$PB_US")
+EOF
+  RESULT="$(sx_result "$worst" "$COUNT_ROWS" "$COUNT_SKIP")"
+  RESULT_CODE="$(px_verdict_exit "$RESULT")"
+}
+
+# ---------------------------------------------------------------------------
+# Format and write the bundle report files and standard output stream.
+# ---------------------------------------------------------------------------
+
+## @description  Atomically writes standard input to a bundle report file (name) via a temporary
+##               file so that readers never observe a partially written file.
+## @return       Exits 0 on success, or 1 when the file cannot be written.
+report_put() {
+  local dir="$REPORT_RUN/report"
+  mkdir -p "$dir" || px_die "$PX_EXIT_FAIL" "cannot create $dir"
+  cat >"$dir/.$1" || px_die "$PX_EXIT_FAIL" "cannot write $dir/.$1"
+  mv -f "$dir/.$1" "$dir/$1" || px_die "$PX_EXIT_FAIL" "cannot write $dir/$1"
+}
+
+## @description  Formats the contents of report/verdicts.tsv, consisting of the header line and the
+##               effective verdict rows.
+## @return       Writes the formatted table to stdout and exits 0.
+report_verdicts_text() {
+  printf '%s\n' "$REPORT_VERDICT_FIELDS" | tr ' ' '\t'
+  printf '%s' "$EFFECTIVE"
+}
+
+## @description  Formats the contents of report/run-summary.tsv, consisting of the header line and a
+##               single summary row.
+## @return       Writes to stdout and exits 0, or exits 1 when a field contains a tab character.
+report_run_text() {
+  printf '%s\n' "$REPORT_RUN_FIELDS" | tr ' ' '\t'
+  px_tsv_row "$RUN_ID" "$RUN_CLASS" "$RUN_BACKEND" "$RUN_DRIVER" "$RUN_SUITE" "$RUN_TEST" \
+    "$RESULT" "$COUNT_ROWS" "$COUNT_PASS" "$COUNT_SKIP" "$COUNT_ADVISORY" "$COUNT_FAIL" \
+    "$COUNT_ERROR" "${CONTAMINATION:-none}"
+}
+
+## @description  Formats the contents of report/cluster-summary.tsv with the header line and one row
+##               for each instance recorded in the pre-run snapshot.
+## @return       Writes the formatted table to stdout and exits 0.
+report_cluster_text() {
+  local images="$REPORT_RUN/cluster/images.tsv"
+  [ -f "$images" ] || images=/dev/null
+  printf '%s\n' "$REPORT_CLUSTER_FIELDS" | tr ' ' '\t'
+  # In run-record.tsv, the columns following the record type are: instance (phase role index
+  # instance_id state ...), restart (phase role index count), diff (role index before after
+  # verdict ...), and oom (role index oom evidence).
+  awk -F '\t' -v OFS='\t' '
+    FILENAME == ARGV[1] { if (FNR > 1) image[$1 SUBSEP $2] = $4; next }
+    $1 == "instance" && $2 == "pre" {
+      k = $3 SUBSEP $4
+      if (!(k in pre)) { order[++n] = k; role[k] = $3; index_[k] = $4 }
+      pre[k] = $6
+    }
+    $1 == "instance" && $2 == "post" { post[$3 SUBSEP $4] = $6 }
+    $1 == "restart" && $2 == "pre" { rpre[$3 SUBSEP $4] = $5 }
+    $1 == "restart" && $2 == "post" { rpost[$3 SUBSEP $4] = $5 }
+    $1 == "diff" { change[$2 SUBSEP $3] = $6 }
+    $1 == "oom" { oom[$2 SUBSEP $3] = $4 }
+    END {
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        print role[k], index_[k], image[k], pre[k], post[k], rpre[k], rpost[k], change[k], oom[k]
+      }
+    }' "$images" "$REPORT_RUN/run-record.tsv"
+}
+
+## @description  Emits the effective verdict rows followed by the closing result row, which records
+##               the resolved bundle path or - when no bundle was read.
+## @return       Writes the report rows to stdout and exits 0.
+report_print() {
+  printf '%s' "$EFFECTIVE"
+  px_result_row "$RESULT" "$RESULT_CODE" "${REPORT_RUN:--}"
+}
+
+# ---------------------------------------------------------------------------
+# Parse and validate command-line arguments.
+# ---------------------------------------------------------------------------
+
+px_cli_parse "$@"
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
+
+# When no bundle operand is supplied, resolution defaults to the newest completed bundle unless
+# explicit verdict streams are provided via --verdict. The bundle resolver rejects any path outside
+# PX_OUT and never creates a missing bundle directory.
+for REPORT_OPERAND in ${PX_CLI_ARGS[@]+"${PX_CLI_ARGS[@]}"}; do
+  REPORT_BUNDLES+=("$(pb_bundle_resolve "$REPORT_OPERAND")") || exit "$?"
 done
-
-px_config_load ${REPORT_CONFIG_FILES[@]+"${REPORT_CONFIG_FILES[@]}"}
-
-case " $REPORT_FORMATS " in
-*" $REPORT_FORMAT "*) ;;
-*) px_usage_error "--format accepts $REPORT_FORMATS, got '$REPORT_FORMAT'" ;;
-esac
-
-# Argument validation is implemented in this round because it does not depend on the merge logic.
-# Because generating a report requires at least one source of verdict records, an invocation that
-# specifies no input source is rejected as a usage error rather than treated as an empty pass.
-if [ -z "$REPORT_RUN" ]; then
-  REPORT_RUN="${PX_RUN_DIR:-}"
+if [ "${#REPORT_BUNDLES[@]}" = 0 ] && [ "${#REPORT_VERDICTS[@]}" = 0 ]; then
+  REPORT_BUNDLES=("$(pb_bundle_newest)") || exit "$?"
 fi
-if [ -z "$REPORT_RUN" ] && [ "${#REPORT_VERDICTS[@]}" = 0 ]; then
-  px_usage_error "name a run with --run, a record with --verdict, or export PX_RUN_DIR"
-fi
-if [ -n "$REPORT_RUN" ] && [ ! -d "$REPORT_RUN" ]; then
-  px_die "$PX_EXIT_NO_OBJECT" "no such run directory: $REPORT_RUN"
+REPORT_RUN=${REPORT_BUNDLES[0]:-}
+if [ -n "$REPORT_RUN" ]; then
+  [ -f "$REPORT_RUN/verdicts.tsv" ] ||
+    px_die "$PX_EXIT_NO_OBJECT" "no verdict stream: $REPORT_RUN/verdicts.tsv"
 fi
 for REPORT_FILE in ${REPORT_VERDICTS[@]+"${REPORT_VERDICTS[@]}"}; do
-  if [ ! -f "$REPORT_FILE" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" "no such verdict record: $REPORT_FILE"
-  fi
+  [ -f "$REPORT_FILE" ] || px_die "$PX_EXIT_NO_OBJECT" "no such verdict stream: $REPORT_FILE"
 done
-# Evaluate the output policy at the top level rather than inside a command argument so that a
-# policy refusal terminates the main process instead of exiting only a subshell.
-if [ -n "$REPORT_OUT" ]; then
-  REPORT_DEST="$(px_out_resolve "$REPORT_OUT")" || exit $?
-  px_debug "the report would go to $REPORT_DEST"
+
+# ---------------------------------------------------------------------------
+# Execute the verdict merge pipeline and emit the final report.
+# ---------------------------------------------------------------------------
+
+if px_is_dry_run; then
+  [ -z "$REPORT_RUN" ] || px_plan read "$REPORT_RUN/verdicts.tsv"
+  for REPORT_FILE in ${REPORT_VERDICTS[@]+"${REPORT_VERDICTS[@]}"}; do
+    px_plan read "$REPORT_FILE"
+  done
+  [ -z "$REPORT_RUN" ] || px_plan write "$REPORT_RUN/report"
+  exit "$PX_EXIT_OK"
 fi
 
-px_die "$PX_EXIT_UNSUPPORTED" \
-  "the verdict merge arrives with round A5, which fixes the verdict record"
+if [ -n "$REPORT_RUN" ]; then
+  report_context_load
+  report_collect "$REPORT_RUN/verdicts.tsv"
+  report_artifacts
+else
+  RUN_CLASS=${PX_RUN_CLASS:-}
+  CONTAMINATION=${PX_CONTAMINATION:-}
+fi
+for REPORT_FILE in ${REPORT_VERDICTS[@]+"${REPORT_VERDICTS[@]}"}; do
+  report_collect "$REPORT_FILE"
+done
+report_merge
+if [ -n "$REPORT_RUN" ]; then
+  report_verdicts_text | report_put verdicts.tsv
+  report_run_text | report_put run-summary.tsv
+  report_cluster_text | report_put cluster-summary.tsv
+fi
+
+report_print
+px_debug "result $RESULT from $COUNT_ROWS rows, exit $RESULT_CODE"
+exit "$RESULT_CODE"

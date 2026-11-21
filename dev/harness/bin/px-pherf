@@ -14,137 +14,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Manages the distributed load-generation topology consisting of a single controller and a
-# configurable number of agents. This topology can target either a cluster provisioned by the
-# harness or an external endpoint, and it deploys onto whichever backend is currently bound so
-# that a single command interface covers both substrates.
-#
-# Two subsequent rounds implement the runtime behavior for their respective backends. Round H3
-# delivers the harness integration for the distributed load generator on the Compose backend,
-# including its deployment generator and driver, while round K5 brings the same topology to
-# Kubernetes. This round establishes the command name, the full option interface, and the argument
-# validation logic so that test suites can invoke the command now. Every execution path that
-# deploys the topology returns the unsupported exit code and identifies the round that owns the
-# bound backend.
+# Front end for deploying the Pherf controller and its load-generation agents across either
+# substrate backend. Because round H3 implements the runtime behavior and its command-line options,
+# this entry point responds to --help and rejects every other invocation with the unsupported exit
+# code.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
-# shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
-. "$SELF/../lib/backend/contract.sh"
 
 set -euo pipefail
-px_trap_enable
-
-PHERF_TARGETS="harness external"
-
-# The maximum agent count shares the upper bound enforced across all scaled roles in the harness.
-# Because the port allocation model computes each port as a base value plus a fixed step multiplied
-# by the zero-based instance index, the address space accommodates at most nine instances across
-# indices 0 through 8.
-PHERF_AGENTS_MAX=9
-
-PHERF_ACTION=""
-PHERF_AGENTS=""
-PHERF_TARGET="harness"
-PHERF_ENDPOINT=""
-PHERF_SCOPE=""
-PHERF_CONFIG_FILES=()
 
 ## @description  Prints the command-line usage summary and supported options.
 ## @return       Writes the help text to stdout and exits with status 0.
 usage() {
   cat <<'EOF'
-Usage: px-pherf <up|down|status> [option...]
+Usage: px-pherf [-h|--help]
 
-Subcommands:
-  up         deploy the controller and the agents [H3 on Compose, K5 on
-             Kubernetes]
-  down       remove the topology [H3 on Compose, K5 on Kubernetes]
-  status     report the controller and every agent [H3 on Compose, K5 on
-             Kubernetes]
+Brings up the Pherf controller and its agents on either backend.
+Round H3 implements it.
 
-Options:
-  --agents N        how many agents to run, 1 to 9, default 3
-  --target NAME     harness drives the cluster of this scope, external
-                    drives the endpoint of --endpoint. Default harness
-  --endpoint URL    the external endpoint, needed by --target external
-  --scope ID        the scope to deploy into, default PX_SCOPE_ID, else the
-                    scope that px-cluster up recorded for PX_CLUSTER_ID
-  --config FILE     an extra configuration file, repeatable
-  -v, --verbose     report detail
-  -h, --help        show this text
-
-Exit codes: 0 ok, 1 failure, 2 usage, 4 timeout, 5 a behaviour a later round
-owns, 6 no such scope.
+Exit codes: 0 help, 2 usage, 5 unsupported until round H3.
 EOF
 }
 
-# Inspects the configured backend name directly rather than binding the backend so that reporting
-# an unsupported operation never requires a reachable execution substrate.
-## @description  Identifies the implementation round that owns this command on the bound backend.
-## @return       Writes the owning round identifier to stdout and exits with status 0.
-pherf_owner() {
-  case "${PX_BACKEND:-compose}" in
-  compose) printf 'H3\n' ;;
-  *) printf 'K5\n' ;;
-  esac
-}
-
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
-  --agents) px_cli_need_value "$@" && PHERF_AGENTS="$2" && shift ;;
-  --target) px_cli_need_value "$@" && PHERF_TARGET="$2" && shift ;;
-  --endpoint) px_cli_need_value "$@" && PHERF_ENDPOINT="$2" && shift ;;
-  --scope) px_cli_need_value "$@" && PHERF_SCOPE="$2" && shift ;;
-  --config) px_cli_need_value "$@" && PHERF_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *)
-    [ -z "$PHERF_ACTION" ] || px_usage_error "unexpected argument: $1"
-    PHERF_ACTION=$1
-    ;;
-  esac
-  shift
-done
-
-if [ -z "$PHERF_ACTION" ]; then
-  px_usage_error "name a subcommand: up, down or status"
-fi
-case "$PHERF_ACTION" in
-up | down | status) ;;
-*) px_usage_error "unknown subcommand: $PHERF_ACTION" ;;
+case "${1:-}" in
+-h | --help)
+  usage
+  exit 0
+  ;;
+-*) px_usage_error "unknown option: $1" ;;
 esac
-
-px_config_load ${PHERF_CONFIG_FILES[@]+"${PHERF_CONFIG_FILES[@]}"}
-
-if [ -z "$PHERF_AGENTS" ]; then
-  PHERF_AGENTS=3
-fi
-case " $PHERF_TARGETS " in
-*" $PHERF_TARGET "*) ;;
-*) px_usage_error "--target accepts $PHERF_TARGETS, got '$PHERF_TARGET'" ;;
-esac
-if ! [[ $PHERF_AGENTS =~ $PX_RE_INT ]] ||
-  [ "$PHERF_AGENTS" -lt 1 ] || [ "$PHERF_AGENTS" -gt "$PHERF_AGENTS_MAX" ]; then
-  px_usage_error "--agents accepts 1 to $PHERF_AGENTS_MAX, got '$PHERF_AGENTS'"
-fi
-# The two target modes require distinct arguments, and because that parameter pairing is an
-# invariant of the command design rather than a backend detail, this round rejects mismatched
-# options immediately.
-if [ "$PHERF_TARGET" = external ] && [ -z "$PHERF_ENDPOINT" ]; then
-  px_usage_error "--target external needs --endpoint"
-fi
-if [ "$PHERF_TARGET" = harness ] && [ -n "$PHERF_ENDPOINT" ]; then
-  px_usage_error "--endpoint belongs to --target external"
-fi
-if [ "$PHERF_TARGET" = harness ]; then
-  PHERF_SCOPE="$(sb_scope_require "$PHERF_SCOPE")" || exit $?
-fi
-
-px_die "$PX_EXIT_UNSUPPORTED" \
-  "px-pherf $PHERF_ACTION on the ${PX_BACKEND:-compose} backend arrives with round $(pherf_owner)"
+px_die "$PX_EXIT_UNSUPPORTED" "px-pherf arrives with round H3"

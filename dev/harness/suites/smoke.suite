@@ -1,0 +1,38 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Fast post-build smoke suite in the validation class for the reduced sizing profile, executed
+# through two drivers. The psql test creates a table and a covered index and loads it in prepare,
+# then runs fixed point, range, and write statements in run so that its row counts are
+# deterministic. The java-main test runs a single Phoenix client class on client 0, verifying the
+# class path, client configuration, and JVM options of the client role. Because SchemaTool opens
+# its own connection and does not read px.jdbc.url, its request metrics stay off. Every test leaves
+# the cluster as it found it, with the psql test dropping its table during restore.
+
+suite: smoke
+description: The smoke check of a build, through the psql and java-main drivers
+class: validation
+timeout: 600
+
+test: sql
+  name: Create, load, index and query one table
+  driver: psql
+  args: --prepare sql/smoke-schema.sql sql/smoke-query.sql
+
+test: client
+  name: Read the catalog with a Phoenix client class
+  needs: sql
+  driver: java-main
+  args: org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb CATALOG -s SYSTEM

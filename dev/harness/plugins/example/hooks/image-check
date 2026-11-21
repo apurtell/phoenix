@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Implements the image-check hook for the example plugin, which the deployment generator invokes
+# once per render with the image assigned to every role. Validation succeeds only when the image
+# reference is a local repository:tag with no registry host and no digest, since the harness
+# executes only local images. Any check failure aborts the render pass so that the backend never
+# provisions an instance of a refused deployment.
+
+set -euo pipefail
+: "${PX_HOOK_OUT:?the harness sets PX_HOOK_OUT for every hook}"
+image=${1:-}
+case "$image" in
+*@* | *.*/* | *:*/* | localhost/* | '' | *[!A-Za-z0-9._/:-]* | [!a-z0-9]*)
+  printf 'example image-check: %s is not a local repository:tag\n' "${image:-(none)}" >&2
+  exit 1
+  ;;
+*:*) ;;
+*)
+  printf 'example image-check: %s names no tag\n' "$image" >&2
+  exit 1
+  ;;
+esac
+date -u '+%Y-%m-%dT%H:%M:%SZ' >>"$PX_HOOK_OUT/image-check.marker"

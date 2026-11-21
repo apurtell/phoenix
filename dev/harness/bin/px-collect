@@ -197,13 +197,6 @@ collect_sleep_ms() {
 collect_container() {
   local csv=$1 columns role_col header rows row role tick=0 samples=0
   local start_ms due_ms now_ms status=0
-  if ! sb_supports sb_sample_resources ||
-    ! sb_capability resource_sampling >/dev/null; then
-    collect_record container "$COLLECT_TARGETS" skip "" \
-      "the backend declares no resource sampling"
-    px_warn "container: the backend has no metrics source, skipped"
-    return 0
-  fi
   sb_scope_check "$COLLECT_SCOPE"
   header="$(collect_csv_header sample)"
   columns="$(sb_schema_count sample)"
@@ -215,10 +208,10 @@ collect_container() {
   start_ms="$(px_epoch_ms)"
   while [ "$COLLECT_STOP" = 0 ]; do
     status=0
-    rows="$(sb_call sb_sample_resources "$COLLECT_SCOPE")" || status=$?
+    rows="$(sb_sample_resources "$COLLECT_SCOPE")" || status=$?
     if [ "$status" = "$PX_EXIT_UNSUPPORTED" ]; then
       collect_record container "$COLLECT_TARGETS" skip "$csv" \
-        "the backend stopped reporting resource metrics"
+        "the backend reports no resource metrics"
       return 0
     fi
     if [ "$status" != 0 ]; then

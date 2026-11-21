@@ -30,26 +30,33 @@ support a Kubernetes backend in a subsequent phase, allowing test drivers, suite
 and telemetry collectors to run unmodified across both substrates. `docs/backends.md` serves as the
 authoritative contract specification and the blueprint for implementing additional backends.
 
+Three additional documents specify the interfaces layered above the contract.
+`docs/driver-contract.md` defines the six lifecycle verbs of a driver, their exit codes, the
+`describe` document, and the built-in `psql`, `pherf`, and `java-main` drivers.
+`docs/bundle-format.md` defines the structure of a run's result bundle, its manifest, the verdict
+merge logic, and the cluster checks. `docs/PLUGINS.md` defines the plug-in model, including its
+manifest, its nine hooks, its check scripts, and its driver, using `plugins/example` as a worked
+example.
+
 ## Quick start
 
 ```sh
 export PATH="$PWD/dev/harness/bin:$PATH"   # or call the commands by path
 px-cluster --help                          # every command answers --help
 px-cluster config                          # every resolved value with its origin
-px-cluster validate --no-backend           # check the configuration and the contract only
 px-cluster render --class validation       # render a deployment, change nothing else
 px-suite my.suite --dry-run                # print the execution order, change nothing
 px-run psql --class validation -- --prepare schema.sql query.sql   # one test, one bundle
 dev/harness/test/run-tests.sh              # the self-test: no runtime, no network, no Maven
 ```
 
-Because `px-cluster config`, `px-cluster validate --no-backend`, and `px-cluster render` do not
-contact a container runtime, they function even before a runtime is installed on the host. Bringing
-up a cluster requires two additional prerequisites: the container image and a rendered deployment
-directory. That deployment directory serves as the sole architectural boundary between the generator
-and the backend, allowing `px-cluster up DIR` to provision whatever directory it receives without
-any knowledge of roles, sizing, ports, or versions. See the "The deployment directory" section of
-`docs/backends.md` for the specification of what that directory contains.
+Because `px-cluster config` and `px-cluster render` do not contact a container runtime, they
+function even before a runtime is installed on the host. Bringing up a cluster requires two
+additional prerequisites: the container image and a rendered deployment directory. That deployment
+directory serves as the sole architectural boundary between the generator and the backend, allowing
+`px-cluster up DIR` to provision whatever directory it receives without any knowledge of roles,
+sizing, ports, or versions. See the "The deployment directory" section of `docs/backends.md` for the
+specification of what that directory contains.
 
 Once the image is built, a single command brings up a cluster from a run class and a topology file.
 During staging, `stage-artifacts.sh` pins each base image by digest through
@@ -58,8 +65,7 @@ During staging, `stage-artifacts.sh` pins each base image by digest through
 every subsequent build uses that record:
 
 ```sh
-dev/harness/scripts/build-phoenix.sh       # the Phoenix jars of this tree
-dev/harness/scripts/stage-artifacts.sh     # the staging checks, then the image build
+px-cluster build                           # build-phoenix.sh, then stage-artifacts.sh
 px-cluster --class measurement --config dev/harness/docker/env/override-24gib.env up
 ```
 
@@ -72,6 +78,12 @@ loopback ports, and then compares the sum of the container memory limits against
 less 4 GiB. Any deployment that exceeds this budget is refused with exit code 3 and a diagnostic
 message showing the arithmetic.
 
+`px-cluster scale ROLE COUNT` adjusts the instance count of a DataNode, NodeManager, or
+RegionServer role in a running cluster. It re-renders the deployment with the updated count, runs
+the memory check against it, and starts or stops only the instances added or removed by the count
+change. Pass the `--class`, `--config`, and `-e` values used during bring-up; the command refuses
+any render that alters another instance.
+
 Upon completion, `px-cluster up` records the cluster scope so that subsequent commands in any shell
 session can discover it automatically; see "Scope resolution" below. All generated output is placed
 under `$PX_OUT`, which defaults to `$HOME/phoenix-harness`. Operators should inspect the run
@@ -81,21 +93,22 @@ directory printed by the command, as nothing useful is left inside the repositor
 
 | Command | Purpose |
 |---|---|
-| `px-cluster` | Manages lifecycle: provision, wait, inspect, faults, teardown, version matrix. |
+| `px-cluster` | Manages lifecycle: image build, provision, scale, faults, teardown, and matrix. |
 | `px-suite` | Executes a declarative suite file: dependencies, boundaries, filters, and dry run. |
 | `px-run` | Executes one test: one run directory, one driver, snapshots, disruptions, exit code. |
-| `px-tool` | Runs administration: a shell, the doctor report, the health monitor, the quiet host. |
-| `px-collect` | Samples host and container resource utilization and writes the telemetry to CSV. |
-| `px-profile` | Orchestrates sampling profiler sessions against selected cluster roles. |
-| `px-jfr` | Captures Java Flight Recorder profiling sessions against selected cluster roles. |
-| `px-trace-count` | Runs exact invocation-count tracing, the count-based evidence a run prefers. |
-| `px-bundle` | Packages and validates the result bundle produced by a test run. |
-| `px-report` | Merges verdict streams into a single consolidated run verdict and exit code. |
-| `px-pherf` | Deploys and coordinates the Pherf controller and its agents on either backend. |
-| `px-k3d` | Creates and removes the local k3d cluster used to validate the Kubernetes backend. |
+| `px-tool` | Runs host safeguards: the health monitor and the quiet-host check. |
+| `px-collect` | Samples host and container resource utilization to CSV. |
+| `px-profile` | Runs sampling profiler sessions against selected roles; implemented in A6. |
+| `px-jfr` | Captures Java Flight Recorder sessions against selected roles; implemented in A6. |
+| `px-trace-count` | Archives trace counter outputs into the result bundle; implemented in A6. |
+| `px-bundle` | Packages and validates the result bundle produced by a run. |
+| `px-report` | Merges verdict streams into a single run verdict and exit code. |
+| `px-pherf` | Manages the Pherf controller and its agents on either backend; implemented in H3. |
+| `px-k3d` | Manages the local k3d cluster for the Kubernetes backend proofs; implemented in K2. |
 
 Every command responds to `--help` with exit code 0 and rejects any unrecognized flag with exit
-code 2.
+code 2. Commands scheduled for implementation in a later round exit with code 5 on any other
+invocation.
 
 ## Policy
 
@@ -184,8 +197,8 @@ $PX_OUT/
     monitor-<scope>             the health monitor of a cluster, and its
                                 .heartbeat
     down-<scope>                the lock that one px-cluster down holds
-    compose/                    the Compose backend: its scope records, its
-                                capability table and its host lock
+    compose/                    the Compose backend: its scope records and its
+                                host lock
   deploy/<cluster>/    the rendered deployment directory: compose.yaml,
                        ports.generated.env, topology.env, services.tsv
   dist/                the verified distributions, and pins.env, the pins that trust on
@@ -200,11 +213,12 @@ $PX_OUT/
   monitor/<run-id>/    one directory per health monitor: samples.tsv, breach.tsv
 ```
 
-Each run identifier combines a chronologically sortable UTC timestamp with a compact disambiguating
-suffix in the format `<YYYYMMDDTHHMMSSZ>-<4 characters>`. The timestamp prefix ensures that run
-directories sort lexicographically in execution order. The suffix incorporates the process ID, two
-random characters, and a per-process counter, and the resulting run directory is created
-exclusively so that two runs initiated within the same second cannot collide or share a directory.
+Each run identifier combines a sortable UTC timestamp with a short suffix in the format
+`<YYYYMMDDTHHMMSSZ>-<4 characters>`. The suffix encodes the millisecond, a per-process counter, and
+one random character, ensuring that identifiers sort lexicographically in creation order even within
+the same second. The harness then creates the run directory exclusively so that two runs initiated
+within the same second never share a directory. See the "The run id" section of
+`docs/bundle-format.md` for the formal grammar.
 
 ## Scope resolution
 
@@ -236,12 +250,8 @@ file. Lax validation remains the default so that subsequent development rounds c
 register their own variable families: under lax mode, an undeclared variable is logged as a debug
 note and loading proceeds.
 
-Internal harness constants are not user-configurable settings. In particular, `PX_CONTRACT_VERSION`
-is strictly read-only, and any attempt to assign it in a configuration file or via `--set` is
-rejected with exit code 2.
-
-Whenever a change introduces a new configuration variable, register its name under the appropriate
-section of `lib/varnames.txt` within the same commit.
+Whenever a change reads a new configuration variable, register its name under the group it belongs
+to in `lib/varnames.txt` within the same change.
 
 ## Configuration precedence
 
@@ -396,14 +406,13 @@ exposed outside the host machine. JVM debug ports are published only when the de
 with `PX_JVM_DEBUG=1`. During bring-up, the host preflight check aborts provisioning if any
 published port is already bound on `127.0.0.1`.
 
-Operators on the host can access all published endpoints at `127.0.0.1:<port>`, including daemon web
-interfaces, JMX servlets, and JVM debug ports, and can query `px-cluster endpoint` to resolve the
-port assigned to a specific instance. Running a JDBC or HBase client directly on the host is not
-supported because HBase returns internal container hostnames that do not resolve on the host system.
-Instead, execute client workloads inside the `client` or `tooling` container, for example via
-`px-tool shell`, where the rendered `phoenix-client.properties` file provides the configured JDBC
-URL. The complete networking contract is specified in the "The network" section of
-`docs/backends.md`.
+Operators on the host can reach every published port at `127.0.0.1:<port>`, including daemon web
+interfaces, JMX servlets, and debug ports, and can query `px-cluster endpoint` to resolve the port
+of an instance. Running a JDBC or HBase client directly on the host is not supported because HBase
+returns container hostnames to the client that the host system cannot resolve. Instead, run clients
+inside the `client` or `tooling` container, for example with
+`px-cluster exec client 0 -- /bin/bash`, where the rendered `phoenix-client.properties` file holds
+the JDBC URL. The "The network" section of `docs/backends.md` provides the full specification.
 
 ## Exit codes
 
@@ -441,22 +450,21 @@ environment cannot be trusted. The verdict mapping is defined as a second named 
 `lib/common.sh`, where PASS, SKIP, and ADVISORY map to 0, FAIL and INCONCLUSIVE map to 1, and ERROR
 maps to 3. Every help message that maps a verdict to an exit code prints this table.
 
-Exit code 3 serves as the universal indicator for cluster anomalies across every backend. During a
-test execution, `px-run` captures an instance state snapshot immediately before and after invoking
-the test driver, and it overrides a driver exit status of 0 or 1 with code 3 whenever an instance
-not covered by a planned action exhibits any of three state transitions: its restart count
-increased, it was running prior to the test and is exited, dead, or in an unknown state afterward,
-or it disappeared entirely. For every affected instance, the run record captures both the
-termination reason and the out-of-memory flag so operators can distinguish an unexpected process
-restart from an out-of-memory kill.
+Exit code 3 serves as the universal anomaly code across every backend. `px-run` captures a snapshot
+of every instance before and after the workload, and overrides a verb exit code of 0 or 1 with code
+3 whenever an instance not covered by a planned action exhibits one of three state transitions: its
+restart count increased, it was running beforehand and is exited, dead, or unknown afterward, or it
+vanished. For each affected instance, the run record captures the termination reason and the
+out-of-memory indicator so operators can distinguish an unplanned restart from an out-of-memory
+kill.
 
-While the driver is running, `px-run` also compares the live cluster against the initial snapshot
-once every `PX_POLL_INTERVAL_S`. The first unplanned restart, exit, disappearance, or out-of-memory
-kill immediately aborts the run with exit code 3 regardless of what the driver would return:
-`px-run` terminates the driver, writes an `abort` row recording the affected instance and its state
-change, and captures the second snapshot to preserve the failure evidence. Because a workload
-executing against a broken cluster produces no valid measurements, the run does not wait for the
-driver to finish.
+While the `prepare` and `run` verbs are executing, `px-run` also compares the live cluster against
+the initial snapshot once every `PX_POLL_INTERVAL_S`. The first unplanned restart, exit, loss, or
+out-of-memory kill immediately aborts the run with exit code 3 regardless of what the verb would
+return: `px-run` stops the active verb, writes an `abort` row recording the instance and its state
+change, and then captures the second snapshot to preserve the failure evidence. Because a workload
+running on a broken cluster produces no valid measurements, the run does not wait for the verb to
+finish.
 
 An action qualifies as planned only when `px-cluster` (`kill`, `signal`, `restart`, `scale`, or
 `group`) or a scheduled disruption managed by `px-run` logs an entry in the planned-action record
@@ -517,18 +525,26 @@ succeeds as already down. Each sampling pass also refreshes the heartbeat file
 bootstrap probe. The setup instance reads this heartbeat through a read-only mount of
 `$PX_OUT/state`, and the probe accepts a heartbeat age of up to three monitor intervals.
 
-**The quiet-host check.** Timing measurements are meaningful only on a quiet host. Before starting
-the test driver, `px-run` invokes `px-tool quiet-host`, which compares the host's one-minute load
-average, expressed as a percentage of its processor count, against `PX_QUIET_HOST_LOAD_PCT`. Two
-settings control this check: the wait duration `PX_QUIET_HOST_WAIT_S` bounds how long the check
-pauses for the host load to subside (a wait of 0 takes a single sample), and
-`PX_REQUIRE_QUIET_HOST=1` causes the run to fail with exit code 4 if the host remains busy when the
-wait expires. The check is disabled and takes no sample only when the wait duration is 0 and no
-quiet host is required, which is the configuration of the validation run class. Both a disabled
-check and a busy host on a run that does not require a quiet host mark the run as contaminated: the
-run record receives a `contamination quiet-host` row, every timing verdict of the run is downgraded
-to ADVISORY, and the driver receives `PX_CONTAMINATION=quiet-host`. The measurement run class waits
-up to 300 seconds and requires a quiet host.
+**The quiet-host check.** Timing measurements are meaningful only on a quiet host. After `validate`
+and before `prepare`, `px-run` invokes `px-tool quiet-host`, which compares the host's one-minute
+load average, expressed as a percentage of its processor count, against `PX_QUIET_HOST_LOAD_PCT`.
+Two settings govern this check: the wait duration `PX_QUIET_HOST_WAIT_S` bounds how long the check
+pauses for the load to subside (a wait of 0 takes a single sample), and `PX_REQUIRE_QUIET_HOST=1`
+causes the run to fail with exit code 4 if the host remains busy when the wait expires. The check is
+disabled and takes no sample only when the wait duration is 0 and no quiet host is required, which
+is the configuration of the validation run class. Both a disabled check and a busy host on a run
+that does not require a quiet host mark the run as contaminated: the run record receives a
+`contamination quiet-host` row, every timing verdict of the run becomes ADVISORY, and every verb
+receives `PX_CONTAMINATION=quiet-host`. A measurement run is also marked contaminated whenever its
+sizing diverges from the standard measurement table: through an override of `PX_<KEY>_MEM_MIB`,
+`PX_<KEY>_HEAP_MIB`, or `PX_<KEY>_DIRECT_MIB` in its own configuration, through an override named in
+the cluster's topology record (such as `override-24gib.env`), or by running against a cluster
+rendered for another class. In that case, the run record receives a `contamination sizing` row
+identifying the overrides. Each metric record captures both the run class and the contamination
+state at the time it is written. `px-report` demotes any failed verdict of class `duration` to
+`ADVISORY` unless the run belongs to the measurement class and has no contamination row, whereas
+count, share, and functional checks remain authoritative on any host. The measurement class waits up
+to 300 seconds and requires a quiet host.
 
 ## The host memory check
 
@@ -556,20 +572,29 @@ fail: a check whose required input artifact is unavailable emits `SKIP`, while a
 evaluated on a noisy or contaminated host emits `ADVISORY`. The severity lattice is implemented in
 `suites/lib/common.sh`.
 
-This aggregation lattice is already enforced by `px-suite`. Each test's process exit code is mapped
-onto an initial severity level: exit code 0 maps to `PASS`, code 5 maps to `SKIP`, codes 2, 3, and
-6 map to `ERROR`, and any other exit code maps to `FAIL`. If a test also emits explicit verdict
-records, the test assumes the highest severity present in its verdict stream whenever that severity
-exceeds the exit-code mapping. Any verdict record containing a severity token outside the defined
-lattice is rejected, elevating the test outcome to `ERROR`. At the suite level, the session assumes
-the worst severity observed across all executed tests, with one important exception: a session in
-which every executed test resolved to `SKIP`, or in which no tests executed at all, has verified
-nothing and therefore concludes with `INCONCLUSIVE`. Note that `INCONCLUSIVE` is a session-level
-summary result rather than a verdict severity, and no individual verdict record may carry it. Upon
-completion, `px-suite` prints the final session result and exits with code 0 for `PASS`, `SKIP`, or
-`ADVISORY`, code 1 for `FAIL` or `INCONCLUSIVE`, and code 3 for `ERROR`. Once round A5 is
-implemented, `px-report` will apply this exact same lattice when reducing the verdict streams of a
-single test run.
+`px-report [BUNDLE]` merges the verdict streams for a single run using this lattice after applying
+the demotion rule described above, and writes `report/verdicts.tsv`, the run summary, and the
+cluster summary into the result bundle; when invoked without an operand, it defaults to reading the
+newest completed bundle and concludes its output with a `result RESULT CODE BUNDLE` row. See the
+"Verdict severity" section of `docs/bundle-format.md` for the four steps of the merge procedure.
+
+`px-suite` applies the same lattice to a suite session. Each test's process exit code maps onto an
+initial severity: 0 maps to `PASS`, 5 maps to `SKIP`, 2, 3, and 6 map to `ERROR`, and every other
+exit code maps to `FAIL`. A test that recorded verdicts assumes the worst verdict in its stream
+whenever that severity is worse; for a driver test, those are the effective rows of
+`report/verdicts.tsv` in its bundle. `px-suite` rejects any verdict row whose severity is outside
+the lattice and elevates the test outcome to `ERROR`. The session assumes the worst test severity,
+with one exception: a session in which no test verified anything, either because every test resolved
+to `SKIP` with no verdict of another severity or because no test ran, concludes with the result
+`INCONCLUSIVE`. A driver test whose executed checks passed alongside the `SKIP` rows of its
+unsupported checks resolves to `SKIP` but still counts as having verified checks. `INCONCLUSIVE` is
+a summary result rather than a verdict severity, and no individual verdict may carry it. Both
+`px-suite` and `px-report` print the final result and exit with code 0 for `PASS`, `SKIP`, and
+`ADVISORY`, code 1 for `FAIL` and `INCONCLUSIVE`, and code 3 for `ERROR`. Each test result row
+emitted by `px-suite` records the test's bundle in a seventh column—left empty if the test did not
+run—and `results.tsv` persists the same rows; a session that runs to completion concludes standard
+output with a `result RESULT CODE SESSION_DIR` row, whereas an interrupted session emits no closing
+row.
 
 ## Self-test
 

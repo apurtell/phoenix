@@ -178,6 +178,9 @@ COPY entrypoint.sh healthcheck.sh render.sh /opt/px/
 COPY lib/ /opt/px/lib/
 COPY bin/ /opt/px/bin/
 COPY conf/ /opt/px/conf/
+# Copy the enabled plug-ins staged by scripts/stage-artifacts.sh, or an empty directory when no
+# plug-ins are enabled.
+COPY plugins/ /opt/px/plugins/
 
 # When a named volume is mounted for the first time, the container runtime copies the ownership of
 # the mount point from the image. Pre-creating every mount point here and assigning ownership to
@@ -200,13 +203,13 @@ ENV PX_HADOOP_HOME=/opt/hadoop \
     PX_CONF_DIR=/var/lib/px/conf \
     PATH=/opt/px/bin:/opt/hadoop/bin:/opt/hbase/bin:$PATH
 
-# Commands executed directly inside a running container instance by the orchestration substrate—
-# such as the region mover, a workload driver, or an interactive px-tool shell—do not inherit the
-# dynamic environment exported by the container entrypoint. Exporting these configuration directory
-# variables in the image environment ensures that the launch scripts for such commands use the
-# rendered cluster configuration and address each peer service by hostname; without them, the
-# launch scripts fall back to the default distribution configuration, which points ZooKeeper at
-# localhost and the default filesystem at file:///.
+# Commands executed directly inside a running instance by the orchestration substrate—such as the
+# region mover, a workload driver, or px-cluster exec—do not inherit the runtime environment
+# exported by the container entrypoint. Defining these configuration directory variables in the
+# image environment ensures that the launch scripts for such commands load the rendered cluster
+# configuration and address each peer by hostname; without them, the launch scripts fall back to
+# the default distribution configuration, which points ZooKeeper at localhost and the file system
+# at file:///.
 ENV HADOOP_CONF_DIR=${PX_CONF_DIR} \
     YARN_CONF_DIR=${PX_CONF_DIR} \
     HBASE_CONF_DIR=${PX_CONF_DIR}

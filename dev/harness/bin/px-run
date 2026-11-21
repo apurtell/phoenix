@@ -14,32 +14,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# px-run executes a single test run. It owns a single dedicated run directory under PX_OUT and
-# writes its own files exclusively within that directory, while backend state and the
-# planned-action record are stored in the shared state directory under PX_OUT.
+# px-run executes a single test run. It owns a single bundle directory at $PX_OUT/runs/<run-id>
+# and writes its own files exclusively within that bundle, while backend state and the
+# planned-action record are stored in the state directory under PX_OUT.
 #
-# Execution proceeds through five ordered steps:
-#   1. Resolve the configuration, mint the unique run identifier, and create the run directory.
-#   2. Capture the pre-run snapshot of the cluster through the substrate contract.
-#   3. Start the workload driver and inject the disruptions defined by the schedule.
-#   4. Capture the post-run snapshot and compare each instance against its pre-run state and
-#      restart count.
-#   5. Tear down the cluster by default and report a single exit code from the shared exit-code
-#      vocabulary.
+# docs/driver-contract.md specifies the six driver verbs that px-run invokes, and
+# docs/bundle-format.md specifies the diagnostic bundle that the run populates. Execution proceeds
+# in the following order:
+#   1. Invoke describe. A refused document stops the run with exit code 2, and each check that the
+#      document declares unsupported receives a SKIP row.
+#   2. Run validate, capture the pre-run snapshot, run the quiet-host check, perform the sizing
+#      check for a measurement run, and run the fetch-data plug-in hook.
+#   3. Run prepare, the pre-workload hook, run (which px-run monitors), and the post-workload
+#      hook. Scheduled disruptions fire during the verbs, and px-run waits for each one to recover.
+#   4. Capture the post-run snapshot and compare it against the pre-run snapshot.
+#   5. Run restore whenever prepare ran, run report whenever validate ran, execute the cluster
+#      checks, and run the collect hook.
+#   6. Merge the verdicts with px-report, write and validate the manifest with px-bundle, and tear
+#      down the cluster by default.
 #
-# Because the driver owns the verdict for its workload, its exit status passes through unchanged
-# unless overridden by a cluster anomaly: an unplanned instance change replaces an exit code of 0
-# or 1 with the cluster-anomaly exit code 3. An instance is considered changed if its restart count
-# rose, if a running instance exited or transitioned to unknown, or if the instance vanished. A
-# change is unplanned when no planned action recorded during the run covers that instance, showing
-# that the failure originated in the cluster rather than the workload so that callers can tell the
-# two apart.
+# A failing step blocks only the downstream steps that depend on it, so restore and report still
+# execute and the bundle remains complete. px-run writes one verdict row per verb, and px-report
+# computes the overall result. The exit code is the first non-zero code returned by a verb, except
+# that an unplanned cluster change replaces 0 or 1 with the anomaly code 3 and a verb that exceeds
+# its timeout bound yields 4. An instance is considered changed if its restart count rose, if a
+# running instance exited or transitioned to unknown, or if the instance vanished. A change is
+# unplanned when no planned action from this run covers the instance, showing that the failure
+# originated in the cluster rather than the workload so that callers can distinguish the two.
 #
-# This instance comparison also executes once per poll interval while the driver is running.
-# Detecting an unplanned change during execution aborts the run immediately: the harness stops the
-# driver, appends an abort row with the cause to the run record, and terminates the run with exit
-# code 3 regardless of the status returned by the driver, because running a workload against a
-# broken cluster produces no valid measurement.
+# This cluster comparison also executes once per poll interval while prepare and run are executing.
+# Detecting an unplanned change during execution aborts the run immediately: px-run stops the
+# active verb, appends an abort row with the cause to the run record, and ends the run with exit
+# code 3 regardless of the status returned by the verb, because running a workload against a broken
+# cluster produces no valid measurement.
 #
 # Host safety: the usage text below describes the host safeguards enforced during a run, and the
 # "Host safety" section of the README explains their design rationale.
@@ -47,42 +54,12 @@
 # Because every cluster query and fault injection goes through the substrate contract, this script
 # references no specific container runtime and executes unchanged across every supported backend.
 #
-# Run record format: A real run writes a single flat tab-separated record file at
-# $PX_RUN_DIR/run-record.tsv whose first column identifies the row type. Because a subsequent
-# development round defines the final bundle layout, this file is intentionally structured as a
-# single flat stream that a bundle writer can ingest without walking a directory tree:
-#   run       run_id run_class backend scope driver
-#   stage     name ts_ms
-#   version   phase component version
-#   instance  phase <the instance schema of the contract>
-#   restart   phase role index count
-#   sample    phase <the sample schema of the contract>
-#   disrupt   ordinal when_kind when_value action role index argument state
-#   action    ts_ms action role index argument state exit_code
-#   phase     role index <the phase schema of the contract>
-#   diff      role index before after verdict pre_state post_state
-#   term      role index <the term schema of the contract>
-#   oom       role index <the oom schema of the contract>
-#   quiet     sample ts_ms load_pct threshold_pct, or
-#             result state samples waited_s load_pct
-#   monitor   phase dir
-#   contamination  source detail
-#   abort     ts_ms role index change
-#   driver    elapsed_ms exit_code log
-#   skip      phase subject reason
-#   breach    path
-#   teardown  exit_code name
-#   result    exit_code name anomaly
-# Each diff row carries a verdict of unchanged, planned, unplanned, vanished, or unknown. Every
-# unplanned or vanished instance is also accompanied by a term row and an oom row containing
-# evidence of the underlying cause. A quiet result row reports a state of quiet, contaminated,
-# refused, unmeasured, or off, and any contamination row makes every time verdict of the run
-# ADVISORY. A monitor row records the run directory of the health monitor, while a breach row names
-# the local copy of its breach.tsv file. A record file that ends without a result row indicates an
-# interrupted run.
+# THE RECORD FILE. A real run writes run-record.tsv in its bundle as a single stream of TSV rows
+# whose first column identifies the row type. See the "run-record.tsv" section of
+# docs/bundle-format.md for the definition of every row type and its fields.
 #
-# A dry run neither creates a run directory nor invokes the backend; instead, it writes the same
-# row stream to stdout and emits "plan step detail" rows describing what a real run would execute.
+# A dry run neither creates a bundle nor invokes a backend. Instead, it runs describe to validate
+# the driver document and writes "plan step detail" rows to stdout.
 
 set -euo pipefail
 
@@ -91,6 +68,10 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/../lib/common.sh"
 # shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
 . "$SELF/../lib/backend/contract.sh"
+# shellcheck source=SCRIPTDIR/../lib/bundle.sh
+. "$SELF/../lib/bundle.sh"
+# shellcheck source=SCRIPTDIR/../lib/plugin.sh
+. "$SELF/../lib/plugin.sh"
 
 px_trap_enable
 
@@ -100,55 +81,77 @@ usage() {
   cat <<'EOF'
 Usage: px-run [option...] [-- driver argument...]
 
-Runs one test. px-run owns one run directory, runs one driver, snapshots the
-cluster before and after the driver, injects the declared disruptions, and
-reports one exit code.
+Runs one test. px-run owns one bundle, calls the six verbs of one driver,
+snapshots the cluster before and after the workload, injects the declared
+disruptions, runs the cluster checks, merges the verdicts and writes the
+manifest of the bundle.
 
 Options:
-  -d, --driver NAME|PATH  the driver program: a path, or a name that resolves
-                          to <drivers>/NAME/driver.sh. A real run needs one.
+  -d, --driver NAME|PATH  the driver: a path, or a name that resolves to
+                          <drivers>/NAME/driver.sh, else to the driver of the
+                          enabled plug-in NAME. A real run needs one.
   -s, --scope ID          the scope id of a provisioned cluster, default
                           PX_SCOPE_ID, else the scope px-cluster recorded for
                           PX_CLUSTER_ID. Without one px-run takes no snapshot
                           and refuses a disruption.
   -b, --backend NAME      the substrate backend to bind
-  -c, --class NAME        the run class, which selects the configuration
+  -c, --class NAME        the run class, validation or measurement. A real
+                          run needs one.
   -D, --disrupt SPEC      one disruption, repeatable. Several specifications
                           in one value are separated by a semicolon.
-  -t, --timeout SECONDS   the bound on the driver, default PX_TIMEOUT_DEFAULT
+  -t, --timeout SECONDS   the bound that prepare and run share, default
+                          PX_TIMEOUT_DEFAULT. Each other verb has the bound
+                          PX_TIMEOUT_VERB.
   -e, --set NAME=VALUE    one configuration value, repeatable
   -f, --config FILE       one configuration file, repeatable
-  -n, --dry-run           print the plan, call no backend, make no run
-                          directory
+  -n, --dry-run           run describe, print the plan, call no backend and
+                          make no bundle
   -k, --keep              keep the cluster and temporary files, and give the
                           switch to the driver
   -v, --verbose           report progress in detail
   -h, --help              print this text
 
 A disruption specification is WHEN,ACTION,ROLE,INDEX[,ARGUMENT].
-  WHEN      +SECONDS after the driver starts, or phase:NAME
-  ACTION    kill, signal or restart
-  ARGUMENT  the kill mode (hard or delete, default hard), the signal name, or
-            empty for restart
+  WHEN      +SECONDS after the run verb starts, or phase:NAME
+  ACTION    kill, signal or restart; a kill names a regionserver
+  ARGUMENT  the kill mode (hard, the default), the signal name, or empty for
+            restart
 A phase name is a point that px-run announces: setup, snapshot_pre,
-driver_start, driver_exit and snapshot_post. A specification that never fires
-is recorded as skipped. signal and restart are optional substrate functions,
-so a backend that lacks one records a skip instead of a failure.
+driver_start (the run verb starts), driver_exit (the run verb ends) and
+snapshot_post. It can also be a stage anchor <kind>@<name>, such as
+steady@script or verb@prepare: the disruption fires when a verb writes the
+begin row of that anchor. A specification that never fires is recorded as
+skipped, and one whose anchor opened and closed before px-run saw it as
+missed. A substrate function that the backend cannot serve exits 5, and the
+disruption is then recorded as a skip instead of a failure. After each
+injection px-run waits for recovery: a killed RegionServer starts again
+through the drain-aware restart, then the whole scope must be ready and the
+online regions back to their count before the disruption, within
+PX_TIMEOUT_READY and within the bound of the verb that is running. The time
+to recovery is the mttr_seconds of the disruption in the manifest.
 
-Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
-5 unsupported, 6 no such object. A status of 0 to 6 from the driver passes
-through unchanged. An unplanned restart, an unplanned exit of a running
-instance, or an instance that vanished replaces 0 or 1 with 3. A planned
-action of this run, or of px-cluster during this run, explains a change.
-Such a change found while the driver runs aborts the run at once with 3.
-4 also means that the host stayed busy and the run requires a quiet host.
+Exit codes: 0 ok, 1 failure, 2 usage or a refused describe document, 3
+cluster anomaly, 4 timeout, 5 unsupported, 6 no such object. The code is the
+first non-zero code of a verb; a code outside 0 to 3 counts as 1. A verb
+that passed its bound gives 4. An unplanned restart, an unplanned exit of a
+running instance, or an instance that vanished replaces 0 or 1 with 3. A
+planned action of this run, or of px-cluster during this run, explains a
+change. Such a change found while prepare or run works aborts the run at
+once with 3. When every verb gave 0, the code is that of the merged verdict
+of px-report: 0 PASS, SKIP or ADVISORY, 1 FAIL or INCONCLUSIVE, 3 ERROR. A
+bundle that px-bundle validate refuses turns 0 into 1. 4 also means that the
+host stayed busy and the run requires a quiet host.
+
+Time verdicts are ADVISORY unless the run is of the measurement class on a
+quiet host with the measurement sizing: a host that is busy or not checked,
+and a sizing that is not the measurement table, tag the run contaminated.
 
 The run holds the host awake. When it ends, also by a failure or an
 interrupt, it tears the cluster down with px-cluster down, unless --keep,
 PX_KEEP=1 or PX_TEARDOWN=0 keeps the cluster.
 
-Output: a real run writes the run directory to stdout and its record to
-run-record.tsv in that directory. A dry run writes the plan to stdout.
+Output: a real run writes the bundle directory to stdout. A dry run writes
+the plan to stdout.
 EOF
 }
 
@@ -161,21 +164,33 @@ EOF
 RECORD_FILE=""
 RUN_ID=""
 RUN_DIR=""
+STAGES_FILE=""
+STAGE_BASE=0
 SCOPE=""
 DRIVER_SPEC=""
 DRIVER_PATH=""
-DRIVER_LOG=""
-DRIVER_PID=""
-DRIVER_STATUS=0
-DRIVER_START_S=0
-DRIVER_START_MS=0
-DRIVER_DEADLINE=0
+DRIVER_NAME=""
+DRIVER_DIR=""
 DRIVER_TIMEOUT=0
-DRIVER_TIMED_OUT=0
-SNAPSHOT_FAILED=0
+VERB_TIMEOUT=0
+VERB_CWD=""
+VERB_PID=""
+VERB_STATUS=0
+VERB_CODE=0
+VERB_ELAPSED_MS=0
+VERB_DEADLINE=0
+VERB_TIMED_OUT=0
+RUN_START_S=0
+RUN_START_MS=0
+FIRST_CODE=0
+ANY_TIMED_OUT=0
 ANOMALY=0
 ABORTED=0
+BLOCKED=""
 CONTAMINATION=""
+PLUGINS_ENABLED=""
+REPORT_STATUS=0
+BUNDLE_STATUS=0
 MONITOR_DIR=""
 PRE_RESTARTS=""
 POST_RESTARTS=""
@@ -190,8 +205,9 @@ DISRUPT_ROLE=()
 DISRUPT_INDEX=()
 DISRUPT_ARG=()
 DISRUPT_STATE=()
+DISRUPT_INJECTED=()
+DISRUPT_REGIONS=()
 DRIVER_ARGS=()
-DRIVER_CMD=()
 CONFIG_FILES=()
 SET_PAIRS=()
 
@@ -253,106 +269,235 @@ phase_reached() {
   done
 }
 
+## @description  Records the first non-zero status code (code) observed during the run so that it
+##               can serve as the run's exit code.
+## @return       Exits 0.
+note_code() {
+  [ "$FIRST_CODE" != 0 ] || FIRST_CODE=${1:-0}
+}
+
+# Preserves the first recorded failure reason so that the resulting skip row identifies the gate
+# that failed first.
+## @description  Marks downstream steps that depend on a prerequisite gate as blocked (reason).
+## @return       Exits 0.
+block() {
+  [ -n "$BLOCKED" ] || BLOCKED=$1
+}
+
 # ---------------------------------------------------------------------------
 # Workload driver lifecycle
 # ---------------------------------------------------------------------------
 
-## @description  Resolves a driver name or filesystem path to an absolute executable program path.
-## @return       Writes the absolute path to stdout and exits 0, or exits 2 when the program is
-##               absent or not executable.
-driver_resolve() {
-  local spec=$1 dir path
-  case "$spec" in
-  */*) path=$spec ;;
-  *)
-    dir=${PX_DRIVERS_DIR:-drivers}
-    case "$dir" in
-    /*) ;;
-    *) dir="$PX_HOME/$dir" ;;
-    esac
-    path="$dir/$spec/driver.sh"
-    ;;
-  esac
-  if [ ! -f "$path" ]; then
-    px_die "$PX_EXIT_USAGE" "no driver program at $path"
+# The describe verb receives a sanitized environment containing only PX_HOME, PX_DRIVER_NAME, and
+# PX_VERB so that it can execute without an active run directory.
+## @description  Launches a driver verb (verb, stdout file, stderr file) as a background process.
+## @return       Sets VERB_PID and exits 0.
+verb_start() {
+  local verb=$1 out=$2 err=$3
+  # Using exec replaces the background subshell with the driver executable so that the recorded
+  # process identifier refers to the driver rather than a wrapper shell and signals reach the
+  # workload directly. A driver that spawns child processes owns their lifecycle, and the driver
+  # contract requires it to handle termination signals cleanly.
+  if [ "$verb" = describe ]; then
+    env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" "PX_HOME=$PX_HOME" \
+      "PX_DRIVER_NAME=$DRIVER_NAME" PX_VERB=describe "$DRIVER_PATH" describe \
+      >>"$out" 2>>"$err" &
+  else
+    (
+      if [ -n "$VERB_CWD" ]; then
+        cd "$VERB_CWD" || exit "$PX_EXIT_USAGE"
+      fi
+      PX_VERB=$verb
+      PX_RECORD_SOURCE="driver:$DRIVER_NAME"
+      export PX_VERB PX_RECORD_SOURCE
+      exec "$DRIVER_PATH" "$verb" ${DRIVER_ARGS[@]+"${DRIVER_ARGS[@]}"}
+    ) >>"$out" 2>>"$err" &
   fi
-  if [ ! -x "$path" ]; then
-    px_die "$PX_EXIT_USAGE" "the driver program is not executable: $path"
-  fi
-  px_realpath "$path" || px_die "$PX_EXIT_FAIL" "cannot resolve $path"
+  VERB_PID=$!
 }
 
-## @description  Assembles the command line for a single driver invocation in DRIVER_CMD.
-## @return       Sets DRIVER_CMD. Exit 0.
-driver_command() {
-  # Under set -u, Bash 3.2 treats an empty array expansion as an unbound variable error, so the
-  # operator arguments are expanded conditionally.
-  DRIVER_CMD=("$DRIVER_PATH" ${DRIVER_ARGS[@]+"${DRIVER_ARGS[@]}"})
-}
-
-## @description  Launches the driver process in the background and computes its execution deadline.
-## @return       Sets DRIVER_PID, the two start timestamps, and DRIVER_DEADLINE, then exits 0.
-driver_start() {
-  driver_command
-  # Using exec replaces the background subshell with the driver binary itself, ensuring that the
-  # recorded PID refers directly to the driver rather than an intermediate shell and that signals
-  # reach the workload directly. Any child processes spawned by the driver are owned by the driver,
-  # which is required by the driver contract to handle termination signals cleanly.
-  ( exec "${DRIVER_CMD[@]}" ) >"$DRIVER_LOG" 2>&1 &
-  DRIVER_PID=$!
-  DRIVER_START_S="$(px_epoch_s)"
-  DRIVER_START_MS="$(px_epoch_ms)"
-  DRIVER_DEADLINE=$((DRIVER_START_S + DRIVER_TIMEOUT))
-  px_info "driver $DRIVER_PATH started as process $DRIVER_PID"
-}
-
-# Requests graceful termination first and forces termination ten seconds later, allowing the driver
-# to flush its own output while ensuring that a process ignoring the request is still terminated.
-## @description  Stops the active background driver process gracefully, then forcefully after 10s.
+# Requests graceful termination first and escalates to a forced kill after ten seconds so that a
+# driver can flush its output while an unresponsive process is still terminated.
+## @description  Terminates the active background verb process and closes any open stage anchors.
 ## @return       Exit 0.
-driver_terminate() {
+verb_terminate() {
   local waited=0
-  [ -n "$DRIVER_PID" ] || return 0
-  kill -0 "$DRIVER_PID" 2>/dev/null || return 0
-  px_warn "stopping driver process $DRIVER_PID"
-  # Suppress the shell's default job-termination notification on stderr, which would expose the
-  # raw internal command line after the harness has already logged a structured warning message.
-  {
-    kill -s TERM "$DRIVER_PID" || return 0
-    while [ "$waited" -lt 10 ] && kill -0 "$DRIVER_PID"; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    if kill -0 "$DRIVER_PID"; then
-      kill -s KILL "$DRIVER_PID" || true
-    fi
-  } 2>/dev/null
+  [ -n "$VERB_PID" ] || return 0
+  if kill -0 "$VERB_PID" 2>/dev/null; then
+    px_warn "stopping driver process $VERB_PID"
+    # Suppress the shell's default job-termination message for signal-killed background jobs, which
+    # would expose the raw internal command line after the harness has already logged a structured
+    # warning.
+    {
+      kill -s TERM "$VERB_PID" || true
+      while [ "$waited" -lt 10 ] && kill -0 "$VERB_PID"; do
+        sleep 1
+        waited=$((waited + 1))
+      done
+      if kill -0 "$VERB_PID"; then
+        kill -s KILL "$VERB_PID" || true
+      fi
+    } 2>/dev/null
+  fi
+  # A forcefully stopped verb—including when px-run itself is interrupted—leaves its stage anchors
+  # open, so close them here to keep the stage file well-formed.
+  [ -z "$STAGES_FILE" ] || pb_stage_close_open "$STAGES_FILE" "px-run stopped the driver"
 }
 
-# Polls the running driver until it exits or exceeds its timeout bound, firing scheduled time-offset
-# disruptions as their offsets arrive and terminating the driver immediately if an unplanned cluster
-# instance change is detected.
-## @description  Monitors the active driver process for completion, timeout, or cluster anomalies.
-## @return       Sets DRIVER_TIMED_OUT on timeout or ABORTED on an unplanned change, and exits 0.
-driver_watch() {
-  local interval now
-  interval=${PX_POLL_INTERVAL_S:-1}
-  while kill -0 "$DRIVER_PID" 2>/dev/null; do
-    now="$(px_epoch_s)"
-    if [ "$now" -ge "$DRIVER_DEADLINE" ]; then
-      DRIVER_TIMED_OUT=1
-      px_error "the driver passed its bound of ${DRIVER_TIMEOUT}s"
-      driver_terminate
-      return 0
+# Fires scheduled disruptions as they come due and, during prepare and run, terminates the verb
+# immediately if an unplanned cluster change is observed.
+## @description  Monitors the active verb (verb) until it completes or exceeds its deadline.
+## @return       Sets VERB_TIMED_OUT on timeout or ABORTED on an unplanned change, and exits 0.
+verb_watch() {
+  local verb=$1 steps ticks=0 next=0 nap now
+  # Each tick is one tenth of a second. Deadline and anomaly checks run immediately, at the end of
+  # the first second, and once per PX_POLL_INTERVAL_S thereafter; polling the process at every tick
+  # during the first second allows short-lived verbs to finish without paying a full poll interval.
+  steps="$(awk -v i="${PX_POLL_INTERVAL_S:-1}" \
+    'BEGIN { n = int(i * 10 + 0.5); print (n < 1 ? 1 : n) }')"
+  while kill -0 "$VERB_PID" 2>/dev/null; do
+    if [ "$ticks" -ge "$next" ]; then
+      now="$(px_epoch_s)"
+      if [ "$now" -ge "$VERB_DEADLINE" ]; then
+        VERB_TIMED_OUT=1
+        px_error "the $verb verb passed its bound"
+        verb_terminate
+        return 0
+      fi
+      [ "$verb" != run ] || disrupt_due "$now"
+      case "$verb" in
+      prepare | run)
+        if ! anomaly_watch; then
+          ABORTED=1
+          verb_terminate
+          return 0
+        fi
+        ;;
+      esac
+      next=$((ticks < 10 ? 10 : ticks + steps))
     fi
-    disrupt_due "$now"
-    if ! anomaly_watch; then
-      ABORTED=1
-      driver_terminate
-      return 0
+    # When a disruption is waiting on a stage anchor, inspect the stage file on every tick so that
+    # the injection fires within a sub-interval window.
+    nap=1
+    if disrupt_anchor_pending; then
+      disrupt_anchors fire
+    elif [ "$ticks" -ge 10 ]; then
+      nap=$((next - ticks))
     fi
-    sleep "$interval"
+    [ "$nap" -ge 1 ] || nap=1
+    sleep "$((nap / 10)).$((nap % 10))"
+    ticks=$((ticks + nap))
   done
+  # Any anchor that opened and closed after the final tick is recorded as missed because a verb
+  # that has already exited can no longer be disrupted.
+  disrupt_anchors mark
+}
+
+## @description  Launches a driver verb (verb, stdout file, stderr file, deadline in epoch seconds)
+##               in the background and monitors it until completion.
+## @return       Sets VERB_STATUS, VERB_ELAPSED_MS, and VERB_TIMED_OUT, then exits 0.
+verb_exec() {
+  local verb=$1 started
+  VERB_DEADLINE=$4
+  VERB_TIMED_OUT=0
+  VERB_STATUS=0
+  started="$(px_epoch_ms)"
+  verb_start "$verb" "$2" "$3"
+  if [ "$verb" = run ]; then
+    RUN_START_S="$(px_epoch_s)"
+    phase_reached driver_start
+  fi
+  verb_watch "$verb"
+  { wait "$VERB_PID"; } 2>/dev/null || VERB_STATUS=$?
+  VERB_PID=""
+  VERB_ELAPSED_MS=$(($(px_epoch_ms) - started))
+}
+
+## @description  Executes a driver verb within the bundle (verb, deadline in epoch seconds),
+##               recording its stage rows, log output, verb row, and (except for describe) verdict.
+## @return       Sets VERB_CODE (0 to 4) and exits 0.
+verb_run() {
+  local verb=$1 out err aborted=$ABORTED detail
+  out="$RUN_DIR/logs/$verb.log"
+  err=$out
+  if [ "$verb" = describe ]; then
+    out="$DRIVER_DIR/describe.json"
+    err="$RUN_DIR/logs/describe.log"
+  fi
+  pb_stage begin "verb@$verb"
+  verb_exec "$verb" "$out" "$err" "$2"
+  # verb_terminate already closed the open stage anchors when px-run stopped the verb.
+  if [ "$VERB_TIMED_OUT" = 0 ] && [ "$ABORTED" = "$aborted" ]; then
+    pb_stage end "verb@$verb"
+  fi
+  if [ "$ABORTED" != "$aborted" ]; then
+    VERB_CODE=$PX_EXIT_ANOMALY
+    detail="stopped at an unplanned change of the cluster"
+  elif [ "$VERB_TIMED_OUT" = 1 ]; then
+    VERB_CODE=$PX_EXIT_TIMEOUT
+    ANY_TIMED_OUT=1
+    detail="stopped at its bound"
+  else
+    # Map any exit status outside the verb vocabulary (such as 143 from a signal) to a standard
+    # failure code while preserving the raw status in the verb record row.
+    case "$VERB_STATUS" in
+    0 | 1 | 2 | 3) VERB_CODE=$VERB_STATUS ;;
+    *) VERB_CODE=$PX_EXIT_FAIL ;;
+    esac
+    detail="exit $VERB_STATUS"
+  fi
+  record_row verb "$verb" "$VERB_STATUS" "$VERB_ELAPSED_MS" "$VERB_TIMED_OUT"
+  [ "$verb" != run ] || phase_reached driver_exit
+  px_info "verb $verb ended with exit $VERB_STATUS, code $VERB_CODE"
+  [ "$verb" != describe ] || return 0
+  sx_verdict "driver.$verb" "$(sx_severity_of_code "$VERB_CODE")" \
+    "$detail, output in logs/$verb.log"
+  note_code "$VERB_CODE"
+}
+
+## @description  Computes the execution deadline for a short verb as the current time plus
+##               PX_TIMEOUT_VERB.
+## @return       Writes the deadline in epoch seconds to stdout and exits 0.
+verb_deadline() { printf '%s\n' "$(($(px_epoch_s) + VERB_TIMEOUT))"; }
+
+## @description  Executes the describe verb during a dry run using a temporary directory and
+##               validates the resulting document.
+## @return       Exits 0 when the document is accepted, or exits 2 otherwise.
+describe_dry() {
+  local dir
+  dir="$(px_mktemp_dir px-describe)" || exit "$?"
+  verb_exec describe "$dir/describe.json" "$dir/describe.log" "$(verb_deadline)"
+  if [ "$VERB_TIMED_OUT" = 1 ] || [ "$VERB_STATUS" != 0 ]; then
+    cat "$dir/describe.log" >&2 || true
+    px_die "$PX_EXIT_USAGE" "describe of driver $DRIVER_NAME ended with exit $VERB_STATUS"
+  fi
+  pb_describe_load "$dir/describe.json" ||
+    px_die "$PX_EXIT_USAGE" "the describe document of driver $DRIVER_NAME is refused"
+}
+
+# Emits a SKIP verdict row for every check that the describe document declares unsupported so that
+# downstream gates querying that key observe an explained skip.
+## @description  Executes the describe verb in the bundle and validates the resulting document.
+## @return       Exits 0 when accepted, 1 to 4 if describe fails, or 2 if the document is refused.
+describe_run() {
+  local key reason
+  verb_run describe "$(verb_deadline)"
+  if [ "$VERB_CODE" != 0 ]; then
+    sx_verdict driver.describe "$(sx_severity_of_code "$VERB_CODE")" \
+      "describe ended with code $VERB_CODE, output in logs/describe.log"
+    return "$VERB_CODE"
+  fi
+  if ! pb_describe_load "$DRIVER_DIR/describe.json"; then
+    sx_verdict driver.describe ERROR "the describe document is refused, see the messages of px-run"
+    return "$PX_EXIT_USAGE"
+  fi
+  sx_verdict driver.describe PASS "drivers/$DRIVER_NAME/describe.json is accepted"
+  while IFS="$PB_US" read -r key reason; do
+    [ -n "$key" ] || continue
+    sx_verdict "$key" SKIP "unavailable: $reason"
+  done <<EOF
+$(pb_describe_rows checks | tr '\t' "$PB_US")
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -378,6 +523,63 @@ planned_covers() {
   px_warn "cannot read the planned-action record, exit $status:" \
     "a change of $1/$2 counts as unplanned"
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Cluster metadata capture in the bundle
+# ---------------------------------------------------------------------------
+
+## @description  Copies the deployment artifacts for the active scope (topology.env, services.tsv,
+##               and plug-in records) into the bundle.
+## @return       Records a skip row if the deployment record is absent and exits 0.
+cluster_copy() {
+  local file recorded="" dir="" name
+  # Because a deployment record is keyed to a cluster rather than a scope, use it only when the
+  # cluster's scope record matches the active scope.
+  file="$(sb_scope_record || true)"
+  if [ -n "$file" ] && [ -f "$file" ]; then
+    IFS= read -r recorded <"$file" || true
+  fi
+  if [ "$recorded" = "$SCOPE" ]; then
+    file="$(sb_deployment_record || true)"
+    if [ -n "$file" ] && [ -f "$file" ]; then
+      IFS= read -r dir <"$file" || true
+    fi
+  fi
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    record_row skip pre deployment "no deployment record of scope $SCOPE"
+    return 0
+  fi
+  for name in topology.env services.tsv; do
+    if [ -f "$dir/$name" ]; then
+      cp "$dir/$name" "$RUN_DIR/cluster/$name" || px_warn "cannot copy $dir/$name"
+    fi
+  done
+  if [ -d "$dir/plugins" ]; then
+    cp -R "$dir/plugins" "$RUN_DIR/cluster/" || px_warn "cannot copy $dir/plugins"
+  fi
+}
+
+## @description  Writes cluster/images.tsv with the image reference and image ID of every instance
+##               captured in the pre-run snapshot.
+## @return       Exits 0.
+images_record() {
+  local row role index ref image role_col index_col ref_col id_col
+  role_col="$(sb_schema_index instance role)"
+  index_col="$(sb_schema_index instance index)"
+  ref_col="$(sb_schema_index instance image_ref)"
+  id_col="$(sb_schema_index image image_id)"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    role="$(px_tsv_field "$role_col" "$row" || true)"
+    index="$(px_tsv_field "$index_col" "$row" || true)"
+    ref="$(px_tsv_field "$ref_col" "$row" || true)"
+    image="$(sb_image_ref "$SCOPE" "$role" "$index" || true)"
+    image="$(px_tsv_field "$id_col" "$image" || true)"
+    px_tsv_row "$role" "$index" "$ref" "$image" >>"$RUN_DIR/cluster/images.tsv" || true
+  done <<EOF
+$SNAP_ROWS
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -408,8 +610,8 @@ EOF
 ## @description  Queries and records the versions of the underlying substrate tooling.
 ## @return       Exit 0.
 snapshot_versions() {
-  local phase=$1 rows row status=0
-  rows="$(sb_call sb_version_info)" || status=$?
+  local phase=$1 rows status=0
+  rows="$(sb_version_info || exit "$?")" || status=$?
   if [ "$status" != 0 ]; then
     record_row skip "$phase" version_info "exit $status"
     return 0
@@ -420,12 +622,8 @@ snapshot_versions() {
 ## @description  Captures and records a single resource utilization sample for every instance.
 ## @return       Exit 0.
 snapshot_samples() {
-  local phase=$1 rows row status=0
-  if ! sb_capability resource_sampling >/dev/null; then
-    record_row skip "$phase" resource_sampling "the backend declares no metrics source"
-    return 0
-  fi
-  rows="$(sb_call sb_sample_resources "$SCOPE")" || status=$?
+  local phase=$1 rows status=0
+  rows="$(sb_sample_resources "$SCOPE" || exit "$?")" || status=$?
   if [ "$status" != 0 ]; then
     record_row skip "$phase" sample_resources "exit $status"
     return 0
@@ -444,10 +642,10 @@ snapshot_read() {
   index_col="$(sb_schema_index instance index)"
   state_col="$(sb_schema_index instance state)"
   SNAP_LIST=""
-  SNAP_ROWS="$(sb_call sb_list "$SCOPE")" || status=$?
+  SNAP_ROWS="$(sb_list "$SCOPE" || exit "$?")" || status=$?
   [ "$status" = 0 ] || return "$status"
   status=0
-  restarts="$(sb_call sb_restart_count "$SCOPE")" || status=$?
+  restarts="$(sb_restart_count "$SCOPE" || exit "$?")" || status=$?
   if [ "$status" != 0 ]; then
     px_warn "no restart counts in scope $SCOPE, exit $status"
     restarts=""
@@ -468,8 +666,9 @@ EOF
   return 0
 }
 
-# Captures a cluster snapshot by recording the instance inventory, the state and restart count of
-# every instance, the substrate tooling versions, and a resource utilization sample.
+# Captures a cluster snapshot containing the instance inventory, the state and restart count of each
+# instance, the substrate tooling versions, and a resource sample; the pre-run snapshot also writes
+# images.tsv.
 ## @description  Captures and records a complete cluster snapshot for the specified phase.
 ## @return       Exits 0 on success, or exits 1 when the cluster inventory cannot be read.
 snapshot_take() {
@@ -489,6 +688,7 @@ $SNAP_LIST
 EOF
   if [ "$phase" = pre ]; then
     PRE_RESTARTS=$SNAP_LIST
+    images_record
   else
     POST_RESTARTS=$SNAP_LIST
   fi
@@ -519,9 +719,9 @@ change_of() {
   printf '%s\n' "$changed"
 }
 
-# Compares the live cluster state against the pre-run snapshot while the driver is running. An
-# unreadable inventory is treated as inconclusive rather than as evidence of a fault, whereas the
-# first unplanned instance change sets ANOMALY and records an abort row.
+# Compares the live cluster state against the pre-run snapshot while a verb is running. An
+# unreadable inventory is treated as inconclusive rather than evidence of a change, whereas the
+# first unplanned change sets ANOMALY and writes an abort row.
 ## @description  Polls the live cluster against the pre-run snapshot to detect unplanned changes.
 ## @return       Exits 0 when no unplanned change is observed, or exits 3 on the first anomaly.
 anomaly_watch() {
@@ -560,7 +760,7 @@ EOF
 ## @return       Exit 0.
 evidence_record() {
   local role=$1 index=$2 term="" oom="" reason="" kill="" status=0 column
-  term="$(sb_call sb_termination_reason "$SCOPE" "$role" "$index" current)" ||
+  term="$(sb_termination_reason "$SCOPE" "$role" "$index" current || exit "$?")" ||
     status=$?
   if [ "$status" = 0 ] && [ -n "$term" ]; then
     record_line "term$PX_TAB$role$PX_TAB$index$PX_TAB$term"
@@ -570,7 +770,7 @@ evidence_record() {
     record_row skip post "termination reason of $role/$index" "exit $status"
   fi
   status=0
-  oom="$(sb_call sb_oom_killed "$SCOPE" "$role" "$index")" || status=$?
+  oom="$(sb_oom_killed "$SCOPE" "$role" "$index" || exit "$?")" || status=$?
   if [ "$status" = 0 ] && [ -n "$oom" ]; then
     record_line "oom$PX_TAB$role$PX_TAB$index$PX_TAB$oom"
     column="$(sb_schema_index oom oom)" || column=1
@@ -642,8 +842,8 @@ EOF
 # ---------------------------------------------------------------------------
 # Disruption scheduling and injection
 # ---------------------------------------------------------------------------
-# Because Bash 3.2 lacks associative arrays, the disruption schedule is stored across seven
-# parallel indexed arrays where each index represents a single scheduled disruption entry.
+# Because Bash 3.2 lacks associative arrays, the disruption schedule is stored in parallel indexed
+# arrays where each scheduled disruption occupies a single index across all eight arrays.
 
 ## @description  Parses and validates a single disruption specification and appends it to the
 ##               schedule.
@@ -659,47 +859,57 @@ EOF
     px_trim_var "$field"
   done
   if [ -n "${extra:-}" ]; then
-    px_usage_error "disruption '$spec' holds more than five fields"
+    px_die "$PX_EXIT_USAGE" "disruption '$spec' holds more than five fields"
   fi
   case "${when:-}" in
   +*)
     kind=offset
     value=${when#+}
     [[ $value =~ $PX_RE_INT ]] ||
-      px_usage_error "disruption '$spec' needs whole seconds after the plus sign"
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' needs whole seconds after the plus sign"
     ;;
   phase:*)
     kind=phase
     value=${when#phase:}
-    [[ $value =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
-      px_usage_error "disruption '$spec' names an invalid phase '$value'"
+    # A phase target may name either a px-run execution milestone or a <kind>@<name> stage anchor.
+    if ! [[ $value =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] && ! [[ $value =~ $PB_ANCHOR_RE ]]; then
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' names an invalid phase '$value'"
+    fi
     ;;
   *)
-    px_usage_error "disruption '$spec' needs +SECONDS or phase:NAME"
+    px_die "$PX_EXIT_USAGE" "disruption '$spec' needs +SECONDS or phase:NAME"
     ;;
   esac
   case "${action:-}" in
   kill | signal | restart) ;;
-  *) px_usage_error "disruption '$spec' needs the action kill, signal or restart" ;;
+  *) px_die "$PX_EXIT_USAGE" "disruption '$spec' needs the action kill, signal or restart" ;;
   esac
   [[ ${role:-} =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] ||
-    px_usage_error "disruption '$spec' names an invalid role '${role:-}'"
+    px_die "$PX_EXIT_USAGE" "disruption '$spec' names an invalid role '${role:-}'"
   [[ ${index:-} =~ $PX_RE_INT ]] ||
-    px_usage_error "disruption '$spec' needs a whole instance index"
+    px_die "$PX_EXIT_USAGE" "disruption '$spec' needs a whole instance index"
   argument=${argument:-}
   case "$action" in
   kill)
     [ -n "$argument" ] || argument=hard
     sb_valid_value kill_mode "$argument" ||
-      px_usage_error "disruption '$spec' names an unknown kill mode '$argument'"
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' names an unknown kill mode '$argument'"
+    # Recovery restarts a killed instance using the drain-aware restart path, which is supported
+    # only for RegionServers, and a deleted instance cannot be restarted at all.
+    [ "$role" = regionserver ] ||
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' kills a $role: only a RegionServer kill has a" \
+        "recovery path, the drain-aware restart"
+    [ "$argument" != delete ] ||
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' kills with mode delete: a deleted instance" \
+        "cannot start again, so it has no recovery"
     ;;
   signal)
     [[ $argument =~ ^(SIG)?[A-Z][A-Z0-9]+$ ]] ||
-      px_usage_error "disruption '$spec' needs a signal name, for example QUIT"
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' needs a signal name, for example QUIT"
     ;;
   restart)
     [ -z "$argument" ] ||
-      px_usage_error "disruption '$spec' takes no argument after the index"
+      px_die "$PX_EXIT_USAGE" "disruption '$spec' takes no argument after the index"
     ;;
   esac
   DISRUPT_KIND[DISRUPT_COUNT]=$kind
@@ -709,6 +919,8 @@ EOF
   DISRUPT_INDEX[DISRUPT_COUNT]=$index
   DISRUPT_ARG[DISRUPT_COUNT]=$argument
   DISRUPT_STATE[DISRUPT_COUNT]=pending
+  DISRUPT_INJECTED[DISRUPT_COUNT]=""
+  DISRUPT_REGIONS[DISRUPT_COUNT]=""
   DISRUPT_COUNT=$((DISRUPT_COUNT + 1))
 }
 
@@ -735,9 +947,9 @@ disrupt_parse() {
   done
 }
 
-# A dry-run plan shows all scheduled entries in the pending state, whereas a completed run records
-# the final outcome of each entry.
-## @description  Writes the disruption schedule to the run record with the state of every entry.
+# A dry-run plan lists every scheduled entry in the pending state, whereas a completed run records
+# the final outcome of each entry and downstream readers use the last row written for each ordinal.
+## @description  Writes the disruption schedule and the state of every entry to the run record.
 ## @return       Exit 0.
 disrupt_rows() {
   local index=0
@@ -750,9 +962,10 @@ disrupt_rows() {
   done
 }
 
-# When an optional substrate operation is absent on the active backend, the disruption is recorded
-# as skipped rather than treated as a failure.
-## @description  Injects a single scheduled disruption through the substrate contract and logs it.
+# When the active backend does not support an optional substrate operation (exit code 5), the
+# disruption is recorded as a skip rather than a failure.
+## @description  Injects a scheduled disruption through the substrate contract, records the action,
+##               and waits for cluster recovery.
 ## @return       Exit 0.
 disrupt_fire() {
   local index=$1 action role instance argument out="" status=0 state
@@ -763,14 +976,13 @@ disrupt_fire() {
   # Mark the entry as no longer pending immediately so that a failed attempt cannot be re-fired.
   DISRUPT_STATE[index]=fail
   px_info "disruption $((index + 1)): $action $role/$instance ${argument:-(no argument)}"
-  case "$action" in
-  signal)
-    sb_capability signal_delivery >/dev/null || status=$PX_EXIT_UNSUPPORTED
-    ;;
-  restart)
-    sb_capability drain_restart >/dev/null || status=$PX_EXIT_UNSUPPORTED
-    ;;
-  esac
+  # The post-injection recovery gate waits for the online region count to return to this baseline,
+  # so abort the injection if the baseline count cannot be read.
+  DISRUPT_REGIONS[index]="$(region_count || exit "$?")" || status=$?
+  if [ "$status" != 0 ]; then
+    px_error "disruption $((index + 1)) not injected: the online regions cannot be" \
+      "read before it, exit $status"
+  fi
   if [ "$status" = 0 ]; then
     sb_planned_record "$SCOPE" "$action" "$role" "$instance" \
       "run $RUN_ID${argument:+ $argument}" || status=$?
@@ -778,18 +990,20 @@ disrupt_fire() {
       px_error "disruption $((index + 1)) not injected: its planned action" \
         "cannot be recorded, exit $status"
     else
+      # Measure time to recovery starting immediately before the substrate injection call.
+      DISRUPT_INJECTED[index]="$(px_epoch_ms)"
       case "$action" in
       kill)
-        out="$(sb_call sb_kill "$SCOPE" "$role" "$instance" "$argument")" ||
+        out="$(sb_kill "$SCOPE" "$role" "$instance" "$argument" || exit "$?")" ||
           status=$?
         ;;
       signal)
-        out="$(sb_call sb_signal "$SCOPE" "$role" "$instance" "$argument")" ||
+        out="$(sb_signal "$SCOPE" "$role" "$instance" "$argument" || exit "$?")" ||
           status=$?
         ;;
       restart)
-        out="$(sb_call sb_restart_drain "$SCOPE" "$role" "$instance" \
-          "${PX_TIMEOUT_DRAIN:-300}" "${PX_TIMEOUT_READY:-300}")" || status=$?
+        out="$(sb_restart_drain "$SCOPE" "$role" "$instance" \
+          "${PX_TIMEOUT_DRAIN:-600}" "${PX_TIMEOUT_READY:-600}" || exit "$?")" || status=$?
         ;;
       esac
     fi
@@ -806,30 +1020,188 @@ disrupt_fire() {
   record_row action "$(px_epoch_ms)" "$action" "$role" "$instance" "$argument" \
     "$state" "$status"
   record_rows "phase$PX_TAB$role$PX_TAB$instance$PX_TAB" "$out"
+  [ "$state" != ok ] || recover_gate "$index"
 }
 
-## @description  Triggers every pending time-offset disruption whose scheduled offset has arrived.
+## @description  Queries the total number of online regions across the cluster by running
+##               px-region-count in client 0 to sum regionCount across every RegionServer.
+## @return       Writes the count to stdout and exits 0, or returns the exec status (1 if no count).
+region_count() {
+  local out
+  out="$(sb_exec "$SCOPE" client 0 30 -- px-region-count </dev/null || exit "$?")" || return
+  out="$(printf '%s\n' "$out" | sed -n '$p')"
+  [[ $out =~ $PX_RE_INT ]] || return "$PX_EXIT_FAIL"
+  printf '%s\n' "$out"
+}
+
+## @description  Clamps a recovery gate timeout (seconds, shared deadline in epoch seconds or 0) to
+##               the time remaining before the shared deadline, with a minimum of 1 second.
+## @return       Writes the bounded timeout in seconds to stdout and exits 0.
+gate_bound() {
+  local bound=$1 left
+  if [ "$2" -gt 0 ]; then
+    left=$(($2 - $(px_epoch_s)))
+    [ "$left" -ge "$bound" ] || bound=$left
+  fi
+  [ "$bound" -ge 1 ] || bound=1
+  printf '%s\n' "$bound"
+}
+
+# Restarts a killed RegionServer, waits for the scope to become ready, and waits for the online
+# region count to return to its pre-disruption baseline, writing a recover row whose timestamps
+# determine mttr_seconds.
+## @description  Waits for full cluster recovery after an injected disruption (index).
+## @return       Writes the recover row and exits 0.
+recover_gate() {
+  local index=$1 role instance status=0 out="" state recovered="" ready drain deadline regions
+  local shared=0
+  role=${DISRUPT_ROLE[$index]}
+  instance=${DISRUPT_INDEX[$index]}
+  ready="$(px_int_setting PX_TIMEOUT_READY 600 1 || exit "$?")" || status=$?
+  drain="$(px_int_setting PX_TIMEOUT_DRAIN 600 1 || exit "$?")" || status=$?
+  # A disruption triggered while a verb is running is bounded by that verb's deadline—the shared
+  # timeout governing prepare and run—so recovery waiting never extends the overall test time limit
+  # before the verb watcher terminates the verb at the bound.
+  [ -z "$VERB_PID" ] || shared=$VERB_DEADLINE
+  if [ "$status" = 0 ] && [ "${DISRUPT_ACTION[$index]}" = kill ]; then
+    out="$(sb_restart_drain "$SCOPE" "$role" "$instance" "$(gate_bound "$drain" "$shared")" \
+      "$(gate_bound "$ready" "$shared")" || exit "$?")" || status=$?
+    record_rows "phase$PX_TAB$role$PX_TAB$instance$PX_TAB" "$out"
+  fi
+  if [ "$status" = 0 ]; then
+    ready="$(gate_bound "$ready" "$shared")"
+    deadline=$(($(px_epoch_s) + ready))
+    sb_wait_ready "$SCOPE" "$ready" >/dev/null || status=$?
+  fi
+  # A server reports ready before its regions finish coming back online. Waiting for the online
+  # region count reuses the remainder of the same readiness timeout so that a single disruption
+  # consumes at most one drain timeout and two readiness timeouts, and it avoids querying
+  # regions-in-transition metrics because they lag behind actual availability.
+  # Failing to restore the baseline region count within the readiness window is recorded as a
+  # recovery failure rather than a slow recovery, whereas being cut short by the verb's shared
+  # deadline is recorded as a timeout.
+  if [ "$status" = 0 ]; then
+    while :; do
+      regions="$(region_count 2>/dev/null || true)"
+      if [ -n "$regions" ] && [ "$regions" -ge "${DISRUPT_REGIONS[$index]}" ]; then
+        break
+      fi
+      if [ "$shared" -gt 0 ] && [ "$(px_epoch_s)" -ge "$shared" ]; then
+        status=$PX_EXIT_TIMEOUT
+        px_error "disruption $((index + 1)): the online regions are ${regions:-unread}, below" \
+          "the ${DISRUPT_REGIONS[$index]} before the disruption, at the bound of the verb"
+        break
+      fi
+      if [ "$(px_epoch_s)" -ge "$deadline" ]; then
+        status=$PX_EXIT_FAIL
+        px_error "disruption $((index + 1)): the online regions are ${regions:-unread}, below" \
+          "the ${DISRUPT_REGIONS[$index]} before the disruption, at the end of PX_TIMEOUT_READY"
+        break
+      fi
+      sleep "${PX_POLL_INTERVAL_S:-1}"
+    done
+  fi
+  case "$status" in
+  0)
+    state=ok
+    recovered="$(px_epoch_ms)"
+    ;;
+  "$PX_EXIT_TIMEOUT") state=timeout ;;
+  *) state=fail ;;
+  esac
+  [ "$state" = ok ] || px_error "disruption $((index + 1)): no recovery, $state, exit $status"
+  record_row recover "$((index + 1))" "${DISRUPT_INJECTED[$index]}" "$recovered" "$state"
+  # If the verb's shared deadline cuts recovery short, mark the verb as timed out and terminate it
+  # just as the verb watcher would, even if the driver process itself has already exited.
+  if [ "$state" != ok ] && [ "$shared" -gt 0 ] && [ "$(px_epoch_s)" -ge "$shared" ]; then
+    VERB_TIMED_OUT=1
+    px_error "the verb passed its bound during the recovery of disruption $((index + 1))"
+    verb_terminate
+  fi
+}
+
+## @description  Triggers every pending time-offset disruption whose scheduled offset after the
+##               start of the run verb has arrived (now in epoch seconds).
 ## @return       Exit 0.
 disrupt_due() {
   local now=$1 index=0
   while [ "$index" -lt "$DISRUPT_COUNT" ]; do
     if [ "${DISRUPT_STATE[$index]}" = pending ] &&
       [ "${DISRUPT_KIND[$index]}" = offset ] &&
-      [ "$now" -ge $((DRIVER_START_S + DISRUPT_WHEN[index])) ]; then
+      [ "$now" -ge $((RUN_START_S + DISRUPT_WHEN[index])) ]; then
       disrupt_fire "$index"
     fi
     index=$((index + 1))
   done
 }
 
-## @description  Closes the disruption schedule by marking any remaining pending entries as skipped.
+## @description  Checks whether any pending disruption is waiting for a stage anchor.
+## @return       Exits 0 when at least one anchor disruption is pending, or exits 1 otherwise.
+disrupt_anchor_pending() {
+  local index=0
+  [ -n "$RUN_DIR" ] || return 1
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    case "${DISRUPT_STATE[$index]}:${DISRUPT_WHEN[$index]}" in
+    pending:*@*) return 0 ;;
+    esac
+    index=$((index + 1))
+  done
+  return 1
+}
+
+# Ignores pre-existing stage rows copied into the bundle before the run started.
+## @description  Reports every stage anchor opened by a verb in this run along with its current
+##               state (open or closed) and the ts_ms timestamp of its most recent begin row.
+## @return       Writes "anchor<TAB>state<TAB>ts_ms" rows to stdout and exits 0.
+disrupt_anchor_states() {
+  awk -F '\t' -v base="$STAGE_BASE" 'NR > base && $2 == "begin" { s[$3] = "open"; t[$3] = $1 }
+    NR > base && $2 == "end" && s[$3] == "open" { s[$3] = "closed" }
+    END { for (a in s) print a "\t" s[a] "\t" t[a] }' "$STAGES_FILE"
+}
+
+# In fire mode, open anchors trigger injection; in all modes (fire, mark, or sweep), closed anchors
+# are marked as missed; and in sweep mode, still-open anchors are also marked as missed.
+## @description  Evaluates pending anchor-triggered disruptions according to the requested mode
+##               (fire, mark, or sweep).
+## @return       Exits 0.
+disrupt_anchors() {
+  local mode=${1:-fire} index=0 states entry
+  disrupt_anchor_pending || return 0
+  states="$(disrupt_anchor_states)"
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    if [ "${DISRUPT_STATE[$index]}" = pending ] && [ "${DISRUPT_KIND[$index]}" = phase ]; then
+      entry="$(px_tsv_get "${DISRUPT_WHEN[$index]}" "$states" || true)"
+      case "$mode:${entry%%"$PX_TAB"*}" in
+      fire:open) disrupt_fire "$index" ;;
+      *:closed | sweep:open) disrupt_missed "$index" "${entry#*"$PX_TAB"}" ;;
+      esac
+    fi
+    index=$((index + 1))
+  done
+}
+
+# A missed anchor indicates that the target stage began without triggering the disruption, which
+# the cluster check treats as a failure.
+## @description  Marks a scheduled disruption (index, ts_ms of the begin row) as missed.
+## @return       Exits 0.
+disrupt_missed() {
+  local index=$1 reason
+  reason="anchor ${DISRUPT_WHEN[$index]} began at $2, the disruption did not fire"
+  px_warn "disruption $((index + 1)) missed its anchor: $reason"
+  record_row skip run "disruption $((index + 1))" "$reason"
+  DISRUPT_STATE[index]=missed
+}
+
+## @description  Finalizes the disruption schedule by marking unfired entries whose anchor began as
+##               missed and all other remaining pending entries as skipped.
 ## @return       Exit 0.
 disrupt_sweep() {
   local index=0 reason
+  disrupt_anchors sweep
   while [ "$index" -lt "$DISRUPT_COUNT" ]; do
     if [ "${DISRUPT_STATE[$index]}" = pending ]; then
       if [ "${DISRUPT_KIND[$index]}" = offset ]; then
-        reason="the driver ended before offset ${DISRUPT_WHEN[$index]}s"
+        reason="the run verb ended before offset ${DISRUPT_WHEN[$index]}s"
       else
         reason="phase ${DISRUPT_WHEN[$index]} was not reached"
       fi
@@ -845,12 +1217,10 @@ disrupt_sweep() {
 # Host safety and lifecycle guards
 # ---------------------------------------------------------------------------
 
-# Invokes the px-tool quiet-host check before starting the workload driver. Any non-quiet result
-# that still permits the driver to start, including when the check is off, sets CONTAMINATION and
-# records a contamination row in the run record.
-## @description  Verifies host load quiescence via px-tool before launching the driver.
-## @return       Exits 0 when the driver may start, or returns the px-tool failure status (2 usage,
-##               4 busy, 5 unmeasured).
+# Any non-quiet result that still permits the workload to proceed—including when the check is turned
+# off—sets CONTAMINATION and records a contamination row.
+## @description  Runs the px-tool quiet-host check before starting the workload.
+## @return       Exits 0 to proceed, or returns the px-tool status (2 usage, 4 busy, 5 unmeasured).
 quiet_check() {
   local rows status=0 state detail
   rows="$("$PX_HOME/bin/px-tool" quiet-host || exit "$?")" || status=$?
@@ -863,8 +1233,52 @@ quiet_check() {
   off) detail="the quiet-host check is off" ;;
   *) detail="the host was ${state:-not measured}" ;;
   esac
-  CONTAMINATION=quiet-host
-  record_row contamination quiet-host "$detail, so every time verdict is ADVISORY"
+  contaminate quiet-host "$detail"
+}
+
+## @description  Appends a contamination cause (cause, detail...) to the comma-separated
+##               CONTAMINATION list carried by every metric record and writes a contamination row.
+## @return       Exits 0.
+contaminate() {
+  CONTAMINATION="${CONTAMINATION:+$CONTAMINATION,}$1"
+  record_row contamination "$1" "${*:2}, so every time verdict is ADVISORY"
+}
+
+## @description  Marks a measurement run as contaminated if its cluster sizing diverges from the
+##               measurement table via a run configuration override or the deployment record.
+## @return       Exits 0.
+sizing_check() {
+  local names topo="$RUN_DIR/cluster/topology.env" class name
+  [ "$PX_RUN_CLASS" = measurement ] || return 0
+  names="$(px_sizing_overrides)"
+  # The deployment generator records the rendered run class along with any sizing variables that
+  # diverge from that class; a deployment record without those entries reports no overrides.
+  if [ -f "$topo" ]; then
+    class="$(pb_env_value PX_RUN_CLASS "$topo")"
+    if [ -n "$class" ] && [ "$class" != measurement ]; then
+      contaminate sizing "the cluster has the sizing of the class $class"
+      return 0
+    fi
+    for name in $(pb_env_value PX_SIZING_OVERRIDES "$topo"); do
+      case " $names " in
+      *" $name "*) ;;
+      *) names="${names:+$names }$name" ;;
+      esac
+    done
+  fi
+  [ -n "$names" ] || return 0
+  contaminate sizing "the sizing is not the measurement table, overridden: $names"
+}
+
+## @description  Copies health-monitor instance samples taken during this run into the run record
+##               as monitor-phase sample rows so that peak memory calculations cover the full run.
+## @return       Exits 0.
+monitor_samples() {
+  [ -n "$MONITOR_DIR" ] && [ -f "$MONITOR_DIR/samples.tsv" ] || return 0
+  # Each monitor sample row begins with the literal "instance" followed by the standard sample
+  # schema, whose first field is ts_ms.
+  record_rows "sample${PX_TAB}monitor$PX_TAB" "$(awk -F '\t' -v t="$RUN_START_MS" \
+    '$1 == "instance" && $2 + 0 >= t + 0 { print substr($0, 10) }' "$MONITOR_DIR/samples.tsv")"
 }
 
 # Looks up the run directory of the active health monitor for the current scope, stores it in
@@ -881,44 +1295,155 @@ monitor_find() {
   [ -z "$MONITOR_DIR" ] || record_row monitor pre "$MONITOR_DIR"
 }
 
-# Tears down the run's cluster at most once unless retention policy preserves it. Because this
-# function is also registered as an exit hook, interrupted runs tear down their cluster as well; the
-# teardown status is recorded in the run record without overriding the run's own exit code.
-## @description  Tears down the active cluster once at the end of the run unless kept by policy.
-## @return       Always exits 0; records the teardown status in the run record.
-run_teardown() {
-  local status=0
-  [ "$TEARDOWN_DONE" = 0 ] && [ -n "$SCOPE" ] || return 0
-  TEARDOWN_DONE=1
-  if ! px_teardown_wanted; then
-    px_info "scope $SCOPE stays up: --keep, PX_KEEP or PX_TEARDOWN=0"
-    record_row skip run teardown "the cluster is kept"
-    return 0
+# ---------------------------------------------------------------------------
+# Plug-in hooks and cluster checks
+# ---------------------------------------------------------------------------
+
+## @description  Invokes a run-level plug-in hook (hook, argument...) and records a FAIL verdict
+##               row (or ADVISORY for collect) for each plug-in whose call failed.
+## @return       Exits 0 when every plug-in call succeeds, or exits 1 otherwise.
+hook_run() {
+  local hook=$1 status=0 severity=FAIL id row failed=0
+  shift
+  [ -n "$PLUGINS_ENABLED" ] || return 0
+  [ "$hook" != collect ] || severity=ADVISORY
+  pl_hook_run "$hook" "$RUN_DIR" "$@" >>"$RUN_DIR/logs/hook-$hook.log" 2>&1 || status=$?
+  [ "$status" != 0 ] || return 0
+  # Because the plug-in loader appends a ts_ms, hook, status, and elapsed_ms row to each
+  # plug-in's hooks.tsv file on every invocation, inspecting those rows identifies which
+  # individual plug-in failed.
+  while read -r id _; do
+    [ -n "$id" ] || continue
+    row="$(awk -F '\t' -v h="$hook" '$2 == h { s = $3 } END { print s }' \
+      "$RUN_DIR/plugins/$id/hooks.tsv" 2>/dev/null || true)"
+    case "$row" in '' | 0 | ok) continue ;; esac
+    sx_verdict "plugin.$id.$hook" "$severity" "the $hook hook ended with exit $row," \
+      "output in logs/hook-$hook.log"
+    failed=1
+  done <<EOF
+$PLUGINS_ENABLED
+EOF
+  if [ "$failed" = 0 ]; then
+    sx_verdict "plugin.$hook" "$severity" "the plug-in loader ended the $hook hook with" \
+      "exit $status, output in logs/hook-$hook.log"
   fi
-  px_info "the run ends, so scope $SCOPE comes down (teardown by default)"
-  px_cluster_down "$SCOPE" || status=$?
-  [ "$status" = 0 ] || px_warn "the teardown of scope $SCOPE reported $(px_exit_name "$status")"
-  record_row teardown "$status" "$(px_exit_name "$status")"
+  return "$PX_EXIT_FAIL"
 }
 
-## @description  Preserves any health-monitor breach artifact, tears down the cluster, records the
-##               final result row, and terminates the process with the specified exit code.
-## @return       Exits the process with the caller-supplied exit code.
-run_finish() {
-  local code=$1 seen=no
+## @description  Executes suites/check-cluster.sh to write the verdict rows for the cluster and
+##               plug-in checks, recording an ERROR row if a check script cannot run.
+## @return       Exits 0.
+checks_run() {
+  local status=0 line names="" file
+  local -a files=()
+  # Any variable exported in the environment is treated by a child process as an operator-supplied
+  # environment override, which takes precedence over plug-in thresholds. Unset thresholds loaded
+  # from a run-class file or a configuration file before spawning the child so that it reloads
+  # those files directly and preserves each setting's true origin.
+  while IFS= read -r line; do
+    case "$line" in
+    PX_THRESHOLD_*"$PX_TAB"environment | PX_THRESHOLD_*"$PX_TAB"cli) ;;
+    PX_THRESHOLD_*) names="$names ${line%%"$PX_TAB"*}" ;;
+    esac
+  done <<EOF
+$PX_CONFIG_ORIGINS
+EOF
+  for file in ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; do
+    files+=(--config "$file")
+  done
+  # Apply a single timeout equal to twice the verb timeout bound to cover the thresholds hooks,
+  # the built-in check subjects, the steady-state checks, and the plug-in checks combined.
+  (
+    for line in $names; do
+      unset "$line"
+    done
+    px_timeout "$((VERB_TIMEOUT * 2))" "$PX_HOME/suites/check-cluster.sh" \
+      ${files[@]+"${files[@]}"}
+  ) >>"$RUN_DIR/logs/check-cluster.log" 2>&1 || status=$?
+  case "$status" in
+  0 | 1) ;;
+  *)
+    sx_verdict cluster.checks ERROR "suites/check-cluster.sh ended with exit $status," \
+      "output in logs/check-cluster.log"
+    ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Bundle finalization and run completion
+# ---------------------------------------------------------------------------
+
+## @description  Finalizes the run bundle by copying any health-monitor breach record, generating
+##               the merged report, and writing and validating the bundle manifest.
+## @return       Sets REPORT_STATUS and BUNDLE_STATUS, and exits 0.
+bundle_finalize() {
+  local log="$RUN_DIR/logs/px-bundle.log" check detail
   # Because the health monitor writes breach.tsv into its own run directory, copying the file into
-  # PX_RUN_DIR preserves the triggering resource sample alongside the test run that it terminated.
+  # the bundle preserves the triggering resource sample alongside the run that the breach ended.
   if [ -n "$MONITOR_DIR" ] && [ -f "$MONITOR_DIR/breach.tsv" ]; then
-    if cp "$MONITOR_DIR/breach.tsv" "$PX_RUN_DIR/breach.tsv"; then
-      record_row breach "$PX_RUN_DIR/breach.tsv"
+    if cp "$MONITOR_DIR/breach.tsv" "$RUN_DIR/breach.tsv"; then
+      record_row breach "$RUN_DIR/breach.tsv"
     else
-      px_warn "cannot copy $MONITOR_DIR/breach.tsv into $PX_RUN_DIR"
+      px_warn "cannot copy $MONITOR_DIR/breach.tsv into $RUN_DIR"
     fi
   fi
-  run_teardown
+  # Both tools operate exclusively on the bundle directory, so invoke them with only the
+  # operator's initial configuration rather than the runtime settings loaded by this process.
+  px_config_child "$PX_HOME/bin/px-report" "$RUN_DIR" >"$RUN_DIR/logs/px-report.log" \
+    2>&1 || REPORT_STATUS=$?
+  px_config_child "$PX_HOME/bin/px-bundle" write "$RUN_DIR" >"$log" 2>&1 ||
+    BUNDLE_STATUS=$?
+  if [ "$BUNDLE_STATUS" = 0 ]; then
+    px_config_child "$PX_HOME/bin/px-bundle" validate "$RUN_DIR" >>"$log" 2>&1 ||
+      BUNDLE_STATUS=$?
+  fi
+  [ "$BUNDLE_STATUS" != 0 ] || return 0
+  px_warn "the bundle does not validate, exit $BUNDLE_STATUS, rows in logs/px-bundle.log"
+  while IFS="$PX_TAB" read -r check _ detail; do
+    px_warn "bundle check $check: $detail"
+  done <<EOF
+$(awk -F '\t' '$2 == "fail"' "$log")
+EOF
+}
+
+## @description  Computes the final exit code for the run from the driver verb codes, any cluster
+##               anomaly, the merged report verdict, and the bundle validation result.
+## @return       Writes the computed exit code to stdout and exits 0.
+run_code() {
+  local code=$FIRST_CODE
+  if [ "$ABORTED" = 1 ]; then
+    code=$PX_EXIT_ANOMALY
+  elif [ "$ANY_TIMED_OUT" = 1 ]; then
+    code=$PX_EXIT_TIMEOUT
+  fi
+  if [ "$ANOMALY" = 1 ] && { [ "$code" = 0 ] || [ "$code" = 1 ]; }; then
+    code=$PX_EXIT_ANOMALY
+  fi
+  if [ "$code" = 0 ]; then
+    case "$REPORT_STATUS" in
+    0 | 1 | 2 | 3) code=$REPORT_STATUS ;;
+    *) code=$PX_EXIT_FAIL ;;
+    esac
+  fi
+  if [ "$code" = 0 ] && [ "$BUNDLE_STATUS" != 0 ]; then
+    code=$PX_EXIT_FAIL
+  fi
+  printf '%s\n' "$code"
+}
+
+## @description  Finalizes the diagnostic bundle, records the result row, and terminates the run
+##               with either the caller-supplied status or the exit code computed by run_code.
+## @return       Exits with the resolved exit code.
+run_finish() {
+  local code=${1:-} seen=no result
+  bundle_finalize
+  [ -n "$code" ] || code="$(run_code)"
   [ "$ANOMALY" = 0 ] || seen=yes
   record_row result "$code" "$(px_exit_name "$code")" "$seen"
-  px_info "run $RUN_ID ends with exit $code, $(px_exit_name "$code")"
+  result="$(awk -F '\t' '$1 == "result" { r = $2 } END { print r }' \
+    "$RUN_DIR/logs/px-report.log" 2>/dev/null || true)"
+  px_exit_noted "$code" "run $RUN_ID ends at ${result:-no result} (exit $code," \
+    "$(px_exit_name "$code"))"
   exit "$code"
 }
 
@@ -938,21 +1463,26 @@ plan_print() {
   record_row plan run_class "${PX_RUN_CLASS:-}"
   record_row plan backend "${PX_BACKEND:-the default of the contract}"
   record_row plan scope "${SCOPE:-none, snapshots skipped}"
-  record_row plan driver "${DRIVER_PATH:-none, a real run needs one}"
+  record_row plan driver "$DRIVER_PATH"
+  record_row plan driver_name "$DRIVER_NAME"
+  record_row plan describe "accepted, $(pb_describe_rows phases | awk 'END { print NR }') phases"
+  record_row plan verbs "$PB_VERBS"
   record_row plan driver_arguments "${#DRIVER_ARGS[@]}"
   record_row plan driver_timeout_s "$DRIVER_TIMEOUT"
-  record_row plan snapshot_pre "sb_list sb_restart_count sb_version_info sb_sample_resources"
+  record_row plan verb_timeout_s "$VERB_TIMEOUT"
+  record_row plan plugins "${PX_PLUGINS:-none}"
+  record_row plan snapshot_pre \
+    "sb_list sb_restart_count sb_image_ref sb_version_info sb_sample_resources"
   record_row plan quiet_host_wait_s "${PX_QUIET_HOST_WAIT_S:-0}"
   record_row plan disruptions "$DISRUPT_COUNT"
   disrupt_rows
   record_row plan snapshot_post "sb_list sb_restart_count sb_version_info sb_sample_resources"
   record_row plan diff "an unplanned restart, exit or loss gives exit $PX_EXIT_ANOMALY"
+  record_row plan bundle "px-report BUNDLE, px-bundle write BUNDLE, px-bundle validate BUNDLE"
   if [ -z "$SCOPE" ]; then
-    record_row plan teardown "none, no cluster"
-  elif px_teardown_wanted; then
-    record_row plan teardown "px-cluster down $SCOPE"
+    record_row plan checks "none, no cluster"
   else
-    record_row plan teardown "kept"
+    record_row plan checks suites/check-cluster.sh
   fi
 }
 
@@ -1013,75 +1543,127 @@ case "$SCOPE_STATUS" in
 "$PX_EXIT_NO_OBJECT") SCOPE="" ;;
 *) px_die "$SCOPE_STATUS" "cannot resolve the scope of cluster ${PX_CLUSTER_ID:-default}" ;;
 esac
-DRIVER_SPEC=${PX_DRIVER:-}
-DRIVER_TIMEOUT=${PX_TIMEOUT_DEFAULT:-3600}
-[[ $DRIVER_TIMEOUT =~ $PX_RE_INT ]] ||
-  px_usage_error "PX_TIMEOUT_DEFAULT needs whole seconds, got '$DRIVER_TIMEOUT'"
-if [ -n "$DRIVER_SPEC" ]; then
-  DRIVER_PATH="$(driver_resolve "$DRIVER_SPEC")" || exit "$?"
-fi
+DRIVER_TIMEOUT="$(px_int_setting PX_TIMEOUT_RUN 3600 1)" || exit "$?"
+VERB_TIMEOUT="$(px_int_setting PX_TIMEOUT_VERB 300 1)" || exit "$?"
+# Fail immediately before performing any other work—even during a dry run—if any configured
+# plug-in cannot be loaded.
+PLUGINS_ENABLED="$(pl_enabled || exit "$?")" || exit "$?"
+DRIVER_PATH="$(pl_driver_resolve "$DRIVER_SPEC")" || exit "$?"
+DRIVER_NAME="$(pl_driver_name "$DRIVER_SPEC" "$DRIVER_PATH")" || exit "$?"
 disrupt_parse "${PX_DISRUPT_SPEC:-}"
 if [ "$DISRUPT_COUNT" -gt 0 ] && [ -z "$SCOPE" ]; then
-  px_usage_error "a disruption needs a cluster: run px-cluster up, or name one" \
-    "with --scope"
+  px_die "$PX_EXIT_USAGE" "a disruption needs a cluster, and no cluster" \
+    "${PX_CLUSTER_ID:-default} is recorded: $PX_HINT_NO_CLUSTER"
+fi
+# Start each driver verb in the directory containing the suite file so that relative paths in test
+# arguments resolve against the suite file's location.
+if [ -n "${PX_SUITE_FILE:-}" ] && [ -d "$(dirname "$PX_SUITE_FILE")" ]; then
+  VERB_CWD="$(dirname "$PX_SUITE_FILE")"
 fi
 
 # ---------------------------------------------------------------------------
-# Dry-run termination: print the execution plan and exit without invoking the
-# backend or writing anything beyond the validated output root and state directory.
+# Dry-run termination: validate the driver's describe document, print the execution plan, and exit
+# without invoking a backend or writing anything beyond the validated output root and state
+# directory.
 # ---------------------------------------------------------------------------
 
 if px_is_dry_run; then
   RUN_ID="$(px_run_id)"
+  describe_dry
   plan_print
   exit "$PX_EXIT_OK"
 fi
 
-if [ -z "$DRIVER_PATH" ]; then
-  px_usage_error "a run needs a driver: name one with --driver or PX_DRIVER"
-fi
+# Require an explicit run class because every emitted metric record carries it, and records
+# written without a class cannot be classified by downstream readers.
+px_run_class_require
 
 # ---------------------------------------------------------------------------
 # Test run execution
 # ---------------------------------------------------------------------------
 
-RUN_DIR="$(px_run_dir)" || exit "$?"
-RUN_ID=${RUN_DIR##*/}
-RECORD_FILE="$RUN_DIR/run-record.tsv"
-DRIVER_LOG="$RUN_DIR/driver.log"
-# Because px-run mints PX_RUN_ID and PX_RUN_DIR for each execution, it exports them directly rather
-# than passing them through the configuration loader, whose first-writer-wins rule is designed for
-# operator-supplied inputs rather than per-run generated outputs.
-PX_RUN_ID=$RUN_ID
-PX_RUN_DIR=$RUN_DIR
-export PX_RUN_ID PX_RUN_DIR
-printf '%s\n' "$RUN_DIR"
-px_info "run $RUN_ID in $RUN_DIR"
-
 sb_load
-# Exit hooks execute in reverse registration order on every exit: the workload driver stops first,
-# the cluster is torn down next, and the host sleep inhibitor is released last. Converting INT and
-# TERM signals into normal exits ensures that interrupted runs execute the full cleanup sequence.
-px_inhibit_start "run-$RUN_ID" "$$"
-px_on_exit px_guard_release inhibit "run-$RUN_ID"
-px_on_exit run_teardown
-px_on_exit driver_terminate
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-record_row run "$RUN_ID" "${PX_RUN_CLASS:-}" "$(sb_bound_backend)" "$SCOPE" "$DRIVER_PATH"
-# Open the planned-action timestamp window before reaching the first phase that can trigger a
-# disruption so that every fault injected during this run falls within the window.
-PLANNED_SINCE_MS="$(px_epoch_ms)"
-phase_reached setup
-
 if [ -n "$SCOPE" ]; then
   SCOPE_STATUS=0
-  sb_call sb_scope_exists "$SCOPE" || SCOPE_STATUS=$?
+  sb_scope_exists "$SCOPE" || SCOPE_STATUS=$?
   if [ "$SCOPE_STATUS" != 0 ]; then
     px_die "$SCOPE_STATUS" "the scope $SCOPE is not usable"
   fi
-  snapshot_take pre || px_die "$PX_EXIT_FAIL" "the run needs a pre-run snapshot"
+fi
+
+# Resolve the output root in the current shell so that PX_OUT is exported to every driver verb as
+# a canonical physical path.
+px_out_root >/dev/null
+RUN_DIR="$(pb_bundle_create || exit "$?")" || exit "$?"
+RUN_ID=${RUN_DIR##*/}
+RECORD_FILE="$RUN_DIR/run-record.tsv"
+STAGES_FILE="$RUN_DIR/stages.tsv"
+DRIVER_DIR="$RUN_DIR/drivers/$DRIVER_NAME"
+mkdir -p "$DRIVER_DIR" || px_die "$PX_EXIT_FAIL" "cannot create $DRIVER_DIR"
+# Because px-run mints these per-run identifiers and paths itself, it exports them directly. The
+# configuration loader preserves the first value assigned to a variable, which is appropriate for
+# operator-supplied inputs but not for values generated by this command.
+PX_RUN_ID=$RUN_ID
+PX_RUN_DIR=$RUN_DIR
+PX_DRIVER_NAME=$DRIVER_NAME
+PX_DRIVER_DIR=$DRIVER_DIR
+PX_SCOPE_ID=$SCOPE
+PX_BACKEND="$(sb_bound_backend)"
+PX_CONTAMINATION=""
+PX_SUITE_NAME=${PX_SUITE_NAME:-}
+PX_SUITE_FILE=${PX_SUITE_FILE:-}
+PX_TEST_ID=${PX_TEST_ID:-}
+export PX_HOME PX_OUT PX_RUN_ID PX_RUN_DIR PX_RUN_CLASS PX_CONTAMINATION PX_BACKEND PX_SCOPE_ID
+export PX_DRIVER_NAME PX_DRIVER_DIR PX_SUITE_NAME PX_SUITE_FILE PX_TEST_ID
+# Attribute records emitted by the harness itself to px-run, whereas driver verbs, plug-in hooks,
+# and cluster checks each set their own record source.
+PX_RECORD_SOURCE=px-run
+printf '%s\n' "$RUN_DIR"
+px_info "run $RUN_ID in $RUN_DIR"
+
+# Exit hooks run in reverse registration order on every exit: the active verb is terminated and
+# any open stage anchors are closed first, the cluster is torn down next, and the host sleep
+# inhibitor is released last. Converting INT and TERM signals into normal exits ensures that
+# interrupted runs execute the full cleanup sequence.
+px_inhibit_start "run-$RUN_ID" "$$"
+px_on_exit px_guard_release inhibit "run-$RUN_ID"
+px_on_exit run_teardown
+px_on_exit verb_terminate
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+RUN_START_MS="$(px_epoch_ms)"
+record_row run "$RUN_ID" "$PX_RUN_CLASS" "$PX_BACKEND" "$SCOPE" "$DRIVER_PATH"
+record_row context driver "$DRIVER_NAME"
+record_row context suite "$PX_SUITE_NAME"
+record_row context test "$PX_TEST_ID"
+record_row context session "${PX_SESSION_ID:-}"
+record_row context plugins "$(printf '%s\n' "$PLUGINS_ENABLED" |
+  awk -F '\t' 'NF { printf "%s%s", s, $1; s = " " }')"
+# Open the planned-action timestamp window before reaching the first phase that can trigger a
+# disruption so that every planned action recorded during this run falls within the window.
+PLANNED_SINCE_MS="$(px_epoch_ms)"
+phase_reached setup
+[ -z "$SCOPE" ] || cluster_copy
+STAGE_BASE="$(awk 'END { print NR }' "$STAGES_FILE")"
+disrupt_rows
+
+# Run the describe verb first. If the verb fails or its output document is rejected, terminate the
+# run immediately with that exit code before executing any subsequent steps.
+DESCRIBE_STATUS=0
+describe_run || DESCRIBE_STATUS=$?
+if [ "$DESCRIBE_STATUS" != 0 ]; then
+  run_finish "$DESCRIBE_STATUS"
+fi
+
+# Execute the validate verb followed by the pre-run readiness gates required before prepare.
+verb_run validate "$(verb_deadline)"
+[ "$VERB_CODE" = 0 ] || block "validate failed"
+if [ -n "$SCOPE" ]; then
+  if ! snapshot_take pre; then
+    sx_verdict cluster.snapshot FAIL "the pre-run snapshot cannot read the inventory"
+    block "no pre-run snapshot"
+  fi
   monitor_find
 else
   px_warn "no scope id and no recorded cluster: px-run takes no snapshot and" \
@@ -1093,30 +1675,48 @@ phase_reached snapshot_pre
 QUIET_STATUS=0
 quiet_check || QUIET_STATUS=$?
 if [ "$QUIET_STATUS" != 0 ]; then
-  record_row skip run driver "the host is not proven quiet"
-  run_finish "$QUIET_STATUS"
+  sx_verdict host.quiet "$(sx_severity_of_code "$QUIET_STATUS")" \
+    "the host is not proven quiet, px-tool quiet-host exit $QUIET_STATUS"
+  note_code "$QUIET_STATUS"
+  block "the host is not proven quiet"
 fi
-# Export the run's contamination status so the driver can tag every emitted metric record with it.
+sizing_check
+# Export the run's contamination status so that every emitted metric record carries it.
 PX_CONTAMINATION=$CONTAMINATION
 export PX_CONTAMINATION
-driver_start
-phase_reached driver_start
-driver_watch
-DRIVER_STATUS=0
-{ wait "$DRIVER_PID"; } 2>/dev/null || DRIVER_STATUS=$?
-DRIVER_PID=""
-record_row driver "$(($(px_epoch_ms) - DRIVER_START_MS))" "$DRIVER_STATUS" \
-  "$DRIVER_LOG"
-px_info "driver ended with status $DRIVER_STATUS, output in $DRIVER_LOG"
-phase_reached driver_exit
+
+if [ -z "$BLOCKED" ]; then
+  hook_run fetch-data || block "the fetch-data hook failed"
+fi
+
+# The prepare and run verbs share a single overall execution deadline for the test.
+PREPARE_RAN=0
+if [ -z "$BLOCKED" ]; then
+  SHARED_DEADLINE=$(($(px_epoch_s) + DRIVER_TIMEOUT))
+  PREPARE_RAN=1
+  verb_run prepare "$SHARED_DEADLINE"
+  [ "$VERB_CODE" = 0 ] || block "prepare failed"
+  if [ -z "$BLOCKED" ]; then
+    hook_run pre-workload || block "the pre-workload hook failed"
+  fi
+  if [ -z "$BLOCKED" ]; then
+    verb_run run "$SHARED_DEADLINE"
+    hook_run post-workload || true
+  fi
+fi
+if [ -n "$BLOCKED" ]; then
+  px_warn "the workload did not run to its end: $BLOCKED"
+  record_row skip run workload "$BLOCKED"
+fi
 
 if [ -n "$SCOPE" ]; then
-  # An inability to read the post-run inventory does not prove that instances vanished, so run the
-  # state and restart comparison only when the post-run snapshot succeeds.
+  monitor_samples
+  # An inability to read the post-run cluster inventory is not evidence that instances vanished,
+  # so compare instance states and restart counts only when the post-run snapshot succeeds.
   if snapshot_take post; then
     restart_diff
   else
-    SNAPSHOT_FAILED=1
+    sx_verdict cluster.snapshot FAIL "the post-run snapshot cannot read the inventory"
     record_row skip post diff "the post-run inventory cannot be read"
   fi
 else
@@ -1126,37 +1726,11 @@ phase_reached snapshot_post
 disrupt_sweep
 disrupt_rows
 
-# ---------------------------------------------------------------------------
-# Final run verdict
-# ---------------------------------------------------------------------------
-# The workload verdict belongs to the driver, so its exit status passes through whenever it falls
-# within the shared exit-code vocabulary. Any driver status outside that vocabulary (such as 143
-# from a termination signal) is normalized to a general failure, while the run record preserves the
-# raw numeric status. However, if the run was aborted due to an unplanned cluster change while the
-# driver was executing, the final verdict is always the cluster-anomaly exit code regardless of the
-# status the driver returned after being stopped.
+# Run restore whenever prepare was attempted, run report whenever validate ran, and execute the
+# cluster checks while the cluster is still running.
+[ "$PREPARE_RAN" = 0 ] || verb_run restore "$(verb_deadline)"
+verb_run report "$(verb_deadline)"
+[ -z "$SCOPE" ] || checks_run
+hook_run collect || true
 
-EXIT_CODE=$DRIVER_STATUS
-if [ "$ABORTED" = 1 ]; then
-  EXIT_CODE=$PX_EXIT_ANOMALY
-elif [ "$DRIVER_TIMED_OUT" = 1 ]; then
-  EXIT_CODE=$PX_EXIT_TIMEOUT
-else
-  case "$EXIT_CODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6) ;;
-  "$SB_EXEC_TIMEOUT") EXIT_CODE=$PX_EXIT_TIMEOUT ;;
-  *)
-    px_warn "the driver returned $DRIVER_STATUS, which is outside the vocabulary"
-    EXIT_CODE=$PX_EXIT_FAIL
-    ;;
-  esac
-fi
-if [ "$ANOMALY" = 1 ] && { [ "$EXIT_CODE" = 0 ] || [ "$EXIT_CODE" = 1 ]; }; then
-  EXIT_CODE=$PX_EXIT_ANOMALY
-fi
-if [ "$EXIT_CODE" = 0 ] && [ "$SNAPSHOT_FAILED" = 1 ]; then
-  px_error "the post-run snapshot failed, so the run cannot be reported clean"
-  EXIT_CODE=$PX_EXIT_FAIL
-fi
-
-run_finish "$EXIT_CODE"
+run_finish

@@ -15,11 +15,11 @@
 
 # The image build context lives under $PX_OUT/images/, never in the tree.
 # scripts/stage-artifacts.sh fills it with the files of docker/image at its
-# root, the fetched distributions under dist/ and the local Phoenix build
-# under phoenix/. Everything is excluded first, then exactly those entries are
-# admitted again, so a file that no step staged cannot reach the image. A new
-# entry of docker/image must be admitted here too, or the build that copies
-# it fails.
+# root, the fetched distributions under dist/, the local Phoenix build under
+# phoenix/ and the enabled plug-ins under plugins/. This file excludes
+# everything first, then admits exactly those entries again, so a file that
+# no step staged cannot reach the image. A new entry of docker/image needs an
+# admit line here too, or the build that copies it fails.
 *
 !Dockerfile
 !*.sh
@@ -28,6 +28,7 @@
 !lib/
 !dist/
 !phoenix/
+!plugins/
 
 # Leftovers inside the admitted entries.
 **/.DS_Store

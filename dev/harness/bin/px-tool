@@ -14,21 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This script serves as the administrative and diagnostic entry point for the test harness. It
-# houses operational work that is neither cluster lifecycle management nor a test run: opening a
-# shell inside a single instance, generating the initial diagnostic report an operator consults
-# when the harness misbehaves, running the cluster health monitor, and executing the quiet-host
-# check that guards a measurement.
+# This script serves as the host-guard entry point for the test harness. It houses operational work
+# that is neither cluster lifecycle management nor a test run: running the cluster health monitor
+# and executing the quiet-host check that guards a measurement. An operator who needs an interactive
+# shell inside an instance invokes px-cluster exec ROLE INDEX -- /bin/bash.
 #
-# Three architectural principles govern this file:
-#   1. It encodes no knowledge of role names, network ports, or resource sizing. Because cluster
-#      topology is introduced in round A2, the operator specifies the target role explicitly and
-#      the substrate contract resolves the corresponding instance.
+# Two architectural rules govern this file:
+#   1. It encodes no knowledge of role names, network ports, or resource sizing.
 #   2. It interacts with a cluster exclusively through lib/backend/contract.sh.
-#   3. Any subcommand owned by a later round is declared here upfront and returns the unsupported
-#      exit code with a message identifying that round. This keeps the command surface stable from
-#      the first round onward, allowing --help to show operators both what is available now and
-#      what is scheduled for future rounds.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
@@ -39,286 +32,45 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 px_trap_enable
 
-# ---------------------------------------------------------------------------
-# Subcommand registry definition.
-# ---------------------------------------------------------------------------
-# The registry uses parallel indexed arrays because bash 3.2 does not support associative arrays.
-# The owner array records the implementation round responsible for each subcommand. When a later
-# round delivers a subcommand, it updates the owner entry rather than introducing a new name, so
-# scripts written today continue to work without modification.
-
-TOOL_NAMES=(shell doctor monitor quiet-host)
-TOOL_OWNERS=(A1 A1 A3 A3)
-TOOL_SUMMARIES=(
-  "open a shell inside one role instance"
-  "report the harness environment, configuration and backend"
-  "sample instance and host memory and tear down on a breach"
-  "measure background host activity and report contamination"
-)
-
-# This path defines the in-image entry point invoked by the shell subcommand. It forms the
-# interface between this tool and the container image built in round A2, which provides this binary
-# in every role. If an older image predating round A2 returns exit status 127, the error handler
-# reports that round A2 introduces the required binary.
-TOOL_SHELL_COMMAND="/bin/bash"
-
-# Because every wait in the harness must be bounded, interactive shell sessions enforce a maximum
-# duration cap. A one-hour limit provides sufficient time for interactive diagnosis while ensuring
-# that a forgotten session cannot hold a cluster open for a full day.
-TOOL_SHELL_TIMEOUT_S=3600
-
-# Separate the essential host commands required for core harness operation from optional commands
-# used only by specific code paths. The doctor subcommand reports missing commands from the first
-# group as failures and those from the second group as warnings; awk belongs to the core group
-# because px-cluster formats its output tables with awk.
-TOOL_CORE_COMMANDS="sed grep sort sleep mkdir rm cp awk"
-TOOL_EXTRA_COMMANDS="stat base64 tar"
-
-TOOL_FAILURES=0
-
-## @description  Prints the command-line usage summary, including the owning round of each
-##               subcommand.
-## @return       Writes the usage text to stdout and exits 0.
-usage() {
-  local i=0
-  printf 'Usage: %s <subcommand> [option...] [-- command...]\n\n' "$PX_PROG"
-  printf 'Subcommands:\n'
-  while [ "$i" -lt "${#TOOL_NAMES[@]}" ]; do
-    printf '  %-11s [%s]  %s\n' "${TOOL_NAMES[$i]}" "${TOOL_OWNERS[$i]}" \
-      "${TOOL_SUMMARIES[$i]}"
-    i=$((i + 1))
-  done
-  cat <<'EOF'
-
-Options:
-  --role NAME      the role to act on. shell needs it
-  --index N        the zero-based instance index, default 0
-  --scope ID       the scope to act in, default PX_SCOPE_ID, else the scope
-                   that px-cluster up recorded for PX_CLUSTER_ID
-  --timeout S      the cap on one in-instance command, in seconds
-  --config FILE    an extra configuration file, repeatable, strongest after
-                   the process environment
-  --config-only    doctor reports the host and the configuration and binds
-                   no backend
-  -v, --verbose    report detail
-  -h, --help       show this text
-
-Examples:
-  px-tool shell --role client
-  px-tool doctor --config-only
-  px-tool monitor --scope px-default
-  PX_QUIET_HOST_WAIT_S=60 px-tool quiet-host
-
-monitor samples every PX_MONITOR_INTERVAL_S (default 30) seconds. It records
-the memory of each instance and its limit in samples.tsv. Only a host whose
-free memory falls below PX_MONITOR_HOST_FREE_MIB is a breach: the monitor
-then writes the sample to breach.tsv in its run directory, removes the
-cluster with px-cluster down and exits 3. It refreshes the heartbeat
-<state>/monitor-<scope>.heartbeat at each sample. px-cluster up starts it and
-px-cluster down stops it.
-
-quiet-host compares the one-minute load of the host, a percent of its
-processors, with PX_QUIET_HOST_LOAD_PCT, and waits up to
-PX_QUIET_HOST_WAIT_S for it to fall. A wait of 0 takes one sample. The check
-is off, and takes no sample, only when PX_REQUIRE_QUIET_HOST is also 0. It
-writes sample rows and one result row: quiet, contaminated, refused,
-unmeasured or off. When a quiet host is required, it exits 4 when the host
-stays busy and 5 when the load cannot be measured. Else it exits 0.
-
-Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
-5 unsupported, 6 no such object.
+px_cli_spec <<'EOF'
+about Runs the host guards: the health monitor of a cluster and the quiet-host check.
+sub monitor
+shared --cluster
+about sample instance and host memory and tear down on a
++ breach
+about The monitor samples every PX_MONITOR_INTERVAL_S (default 30) seconds. It records
++ the memory of each instance and its limit in samples.tsv. Only a host whose free
++ memory falls below PX_MONITOR_HOST_FREE_MIB is a breach: the monitor then writes
++ the sample to breach.tsv in its run directory, removes the cluster with
++ px-cluster down and exits 3. It refreshes the heartbeat
++ <state>/monitor-<scope>.heartbeat at each sample. px-cluster up starts it, and
++ px-cluster down stops it.
+example px-tool monitor --cluster default
+sub quiet-host
+about measure background host activity and report
++ contamination
+about The check compares the one-minute load of the host, a percent of its processors,
++ with PX_QUIET_HOST_LOAD_PCT, and waits up to PX_QUIET_HOST_WAIT_S for it to
++ fall. A wait of 0 takes one sample. The check is off, and takes no sample, only
++ when PX_REQUIRE_QUIET_HOST is also 0.
+output sample rows, one quiet_host row (quiet, contaminated, refused,
++ unmeasured or off), then result, the status, the code and host.
+exits When a quiet host is required, 4 means that the host stayed busy and 5 that
++ the load cannot be measured.
+example px-tool quiet-host -e PX_QUIET_HOST_WAIT_S=60
 EOF
-}
-
-## @description  Validates and completes the target coordinates for an in-instance operation.
-## @return       Sets TOOL_INDEX when empty and exits 0, or exits 2 on a missing role or a
-##               malformed index.
-tool_require_target() {
-  if [ -z "$TOOL_ROLE" ]; then
-    px_usage_error "name the role with --role"
-  fi
-  if [ -z "$TOOL_INDEX" ]; then
-    TOOL_INDEX=0
-  fi
-  if ! [[ $TOOL_INDEX =~ $PX_RE_INT ]]; then
-    px_usage_error "--index needs a whole number, got '$TOOL_INDEX'"
-  fi
-}
 
 # Verifies that the target scope is active immediately after resolving it so that an absent cluster
-# is reported before attempting an in-instance exec call.
-## @description  Binds the backend, resolves TOOL_SCOPE from --scope or state, and checks it is up.
+# is reported before attempting an in-instance exec call. During a dry run, it records the planned
+# monitor action for the resolved scope and performs no check.
+## @description  Binds the active backend, resolves TOOL_SCOPE from PX_SCOPE_ID or the cluster's
+##               recorded scope, and verifies that the scope exists.
 ## @return       Exits 0 when up, exits 6 if no scope is recorded or it is absent, or exits 2 or 1.
 tool_require_scope() {
   sb_load
-  TOOL_SCOPE="$(sb_scope_require "$TOOL_SCOPE")" || exit $?
+  TOOL_SCOPE="$(sb_scope_require)" || exit $?
+  px_plan monitor px-tool monitor -e "PX_SCOPE_ID=$TOOL_SCOPE" && exit "$PX_EXIT_OK"
   sb_scope_check "$TOOL_SCOPE"
-}
-
-## @description  Resolves the execution timeout cap for a single in-instance command.
-## @return       Writes the timeout in seconds to stdout and exits 0, or exits 2 when the value is
-##               not a valid number of seconds.
-tool_timeout() {
-  local value="${TOOL_TIMEOUT:-}"
-  if [ -z "$value" ]; then
-    value="${PX_TIMEOUT_EXEC:-$1}"
-  fi
-  if ! [[ $value =~ $PX_RE_SECONDS ]]; then
-    px_usage_error "--timeout needs a number of seconds, got '$value'"
-  fi
-  printf '%s\n' "$value"
-}
-
-## @description  Translates the exit status of an in-instance command into the harness vocabulary.
-## @return       Returns the command exit status, or exits with a mapped code on a framing failure.
-tool_exec_status() {
-  local status=$1 target=$2
-  case "$status" in
-  "$SB_EXEC_NOTFOUND")
-    px_die "$PX_EXIT_UNSUPPORTED" \
-      "the image carries no $target. Round A2 builds the image that does"
-    ;;
-  "$SB_EXEC_NOEXEC")
-    px_die "$PX_EXIT_FAIL" "$target is in the image but is not executable"
-    ;;
-  "$SB_EXEC_NOSTART")
-    px_die "$PX_EXIT_FAIL" "the substrate could not start $target"
-    ;;
-  "$SB_EXEC_TIMEOUT")
-    px_die "$PX_EXIT_TIMEOUT" "$target did not finish inside its timeout"
-    ;;
-  esac
-  return "$status"
-}
-
-# Operators access every in-cluster utility through this entry point, ensuring that no component
-# above the backend layer requires direct knowledge of a container runtime.
-## @description  Opens an interactive shell or runs a command inside a single role instance.
-## @return       Returns the exit status of the shell or executed command.
-tool_shell() {
-  local timeout target status=0
-  tool_require_target
-  tool_require_scope
-  timeout="$(tool_timeout "$TOOL_SHELL_TIMEOUT_S")"
-  [ "$#" -gt 0 ] || set -- "$TOOL_SHELL_COMMAND" -l
-  target=$1
-  px_info "$target in $TOOL_ROLE/$TOOL_INDEX of $TOOL_SCOPE, cap $timeout s"
-  sb_exec "$TOOL_SCOPE" "$TOOL_ROLE" "$TOOL_INDEX" "$timeout" -- "$@" || status=$?
-  tool_exec_status "$status" "$target"
-}
-
-## @description  Formats and writes a single diagnostic check row and increments the failure count.
-## @return       Writes a TSV row to stdout and exits 0.
-tool_check() {
-  local name=$1 state=$2 detail=$3
-  if [ "$state" = fail ]; then
-    TOOL_FAILURES=$((TOOL_FAILURES + 1))
-  fi
-  px_tsv_row "$name" "$state" "$(px_tsv_clean "$detail")"
-}
-
-## @description  Audits and reports the host environment and the harness directory layout.
-## @return       Writes diagnostic check rows to stdout and exits 0.
-tool_doctor_host() {
-  local name root value status=0
-  tool_check harness_home ok "$PX_HOME"
-  tool_check bash_version ok "${BASH_VERSION:-unknown}"
-  root="$(px_out_root)" || status=$?
-  if [ "$status" = 0 ]; then
-    tool_check output_root ok "$root"
-    tool_check state_dir ok "$(px_state_dir)"
-  else
-    tool_check output_root fail "PX_OUT is refused, see the message above"
-  fi
-  if [ -n "$PX_TREE_ROOT" ]; then
-    tool_check working_tree ok "output stays outside $PX_TREE_ROOT"
-  else
-    tool_check working_tree warn "this harness sits outside a working tree"
-  fi
-  for name in $TOOL_CORE_COMMANDS $TOOL_EXTRA_COMMANDS; do
-    if command -v "$name" >/dev/null 2>&1; then
-      tool_check "command:$name" ok present
-    else
-      case " $TOOL_CORE_COMMANDS " in
-      *" $name "*) tool_check "command:$name" fail "not on PATH" ;;
-      *) tool_check "command:$name" warn "not on PATH, some paths degrade" ;;
-      esac
-    fi
-  done
-  tool_check processors ok "$(px_nproc)"
-  status=0
-  value="$(px_mem_total_bytes || exit "$?")" || status=$?
-  if [ "$status" = 0 ]; then
-    tool_check host_memory_bytes ok "$value"
-  else
-    tool_check host_memory_bytes warn "no memory source on this host"
-  fi
-}
-
-## @description  Reports the active configuration state, including where the stages originated and
-##               how many variable names carry a value.
-## @return       Writes diagnostic check rows to stdout and exits 0.
-tool_doctor_config() {
-  local count origin status=0
-  count="$(px_config_dump | grep -c .)" || count=0
-  tool_check config_names ok "$count names carry a value"
-  origin="$(px_config_origin PX_ENV_DIR)" || status=$?
-  if [ "$status" = 0 ]; then
-    tool_check config_env_dir ok "$PX_ENV_DIR from $origin"
-  else
-    tool_check config_env_dir fail "the loader set no environment directory"
-  fi
-  if [ -n "${PX_RUN_CLASS:-}" ]; then
-    tool_check run_class ok "$PX_RUN_CLASS from $(px_config_origin PX_RUN_CLASS)"
-  else
-    tool_check run_class warn "no run class is named, defaults only"
-  fi
-}
-
-# Surfacing the backend capability degradation table here allows an operator to see which optional
-# operations the current host supports before a test suite records a skip.
-## @description  Reports the bound backend identity, tool versions, and capability degradation.
-## @return       Writes diagnostic check rows to stdout and exits 0.
-tool_doctor_backend() {
-  local row name detail
-  sb_load
-  tool_check backend ok "$(sb_backend_id) at contract $(sb_contract_version)"
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    tool_check "version:$(px_tsv_field 1 "$row")" ok "$(px_tsv_field 2 "$row")"
-  done <<EOF
-$(sb_version_info || true)
-EOF
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    detail="$(sb_capability_detail "$name")" || detail=""
-    if sb_capability "$name" >/dev/null; then
-      tool_check "capability:$name" ok "${detail:-supported}"
-    else
-      tool_check "capability:$name" warn "${detail:-not declared}"
-    fi
-  done <<EOF
-$(sb_capability_names)
-EOF
-}
-
-# Passing --config-only keeps the diagnostic report free of any cluster or backend calls, providing
-# a safe inspection mode when the underlying container runtime itself is the suspect.
-## @description  Generates the diagnostic report covering the host, configuration, and backend.
-## @return       Writes check rows to stdout and exits 0 when no check fails, or exits 1 otherwise.
-tool_doctor() {
-  tool_doctor_host
-  tool_doctor_config
-  if px_is_true "$TOOL_CONFIG_ONLY"; then
-    tool_check backend warn "--config-only, no backend was bound"
-  else
-    tool_doctor_backend
-  fi
-  if [ "$TOOL_FAILURES" -gt 0 ]; then
-    px_error "$TOOL_FAILURES check(s) failed"
-    return "$PX_EXIT_FAIL"
-  fi
-  px_info "every check passed"
 }
 
 # ---------------------------------------------------------------------------
@@ -356,7 +108,7 @@ tool_monitor_forget() {
 tool_monitor_sample() {
   local scope=$1 dir=$2 floor=$3 rows row free status=0 breach now why
   now="$(px_epoch_ms)"
-  rows="$(sb_call sb_sample_resources "$scope" || exit "$?")" || status=$?
+  rows="$(sb_sample_resources "$scope" || exit "$?")" || status=$?
   if [ "$status" != 0 ]; then
     px_tsv_row skip "$now" sample_resources "exit $status" >>"$dir/samples.tsv"
     rows=""
@@ -516,61 +268,14 @@ tool_quiet_host() {
   return 0
 }
 
-TOOL_SUBCOMMAND=""
-TOOL_ROLE=""
-TOOL_INDEX=""
 TOOL_SCOPE=""
-TOOL_TIMEOUT=""
-TOOL_CONFIG_ONLY=0
-TOOL_CONFIG_FILES=()
 
-# A single parsing loop accepts options in any position and treats the first non-option positional
-# argument as the subcommand name. The built-in getopts utility is not used because bash 3.2
-# getopts lacks support for long options, which the harness interface specifies throughout.
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
-  --role) px_cli_need_value "$@" && TOOL_ROLE="$2" && shift ;;
-  --index) px_cli_need_value "$@" && TOOL_INDEX="$2" && shift ;;
-  --scope) px_cli_need_value "$@" && TOOL_SCOPE="$2" && shift ;;
-  --timeout) px_cli_need_value "$@" && TOOL_TIMEOUT="$2" && shift ;;
-  --config) px_cli_need_value "$@" && TOOL_CONFIG_FILES+=("$2") && shift ;;
-  --config-only) TOOL_CONFIG_ONLY=1 ;;
-  --)
-    shift
-    break
-    ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *)
-    [ -z "$TOOL_SUBCOMMAND" ] || px_usage_error "unexpected argument: $1"
-    TOOL_SUBCOMMAND=$1
-    ;;
-  esac
-  shift
-done
-
-if [ -z "$TOOL_SUBCOMMAND" ]; then
-  px_usage_error "name a subcommand"
-fi
-px_word_at "$TOOL_SUBCOMMAND" "${TOOL_NAMES[@]}" ||
-  px_usage_error "unknown subcommand: $TOOL_SUBCOMMAND"
-TOOL_ROUND=${TOOL_OWNERS[$PX_AT]}
-
-px_config_load ${TOOL_CONFIG_FILES[@]+"${TOOL_CONFIG_FILES[@]}"}
+px_cli_parse "$@"
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 
 TOOL_STATUS=0
-case "$TOOL_SUBCOMMAND" in
-shell) tool_shell "$@" || TOOL_STATUS=$? ;;
-doctor) tool_doctor || TOOL_STATUS=$? ;;
+case "$PX_CLI_SUB" in
 monitor) tool_monitor || TOOL_STATUS=$? ;;
 quiet-host) tool_quiet_host || TOOL_STATUS=$? ;;
-*)
-  px_die "$PX_EXIT_UNSUPPORTED" \
-    "px-tool $TOOL_SUBCOMMAND arrives with round $TOOL_ROUND"
-  ;;
 esac
 exit "$TOOL_STATUS"

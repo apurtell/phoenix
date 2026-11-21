@@ -59,31 +59,27 @@
 #                           All harness components reference the test using this identifier.
 #   name: <text>            Assigns a human-readable display name to the test, defaulting to the
 #                           test id when omitted.
-#   driver: <name>          Names the execution driver that px-run invokes to run the test.
-#   action: <command>       Specifies a shell command line that the harness executes directly in
-#                           place of a driver. Every test block must declare either "driver" or
-#                           "action", but never both.
+#   driver: <name>          Names the required execution driver that px-run invokes for this test.
+#                           Each test consists of a single driver run.
+#   disrupt: <spec>         Declares a fault disruption for a driver test, forwarded to px-run as
+#                           --disrupt <spec>. This directive is repeatable.
 #   args: <text>            Appends whitespace-delimited arguments for the driver without performing
 #                           globbing or shell expansion, ensuring patterns such as *.sql reach the
 #                           driver verbatim. This directive is repeatable, and each occurrence
 #                           appends to the argument list.
 #   arg: <text>             Appends a single literal argument to the driver invocation so that an
 #                           argument may contain spaces or be empty. This directive is repeatable.
-#   overrides: <path>       Specifies an overrides file for the driver; relative paths are resolved
-#                           against the directory containing the suite file, and the referenced file
-#                           must exist. The harness passes this file to the driver as the leading
-#                           argument pair "--overrides <path>" before any declared arguments.
 #   needs: <id>...          Declares prerequisite test ids, separated by spaces or commas, that must
 #                           complete before this test runs. This directive is repeatable.
-#   class: <name>           Overrides the suite default execution class for this individual test.
+#   class: <name>           Sets the execution run class for this individual test.
 #   requires: <name>...     Declares the cluster role groups required by this test; "yarn" is the
-#                           only requirement recognized in this version. Before running the test,
-#                           the harness validates host memory capacity and starts each required
-#                           group, then stops the group afterward even if the test fails. The
-#                           target cluster scope is taken from PX_SCOPE_ID when set, or otherwise
-#                           from the scope recorded by px-cluster for PX_CLUSTER_ID.
-#   timeout: <seconds>      Sets the execution time limit for this test as a positive integer number
-#                           of seconds greater than zero.
+#                           only requirement recognized in this round. Before running the test, the
+#                           harness validates host memory capacity and starts each required group,
+#                           then stops the group afterward even if the test fails. The target
+#                           cluster scope is taken from PX_SCOPE_ID when set, or otherwise from the
+#                           scope recorded by px-cluster for PX_CLUSTER_ID.
+#   timeout: <seconds>      Sets the execution time limit for this test as a whole number of seconds
+#                           greater than zero.
 #
 # Declaring any single-valued directive more than once within the same test block is rejected as an
 # error so that a later line cannot silently overwrite an earlier value.
@@ -96,21 +92,17 @@
 #   test: create
 #     name: Create the schema
 #     driver: psql
-#     args: --script sql/create.sql
+#     args: sql/create.sql
 #
 #   test: count
 #     name: Count the rows
 #     needs: create
 #     requires: yarn
-#     action: . "$PX_HOME/suites/lib/common.sh" && sx_verdict count PASS done
+#     driver: psql
+#     args: sql/count.sql
 #
-# WHAT AN ACTION GETS
-#   The harness executes each action command in a fresh bash process whose working directory is set
-#   to the test's dedicated subdirectory within the session, isolating any stray files created by
-#   the command. In that environment, PX_RUN_DIR points to the same test directory and BASH_ENV
-#   points to lib/common.sh, ensuring that the child shell automatically loads the container-runtime
-#   trap and shared utility functions. An action emits structured verdicts by calling sx_verdict
-#   from suites/lib/common.sh, while its process exit status also contributes a baseline severity.
+#   Every driver invocation receives PX_SUITE_NAME, PX_SUITE_FILE, and PX_TEST_ID in its
+#   environment.
 #
 # WHAT px-suite WRITES
 #   Standard output is reserved exclusively for machine-readable TSV records: a dry run emits one
@@ -125,21 +117,27 @@
 #   subdirectory per test. In addition to session counts, summary.tsv records the active version
 #   set: the HBase profile, the HBase and Hadoop releases, and every configured JDK. Each test
 #   directory holds stdout.txt for the test's structured data channel and stderr.log for its
-#   diagnostic messages. A dry run writes nothing to disk.
+#   diagnostic messages. A dry run writes nothing at all to disk: it resolves each driver and
+#   validates its describe document, and it invokes the suites hook with a temporary output
+#   directory.
 #
 # WHAT A DRIVER TEST BECOMES
 #   For a driver-backed test, px-suite delegates execution to px-run using the command form:
 #     px-run <driver> --timeout <seconds>
-#            [--class <name>] [--config <file>...] -- [--overrides <path>]
+#            [--class <name>] [--config <file>...] [--disrupt <spec>...] --
 #            <declared arguments>
 #   forwarding only the operator-supplied configuration so that px-run loads its own run class.
-#   px-run allocates its own run directory and writes that path to its data channel, which px-suite
-#   captures in the test's stdout.txt file. While px-run enforces the test's declared time limit
-#   around the driver itself, px-suite bounds the outer px-run process using that time limit plus a
-#   fixed margin, the quiet-host wait duration, and one poll interval from the test's own run class,
-#   giving px-run time to wait for a quiet host, take pre- and post-run snapshots, and record its
-#   result outside the driver bound. Because the suite session owns the cluster lifecycle, each
-#   individual test leaves the cluster running and the session tears it down upon completion.
+#   px-run owns the run directory and reports that path on its data channel, which px-suite captures
+#   in the test's stdout.txt file. While px-run bounds the driver with the test's declared time
+#   limit, px-suite bounds the outer px-run process with that limit plus a fixed margin, the short
+#   verb and check bounds (PX_TIMEOUT_VERB), the four bounded hooks of each enabled plug-in, the
+#   recovery gate of each disruption, and the quiet-host wait duration and one poll interval of the
+#   test's run class; px_suite_run_limit enumerates each term. The test's severity is the worst of
+#   its exit code and the effective verdicts in report/verdicts.tsv within the bundle. px-run takes
+#   its snapshots, waits for a quiet host, and writes its result outside the driver time bound.
+#   Because each command tears down only the resources that it provisioned, both individual tests
+#   and the enclosing suite session leave the cluster running, and session cleanup stops only the
+#   role groups that the session itself started.
 #
 # ORDER, BOUNDARIES AND FILTERS
 #   1. The parser records tests in the exact order they appear in the suite file.
@@ -165,6 +163,8 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/../lib/backend/contract.sh"
 # shellcheck source=SCRIPTDIR/../suites/lib/common.sh
 . "$SELF/../suites/lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/plugin.sh
+. "$SELF/../lib/plugin.sh"
 
 set -euo pipefail
 
@@ -183,6 +183,9 @@ SUITE_RUN_MARGIN_S=300
 # Regular expression defining the valid syntax for a test identifier.
 SUITE_ID_RE='^[A-Za-z0-9][A-Za-z0-9_-]*$'
 
+# Enabled plug-ins reported once by lib/plugin.sh as "id<TAB>dir" rows.
+SUITE_PLUGINS=""
+
 # Command-line option values captured during argument parsing before the configuration loader runs.
 OPT_SKIP=""
 OPT_SUITE=""
@@ -191,7 +194,6 @@ OPT_CLASS=""
 # In-memory representation of the parsed suite definition. Because Bash 3.2 lacks associative
 # arrays, each test is represented by a shared integer index across parallel indexed arrays.
 SUITE_FILE=""
-SUITE_DIR=""
 SUITE_NAME=""
 SUITE_DESCRIPTION=""
 SUITE_CLASS=""
@@ -206,10 +208,9 @@ SUITE_ARGV=()
 TEST_ID=()
 TEST_NAME=()
 TEST_DRIVER=()
-TEST_ACTION=()
+TEST_DISRUPT=()
 TEST_ARG_FIRST=()
 TEST_ARG_COUNT=()
-TEST_OVERRIDES=()
 TEST_NEEDS=()
 TEST_CLASS=()
 TEST_REQUIRES=()
@@ -217,6 +218,9 @@ TEST_TIMEOUT=()
 TEST_LINE=()
 TEST_SEEN=()
 TEST_SEVERITY=()
+# Records 1 when a test verified at least one check, including a SKIP test that emitted verdicts of
+# another severity, allowing dependent tests that declare it in needs to proceed.
+TEST_CHECKED=()
 
 # Topologically sorted test order, the set of already-scheduled test ids during sorting, and the
 # filtered execution plan. Each list is stored as a space-delimited string of array indices or test
@@ -258,6 +262,9 @@ RUN_SEVERITY=""
 RUN_STATUS=0
 RUN_REASON=""
 RUN_ELAPSED=0
+RUN_CONCLUSIVE=1
+RUN_BUNDLE=""
+COUNT_INCONCLUSIVE=0
 
 px_cli_spec <<'EOF'
 about Runs a declarative suite file as one session.
@@ -289,12 +296,33 @@ example px-suite smoke --class validation
 example px-suite functional --class validation --from second --continue-on-failure
 EOF
 
-# When no candidate path is readable, the function writes nothing and still exits 0 so that callers
-# invoking it inside a command substitution do not trigger the failure trap.
-## @description  Resolves a suite name or path argument to an absolute readable file path.
-## @return       Writes the resolved absolute path to stdout (or nothing if absent) and exits 0.
+## @description  Resolves a suite (name, hook base) from a path, PX_SUITE_DIR, or a plug-in suite.
+## @return       Writes the absolute path to stdout (or nothing if none is readable) and exits 0, or
+##               exits 2 on a failed hook or a hook path outside its plug-in.
 px_suite_resolve() {
-  local name=${1:-} dir candidate
+  local name=${1:-} base=${2:-} dir candidate listed="" id path pdir found=""
+  # Execute the suites hook unconditionally on every resolution attempt so that each enabled plug-in
+  # observes a consistent invocation regardless of which resolution stage locates the suite file.
+  if [ -n "$SUITE_PLUGINS" ]; then
+    listed="$(pl_hook_run suites "$base" || exit "$?")" ||
+      px_die "$PX_EXIT_USAGE" "the suites hook of a plug-in failed"
+  fi
+  while IFS="$PX_TAB" read -r id path; do
+    [ -n "$id" ] || continue
+    case "/$path/" in
+    //* | */../*)
+      px_die "$PX_EXIT_USAGE" "the suites hook of plug-in $id lists '$path'," \
+        "which is not a path inside the plug-in"
+      ;;
+    esac
+    [ -z "$found" ] || continue
+    pdir="$(px_tsv_get "$id" "$SUITE_PLUGINS" || true)"
+    case "${path##*/}" in
+    "$name" | "$name.suite") [ ! -f "$pdir/$path" ] || found="$pdir/$path" ;;
+    esac
+  done <<EOF
+$listed
+EOF
   if [ -f "$name" ]; then
     px_realpath "$name"
     return 0
@@ -304,11 +332,40 @@ px_suite_resolve() {
   /*) ;;
   *) dir="$PX_HOME/$dir" ;;
   esac
-  for candidate in "$dir/$name" "$dir/$name.suite" "$name.suite"; do
-    if [ -f "$candidate" ]; then
+  for candidate in "$dir/$name" "$dir/$name.suite" "$name.suite" "$found"; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
       px_realpath "$candidate"
       return 0
     fi
+  done
+}
+
+# Validates each planned test's driver during a dry run by resolving the driver binary and invoking
+# its describe verb under PX_TIMEOUT_VERB to verify that pb_describe_load accepts the output.
+## @description  Verifies that every planned driver resolves and produces a valid describe document.
+## @return       Exits 0 when all drivers validate, or exits 2 if a driver fails to resolve or its
+##               describe document is refused.
+px_suite_describe_check() {
+  local index path name dir status bound=${PX_TIMEOUT_VERB:-300}
+  dir="$(px_mktemp_dir px-describe)" || exit "$?"
+  for index in $PLAN; do
+    [ -n "${TEST_DRIVER[$index]}" ] || continue
+    path="$(pl_driver_resolve "${TEST_DRIVER[$index]}")" ||
+      px_die "$PX_EXIT_USAGE" "test ${TEST_ID[$index]}: the driver does not resolve"
+    name="$(pl_driver_name "${TEST_DRIVER[$index]}" "$path")"
+    status=0
+    px_timeout "$bound" env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" \
+      "PX_HOME=$PX_HOME" "PX_DRIVER_NAME=$name" PX_VERB=describe "$path" describe \
+      >"$dir/$index.json" 2>"$dir/$index.log" || status=$?
+    if [ "$status" != 0 ]; then
+      cat "$dir/$index.log" >&2 || true
+      px_die "$PX_EXIT_USAGE" "test ${TEST_ID[$index]}: describe of driver $name ended with" \
+        "exit $status"
+    fi
+    pb_describe_load "$dir/$index.json" ||
+      px_die "$PX_EXIT_USAGE" "test ${TEST_ID[$index]}: the describe document of driver" \
+        "$name is refused"
+    px_debug "test ${TEST_ID[$index]}: driver $name, describe accepted"
   done
 }
 
@@ -396,7 +453,7 @@ px_suite_header() {
     px_suite_check_requires "$value" "$where" "$SUITE_REQUIRES"
     SUITE_REQUIRES=$SUITE_WORDS
     ;;
-  name | driver | action | args | arg | overrides | needs)
+  name | driver | disrupt | args | arg | needs)
     px_die "$PX_EXIT_USAGE" "$where: '$key' belongs to a test," \
       "open one with 'test: <id>'"
     ;;
@@ -418,10 +475,9 @@ px_suite_open() {
   TEST_ID[index]=$id
   TEST_NAME[index]=""
   TEST_DRIVER[index]=""
-  TEST_ACTION[index]=""
+  TEST_DISRUPT[index]=""
   TEST_ARG_FIRST[index]=${#SUITE_ARGV[@]}
   TEST_ARG_COUNT[index]=0
-  TEST_OVERRIDES[index]=""
   TEST_NEEDS[index]=""
   TEST_CLASS[index]=$SUITE_CLASS
   TEST_REQUIRES[index]=$SUITE_REQUIRES
@@ -429,6 +485,7 @@ px_suite_open() {
   TEST_LINE[index]=$lineno
   TEST_SEEN[index]=" "
   TEST_SEVERITY[index]=""
+  TEST_CHECKED[index]=0
 }
 
 ## @description  Parses and applies a single directive within an open test block.
@@ -438,23 +495,21 @@ px_suite_directive() {
   local index=$1 key=$2 value=$3 where=$4 word
   local -a words
   case "$key" in
-  name | driver | action | class | timeout | overrides) px_suite_once "$index" "$key" "$where" ;;
+  name | driver | class | timeout)
+    px_suite_once "$index" "$key" "$where"
+    ;;
   esac
   case "$key" in
   name) TEST_NAME[index]=$value ;;
   driver) TEST_DRIVER[index]=$value ;;
-  action) TEST_ACTION[index]=$value ;;
+  disrupt)
+    [ -n "$value" ] || px_die "$PX_EXIT_USAGE" "$where: 'disrupt' needs a specification"
+    TEST_DISRUPT[index]="${TEST_DISRUPT[$index]:+${TEST_DISRUPT[$index]};}$value"
+    ;;
   class) TEST_CLASS[index]=$value ;;
   timeout)
     px_suite_check_timeout "$value" "$where"
     TEST_TIMEOUT[index]=$value
-    ;;
-  overrides)
-    case "$value" in
-    /*) ;;
-    *) value="$SUITE_DIR/$value" ;;
-    esac
-    TEST_OVERRIDES[index]=$value
     ;;
   args)
     px_suite_split words "$value"
@@ -488,32 +543,15 @@ px_suite_directive() {
   esac
 }
 
-## @description  Finalizes an open test block and rejects any incomplete or conflicting definition.
-## @return       Exits 0 when valid, exits 2 on an incomplete block, or exits 6 on an absent
-##               overrides file.
+## @description  Finalizes an open test block and rejects any incomplete definition.
+## @return       Exits 0 when valid, or exits 2 on an incomplete test block.
 px_suite_close() {
   local index=$1 label=$2 id where
   [ "$index" -ge 0 ] || return 0
   id=${TEST_ID[$index]}
   where="$label line ${TEST_LINE[$index]}"
-  if [ -n "${TEST_DRIVER[$index]}" ] && [ -n "${TEST_ACTION[$index]}" ]; then
-    px_die "$PX_EXIT_USAGE" \
-      "$where: test '$id' declares a driver and an action, it takes one of them"
-  fi
-  if [ -z "${TEST_DRIVER[$index]}" ] && [ -z "${TEST_ACTION[$index]}" ]; then
-    px_die "$PX_EXIT_USAGE" \
-      "$where: test '$id' declares neither a driver nor an action"
-  fi
-  if [ -z "${TEST_DRIVER[$index]}" ]; then
-    if [ "${TEST_ARG_COUNT[$index]}" -gt 0 ] || [ -n "${TEST_OVERRIDES[$index]}" ]; then
-      px_die "$PX_EXIT_USAGE" \
-        "$where: test '$id' carries driver arguments but declares no driver"
-    fi
-  fi
-  if [ -n "${TEST_OVERRIDES[$index]}" ] && [ ! -f "${TEST_OVERRIDES[$index]}" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" \
-      "$where: test '$id' names no such overrides file: ${TEST_OVERRIDES[$index]}"
-  fi
+  [ -n "${TEST_DRIVER[$index]}" ] ||
+    px_die "$PX_EXIT_USAGE" "$where: test '$id' declares no driver"
   [ -n "${TEST_NAME[$index]}" ] || TEST_NAME[index]=$id
   # A run class resolved from the command line or the cluster record overrides any class declared
   # in the suite file.
@@ -779,18 +817,11 @@ px_suite_row() {
 ## @description  Emits the execution plan as one TSV row per selected test in scheduled run order.
 ## @return       Writes the plan rows and exits 0.
 px_suite_plan_emit() {
-  local dest=$1 index position=0 mode target
+  local dest=$1 index position=0
   for index in $PLAN; do
     position=$((position + 1))
-    if [ -n "${TEST_DRIVER[$index]}" ]; then
-      mode=driver
-      target=${TEST_DRIVER[$index]}
-    else
-      mode=action
-      target="$(px_tsv_clean "${TEST_ACTION[$index]}")"
-    fi
     px_suite_row "$dest" "$position" "${TEST_ID[$index]}" \
-      "$(px_tsv_clean "${TEST_NAME[$index]}")" "$mode" "$target" \
+      "$(px_tsv_clean "${TEST_NAME[$index]}")" driver "${TEST_DRIVER[$index]}" \
       "${TEST_CLASS[$index]}" "${TEST_REQUIRES[$index]}" "${TEST_TIMEOUT[$index]}"
   done
 }
@@ -843,9 +874,8 @@ px_suite_group_acquire() {
   GROUP_STATUS=0
   [ -n "${TEST_REQUIRES[$index]}" ] || return 0
   timeout=${PX_TIMEOUT_GROUP:-${TEST_TIMEOUT[$index]}}
-  # Bind the backend lazily on demand rather than at startup so that action-only suites require no
-  # backend and dry runs never load one. Cluster scope resolution runs after binding because scope
-  # records are maintained per backend.
+  # Bind the backend lazily here rather than at startup so that a dry run never reaches this path.
+  # Cluster scope resolution runs after binding because scope records belong to a specific backend.
   sb_load
   # Guarding the command inside the substitution prevents a missing scope from triggering the ERR
   # trap before the caller can record the failure in the test's result row.
@@ -861,12 +891,6 @@ px_suite_group_acquire() {
       GROUP_REASON="requires ${TEST_REQUIRES[$index]}, but the scope did not"
       GROUP_REASON="$GROUP_REASON resolve ($(sb_exit_name "$status"))"
     fi
-    return 1
-  fi
-  if ! px_suite_untrapped sb_capability group_switch >/dev/null; then
-    GROUP_SEVERITY=SKIP
-    GROUP_STATUS=$PX_EXIT_UNSUPPORTED
-    GROUP_REASON="backend $(sb_backend_id) cannot stop and start a role group"
     return 1
   fi
   for requirement in ${TEST_REQUIRES[$index]}; do
@@ -886,6 +910,7 @@ px_suite_group_acquire() {
       >>"$GROUP_FILE" || status=$?
     if [ "$status" != 0 ]; then
       GROUP_SEVERITY=ERROR
+      [ "$status" != "$PX_EXIT_UNSUPPORTED" ] || GROUP_SEVERITY=SKIP
       GROUP_STATUS=$status
       GROUP_REASON="group $requirement did not start ($(sb_exit_name "$status"))"
       return 1
@@ -954,14 +979,26 @@ px_suite_child_stop() {
   [ -z "$SUITE_CHILD" ] || px_kill_tree "$SUITE_CHILD" || true
 }
 
+## @description  Extracts an integer timeout setting in whole seconds (name, dump, default) from a
+##               px-cluster config dump.
+## @return       Writes the parsed value or the default to stdout and exits 0.
+px_suite_dump_s() {
+  local value
+  value="$(px_tsv_get "$1" "$2" || true)"
+  value=${value%%"$PX_TAB"*}
+  [[ $value =~ $PX_RE_INT ]] || value=$3
+  printf '%s\n' "$((10#$value))"
+}
+
 # Computes the outer execution time limit for px-run on a driver test (index) by summing the test's
-# declared timeout, the fixed suite margin, and the quiet-host wait and single poll interval of the
-# test's own run class.
+# declared timeout, the fixed suite margin, the driver verb, plug-in hook, cluster check, and
+# disruption recovery bounds, and the quiet-host wait and single poll interval of the test's run
+# class.
 ## @description  Calculates the outer px-run timeout bound in whole seconds for a driver test
 ##               (index).
 ## @return       Writes the computed timeout in whole seconds to stdout and exits 0.
 px_suite_run_limit() {
-  local index=$1 dump wait poll whole file
+  local index=$1 dump wait poll whole file verb drain ready fetch plugins count
   local -a args=()
   if [ -n "${TEST_CLASS[$index]}" ]; then
     args=(--class "${TEST_CLASS[$index]}")
@@ -973,9 +1010,7 @@ px_suite_run_limit() {
   # individual test's run class rather than the outer session's run class.
   dump="$(px_config_child "$PX_HOME/bin/px-cluster" ${args[@]+"${args[@]}"} config \
     2>/dev/null || exit "$?")" || dump=""
-  wait="$(px_tsv_get PX_QUIET_HOST_WAIT_S "$dump" || exit "$?")" || wait=""
-  wait=${wait%%"$PX_TAB"*}
-  [[ $wait =~ $PX_RE_INT ]] || wait=0
+  wait="$(px_suite_dump_s PX_QUIET_HOST_WAIT_S "$dump" 0)"
   poll="$(px_tsv_get PX_POLL_INTERVAL_S "$dump" || exit "$?")" || poll=""
   poll=${poll%%"$PX_TAB"*}
   whole=${poll%%.*}
@@ -983,23 +1018,31 @@ px_suite_run_limit() {
   case "$poll" in
   *.*[1-9]*) whole=$((10#$whole + 1)) ;;
   esac
-  printf '%s\n' "$((TEST_TIMEOUT[index] + SUITE_RUN_MARGIN_S + 10#$wait + 10#$whole))"
-}
-
-## @description  Maps a test process exit code onto the harness severity lattice.
-## @return       Writes the corresponding severity label to stdout and exits 0.
-px_suite_severity_of_code() {
-  case "${1:-}" in
-  "$PX_EXIT_OK") printf 'PASS\n' ;;
-  "$PX_EXIT_UNSUPPORTED") printf 'SKIP\n' ;;
-  "$PX_EXIT_USAGE" | "$PX_EXIT_ANOMALY" | "$PX_EXIT_NO_OBJECT") printf 'ERROR\n' ;;
-  *) printf 'FAIL\n' ;;
-  esac
+  verb="$(px_suite_dump_s PX_TIMEOUT_VERB "$dump" 300)"
+  drain="$(px_suite_dump_s PX_TIMEOUT_DRAIN "$dump" 600)"
+  ready="$(px_suite_dump_s PX_TIMEOUT_READY "$dump" 600)"
+  fetch="$(px_suite_dump_s PX_TIMEOUT_FETCH "$dump" 1800)"
+  plugins="$(px_tsv_get PX_PLUGINS "$dump" || true)"
+  plugins="$(printf '%s\n' "${plugins%%"$PX_TAB"*}" | awk '{ n += NF } END { print n + 0 }')"
+  # Combine the disrupt: directives declared on the test with any session-wide --disrupt setting,
+  # splitting on semicolons in the same manner as px-run.
+  count="$(px_tsv_get PX_DISRUPT_SPEC "$dump" || true)"
+  count="$(printf '%s;%s\n' "${count%%"$PX_TAB"*}" "${TEST_DISRUPT[$index]}" |
+    awk -F ';' '{ for (i = 1; i <= NF; i++) if ($i ~ /[^ \t]/) n++ } END { print n + 0 }')"
+  # Sum the budget terms in order: the test's declared time limit (shared by prepare and run); the
+  # fixed margin for snapshots and result recording; one verb bound for each of describe, validate,
+  # restore, and report, plus two for cluster checks; the four bounded hooks (fetch-data,
+  # pre-workload, post-workload, and collect) for each enabled plug-in; the drain-aware restart plus
+  # the readiness and region waits of the recovery gate for each disruption; the quiet-host wait;
+  # and one poll interval.
+  printf '%s\n' "$((TEST_TIMEOUT[index] + SUITE_RUN_MARGIN_S + 6 * verb +
+    plugins * (3 * verb + fetch) + count * (drain + 2 * ready) + wait + 10#$whole))"
 }
 
 # Driver-backed tests are delegated to px-run, which owns the workload driver lifecycle.
-## @description  Executes a single test within its configured execution time limit.
-## @return       Sets RUN_SEVERITY, RUN_STATUS, RUN_REASON, and RUN_ELAPSED, then exits 0.
+## @description  Executes a single test within its configured time limit and populates RUN_SEVERITY,
+##               RUN_STATUS, RUN_REASON, RUN_ELAPSED, and RUN_BUNDLE.
+## @return       Exits 0 on completion, or exits 1 when a test record cannot be written.
 px_suite_run_one() {
   local index=$1 id dir out log timeout limit status=0 started finished worst file
   local verdicts reported
@@ -1016,6 +1059,8 @@ px_suite_run_one() {
   RUN_STATUS=0
   RUN_REASON=""
   RUN_ELAPSED=0
+  RUN_CONCLUSIVE=0
+  RUN_BUNDLE=""
   started="$(px_epoch_ms)"
   if ! px_suite_group_acquire "$index"; then
     px_suite_group_release
@@ -1027,52 +1072,50 @@ px_suite_run_one() {
     RUN_REASON=$GROUP_REASON
     return 0
   fi
-  # Export PX_RUN_DIR so helper libraries sourced by the check write into the test's own directory,
-  # and export BASH_ENV so non-interactive action and driver subshells automatically load
-  # lib/common.sh and its container-runtime trap.
+  # Export PX_RUN_DIR so that each test writes into its own dedicated directory and any library
+  # sourced by a check reads that path. Export BASH_ENV so that the driver shell and every child
+  # subshell automatically load the shared library along with its container-runtime trap.
   PX_RUN_DIR="$dir"
   export PX_RUN_DIR
   BASH_ENV="$PX_HOME/lib/common.sh"
   export BASH_ENV
-  limit=$timeout
+  # Export the suite and test identity so the driver knows which test of which suite it is running
+  # and can resolve relative argument paths against the suite file location.
+  PX_SUITE_NAME=$SUITE_NAME
+  PX_SUITE_FILE=$SUITE_FILE
+  PX_TEST_ID=$id
+  export PX_SUITE_NAME PX_SUITE_FILE PX_TEST_ID
   # Run the test as a background child with standard input redirected from /dev/null so it never
-  # blocks on terminal input. Waiting on the background child allows a session INT or TERM signal
-  # to interrupt the wait immediately so the exit hook can terminate the child, while the time
-  # limit terminates the entire process tree spawned by the test rather than only the test process.
-  if [ -n "${TEST_DRIVER[$index]}" ]; then
-    # Delegate driver lifecycle and run-directory management to px-run, passing the driver, run
-    # class, configuration files, and time limit as px-run options and forwarding all arguments
-    # after the "--" separator directly to the driver.
-    argv=("$PX_HOME/bin/px-run" --driver "${TEST_DRIVER[$index]}"
-      --timeout "$timeout" --set PX_TEARDOWN=0)
-    if [ -n "${TEST_CLASS[$index]}" ]; then
-      argv=("${argv[@]}" --class "${TEST_CLASS[$index]}")
-    fi
-    for file in ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}; do
-      argv=("${argv[@]}" --config "$file")
-    done
-    argv=("${argv[@]}" --)
-    if [ -n "${TEST_OVERRIDES[$index]}" ]; then
-      argv=("${argv[@]}" --overrides "${TEST_OVERRIDES[$index]}")
-    fi
-    # Extract the test's contiguous argument slice from SUITE_ARGV as a double-quoted array
-    # expansion so each element is preserved as an exact literal word without shell expansion.
-    if [ "${TEST_ARG_COUNT[$index]}" -gt 0 ]; then
-      argv=("${argv[@]}"
-        "${SUITE_ARGV[@]:TEST_ARG_FIRST[index]:TEST_ARG_COUNT[index]}")
-    fi
-    limit="$(px_suite_run_limit "$index")"
-    px_debug "test $id: px-run gets a bound of ${limit}s"
-    # Invoke px-run with only the operator's initial configuration environment so that px-run loads
-    # its own run class without having those settings masked by values loaded in this process.
-    px_suite_child "$out" "$log" px_config_child px_timeout "$limit" "${argv[@]}" ||
-      status=$?
-  else
-    # shellcheck disable=SC2016  # the child shell expands this text, not this one
-    px_suite_child "$out" "$log" px_timeout "$limit" "${BASH:-bash}" \
-      -c 'cd "$1" || exit 2; eval "$2"' px-suite-action "$dir" "${TEST_ACTION[$index]}" ||
-      status=$?
+  # reads from the terminal. Waiting on the background child allows a session INT or TERM signal to
+  # interrupt the wait immediately so the exit hook can stop the child, while the time limit
+  # terminates all descendant processes started by the test rather than only the test process.
+  #
+  # Delegate driver lifecycle and run-directory management to px-run, passing the driver, run
+  # class, configuration files, and time limit as px-run options and forwarding all arguments after
+  # the "--" separator directly to the driver.
+  argv=("$PX_HOME/bin/px-run" "${TEST_DRIVER[$index]}" --timeout "$timeout")
+  if [ -n "${TEST_CLASS[$index]}" ]; then
+    argv=("${argv[@]}" --class "${TEST_CLASS[$index]}")
   fi
+  for file in ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; do
+    argv=("${argv[@]}" --config "$file")
+  done
+  if [ -n "${TEST_DISRUPT[$index]}" ]; then
+    argv=("${argv[@]}" --disrupt "${TEST_DISRUPT[$index]}")
+  fi
+  argv=("${argv[@]}" --)
+  # Extract the test's contiguous argument slice from SUITE_ARGV as a double-quoted array expansion
+  # so that each element is passed as a single literal word without shell expansion.
+  if [ "${TEST_ARG_COUNT[$index]}" -gt 0 ]; then
+    argv=("${argv[@]}"
+      "${SUITE_ARGV[@]:TEST_ARG_FIRST[index]:TEST_ARG_COUNT[index]}")
+  fi
+  limit="$(px_suite_run_limit "$index")"
+  px_debug "test $id: px-run gets a bound of ${limit}s"
+  # Invoke px-run with only the operator's initial configuration environment so that px-run loads
+  # its own run class without having that class masked by values loaded in this process.
+  px_suite_child "$out" "$log" px_config_child px_timeout "$limit" "${argv[@]}" ||
+    status=$?
   px_suite_group_release
   finished="$(px_epoch_ms)"
   RUN_ELAPSED=$((finished - started))
@@ -1085,17 +1128,23 @@ px_suite_run_one() {
     RUN_REASON="exit $status ($(px_exit_name "$status")), messages in $log"
   fi
   RUN_STATUS=$status
-  RUN_SEVERITY="$(px_suite_severity_of_code "$status")"
-  # Elevate the test's baseline exit-code severity if its recorded verdict stream contains a worse
-  # outcome, allowing an ADVISORY verdict to surface even when the process exits 0. Action tests
-  # write verdicts.tsv directly in the test directory, whereas driver tests write verdicts.tsv
-  # inside the run directory that px-run created and printed on its stdout data channel.
+  RUN_SEVERITY="$(sx_severity_of_code "$status")"
+  # Elevate the test's baseline severity when its recorded verdicts carry a worse outcome than its
+  # process exit code, allowing an ADVISORY verdict to survive a test that exits 0. The driver
+  # writes its verdicts inside the run directory that px-run allocated and reported on its stdout
+  # data channel.
   verdicts="$dir/verdicts.tsv"
-  if [ -n "${TEST_DRIVER[$index]}" ] && [ -s "$out" ]; then
+  if [ -s "$out" ]; then
     reported=""
     read -r reported <"$out" || reported=""
     [ -z "$reported" ] || [ ! -d "$reported" ] || RUN_BUNDLE=$reported
-    if [ -n "$reported" ] && [ -f "$reported/verdicts.tsv" ]; then
+    if [ -n "$reported" ] && [ -f "$reported/report/verdicts.tsv" ]; then
+      # Because the exported report table begins with a header line, strip the header and write the
+      # effective verdict rows into the test directory as a headerless stream for the lattice.
+      verdicts="$dir/verdicts.effective.tsv"
+      tail -n +2 "$reported/report/verdicts.tsv" >"$verdicts" ||
+        px_die "$PX_EXIT_FAIL" "cannot write $verdicts"
+    elif [ -n "$reported" ] && [ -f "$reported/verdicts.tsv" ]; then
       verdicts="$reported/verdicts.tsv"
     fi
   fi
@@ -1105,6 +1154,14 @@ px_suite_run_one() {
     if [ -z "$RUN_REASON" ] && [ "$worst" != PASS ]; then
       RUN_REASON="the verdicts of this test reach $worst"
     fi
+  fi
+  # A test whose worst overall severity is SKIP has still verified real behavior if at least one of
+  # its recorded verdicts is not SKIP (for example, a passing run with unsupported checks). Only a
+  # test that verified nothing at all counts toward an inconclusive session.
+  if [ "$RUN_SEVERITY" != SKIP ] ||
+    awk -F '\t' '$2 != "" && $2 != "SKIP" { f = 1 } END { exit !f }' "$verdicts" \
+      2>/dev/null; then
+    RUN_CONCLUSIVE=1
   fi
   return 0
 }
@@ -1131,6 +1188,9 @@ px_suite_blocked_by() {
     case "$severity" in
     '' | PASS | ADVISORY) ;;
     SKIP)
+      # A prerequisite whose overall severity is SKIP because of unsupported checks alongside
+      # passing checks still verified the behavior that dependent tests require.
+      [ "${TEST_CHECKED[$at]}" != 1 ] || continue
       printf 'test %s was skipped\n' "$need"
       return 0
       ;;
@@ -1155,6 +1215,7 @@ px_suite_execute() {
     blocked="$(px_suite_blocked_by "$index")"
     if [ -n "$blocked" ]; then
       TEST_SEVERITY[index]=SKIP
+      COUNT_INCONCLUSIVE=$((COUNT_INCONCLUSIVE + 1))
       px_suite_count SKIP
       px_warn "skip ${TEST_ID[$index]}: $blocked"
       px_suite_row "$RESULT_FILE" "$position" "${TEST_ID[$index]}" SKIP \
@@ -1165,6 +1226,10 @@ px_suite_execute() {
       "run class ${TEST_CLASS[$index]:-${PX_RUN_CLASS:-none}}"
     px_suite_run_one "$index"
     TEST_SEVERITY[index]=$RUN_SEVERITY
+    TEST_CHECKED[index]=$RUN_CONCLUSIVE
+    if [ "$RUN_SEVERITY" = SKIP ] && [ "$RUN_CONCLUSIVE" = 0 ]; then
+      COUNT_INCONCLUSIVE=$((COUNT_INCONCLUSIVE + 1))
+    fi
     COUNT_RAN=$((COUNT_RAN + 1))
     px_suite_count "$RUN_SEVERITY"
     px_suite_row "$RESULT_FILE" "$position" "${TEST_ID[$index]}" "$RUN_SEVERITY" \
@@ -1184,9 +1249,9 @@ px_suite_execute() {
   return 0
 }
 
-## @description  Writes the session summary record as key-value rows capturing the session verdict,
-##               outcome counts, and the version set selected by the active configuration.
-## @return       Writes summary.tsv and exits 0.
+## @description  Writes the session summary record as key-value rows capturing the session outcome
+##               and the version set selected by the active configuration.
+## @return       Exits 0 on success, or exits 1 when the summary record cannot be written.
 px_suite_summary() {
   local code=$1 record="$SESSION_DIR/summary.tsv"
   {
@@ -1199,6 +1264,7 @@ px_suite_summary() {
     px_tsv_row not_run "$COUNT_NOT_RUN"
     px_tsv_row pass "$COUNT_PASS"
     px_tsv_row skip "$COUNT_SKIP"
+    px_tsv_row inconclusive "$COUNT_INCONCLUSIVE"
     px_tsv_row advisory "$COUNT_ADVISORY"
     px_tsv_row fail "$COUNT_FAIL"
     px_tsv_row error "$COUNT_ERROR"
@@ -1244,18 +1310,27 @@ fi
 # would misreport every newly loaded variable as a failure.
 px_trap_enable
 
-SUITE_FILE="$(px_suite_resolve "$OPT_SUITE")"
+# Validate and load enabled plug-ins before performing any other work so that a broken plug-in
+# aborts the session immediately, even during a dry run. Because no session directory exists yet and
+# a dry run writes no persistent files, the suites hook initially writes into a temporary directory.
+SUITE_PLUGINS="$(pl_enabled || exit "$?")" || exit "$?"
+SUITE_HOOK_BASE=""
+if [ -n "$SUITE_PLUGINS" ]; then
+  SUITE_HOOK_BASE="$(px_mktemp_dir px-suites)" || exit "$?"
+fi
+SUITE_FILE="$(px_suite_resolve "$OPT_SUITE" "$SUITE_HOOK_BASE" || exit "$?")" || exit "$?"
 [ -n "$SUITE_FILE" ] ||
   px_die "$PX_EXIT_NO_OBJECT" "no such suite: $OPT_SUITE"
-SUITE_DIR=${SUITE_FILE%/*}
 px_suite_parse "$SUITE_FILE"
 px_suite_order
 px_suite_select
 
 # A dry run validates the execution plan without modifying host state: it creates no output root,
 # allocates no session directory, and loads no backend, making it safe for an operator to run on a
-# host that already holds a live cluster.
+# host that already holds a live cluster. It still resolves every planned driver and validates its
+# describe document, which requires no running cluster.
 if px_is_dry_run; then
+  px_suite_describe_check
   px_info "dry run of $SUITE_NAME, $PLAN_COUNT of $ORDER_COUNT tests selected"
   px_suite_plan_emit ""
   exit "$PX_EXIT_OK"
@@ -1265,6 +1340,12 @@ fi
 # PX_OUT is inherited by all child processes.
 px_out_root >/dev/null
 px_suite_session_create
+# Copy any plug-in records produced by the suites hook from the temporary staging directory into
+# the newly created session directory, which serves as the permanent output location for that hook.
+if [ -n "$SUITE_HOOK_BASE" ] && [ -d "$SUITE_HOOK_BASE/plugins" ]; then
+  cp -R "$SUITE_HOOK_BASE/plugins" "$SESSION_DIR/" ||
+    px_warn "cannot copy the suites hook records into $SESSION_DIR"
+fi
 # Exit hooks run in reverse registration order on every exit: the active test child stops first
 # (via SIGTERM, a two-second wait, and SIGKILL, since background jobs ignore SIGINT), followed by
 # any role groups started by the session, ensuring that an interruption never leaves behind a
@@ -1285,12 +1366,13 @@ else
   px_suite_execute 0
 fi
 
-# If every test in the session was skipped, nothing was verified and the overall session result is
-# INCONCLUSIVE rather than PASS. Delegating this calculation to the shared lattice library ensures
-# that any downstream reporting tool derives the identical result from the same counters.
+# If every test in the session verified nothing (reaching SKIP without recording any verdict of
+# another severity), the overall session result is INCONCLUSIVE rather than a pass. Delegating this
+# decision to the shared lattice library ensures that downstream reports derive the identical result
+# from the same summary counts.
 SESSION_RESULT="$(sx_result "$SESSION_SEVERITY" \
   "$((COUNT_PASS + COUNT_SKIP + COUNT_ADVISORY + COUNT_FAIL + COUNT_ERROR))" \
-  "$COUNT_SKIP")"
+  "$COUNT_INCONCLUSIVE")"
 EXIT_CODE="$(px_verdict_exit "$SESSION_RESULT")" || EXIT_CODE=$PX_EXIT_FAIL
 px_suite_summary "$EXIT_CODE"
 # Emit the closing session row on standard output only when the session runs to completion; the row

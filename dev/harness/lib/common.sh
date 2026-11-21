@@ -283,12 +283,12 @@ px_timestamp() {
 # ---------------------------------------------------------------------------
 
 # Duplicating log messages to a file is governed by the output policy. When px_log_file_set
-# validates and resolves PX_LOG_FILE under the output root, it records the admitted path in
-# _PX_LOG_ADMITTED. The px_log function appends to PX_LOG_FILE only while its value matches that
-# admitted path, ensuring an unvalidated path never receives log output. Because the admission token
-# is exported outside the PX_* namespace, the configuration loader ignores it, while child shells
-# that source this library via BASH_ENV (such as test actions or drivers) inherit the parent
-# admission and continue teeing log lines to the admitted file.
+# resolves PX_LOG_FILE under the output root, it records the admitted path in _PX_LOG_ADMITTED. The
+# px_log function writes a copy only while PX_LOG_FILE still equals that result, ensuring that a
+# value not admitted by the policy never receives a log line. Because this result is exported under
+# a name outside the PX_* namespace, the configuration loader does not read it. When a driver
+# sources this file through BASH_ENV, that shell inherits the parent admission and also writes the
+# log copy.
 _PX_LOG_ADMITTED="${_PX_LOG_ADMITTED:-}"
 
 # Accepts a severity level followed by message words, formats a single timestamped diagnostic line
@@ -1432,21 +1432,20 @@ px_base36() {
   printf '%s\n' "$out"
 }
 
-# Formats each identifier as a compact UTC timestamp, a hyphen, and a four-character base-36 suffix
-# encoding the process ID, two random characters, and a per-shell sequence counter.
-## @description  Generates a chronologically sortable run identifier for a harness execution.
-## @return       Writes the run identifier to stdout and exits 0.
+# Formats each identifier as a compact UTC timestamp, a hyphen, and four base-36 digits: two for
+# the millisecond, one for PX_ID_SEQ, and one random digit.
+## @description  Mints a chronologically sortable run identifier for a harness execution.
+## @return       Writes the identifier to stdout and exits 0.
 px_run_id() {
-  # The sequence counter distinguishes successive calls within the same shell. Because invocations
-  # inside a command substitution cannot advance the parent shell's counter, the random characters
-  # separate subshell calls while px_run_dir closes any remaining collision window via an exclusive
-  # mkdir call.
-  local now suffix
-  now="$(px_epoch_s)"
-  px_utc_fields "$now"
-  PX_ID_SEQ=$((PX_ID_SEQ + 1))
-  suffix="$(px_base36 $(((($$ % 36) * 1296 + RANDOM % 1296) * 36 + PX_ID_SEQ % 36)) 4)"
-  printf '%s-%s\n' "$PX_UTC_COMPACT" "$suffix"
+  # The suffix digits sort in creation order: the millisecond within the second comes first,
+  # followed by the calling shell's sequence counter, which orders two calls from the same shell
+  # within a single millisecond. The trailing random digit separates concurrent processes, and
+  # px_run_dir closes any remaining collision window with an exclusive mkdir call.
+  local now
+  now="$(px_epoch_ms)"
+  px_utc_fields "$((now / 1000))"
+  printf '%s-%s\n' "$PX_UTC_COMPACT" \
+    "$(px_base36 $(((now % 1000) * 1296 + (PX_ID_SEQ % 36) * 36 + RANDOM % 36)) 4)"
 }
 
 # Allocates an exclusive directory using a freshly minted run identifier under the specified parent
@@ -1458,6 +1457,9 @@ px_run_dir() {
   local runs id dir attempt=0
   runs="$(px_out_subdir "${1:-runs}")" || return $?
   while [ "$attempt" -lt 16 ]; do
+    # Advance the sequence counter in the parent shell because px_run_id executes inside a command
+    # substitution subshell where any variable increment would be lost.
+    PX_ID_SEQ=$((PX_ID_SEQ + 1))
     id="$(px_run_id)"
     dir="$runs/$id"
     if mkdir "$dir" 2>/dev/null; then
@@ -1476,8 +1478,9 @@ px_run_dir() {
 # and records the provenance of every variable. The loader evaluates stages in the following order,
 # and the first stage that defines a variable wins:
 #   1. The inherited process environment.
-#   2. Explicit configuration files specified on the command line.
+#   2. Explicit configuration files named on the command line.
 #   3. Local environment overrides in <layout>/env/local.env.
+#      3a. Enabled plug-ins (the sizing and JVM lines of each plugin.env).
 #   4. Run-class defaults in <layout>/env/class-<class>.env.
 #   5. Baseline defaults in <layout>/env/defaults.env (mandatory).
 #   6. Component version definitions in <layout>/versions.env.
@@ -1485,12 +1488,11 @@ px_run_dir() {
 #   8. The generated port map in <deployment>/ports.generated.env.
 # Because later stages never overwrite values established by earlier stages, explicit overrides
 # always prevail over defaults. Stage 7 holds pins recorded manually by an operator, such as base
-# image digests or promoted download pins, together with version selections that re-pin a component
-# release. Stage 6 defines only default version values rather than active selections; the loader
-# derives any unset selection from its default after all stages complete. The trust-on-first-use
-# download pins recorded by scripts/fetch-dist.sh are not part of this configuration hierarchy: they
-# reside in $PX_OUT/dist/pins.env and are read directly by fetch-dist.sh. An operator who wishes to
-# override a declared pin in stage 6 places the replacement in local.env (stage 3).
+# image digests or a promoted download pin, together with version selections that re-pin a release.
+# Stage 6 sets no active selection, only its default, which the loader applies after the last
+# stage. The trust-on-first-use records of scripts/fetch-dist.sh are not a configuration stage:
+# they reside in $PX_OUT/dist/pins.env and are read directly by fetch-dist.sh. An operator who
+# wishes to replace a declared pin places the override in local.env.
 #
 # The deployment generator writes ports.generated.env into the deployment directory under PX_OUT,
 # ensuring that stage 8 never reads generated state from the working tree. Stage 8 runs
@@ -1721,6 +1723,17 @@ px_config_load() {
   env_dir="${PX_ENV_DIR:-$PX_HOME/$PX_DEPLOY_SUBDIR/env}"
   px_config_set PX_ENV_DIR "$env_dir" derived
   px_config_parse_file "${PX_LOCAL_ENV:-$env_dir/local.env}" local || true
+  # Load the sizing and JVM assignments of enabled plug-ins after local overrides and before the
+  # run-class defaults so that explicit operator values still take precedence.
+  if [ -n "${PX_PLUGINS:-}" ]; then
+    if ! declare -F pl_config_stage >/dev/null; then
+      # Because lib/plugin.sh sources this file, ShellCheck validates it through the callers that
+      # source it directly rather than following this circular include.
+      # shellcheck source=/dev/null
+      . "$PX_HOME/lib/plugin.sh"
+    fi
+    pl_config_stage
+  fi
   if [ -n "${PX_RUN_CLASS:-}" ]; then
     px_config_parse_file "${PX_CLASS_ENV:-$env_dir/class-$PX_RUN_CLASS.env}" \
       "class:$PX_RUN_CLASS" || true
@@ -1777,6 +1790,36 @@ px_config_dump() {
   done <<EOF
 $(printf '%s' "$PX_CONFIG_ORIGINS" | sort)
 EOF
+}
+
+# Lists the role keys of the sizing table in table order. Each sizing variable is named
+# PX_<KEY>_MEM_MIB, PX_<KEY>_HEAP_MIB, or PX_<KEY>_DIRECT_MIB.
+PX_SIZING_KEYS="ZK NN SNN DN RM NM JHS MASTER RS CLIENT TOOLING SETUP"
+
+## @description  Reports each sizing variable whose loaded value differs from the run-class file for
+##               PX_RUN_CLASS, identifying overrides of the sizing defined by the class.
+## @return       Writes the space-separated variable names in table order to stdout and exits 0.
+px_sizing_overrides() {
+  local file table key part name value out=""
+  file="${PX_CLASS_ENV:-${PX_ENV_DIR:-$PX_HOME/$PX_DEPLOY_SUBDIR/env}/class-${PX_RUN_CLASS:-}.env}"
+  if [ -z "${PX_RUN_CLASS:-}" ] || [ ! -f "$file" ]; then
+    printf '\n'
+    return 0
+  fi
+  # Because the run-class file is plain text, a single pass extracts every sizing assignment in it.
+  table="$(awk '{ sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
+    /^PX_[A-Z]+_(MEM|HEAP|DIRECT)_MIB[ \t]*=/ {
+      k = $0; sub(/[ \t]*=.*/, "", k); v = $0; sub(/^[^=]*=[ \t]*/, "", v)
+      gsub(/^["\047]|["\047]$/, "", v); print k "\t" v }' "$file")"
+  for key in $PX_SIZING_KEYS; do
+    for part in MEM HEAP DIRECT; do
+      name="PX_${key}_${part}_MIB"
+      value="$(px_tsv_get "$name" "$table" || true)"
+      [ -n "$value" ] || continue
+      [ "${!name:-}" = "$value" ] || out="${out:+$out }$name"
+    done
+  done
+  printf '%s\n' "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -2369,9 +2412,10 @@ EOF
   )
 }
 
-# Invokes scripts/preflight.sh --phase memory under PX_TIMEOUT_DEFAULT before starting an on-demand
-# role group and redirects its report to stderr so stdout remains clean.
-## @description  Re-evaluates container memory capacity via scripts/preflight.sh before group start.
+# Invokes scripts/preflight.sh --phase memory under PX_TIMEOUT_DEFAULT against the supplied
+# deployment directory (DIR) or the recorded deployment before starting a group or scaling,
+# redirecting its report to stderr.
+## @description  Re-evaluates memory capacity via scripts/preflight.sh before group start or scale.
 ## @return       Returns 0 to admit, 1 if the script is missing or not executable, 4 on timeout
 ##               expiry, or the exit status of preflight.sh.
 px_memory_recheck() {
@@ -2383,7 +2427,8 @@ px_memory_recheck() {
     px_error "the memory check $script is missing or not executable"
     return "$PX_EXIT_FAIL"
   fi
-  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" --phase memory >&2 ||
+  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" --phase memory \
+    ${1:+--deployment "$1"} >&2 ||
     status=$?
   case "$status" in
   124 | 137)
@@ -3005,16 +3050,30 @@ px_json_num() {
   printf '%s' "$PX_JSON_VALUE"
 }
 
+# Writes a JSON literal member (true, false, or null), taking a key when inside an object followed
+# by the literal value.
+## @description  Emits a JSON boolean or null literal member (true, false, or null).
+## @return       Exits 0 on success, exits 2 on a wrong argument count or another word, or exits 1
+##               when no container is open.
+px_json_lit() {
+  px_json_args "$@"
+  case "$PX_JSON_VALUE" in
+  true | false | null) ;;
+  *) px_die "$PX_EXIT_USAGE" "px_json_lit: not a JSON literal: $PX_JSON_VALUE" ;;
+  esac
+  px_json_prefix "$PX_JSON_KEY"
+  printf '%s' "$PX_JSON_VALUE"
+}
+
 # ---------------------------------------------------------------------------
 # Runtime execution traps that forbid direct container and Kubernetes CLI invocations.
 # ---------------------------------------------------------------------------
 # Only a backend implementation is permitted to invoke a container runtime or a Kubernetes tool,
-# which it accomplishes by invoking the executable through the "command" builtin and a privately
-# held path (since "command" bypasses shell functions by definition). Because every px-* process
-# sources this file, any stray direct call from a driver, check, hook, suite action, or collector is
-# intercepted by these trap functions and fails with usage exit code 2. The loop below defines one
-# trap function for each forbidden tool name, and its inline waiver marker satisfies the static scan
-# in test/run-tests.sh.
+# which it accomplishes by invoking the binary through the command builtin and a privately held
+# path (since command bypasses shell functions by definition). Because every px-* process sources
+# this file, any stray call from a driver, a check, a hook, or a collector is intercepted by the
+# trap and fails with the usage exit code. The loop below defines one trap function for each tool
+# name, and its inline waiver marker satisfies the static scan in test/run-tests.sh.
 
 ## @description  Rejects a direct call to a container runtime or Kubernetes tool and reports the
 ##               attempted command line in the error message so the author can identify it.

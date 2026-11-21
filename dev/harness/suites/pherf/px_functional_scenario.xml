@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  The Pherf scenario of the functional suite: one small table, loaded with
+  1000 rows, and one serial query set of two query groups. It is a smoke
+  variant: the counts prove the load path and the query path, and its
+  times are advisory in the validation class.
+-->
+<datamodel name="px_functional">
+  <datamapping>
+    <column>
+      <type>VARCHAR</type>
+      <dataSequence>RANDOM</dataSequence>
+      <length>15</length>
+      <name>GENERAL_VARCHAR</name>
+    </column>
+    <column>
+      <type>INTEGER</type>
+      <dataSequence>RANDOM</dataSequence>
+      <minValue>1</minValue>
+      <maxValue>1000000</maxValue>
+      <name>GENERAL_INTEGER</name>
+    </column>
+  </datamapping>
+  <scenarios>
+    <scenario tableName="PX_PHERF.FUNCTIONAL" rowCount="1000" name="px_functional">
+      <querySet concurrency="1" executionType="SERIAL" executionDurationInMs="10000"
+                numberOfExecutions="20">
+        <query id="count" queryGroup="count" expectedAggregateRowCount="1000"
+               statement="select count(*) from PX_PHERF.FUNCTIONAL"/>
+        <query id="scan" queryGroup="scan"
+               statement="select ID, AMOUNT from PX_PHERF.FUNCTIONAL
+                          where AMOUNT &gt; 500000 limit 10"/>
+      </querySet>
+    </scenario>
+  </scenarios>
+</datamodel>

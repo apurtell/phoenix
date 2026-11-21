@@ -14,110 +14,505 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The result-bundle tool writes the bundle for a completed run and verifies any bundle supplied to
-# it.
+# The result-bundle utility assembles, validates, and queries run bundles. The write subcommand
+# constructs manifest.json from the bundle's constituent files, the validate subcommand verifies a
+# bundle against the specification in docs/bundle-format.md (section "Validation"), and the metrics
+# subcommand outputs the bundle's aggregate metrics filtered by anchor and key. Because every
+# operation reads exclusively from the bundle directory, all subcommands run without a driver or a
+# cluster and can inspect a bundle copied from another host once placed under PX_OUT. Every BUNDLE
+# operand follows the shared resolution policy in lib/bundle.sh—accepting a directory path or a run
+# id under PX_OUT—while validate and metrics default to the newest completed bundle.
 #
-# Round A5 owns the underlying behavior: A5 defines the required artifact paths in
-# docs/bundle-format.md, writes the manifest with its steady-state anchors, and verifies a bundle
-# without requiring a driver to be present. The current round delivers the command name, the
-# complete option surface, and the argument validation checks so that a suite, a run wrapper, and an
-# operator can all be written against the final interface before the format exists. Every execution
-# path that requires the format reports the unsupported status code and identifies round A5.
+# The validate subcommand evaluates and reports every check rather than halting at the first
+# failure. Each check emits a single row containing check, status, and detail fields, where status
+# is ok, fail, or skip. An absent optional path is always recorded as skip and never as fail. Shared
+# definitions in lib/bundle.sh provide the path lists, the JSON reader, and the describe checks so
+# that px-run, px-report, and this tool apply a single definition.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/bundle.sh
+. "$SELF/../lib/bundle.sh"
 
 set -euo pipefail
 px_trap_enable
 
-BUNDLE_ACTION=""
 BUNDLE_RUN=""
-BUNDLE_PATH=""
-BUNDLE_OUT=""
-BUNDLE_CONFIG_FILES=()
 
-## @description  Outputs the command-line interface syntax, options, and exit code reference.
-## @return       Writes usage documentation to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: px-bundle <write|verify> [option...]
+# Validation state tracks the parsed manifest as pb_json_flat rows and maintains a running count of
+# failed checks across the validate pass.
+MANIFEST=""
+FAILED=0
 
-Subcommands:
-  write      collect the artifacts of one run into a bundle [A5]
-  verify     check a bundle against the required artifact paths [A5]
+px_cli_spec <<'EOF'
+about Writes, validates and reads one result bundle.
+about BUNDLE is a path or a run id under $PX_OUT/runs. validate and metrics default
++ to the newest finished bundle: the newest run whose directory holds
++ manifest.json. The bundle must lie under PX_OUT.
+exits 1 also means that a check failed; 6 also no finished bundle, or no metric
++ matches.
+example px-bundle validate
+example px-bundle metrics op@query_slo_closed_get 'pherf.latency.*_us'
+sub write BUNDLE
+about write manifest.json of the bundle from its parts
+sub validate [BUNDLE]
+about check the bundle against docs/bundle-format.md
+output one row per check (check, ok|fail|skip, detail), then result, ok or
++ fail, the code and the bundle.
+sub metrics [BUNDLE] [ANCHOR [KEY]]
+about print the aggregate metrics of ANCHOR and KEY
+about ANCHOR and KEY are shell globs, default *. A first operand that is a run id or
++ holds a / is the BUNDLE; give a relative path as ./NAME. Of the records of one
++ source, anchor and key, the last one counts.
+output one row per metric in the order of their first records: anchor, key,
++ value and unit.
+EOF
 
-Options:
-  --run DIR       the run directory to bundle, default PX_RUN_DIR
-  --bundle PATH   the bundle to verify, or the bundle write produces
-  --out DIR       where write puts the bundle, default the run directory
-  --config FILE   an extra configuration file, repeatable
-  -v, --verbose   report detail
-  -h, --help      show this text
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 
-Exit codes: 0 ok, 1 the bundle is not valid, 2 usage, 5 a behaviour round A5
-owns, 6 no such run or bundle.
+## @description  Emits a formatted check row (check, status, detail...) and increments the failure
+##               counter when a check fails.
+## @return       Writes the check row to stdout and returns exit code 0.
+v_row() {
+  [ "$2" != fail ] || FAILED=$((FAILED + 1))
+  px_tsv_row "$1" "$2" "$(px_tsv_clean "${*:3}")"
+}
+
+## @description  Verifies whether a parsed manifest entry at the given path matches the expected
+##               JSON type (path, type).
+## @return       Returns exit code 0 when the path holds that type, or 1 otherwise.
+v_is() { [ "$(pb_json_type "$1" "$MANIFEST" || true)" = "$2" ]; }
+
+## @description  Retrieves the scalar value at a manifest path (path), or outputs nothing when the
+##               path is absent.
+## @return       Writes the value to stdout and returns exit code 0.
+v_get() { pb_json_get "$1" "$MANIFEST" || true; }
+
+## @description  Verifies that manifest.json exists as a single valid JSON document and caches its
+##               flattened rows in MANIFEST.
+## @return       Returns exit code 0 when the manifest is readable, or 1 otherwise.
+v_manifest() {
+  local file="$BUNDLE_RUN/manifest.json" status=0 why
+  if [ ! -f "$file" ]; then
+    v_row manifest fail "manifest.json is absent"
+    return 1
+  fi
+  MANIFEST="$(pb_json_flat "$file" 2>/dev/null || exit "$?")" || status=$?
+  if [ "$status" != 0 ]; then
+    MANIFEST=""
+    why="$(pb_json_flat "$file" 2>&1 >/dev/null || true)"
+    v_row manifest fail "manifest.json is not one JSON document: ${why:-unreadable}"
+    return 1
+  fi
+  v_row manifest ok "manifest.json is one JSON document"
+}
+
+## @description  Validates the bundle format version, the run id against the directory name and
+##               grammar, the run class, and the execution backend.
+## @return       Returns exit code 0.
+v_identity() {
+  local version id name=${BUNDLE_RUN##*/} class backend
+  version="$(v_get /bundle_format_version)"
+  if ! v_is /bundle_format_version number; then
+    v_row format fail "bundle_format_version is absent or not a number"
+  elif [ "$version" != "$PB_FORMAT_VERSION" ]; then
+    v_row format fail "bundle_format_version $version is unknown, this tool reads" \
+      "$PB_FORMAT_VERSION"
+  else
+    v_row format ok "bundle_format_version $version"
+  fi
+  id="$(v_get /run/id)"
+  if [ "$id" != "$name" ]; then
+    v_row id fail "run.id '$id' is not the directory name '$name'"
+  elif ! [[ $id =~ $PB_RUN_ID_RE ]]; then
+    v_row id fail "run.id '$id' does not follow the run id grammar"
+  else
+    v_row id ok "run.id $id"
+  fi
+  class="$(v_get /run/class)"
+  case "$class" in
+  validation | measurement) v_row class ok "run.class $class" ;;
+  *) v_row class fail "run.class is '$class', not validation or measurement" ;;
+  esac
+  backend="$(v_get /run/backend)"
+  if v_is /run/backend string && [ -n "$backend" ]; then
+    v_row backend ok "run.backend $backend"
+  else
+    v_row backend fail "run.backend is absent or empty"
+  fi
+}
+
+## @description  Verifies that each entry of a manifest array (array path, check, member, type)
+##               contains the named member and matches the required type when type is not empty.
+## @return       Returns exit code 0.
+v_members() {
+  local path=$1 check=$2 member=$3 type=${4:-} count index=0 missing="" kind
+  if ! v_is "$path" array; then
+    v_row "$check" fail "${path#/} is absent or not an array"
+    return 0
+  fi
+  count="$(v_get "$path")"
+  while [ "$index" -lt "$count" ]; do
+    kind="$(pb_json_type "$path/$index/$member" "$MANIFEST" || true)"
+    [ -n "$kind" ] && [ "${type:-$kind}" = "$kind" ] || missing="$missing ${path#/}/$index"
+    index=$((index + 1))
+  done
+  if [ -n "$missing" ]; then
+    v_row "$check" fail "entries without ${type:+the $type }$member:$missing"
+  else
+    v_row "$check" ok "$count entries, each with $member"
+  fi
+}
+
+## @description  Validates the types of the version set, the images, the tables, and the quiet-host
+##               tags.
+## @return       Returns exit code 0.
+v_types() {
+  if v_is /versions object; then
+    v_row versions ok "versions is an object"
+  else
+    v_row versions fail "versions is absent or not an object"
+  fi
+  v_members /images images image_id string
+  v_members /tables tables update_cache_frequency string
+  if v_is /quiet_host/tags array; then
+    v_row quiet_host ok "quiet_host.tags holds $(v_get /quiet_host/tags) tags"
+  else
+    v_row quiet_host fail "quiet_host.tags is absent or not an array"
+  fi
+  v_anomaly
+}
+
+# The anomaly member must be either null or a structured object containing aborted, abort_ms, and
+# at least one instance entry recording its role, index, change, restart counts, and termination
+# evidence.
+## @description  Validates the manifest anomaly member and its per-instance failure evidence.
+## @return       Returns exit code 0.
+v_anomaly() {
+  local key missing="" count index=0
+  case "$(pb_json_type /anomaly "$MANIFEST" || true)" in
+  null)
+    v_row anomaly ok "anomaly is null"
+    return 0
+    ;;
+  object) ;;
+  *)
+    v_row anomaly fail "anomaly is absent, or neither null nor an object"
+    return 0
+    ;;
+  esac
+  v_is /anomaly/aborted boolean || missing="$missing aborted"
+  [ -n "$(pb_json_type /anomaly/abort_ms "$MANIFEST" || true)" ] || missing="$missing abort_ms"
+  count=0
+  if v_is /anomaly/instances array; then
+    count="$(v_get /anomaly/instances)"
+  fi
+  [ "$count" -gt 0 ] || missing="$missing instances"
+  while [ "$index" -lt "$count" ]; do
+    for key in role index change restarts_before restarts_after termination_reason exit_code \
+      oom; do
+      [ -n "$(pb_json_type "/anomaly/instances/$index/$key" "$MANIFEST" || true)" ] ||
+        missing="$missing instances/$index/$key"
+    done
+    index=$((index + 1))
+  done
+  if [ -n "$missing" ]; then
+    v_row anomaly fail "anomaly lacks:$missing"
+  else
+    v_row anomaly ok "anomaly of $count instances, the first" \
+      "$(v_get /anomaly/instances/0/role)/$(v_get /anomaly/instances/0/index):" \
+      "$(v_get /anomaly/instances/0/change)"
+  fi
+}
+
+# Steady-state validation enforces requirement G5 by verifying that the manifest records at least
+# one closed steady@ entry and that each of the five steady-state metric values falls inside the
+# window of its anchor.
+## @description  Validates the steady windows to ensure at least one closed steady@ entry exists and
+##               all five steady-state values fall inside their anchor window (G5).
+## @return       Returns exit code 0.
+v_steady() {
+  local count index=0 closed=0 anchor start end key base kind from to bad
+  if ! v_is /steady array; then
+    v_row steady fail "steady is absent or not an array"
+    return 0
+  fi
+  count="$(v_get /steady)"
+  while [ "$index" -lt "$count" ]; do
+    anchor="$(v_get "/steady/$index/anchor")"
+    start="$(v_get "/steady/$index/start_ms")"
+    end="$(v_get "/steady/$index/end_ms")"
+    bad=""
+    # A valid G5 anchor pairs a steady@ name with integer start and end timestamps in epoch ms such
+    # that the end does not precede the start. Each defect is diagnosed and named on its own.
+    case "$anchor" in
+    steady@?*) ;;
+    '') bad="the entry lacks the name of its steady@ anchor" ;;
+    *) bad="the anchor '$anchor' is not a steady@ anchor" ;;
+    esac
+    for kind in start_ms:"$start" end_ms:"$end"; do
+      [ -z "$bad" ] || break
+      if [ -z "$(pb_json_type "/steady/$index/${kind%%:*}" "$MANIFEST" || true)" ]; then
+        bad="$anchor lacks ${kind%%:*}"
+      elif ! [[ ${kind#*:} =~ $PX_RE_INT ]]; then
+        bad="$anchor has no integer ${kind%%:*}: the window is not closed"
+      fi
+    done
+    if [ -z "$bad" ] && [ "$end" -lt "$start" ]; then
+      bad="$anchor ends at $end, before its start at $start"
+    fi
+    if [ -n "$bad" ]; then
+      v_row steady fail "steady/$index: $bad"
+      index=$((index + 1))
+      continue
+    fi
+    closed=$((closed + 1))
+    for key in $PB_STEADY_KEYS; do
+      base="/steady/$index/metrics/$key"
+      kind="$(pb_json_type "$base" "$MANIFEST" || true)"
+      case "$kind" in
+      null) continue ;;
+      object) ;;
+      '')
+        v_row steady fail "$anchor lacks the steady-state key $key"
+        continue
+        ;;
+      *)
+        v_row steady fail "$anchor: $key is a $kind, not null or an object"
+        continue
+        ;;
+      esac
+      from="$(v_get "$base/start_ms")"
+      to="$(v_get "$base/end_ms")"
+      if ! v_is "$base/value" number || ! [[ $from =~ $PX_RE_INT ]] ||
+        ! [[ $to =~ $PX_RE_INT ]]; then
+        v_row steady fail "$anchor: $key needs a number value and a whole start_ms and end_ms"
+      elif [ "$from" -lt "$start" ] || [ "$to" -gt "$end" ]; then
+        v_row steady fail "$anchor: $key covers $from to $to, outside the window $start to $end"
+      fi
+    done
+    index=$((index + 1))
+  done
+  if [ "$closed" = 0 ]; then
+    v_row steady fail "no closed steady@ window: a base run carries at least one"
+  else
+    v_row steady ok "$closed closed steady@ windows"
+  fi
+}
+
+## @description  Records a skip row for every validation check that depends on the manifest when
+##               manifest.json is absent or unreadable.
+## @return       Returns exit code 0.
+v_no_manifest() {
+  local check
+  for check in format id class backend versions images tables quiet_host anomaly steady \
+    disruptions stages; do
+    v_row "$check" skip "no readable manifest"
+  done
+}
+
+## @description  Audits the artifact inventory of the bundle, recording a missing required path as
+##               a failure and an absent optional path as a skip.
+## @return       Returns exit code 0.
+v_paths() {
+  local path status required reason
+  while IFS="$PB_US" read -r path status required reason; do
+    [ -n "$path" ] || continue
+    case "$status" in
+    present) v_row path ok "$path" ;;
+    missing) v_row path fail "$path is absent, $reason" ;;
+    unavailable) v_row path skip "$path is unavailable: $reason" ;;
+    *)
+      [ "$reason" != absent ] || reason=""
+      v_row path skip "$path is absent${reason:+: $reason}"
+      ;;
+    esac
+  done <<EOF
+$(pb_artifact_rows "$BUNDLE_RUN" | tr '\t' "$PB_US")
 EOF
 }
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -v | --verbose) px_config_set PX_VERBOSE 1 cli ;;
-  --run) px_cli_need_value "$@" && BUNDLE_RUN="$2" && shift ;;
-  --bundle) px_cli_need_value "$@" && BUNDLE_PATH="$2" && shift ;;
-  --out) px_cli_need_value "$@" && BUNDLE_OUT="$2" && shift ;;
-  --config) px_cli_need_value "$@" && BUNDLE_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *)
-    [ -z "$BUNDLE_ACTION" ] || px_usage_error "unexpected argument: $1"
-    BUNDLE_ACTION=$1
-    ;;
-  esac
-  shift
-done
+## @description  Validates the describe document for the driver of the bundle using
+##               pb_describe_load.
+## @return       Returns exit code 0.
+v_describe() {
+  local driver file why status=0
+  driver="$(pb_bundle_driver "$BUNDLE_RUN")"
+  if [ -z "$driver" ]; then
+    v_row describe skip "the run names no driver"
+    return 0
+  fi
+  file="$BUNDLE_RUN/drivers/$driver/describe.json"
+  why="$(pb_describe_load "$file" 2>&1 || exit "$?")" || status=$?
+  if [ "$status" = 0 ]; then
+    v_row describe ok "drivers/$driver/describe.json is accepted"
+  else
+    v_row describe fail "drivers/$driver/describe.json is refused: $why"
+  fi
+}
 
-if [ -z "$BUNDLE_ACTION" ]; then
-  px_usage_error "name a subcommand: write or verify"
+# Each of the two metric exports must start with one header line, and every data row must contain
+# ten fields holding a known class, a numeric value, the run class from the manifest, and a
+# contamination field.
+## @description  Validates every row of the two metric exports against the manifest run class
+##               (run class).
+## @return       Returns exit code 0.
+v_metrics() {
+  local class=$1 name file bad header
+  header="$(printf '%s\n' "$PB_METRIC_FIELDS" | tr ' ' '\t')"
+  for name in timeline aggregate; do
+    file="$BUNDLE_RUN/metrics/$name.tsv"
+    if [ ! -f "$file" ]; then
+      v_row "metrics.$name" skip "metrics/$name.tsv is absent, see its path row"
+      continue
+    fi
+    bad="$(awk -F '\t' -v header="$header" -v classes="$PB_METRIC_CLASSES" -v rc="$class" '
+      BEGIN { n = split(classes, c, " "); for (i = 1; i <= n; i++) cls[c[i]] = 1 }
+      NR == 1 { if ($0 != header) { bad++; first = "line 1 is not the header" }; next }
+      {
+        why = ""
+        if (NF != 10) why = NF " fields"
+        else if (!($6 in cls)) why = "class \"" $6 "\""
+        else if ($7 !~ /^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$/) why = "value \"" $7 "\""
+        else if ($9 != rc) why = "run class \"" $9 "\", the manifest says \"" rc "\""
+        else if ($10 == "") why = "no contamination field, which is none when clean"
+        if (why != "") { bad++; if (first == "") first = "line " NR ": " why }
+      }
+      END { if (bad) print bad " bad rows, first " first }' "$file")"
+    if [ -n "$bad" ]; then
+      v_row "metrics.$name" fail "metrics/$name.tsv: $bad"
+    else
+      v_row "metrics.$name" ok "metrics/$name.tsv rows are well formed"
+    fi
+  done
+}
+
+## @description  Validates every row of verdicts.tsv to confirm that each entry carries a severity
+##               from the lattice and a known class.
+## @return       Returns exit code 0.
+v_verdicts() {
+  local file="$BUNDLE_RUN/verdicts.tsv" bad
+  if [ ! -f "$file" ]; then
+    v_row verdicts skip "verdicts.tsv is absent, see its path row"
+    return 0
+  fi
+  bad="$(awk -F '\t' -v severities="$SX_SEVERITIES" -v classes="$SX_CLASSES" '
+    BEGIN {
+      n = split(severities, s, " "); for (i = 1; i <= n; i++) sev[s[i]] = 1
+      n = split(classes, c, " "); for (i = 1; i <= n; i++) cls[c[i]] = 1
+    }
+    $0 == "" { next }
+    {
+      why = ""
+      if (NF < 5) why = NF " fields"
+      else if (!($2 in sev)) why = "severity \"" $2 "\""
+      else if (!($3 in cls)) why = "class \"" $3 "\""
+      if (why != "") { bad++; if (first == "") first = "line " NR ": " why }
+    }
+    END { if (bad) print bad " bad rows, first " first }' "$file")"
+  if [ -n "$bad" ]; then
+    v_row verdicts fail "verdicts.tsv: $bad"
+  else
+    v_row verdicts ok "verdicts.tsv rows carry a known severity and class"
+  fi
+}
+
+## @description  Executes every validation check specified in docs/bundle-format.md, section
+##               "Validation", against the bundle.
+## @return       Writes the check rows to stdout. Exits 0 when no check failed, or 1 otherwise.
+bundle_validate() {
+  local class
+  if v_manifest; then
+    v_identity
+    v_types
+    v_steady
+    v_members /disruptions disruptions mttr_seconds ""
+    v_members /stages stages end_ms number
+    class="$(v_get /run/class)"
+  else
+    v_no_manifest
+    class="$(pb_record_rows run "$BUNDLE_RUN/run-record.tsv" |
+      awk -F '\t' '{ c = $2 } END { print c }')"
+  fi
+  v_paths
+  v_describe
+  v_metrics "$class"
+  v_verdicts
+  [ "$FAILED" = 0 ] || return "$PX_EXIT_FAIL"
+}
+
+# ---------------------------------------------------------------------------
+# Aggregate metric queries
+# ---------------------------------------------------------------------------
+
+# The aggregate metric export retains a single effective value for each unique combination of
+# source, anchor, and key, where later records supersede earlier ones; each matching metric is
+# emitted once in the positional order of its first appearance.
+## @description  Outputs the bundle's aggregate metrics (anchor, key, value, and unit) whose anchor
+##               and key match the supplied shell globs (anchor glob, key glob).
+## @return       Writes the matching rows to stdout and exits 0, or exits 6 when no row matches.
+bundle_metrics() {
+  local file="$BUNDLE_RUN/metrics/aggregate.tsv"
+  [ -f "$file" ] && [ "$(grep -c . "$file")" -gt 1 ] ||
+    px_die "$PX_EXIT_NO_OBJECT" "$BUNDLE_RUN holds no aggregate metrics"
+  METRIC_ANCHOR=$1 METRIC_KEY=$2 awk -F '\t' -v OFS='\t' "$(px_awk_glob)"'
+    BEGIN { ra = glob(ENVIRON["METRIC_ANCHOR"]); rk = glob(ENVIRON["METRIC_KEY"]) }
+    FNR > 1 && $4 ~ ra && $5 ~ rk {
+      k = $3 OFS $4 OFS $5
+      if (!(k in row)) order[++n] = k
+      row[k] = $4 OFS $5 OFS $7 OFS $8 }
+    END { for (i = 1; i <= n; i++) print row[order[i]]; exit !n }' "$file" ||
+    px_die "$PX_EXIT_NO_OBJECT" "no metric of $BUNDLE_RUN matches $1 $2"
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+px_cli_parse "$@"
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
+
+# For the metrics subcommand, an initial operand whose syntax identifies a bundle—or the first
+# argument when three operands are provided—is taken as the target BUNDLE, whereas any other first
+# operand is interpreted as the anchor glob for the newest completed bundle.
+BUNDLE_OPERANDS=(${PX_CLI_ARGS[@]+"${PX_CLI_ARGS[@]}"})
+if [ "$PX_CLI_SUB" != metrics ] || [ "${#BUNDLE_OPERANDS[@]}" = 3 ] ||
+  pb_bundle_operand "${BUNDLE_OPERANDS[0]:-}"; then
+  BUNDLE_RUN=${BUNDLE_OPERANDS[0]:-}
+  BUNDLE_OPERANDS=(${BUNDLE_OPERANDS[@]+"${BUNDLE_OPERANDS[@]:1}"})
 fi
-case "$BUNDLE_ACTION" in
-write | verify) ;;
-*) px_usage_error "unknown subcommand: $BUNDLE_ACTION" ;;
-esac
-
-px_config_load ${BUNDLE_CONFIG_FILES[@]+"${BUNDLE_CONFIG_FILES[@]}"}
-
-# Argument validation runs in the current round because these checks do not depend on the bundle
-# format. Validating paths upfront ensures that an operator discovers an invalid path immediately
-# rather than after round A5 lands.
-if [ "$BUNDLE_ACTION" = write ]; then
-  if [ -z "$BUNDLE_RUN" ]; then
-    BUNDLE_RUN="${PX_RUN_DIR:-}"
-  fi
-  if [ -z "$BUNDLE_RUN" ]; then
-    px_usage_error "name the run with --run, or export PX_RUN_DIR"
-  fi
-  if [ ! -d "$BUNDLE_RUN" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" "no such run directory: $BUNDLE_RUN"
-  fi
-  # Because a result bundle is a run artifact, it must reside under the configured output root like
-  # every other artifact. This boundary check executes here at the top level rather than in round A5
-  # so that a rejected path terminates the main process immediately instead of exiting a subshell.
-  if [ -n "$BUNDLE_OUT" ]; then
-    BUNDLE_DEST="$(px_out_resolve "$BUNDLE_OUT")" || exit $?
-    px_debug "the bundle would go to $BUNDLE_DEST"
-  fi
+BUNDLE_ANCHOR=${BUNDLE_OPERANDS[0]:-*}
+BUNDLE_KEY=${BUNDLE_OPERANDS[1]:-*}
+if [ -n "$BUNDLE_RUN" ]; then
+  BUNDLE_RUN="$(pb_bundle_resolve "$BUNDLE_RUN")" || exit "$?"
 else
-  if [ -z "$BUNDLE_PATH" ]; then
-    px_usage_error "name the bundle with --bundle"
-  fi
-  if [ ! -e "$BUNDLE_PATH" ]; then
-    px_die "$PX_EXIT_NO_OBJECT" "no such bundle: $BUNDLE_PATH"
-  fi
+  BUNDLE_RUN="$(pb_bundle_newest)" || exit "$?"
 fi
 
-px_die "$PX_EXIT_UNSUPPORTED" \
-  "px-bundle $BUNDLE_ACTION arrives with round A5, which also writes docs/bundle-format.md"
+if [ "$PX_CLI_SUB" = metrics ]; then
+  px_debug "metrics $BUNDLE_RUN $BUNDLE_ANCHOR $BUNDLE_KEY"
+  px_plan read "$BUNDLE_RUN/metrics/aggregate.tsv" && exit "$PX_EXIT_OK"
+  bundle_metrics "$BUNDLE_ANCHOR" "$BUNDLE_KEY"
+  exit 0
+fi
+
+if [ "$PX_CLI_SUB" = write ]; then
+  px_debug "write $BUNDLE_RUN"
+  px_plan write "$BUNDLE_RUN/manifest.json" && exit "$PX_EXIT_OK"
+  WRITE_STATUS=0
+  pb_manifest_write "$BUNDLE_RUN" || WRITE_STATUS=$?
+  [ "$WRITE_STATUS" = 0 ] || px_die "$WRITE_STATUS" "cannot write $BUNDLE_RUN/manifest.json"
+  px_info "wrote $BUNDLE_RUN/manifest.json"
+  exit 0
+fi
+
+px_debug "validate $BUNDLE_RUN"
+px_plan validate "$BUNDLE_RUN" && exit "$PX_EXIT_OK"
+VALIDATE_STATUS=0
+bundle_validate || VALIDATE_STATUS=$?
+px_result_close "$VALIDATE_STATUS" "$BUNDLE_RUN" ||
+  px_error "the bundle $BUNDLE_RUN fails $FAILED checks"
+exit "$VALIDATE_STATUS"

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Implements the cluster check script for the example plug-in, which suites/check-cluster.sh
+# executes after the built-in subjects and steady-state checks. This script counts the marker files
+# written into $PX_HOOK_OUT by the hooks of the current run and persists its outcome twice: once as
+# a verdict row consumed by the merge step, and once as a metric record that preserves the measured
+# value for post-run inspection. Its exit status indicates only that the script executed.
+
+set -euo pipefail
+: "${PX_HOOK_OUT:?the harness sets PX_HOOK_OUT for every check script}"
+: "${PX_HOME:?the harness sets PX_HOME for every check script}"
+# shellcheck source=SCRIPTDIR/../../../lib/bundle.sh
+. "$PX_HOME/lib/bundle.sh"
+
+count=0
+names=""
+for marker in "$PX_HOOK_OUT"/*.marker; do
+  if [ -f "$marker" ]; then
+    count=$((count + 1))
+    names="$names ${marker##*/}"
+  fi
+done
+pb_metric plugin.example.markers count "$count" markers
+if [ "$count" -gt 0 ]; then
+  sx_verdict_row plugin.example.marker PASS count "$count hook markers in this run:$names"
+else
+  sx_verdict_row plugin.example.marker FAIL count "no hook of the example plug-in fired in this run"
+fi

@@ -1,0 +1,48 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Functional test suite providing validation-class verification of both the build and the test
+# harness across the psql and pherf drivers:
+#   schema    Creates a salted table with UPDATE_CACHE_FREQUENCY and a covered global index, then
+#             verifies fixed row counts queried through both the index and the base table.
+#   recover   Executes the same workload while px-run kills RegionServer 0 at the start of the
+#             steady window; the recovery gate restarts the process, after which the cluster checks
+#             enforce the two-minute recovery bound and confirm that no residual fault remains.
+#   pherf     Runs a small Pherf scenario consisting of a data load followed by a serial query set.
+# Each test is fully self-contained: the prepare phase creates the state that run reads, and the
+# restore phase drops it, allowing any test to run alone with --from or --filter.
+
+suite: functional
+description: The functional proof, through the psql and pherf drivers, with one disruption
+class: validation
+timeout: 900
+
+test: schema
+  name: Apply a salted and indexed schema, then query it through the index
+  driver: psql
+  args: --prepare sql/functional-schema.sql sql/functional-query.sql
+
+test: recover
+  name: Query through a kill of RegionServer 0 and its recovery
+  needs: schema
+  driver: psql
+  args: --prepare sql/functional-schema.sql sql/functional-query.sql
+  disrupt: phase:steady@script,kill,regionserver,0,hard
+
+test: pherf
+  name: Load and query a small Pherf scenario
+  needs: schema
+  driver: pherf
+  args: --scenario pherf/px_functional_scenario.xml --schema pherf/px_functional_schema.sql

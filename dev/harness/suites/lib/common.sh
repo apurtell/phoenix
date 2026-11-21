@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This shared library is sourced by suite action commands to provide two core facilities: the
+# Shared library sourced by drivers, checks, and plug-in hooks to provide two core facilities: the
 # severity lattice and the verdict record writer. The px-suite runner consumes this same lattice
 # definition along with the verdict records emitted by each test.
 #
@@ -31,7 +31,7 @@
 
 # This file is a library that must be sourced; executing it directly is an operator error.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  printf 'px: suites/lib/common.sh is a library. Source it from a suite action.\n' >&2
+  printf 'px: suites/lib/common.sh is a library. Source it from a driver, a check or a hook.\n' >&2
   exit 2
 fi
 
@@ -120,15 +120,13 @@ sx_result() {
 # ---------------------------------------------------------------------------
 # Run directory resolution and output isolation enforcement.
 # ---------------------------------------------------------------------------
-# Every artifact produced by an action resides in a single directory designated by px-suite or
-# px-run via PX_RUN_DIR. Resolving this location through the shared output policy guarantees that
-# an action cannot write inside the working tree, even if supplied with a path that points there.
+# Every artifact produced by a writer resides in a single directory designated by px-suite or px-run
+# via PX_RUN_DIR. This library resolves that directory through the output policy so that a writer
+# cannot write inside the working tree, even when given a path that points there.
 
-# Validates that PX_RUN_DIR is set, resides within the output root, and lies outside the working
-# tree before reporting its resolved path.
-## @description  Resolves and reports the PX_RUN_DIR run directory for the current action.
-## @return       Writes the directory to stdout and exits 0; exits 2 if unset, outside the output
-##               root, or inside the tree, or exits 1 if it cannot be resolved.
+## @description  Resolves and reports the PX_RUN_DIR run directory for the current writer.
+## @return       Writes the directory to stdout and exits 0; exits 2 when unset, outside the output
+##               root, or inside the tree, or exits 1 when it cannot be resolved.
 sx_run_dir() {
   if [ -z "${PX_RUN_DIR:-}" ]; then
     px_die "$PX_EXIT_USAGE" \
@@ -150,25 +148,39 @@ sx_verdict_file() {
 # ---------------------------------------------------------------------------
 # Verdict stream recording and severity aggregation.
 # ---------------------------------------------------------------------------
-# Each verdict is persisted as a three-column TSV record containing check, severity, and detail.
-# Field values are sanitized with px_tsv_clean before writing because an embedded tab character in
-# a detail message would corrupt column alignment for every downstream reader.
+# Each verdict is recorded as a single TSV row with five columns: check, severity, class, source,
+# and detail. Keeping severity in the second column allows any reader computing the worst severity
+# to inspect that column alone. The class column identifies the evidence class: count, share, and
+# duration correspond to the metric classes in docs/driver-contract.md, whereas none indicates a
+# functional or structural check. px-report demotes a failed duration verdict to ADVISORY whenever
+# the run's time evidence is not authoritative, and never demotes any other class. The source column
+# records the writer from PX_RECORD_SOURCE. The detail message is sanitized through px_tsv_clean
+# because an embedded tab would break column alignment for every reader. See docs/bundle-format.md,
+# section "verdicts.tsv", for the specification.
 
-# Appends a single verdict record (check, severity, detail...) to the verdict stream and logs the
-# outcome to stderr.
-## @description  Records a check verdict and reports it on stderr.
-## @return       Exits 0, or returns exit code 2 or 1 from sx_verdict_file; exits 2 on an empty
-##               check or unknown severity, and exits 1 if the row cannot be written.
-sx_verdict() {
-  local check=${1:-} severity=${2:-} detail="${*:3}" file
+SX_CLASSES="count share duration none"
+
+## @description  Appends a verdict row (check, severity, class, detail...) and logs it to stderr.
+## @return       Exits 0, or propagates exit code 2 or 1 from sx_verdict_file; exits 2 on an empty
+##               check or an unknown severity or class, and exits 1 if the row cannot be written.
+sx_verdict_row() {
+  local check=${1:-} severity=${2:-} class=${3:-} detail="${*:4}" file source
   [ -n "$check" ] || px_die "$PX_EXIT_USAGE" "a verdict needs a check name"
   sx_severity_rank "$severity" >/dev/null ||
     px_die "$PX_EXIT_USAGE" \
       "check '$check' carries unknown severity '$severity', expected one of $SX_SEVERITIES"
+  case " $SX_CLASSES " in
+  *" $class "*) ;;
+  *)
+    px_die "$PX_EXIT_USAGE" "check '$check' carries unknown class '$class'," \
+      "expected one of $SX_CLASSES"
+    ;;
+  esac
   file="$(sx_verdict_file)" || return $?
   check="$(px_tsv_clean "$check")"
   detail="$(px_tsv_clean "$detail")"
-  px_tsv_row "$check" "$severity" "$detail" >>"$file" ||
+  source="$(px_tsv_clean "${PX_RECORD_SOURCE:-action}")"
+  px_tsv_row "$check" "$severity" "$class" "$source" "$detail" >>"$file" ||
     px_die "$PX_EXIT_FAIL" "cannot append to the verdict stream $file"
   case "$severity" in
   PASS) px_debug "$check: PASS $detail" ;;
@@ -179,7 +191,38 @@ sx_verdict() {
   return 0
 }
 
-# Any row carrying an unknown severity is promoted to ERROR so that a misspelled FAIL cannot pass.
+## @description  Records a verdict (check, severity, detail...) with class none for a functional or
+##               structural check that no host condition can demote.
+## @return       Exits 0, or returns the exit status of sx_verdict_row.
+sx_verdict() { sx_verdict_row "${1:-}" "${2:-}" none "${@:3}"; }
+
+## @description  Looks up a threshold (key) in PX_THRESHOLDS_FILE, the merged cluster-check set.
+## @return       Writes the value to stdout and exits 0; exits 6 when the key or file is absent, or
+##               exits 2 when PX_THRESHOLDS_FILE is unset.
+sx_threshold() {
+  local key=${1:-} file=${PX_THRESHOLDS_FILE:-} value
+  [ -n "$file" ] || px_die "$PX_EXIT_USAGE" \
+    "PX_THRESHOLDS_FILE is unset. suites/check-cluster.sh sets it for every check."
+  [ -f "$file" ] || return "$PX_EXIT_NO_OBJECT"
+  value="$(awk -v k="$key" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2); f = 1 }
+    END { if (!f) exit 6; print v }' "$file" || exit "$?")" || return "$PX_EXIT_NO_OBJECT"
+  printf '%s\n' "$value"
+}
+
+# Maps a shared-vocabulary exit code onto the severity lattice: 0 to PASS, 5 to SKIP, 2, 3, and 6
+# to ERROR, and any other exit code to FAIL.
+## @description  Translates a shared-vocabulary process exit code into a severity lattice level.
+## @return       Writes the severity to stdout and exits 0.
+sx_severity_of_code() {
+  case "${1:-}" in
+  "$PX_EXIT_OK") printf 'PASS\n' ;;
+  "$PX_EXIT_UNSUPPORTED") printf 'SKIP\n' ;;
+  "$PX_EXIT_USAGE" | "$PX_EXIT_ANOMALY" | "$PX_EXIT_NO_OBJECT") printf 'ERROR\n' ;;
+  *) printf 'FAIL\n' ;;
+  esac
+}
+
+# Treats any row carrying an unknown severity as ERROR so that a misspelled FAIL cannot pass.
 ## @description  Reports the worst severity recorded in a verdict stream.
 ## @return       Writes the worst severity to stdout, or nothing for an absent or empty file, and
 ##               exits 0.

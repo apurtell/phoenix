@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Implements the fetch-data hook for the example plugin, invoked by px-run before the prepare
+# phase. Because the dataset is bundled directly within the plugin, this hook requires no network
+# access. It stages the dataset into two locations: locally under $PX_HOOK_OUT/data/ for the
+# example driver to read, and, when running with a cluster, into the remote working directory
+# /tmp/px/<run-id> on client 0 via sb_copy_in for in-cluster workloads to consume. A plugin that
+# downloads an external dataset verifies a declared hash at this stage, following the pattern in
+# scripts/fetch-dist.sh.
+
+set -euo pipefail
+: "${PX_HOOK_OUT:?the harness sets PX_HOOK_OUT for every hook}"
+: "${PX_PLUGIN_DIR:?the harness sets PX_PLUGIN_DIR for every hook}"
+: "${PX_HOME:?the harness sets PX_HOME for every hook}"
+mkdir -p "$PX_HOOK_OUT/data"
+cp "$PX_PLUGIN_DIR/data/example.tsv" "$PX_HOOK_OUT/data/example.tsv"
+if [ -n "${PX_SCOPE_ID:-}" ]; then
+  # shellcheck source=SCRIPTDIR/../../../lib/common.sh
+  . "$PX_HOME/lib/common.sh"
+  # shellcheck source=SCRIPTDIR/../../../lib/backend/contract.sh
+  . "$PX_HOME/lib/backend/contract.sh"
+  sb_load "${PX_BACKEND:-}"
+  remote="/tmp/px/${PX_RUN_ID:?px-run sets PX_RUN_ID for a hook of a run}"
+  sb_exec "$PX_SCOPE_ID" client 0 "${PX_TIMEOUT_VERB:-300}" -- mkdir -p "$remote" >&2
+  sb_copy_in "$PX_SCOPE_ID" client 0 "$PX_HOOK_OUT/data/example.tsv" "$remote/example.tsv"
+fi
+date -u '+%Y-%m-%dT%H:%M:%SZ' >>"$PX_HOOK_OUT/fetch-data.marker"

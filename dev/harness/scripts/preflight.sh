@@ -300,7 +300,7 @@ pf_backend() {
   scope="$(sb_scope_resolve)" || status=$?
   if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
     status=0
-    scope="$(PX_DRY_RUN=1 sb_call sb_scope_create "${PX_CLUSTER_ID:-default}" 2>/dev/null)" ||
+    scope="$(PX_DRY_RUN=1 sb_scope_create "${PX_CLUSTER_ID:-default}" 2>/dev/null)" ||
       status=$?
   fi
   if [ "$status" = 0 ] && [ -z "$scope" ]; then
@@ -309,7 +309,7 @@ pf_backend() {
   if [ "$status" != 0 ]; then
     px_die "$status" "cannot name a scope for cluster ${PX_CLUSTER_ID:-default} to ask the backend"
   fi
-  PF_SB_ROWS="$(sb_call sb_preflight "$scope")" || PF_SB_STATUS=$?
+  PF_SB_ROWS="$(sb_preflight "$scope")" || PF_SB_STATUS=$?
   if [ "$PF_SB_STATUS" = "$PX_EXIT_USAGE" ]; then
     px_die "$PX_EXIT_USAGE" "the backend preflight refused its arguments"
   fi

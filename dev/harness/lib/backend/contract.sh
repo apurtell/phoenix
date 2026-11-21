@@ -17,14 +17,14 @@
 # Defines the substrate contract by declaring what a backend must provide, binding a single
 # backend, and verifying that the binding is complete.
 #
-# Every layer above this file interacts with the substrate exclusively through these 35 sb_*
-# functions. Consequently, a driver, a check, a suite action, a health monitor, a collector, and
+# Every layer above this file interacts with the substrate exclusively through these 31 sb_*
+# functions. Consequently, a driver, a check, a plug-in hook, a health monitor, a collector, and
 # the operator commands execute unchanged across every backend, and no component above this layer
 # depends on a container runtime. This file itself does not reference any specific runtime.
 #
-# Each backend implementation resides in lib/backend/<name>.sh. It must define the required
-# functions, report the current contract version, and perform no side effects when sourced,
-# because sb_load sources the file before any operator intent is established.
+# Each backend implementation resides in lib/backend/<name>.sh. It must define every function in
+# the contract set and perform no side effects when sourced, because sb_load sources the file
+# before any operator intent is established.
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   printf 'px: lib/backend/contract.sh is a library. Source it.\n' >&2
@@ -39,18 +39,6 @@ PX_CONTRACT_LOADED=1
 PX_BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../common.sh
 . "$PX_BACKEND_DIR/../common.sh"
-
-# ---------------------------------------------------------------------------
-# Contract version
-# ---------------------------------------------------------------------------
-# The contract version is a decimal integer that must be incremented whenever a function name, an
-# argument list, a stdout contract, an exit code, or a schema changes. Because sb_load rejects any
-# backend reporting a different number, a backend can never operate in a partially upgraded state.
-# This value is a read-only constant rather than a configuration parameter: the configuration
-# loader refuses to set it, ensuring that neither a file nor an environment variable can alter the
-# revision that sb_load enforces.
-
-readonly PX_CONTRACT_VERSION=1
 
 # ---------------------------------------------------------------------------
 # Exit codes
@@ -145,8 +133,7 @@ sb_valid_value() {
 }
 
 # Reports the ordered field names for a contract schema. The supported schemas are instance, ready,
-# stopped, group, phase, term, oom, event, sample, capability, check, kv, endpoint, image, and
-# restart.
+# stopped, group, phase, term, oom, sample, kv, check, endpoint, image, and restart.
 ## @description  Outputs the ordered field names for a contract schema.
 ## @param        schema: The schema name to inspect.
 ## @return       Writes the space-separated names to stdout; exits 0, or 6 for an unknown schema.
@@ -159,14 +146,12 @@ sb_schema_fields() {
   phase) printf '%s\n' 'phase status elapsed_ms' ;;
   term) printf '%s\n' 'reason exit_code signal finished_at' ;;
   oom) printf '%s\n' 'oom evidence' ;;
-  event) printf '%s\n' 'ts_ms role index type reason message' ;;
   sample)
     printf '%s %s\n' 'ts_ms role index cpu_pct mem_bytes mem_limit_bytes rx_bytes' \
       'tx_bytes blk_read_bytes blk_write_bytes'
     ;;
-  capability) printf '%s\n' 'capability supported detail' ;;
-  check) printf '%s\n' 'check status detail' ;;
   kv) printf '%s\n' 'key value' ;;
+  check) printf '%s\n' 'check status detail' ;;
   endpoint) printf '%s\n' 'host port' ;;
   image) printf '%s\n' 'image_ref image_id' ;;
   restart) printf '%s\n' 'role index count' ;;
@@ -227,25 +212,18 @@ EOF
 # ---------------------------------------------------------------------------
 # The function set
 # ---------------------------------------------------------------------------
-# The substrate contract consists of 35 functions. Every function that operates on a cluster takes
-# the scope id returned by sb_scope_create as its first argument. The three image functions
+# The substrate contract consists of 31 required functions: sb_load refuses a backend that does not
+# define each one. A backend that cannot serve a function on its substrate must still define it and
+# return 5 so that the caller records a skip. Every function that operates on a cluster takes the
+# scope id returned by sb_scope_create as its first argument. The three image functions
 # sb_image_build, sb_image_present, and sb_image_base_digest operate on the host rather than on a
 # cluster, so they take no scope id.
-#
-# Required functions must be defined by every backend implementation, and sb_load refuses to bind a
-# backend that omits any of them. Optional functions require callers to check sb_supports or
-# sb_capability first and record a skip rather than fail when support is absent. The five optional
-# functions correspond to capabilities that a substrate can genuinely lack: signal delivery, a
-# drain-aware restart, a lifecycle event stream, a metrics source, and a forward to release.
 
 SB_REQUIRED_FUNCTIONS="sb_backend_id
-sb_contract_version
 sb_version_info
-sb_capabilities
 sb_preflight
 sb_scope_create
 sb_scope_exists
-sb_scope_args
 sb_scope_delete
 sb_provision
 sb_teardown
@@ -259,76 +237,31 @@ sb_group_stop
 sb_group_start
 sb_group_status
 sb_kill
+sb_signal
+sb_restart_drain
 sb_list
 sb_restart_count
 sb_termination_reason
 sb_oom_killed
+sb_sample_resources
 sb_endpoint
+sb_endpoint_release
 sb_image_ref
 sb_image_build
 sb_image_present
 sb_image_base_digest"
 
-SB_OPTIONAL_FUNCTIONS="sb_signal
-sb_restart_drain
-sb_events
-sb_sample_resources
-sb_endpoint_release"
-
-# Lists the capability identifiers that a backend may declare in its sb_capabilities table.
-# Callers query sb_capability so they can degrade to a skip instead of failing when one is absent.
-SB_CAPABILITY_NAMES="logs_previous
-previous_termination
-resource_sampling
-signal_delivery
-events
-drain_restart
-port_forward
-scale
-group_switch
-oom_evidence
-image_digest
-node_placement"
-
-## @description  Outputs the list of required substrate contract function names.
+## @description  Outputs the list of all substrate contract function names.
 ## @return       Writes one function name per line to stdout and exits 0.
-sb_contract_required() { printf '%s\n' "$SB_REQUIRED_FUNCTIONS"; }
-
-## @description  Outputs the list of optional substrate contract function names.
-## @return       Writes one function name per line to stdout and exits 0.
-sb_contract_optional() { printf '%s\n' "$SB_OPTIONAL_FUNCTIONS"; }
-
-## @description  Outputs every substrate contract function name, with required functions first.
-## @return       Writes one function name per line to stdout and exits 0.
-sb_contract_functions() {
-  printf '%s\n%s\n' "$SB_REQUIRED_FUNCTIONS" "$SB_OPTIONAL_FUNCTIONS"
-}
-
-## @description  Outputs the list of all declared substrate capability names.
-## @return       Writes one capability name per line to stdout and exits 0.
-sb_capability_names() { printf '%s\n' "$SB_CAPABILITY_NAMES"; }
+sb_contract_functions() { printf '%s\n' "$SB_REQUIRED_FUNCTIONS"; }
 
 # ---------------------------------------------------------------------------
 # Binding
 # ---------------------------------------------------------------------------
 
 PX_BACKEND_BOUND=""
-PX_SB_CAPS=""
-PX_SB_CAPS_READY=""
 
-## @description  Checks whether a function name belongs to the substrate contract.
-## @param        name: The function name to test.
-## @return       Exits 0 when the name is a contract function, or 1 otherwise.
-sb_is_contract_name() {
-  case "$PX_NL$SB_REQUIRED_FUNCTIONS$PX_NL$SB_OPTIONAL_FUNCTIONS$PX_NL" in
-  *"$PX_NL${1:-}$PX_NL"*) return 0 ;;
-  esac
-  return 1
-}
-
-# Verifies that the currently bound backend defines every required contract function and reports
-# any missing function names.
-## @description  Reports every required contract function that the bound backend does not define.
+## @description  Reports every contract function that the currently bound backend does not define.
 ## @return       Writes any missing names to stdout; exits 0 when complete, or 1 if any is missing.
 sb_verify_backend() {
   local name missing=0
@@ -349,13 +282,12 @@ EOF
 
 # Binds a single backend for the process by sourcing lib/backend/<name>.sh, while treating a repeat
 # call for the same backend as a no-op. Ends the process with code 2 on an invalid or unknown
-# backend name, and with code 1 on a contract version mismatch, an attempt to bind a second
-# backend, or a missing required function.
+# backend name, and with code 1 on an attempt to bind a second backend or a missing function.
 ## @description  Loads, validates, and binds one backend from lib/backend/<name>.sh.
 ## @param        backend: Name matching ^[a-z][a-z0-9_]*$; defaults to PX_BACKEND, else compose.
 ## @return       Exits 0 when bound, or ends the process with 2 on a bad name or 1 on bind failure.
 sb_load() {
-  local backend file version missing
+  local backend file missing
   backend="${1:-${PX_BACKEND:-compose}}"
   if ! [[ $backend =~ ^[a-z][a-z0-9_]*$ ]]; then
     px_die "$SB_EXIT_USAGE" "invalid backend name '$backend'"
@@ -375,20 +307,12 @@ sb_load() {
   # contents determine which backends are available.
   # shellcheck source=/dev/null
   . "$file" || px_die "$SB_EXIT_FAIL" "backend $backend could not be read"
-  if ! declare -F sb_contract_version >/dev/null 2>&1; then
-    px_die "$SB_EXIT_FAIL" "backend $backend declares no contract version"
-  fi
-  version="$(sb_contract_version)"
-  if [ "$version" != "$PX_CONTRACT_VERSION" ]; then
-    px_die "$SB_EXIT_FAIL" \
-      "backend $backend implements contract $version, this harness needs $PX_CONTRACT_VERSION"
-  fi
   missing="$(sb_verify_backend)" || px_die "$SB_EXIT_FAIL" \
     "backend $backend is incomplete, missing: $(px_tsv_clean "$missing")"
   PX_BACKEND_BOUND="$backend"
   PX_BACKEND="$backend"
   export PX_BACKEND
-  px_debug "bound backend $backend at contract $PX_CONTRACT_VERSION"
+  px_debug "bound backend $backend"
 }
 
 ## @description  Reports the name of the backend currently bound in this process.
@@ -398,89 +322,6 @@ sb_bound_backend() {
     return "$SB_EXIT_NO_OBJECT"
   fi
   printf '%s\n' "$PX_BACKEND_BOUND"
-}
-
-## @description  Tests whether the bound backend implements a specified contract function.
-## @param        name: A contract function name to check.
-## @return       Exits 0 when available, 1 when not implemented, or 2 if not a contract function.
-sb_supports() {
-  local name=${1:-}
-  if ! sb_is_contract_name "$name"; then
-    px_error "'$name' is not a substrate contract function"
-    return "$SB_EXIT_USAGE"
-  fi
-  declare -F "$name" >/dev/null 2>&1
-}
-
-# Invokes a contract function on the bound backend and translates an unimplemented optional
-# function into exit code 5 (unsupported).
-## @description  Dispatches a contract function call, returning code 5 if it is not implemented.
-## @param        name: The contract function name to invoke.
-## @param        argument...: Zero or more arguments forwarded to the contract function.
-## @return       Returns the function status, 5 if not implemented, or 2 if not a contract function.
-sb_call() {
-  local name=${1:-} status
-  shift || true
-  if ! sb_is_contract_name "$name"; then
-    px_error "'$name' is not a substrate contract function"
-    return "$SB_EXIT_USAGE"
-  fi
-  if ! declare -F "$name" >/dev/null 2>&1; then
-    px_debug "backend ${PX_BACKEND_BOUND:-none} does not implement $name"
-    return "$SB_EXIT_UNSUPPORTED"
-  fi
-  status=0
-  "$name" "$@" || status=$?
-  return "$status"
-}
-
-## @description  Reads and caches the capability table of the bound backend once per process.
-## @return       Exits 0, or 1 when no backend is bound or the backend cannot report its table.
-sb_capabilities_cache() {
-  [ -z "$PX_SB_CAPS_READY" ] || return 0
-  if ! declare -F sb_capabilities >/dev/null 2>&1; then
-    px_error "no backend is bound, call sb_load first"
-    return "$SB_EXIT_FAIL"
-  fi
-  PX_SB_CAPS="$(sb_capabilities)" || return "$SB_EXIT_FAIL"
-  PX_SB_CAPS_READY=1
-}
-
-# Checks whether the bound backend declares a capability from SB_CAPABILITY_NAMES, treating any
-# omitted row as no. Exits 1 with no stdout output when the capability table cannot be read, and
-# exits 6 when the queried name is not a declared capability.
-## @description  Reports whether the bound backend declares support for a named capability.
-## @param        name: A capability name from SB_CAPABILITY_NAMES.
-## @return       Writes yes or no to stdout; exits 0 for yes, 1 for no or error, or 6 if undeclared.
-sb_capability() {
-  local name=${1:-} row
-  case "$PX_NL$SB_CAPABILITY_NAMES$PX_NL" in
-  *"$PX_NL$name$PX_NL"*) ;;
-  *)
-    px_error "'$name' is not a declared capability"
-    return "$SB_EXIT_NO_OBJECT"
-    ;;
-  esac
-  sb_capabilities_cache || return "$SB_EXIT_FAIL"
-  row="$(sb_row_get "$name" "$PX_SB_CAPS")" || row=no
-  if [ "${row%%"$PX_TAB"*}" = yes ]; then
-    printf 'yes\n'
-    return 0
-  fi
-  printf 'no\n'
-  return 1
-}
-
-# Extracts the detail column for a capability row from the backend capability table, explaining why
-# the capability is absent or how the backend satisfies it.
-## @description  Reports the diagnostic detail column for one capability row.
-## @param        name: A capability name from SB_CAPABILITY_NAMES.
-## @return       Writes the detail to stdout; exits 0, 1 if the table is unreadable, or 6 if absent.
-sb_capability_detail() {
-  local row
-  sb_capabilities_cache || return "$SB_EXIT_FAIL"
-  row="$(sb_row_get "${1:-}" "$PX_SB_CAPS")" || return "$SB_EXIT_NO_OBJECT"
-  px_tsv_field 2 "$row" || printf '\n'
 }
 
 # ---------------------------------------------------------------------------

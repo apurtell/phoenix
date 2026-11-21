@@ -153,7 +153,12 @@ T_ENVD=""
 T_ZK_PORT=""
 T_ZK_PID=""
 
-## @description  Prints command-line usage instructions for invoking this test runner.
+# Default CLI options for executing against the fake selftest cluster recorded by t_seed_deployment:
+# a full validation run configuration, and the cluster identifier option alone.
+T_SELFTEST_RUN=(--class validation -e PX_CLUSTER_ID=selftest)
+T_SELFTEST_CLUSTER=(-e PX_CLUSTER_ID=selftest)
+
+## @description  Prints command-line usage instructions for invoking this command.
 ## @return       Writes the usage text to stdout. Exit 0.
 usage() {
   cat <<'EOF'
@@ -341,7 +346,7 @@ t_suite() { t_run env "PX_SESSION_ID=$1" "$T_BASH" "$T_BIN/px-suite" "${@:2}"; }
 ##               leaving the cluster running so subsequent test cases can discover it.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
 t_px_run() {
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 -e PX_TEARDOWN=0 \
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_POLL_INTERVAL_S=1 \
     -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/$1.sh" "${@:2}"
 }
 
@@ -387,7 +392,28 @@ EOF
 ## @return       Truncates the fake runtime call log. Exit 0.
 t_shim_log_reset() { : >"$T_SHIM_LOG"; }
 
-## @description  Resets the fake runtime to a single running RegionServer with restart count 0.
+## @description  Records the fake selftest cluster deployment (scope px-selftest) in each output
+##               root (root...) so run bundles generated against it include the cluster/ directory.
+## @return       Exit 0.
+t_seed_deployment() {
+  local root dir="$T_WORK/deploy-selftest"
+  mkdir -p "$dir"
+  printf '%s\n' "# Rendered by compose.gen.sh. Render again instead of editing." \
+    PX_CLUSTER_ID=selftest PX_PHOENIX_HBASE_PROFILE=2.6 PX_DIST_HBASE_VERSION=2.6.7 \
+    PX_DIST_HADOOP_VERSION=3.4.3 PX_ZOOKEEPER_VERSION=3.8.6 PX_HBASE_HADOOP_VERSION=3.4.3 \
+    PX_GROUPS= >"$dir/topology.env"
+  printf '%s\n' "# service role index group start mem_limit_mib heap_mib direct_mib jdk" \
+    "$(t_rows 9 regionserver-1 regionserver 1 '' '' 3584 3072 512 17)" >"$dir/services.tsv"
+  printf 'PX_PORT_REGIONSERVER_RPC_0=16020\n' >"$dir/ports.generated.env"
+  for root in "$@"; do
+    mkdir -p "$root/state"
+    printf 'px-selftest\n' >"$root/state/scope-compose-selftest"
+    printf '%s\n' "$dir" >"$root/state/deployment-compose-selftest"
+  done
+}
+
+## @description  Resets the fake runtime state to a single running RegionServer with a restart
+##               count of 0.
 ## @return       Reinitializes the fake runtime state files. Exit 0.
 t_shim_state_reset() {
   rm -f "$T_SHIM_STATE"/*
@@ -395,6 +421,7 @@ t_shim_state_reset() {
     px-selftest-regionserver-1 running 'Up 3 minutes (healthy)' \
     phoenix-harness:selftest regionserver 1 0 >"$T_SHIM_STATE/instances.txt"
   printf '0\n' >"$T_SHIM_STATE/restart-count"
+  t_seed_deployment "$PX_OUT" ${T_A3_OUT:+"$T_A3_OUT"}
 }
 
 ## @description  Reads the planned-action ledger for the sweep cluster.
@@ -419,106 +446,113 @@ t_tree_added() { LC_ALL=C comm -13 "$1" "$2"; }
 ## @return       Populates the suite fixture directory. Exit 0.
 t_fixtures_suites() {
   mkdir -p "$T_WORK/suites"
-  cat >"$T_WORK/suites/order.suite" <<'SUITE_EOF'
+  cat >"$T_WORK/suites/order.suite" <<SUITE_EOF
 suite: selftest-order
+class: validation
 description: four tests whose declaration order is not their run order
 timeout: 60
 
 test: third
   needs: second
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 
 test: first
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 
 test: second
   needs: first
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 
 test: fourth
   needs: third
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 SUITE_EOF
-  cat >"$T_WORK/suites/cycle.suite" <<'SUITE_EOF'
+  cat >"$T_WORK/suites/cycle.suite" <<SUITE_EOF
 suite: selftest-cycle
+class: validation
 timeout: 60
 
 test: alpha
   needs: beta
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 
 test: beta
   needs: alpha
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 SUITE_EOF
-  cat >"$T_WORK/suites/mixed.suite" <<'SUITE_EOF'
+  cat >"$T_WORK/suites/mixed.suite" <<SUITE_EOF
 suite: selftest-mixed
+class: validation
 timeout: 60
 
 test: good
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 
 test: bad
-  action: exit 1
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 1
 
 test: harsh
-  action: exit 2
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 2
 SUITE_EOF
-  cat >"$T_WORK/suites/trapped.suite" <<'SUITE_EOF'
+  cat >"$T_WORK/suites/blocked.suite" <<SUITE_EOF
+suite: selftest-blocked
+class: validation
+timeout: 60
+
+test: first
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 1
+
+test: later
+  needs: first
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
+SUITE_EOF
+  cat >"$T_WORK/suites/trapped.suite" <<SUITE_EOF
 suite: selftest-trapped
+class: validation
 timeout: 60
 
 test: blocked
-  action: docker ps
+  driver: $T_WORK/drivers/runtime-call.sh
+  args: docker ps
 
 test: blocked-kubectl
-  action: kubectl get pods
+  driver: $T_WORK/drivers/runtime-call.sh
+  args: kubectl get pods
 SUITE_EOF
-  cat >"$T_WORK/suites/skips.suite" <<'SUITE_EOF'
-suite: selftest-skips
-timeout: 60
-
-test: skip-one
-  action: exit 5
-
-test: skip-two
-  action: exit 5
-SUITE_EOF
-  cat >"$T_WORK/suites/severity.suite" <<'SUITE_EOF'
+  cat >"$T_WORK/suites/severity.suite" <<SUITE_EOF
 suite: selftest-severity
+class: validation
 timeout: 60
 
 test: unknown-severity
-  action: printf 'chk\tFAILED\tbad\n' >>verdicts.tsv; exit 0
+  driver: $T_WORK/drivers/bad-severity.sh
 SUITE_EOF
-  cat >"$T_WORK/suites/speak.suite" <<'SUITE_EOF'
-suite: selftest-speak
-timeout: 60
-
-test: speak
-  action: px_warn "hello from the action"; exit 0
-SUITE_EOF
-  # Spawn a background child process, record its PID, and wait so that the suite timeout expires
-  # while the child process is still active.
-  cat >"$T_WORK/suites/slow.suite" <<'SUITE_EOF'
-suite: selftest-slow
-timeout: 1
-
-test: slow
-  action: /bin/sleep 30 & printf '%s\n' "$!" >child.pid; wait
-SUITE_EOF
-  cat >"$T_WORK/suites/requires.suite" <<'SUITE_EOF'
+  cat >"$T_WORK/suites/requires.suite" <<SUITE_EOF
 suite: selftest-requires
+class: validation
 timeout: 60
 
 test: needs-yarn
   requires: yarn
-  action: exit 0
+  driver: $T_WORK/drivers/exit-code.sh
+  args: 0
 SUITE_EOF
   # Because the driver path is absolute, this heredoc expands T_WORK while leaving globs, tildes,
   # and backslashes literal so they reach the suite parser unaltered.
   cat >"$T_WORK/suites/args.suite" <<SUITE_EOF
 suite: selftest-args
+class: validation
 timeout: 60
 
 test: literal
@@ -547,13 +581,103 @@ SUITE_EOF
 ## @return       Populates the stub driver fixture directory. Exit 0.
 t_fixtures_drivers() {
   mkdir -p "$T_WORK/drivers"
+  # Shared six-verb lifecycle framework sourced by every stub driver with its incoming arguments
+  # before shifting the verb argument away. The describe verb emits a descriptor declaring the five
+  # steady-state metrics unsupported, the remaining short verbs succeed as no-ops, and the run verb
+  # records a single closed steady-state window before returning control to the stub body so that
+  # the resulting run bundle passes validation. Any unrecognized verb exits with status 2.
+  cat >"$T_WORK/drivers/stub-lib.sh" <<'DRIVER_EOF'
+case "${1:-}" in
+describe)
+  printf '{"contract": 1, "driver": "%s",\n' "${PX_DRIVER_NAME:-stub}"
+  printf ' "phases": [{"anchor": "steady@stub", "verb": "run"}],\n'
+  printf ' "metrics": {"count": [], "share": [], "duration": []},\n'
+  printf ' "unsupported": {"checks": [\n'
+  printf '  {"key": "query_latency.p50_ms", "reason": "a stub"},\n'
+  printf '  {"key": "query_latency.p99_ms", "reason": "a stub"},\n'
+  printf '  {"key": "query_errors", "reason": "a stub"},\n'
+  printf '  {"key": "offered_rate", "reason": "a stub"},\n'
+  printf '  {"key": "achieved_qps", "reason": "a stub"}],\n'
+  printf '  "artifacts": [{"path": "oplog/", "reason": "a stub"}]}}\n'
+  exit 0
+  ;;
+validate | prepare | restore | report) exit 0 ;;
+run) ;;
+*) exit 2 ;;
+esac
+. "$PX_HOME/lib/bundle.sh"
+pb_stage begin steady@stub
+pb_stage end steady@stub
+DRIVER_EOF
+  cat >"$T_WORK/drivers/validate-fails.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver whose validate fails.
+[ "${1:-}" != validate ] || exit 1
+. "${0%/*}/stub-lib.sh" "$@"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/prepare-fails.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver whose prepare fails.
+[ "${1:-}" != prepare ] || exit 1
+. "${0%/*}/stub-lib.sh" "$@"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/describe-fails.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver whose describe fails with the workload code.
+[ "${1:-}" != describe ] || exit 1
+. "${0%/*}/stub-lib.sh" "$@"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/describe-sleeps.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+# A stub driver whose describe outlives its bound.
+[ "${1:-}" != describe ] || exec sleep 30
+. "${0%/*}/stub-lib.sh" "$@"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/blink.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. Its run writes the begin and the end row of phase@blink in
+# one write and exits, so no poll of px-run can see the anchor open.
+blink_ms="$(px_epoch_ms)"
+printf '%s\t%s\t%s\t%s\t\n%s\t%s\t%s\t%s\t\n' "$blink_ms" begin phase@blink \
+  "$PX_RECORD_SOURCE" "$blink_ms" end phase@blink "$PX_RECORD_SOURCE" >>"$PX_RUN_DIR/stages.tsv"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/monitor-peak.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. In run, it adds one sample of the health monitor: the
+# RegionServer at 98 percent of its memory limit.
+printf 'instance\t%s\tregionserver\t0\t5.0\t4110000\t4194304\t0\t0\t0\t0\n' \
+  "$(px_epoch_ms)" >>"$PX_FAKE_MONITOR_SAMPLES"
+DRIVER_EOF
   cat >"$T_WORK/drivers/exit-code.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It ends with the status its first argument names.
 exit "${1:-0}"
 DRIVER_EOF
+  cat >"$T_WORK/drivers/runtime-call.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A hostile stub driver. Its run calls the container tool that its arguments
+# name, which the trap of BASH_ENV must block.
+"$@"
+DRIVER_EOF
+  cat >"$T_WORK/drivers/bad-severity.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. Its run writes a verdict row with an unknown severity.
+printf 'chk\tFAILED\tbad\n' >>"$PX_RUN_DIR/verdicts.tsv"
+DRIVER_EOF
   cat >"$T_WORK/drivers/bump-restart.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It raises the restart count the fake runtime reports, so the
 # snapshot after the run differs from the snapshot before it.
 printf '%s\n' "${1:-1}" >"$PX_FAKE_STATE_DIR/restart-count"
@@ -561,6 +685,8 @@ exit 0
 DRIVER_EOF
   cat >"$T_WORK/drivers/exit-instance.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It ends the one instance of the fake runtime with the code of
 # a kill and keeps its restart count. That is a crash under the restart
 # policy no.
@@ -571,12 +697,16 @@ exit 0
 DRIVER_EOF
   cat >"$T_WORK/drivers/vanish.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It removes the one instance of the fake runtime.
 : >"$PX_FAKE_STATE_DIR/instances.txt"
 exit 0
 DRIVER_EOF
   cat >"$T_WORK/drivers/unreachable.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It makes the fake runtime stop answering, so the snapshot
 # after the run cannot read the inventory.
 : >"$PX_FAKE_STATE_DIR/unreachable"
@@ -584,6 +714,8 @@ exit 0
 DRIVER_EOF
   cat >"$T_WORK/drivers/print-args.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It prints each argument between brackets, so an argument
 # that was split, joined, expanded or lost shows in its output.
 for driver_arg in "$@"; do
@@ -593,6 +725,8 @@ printf '\n'
 DRIVER_EOF
   cat >"$T_WORK/drivers/engine-var.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A hostile driver. It reads the engine variable of the backend and calls the
 # runtime by that path, which is the one way past every shell function. The
 # backend keeps the variable out of a child, so it must arrive empty here.
@@ -695,40 +829,19 @@ fake_find() {
   return 1
 }
 
-## @description  Scales the service of a --scale service=count argument, copying its first instance.
+## @description  Adds the instance of a service (name) that the inventory does not hold yet, the
+##               way a new service of a render appears: service <role>-<index>, created.
 ## @return       Exit 0.
-fake_scale() {
-  local spec="" service count line out="" top=0 template="" number
-  while [ $# -gt 0 ]; do
-    [ "$1" != --scale ] || spec=$2
-    shift
-  done
-  service=${spec%%=*}
-  count=${spec#*=}
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    fake_split "$line"
-    if [ "$f_service" = "$service" ]; then
-      [ -n "$template" ] || template=$line
-      [ "$f_number" -le "$count" ] || continue
-      [ "$f_number" -le "$top" ] || top=$f_number
-    fi
-    out="$out$line
-"
-  done <"$fake_inv"
-  number=$((top + 1))
-  while [ -n "$template" ] && [ "$number" -le "$count" ]; do
-    fake_split "$template"
-    f_id="${f_id%?}$number"
-    f_name="${f_name%-*}-$number"
-    f_number=$number
-    f_state=running
-    f_status='Up 1 second (healthy)'
-    out="$out$(fake_join)
-"
-    number=$((number + 1))
-  done
-  printf '%s' "$out" >"$fake_inv"
+fake_add() {
+  local line
+  if [ -f "$fake_inv" ]; then
+    while IFS= read -r line; do
+      fake_split "$line"
+      [ "$f_service" != "$1" ] || return 0
+    done <"$fake_inv"
+  fi
+  printf 'new-%s|%s|px-%s|created|Created|px:selftest|%s|1|%s|||\n' "$1" "${1%-*}" "$1" \
+    "$1" "${1##*-}" >>"$fake_inv"
 }
 
 fake_verb=${1:-}
@@ -815,13 +928,19 @@ inspect)
     fi
     case "$fake_template" in
     *RestartCount*)
-      printf '/%s|%s\n' "$f_name" "$(cat "$fake_state/restart-count" 2>/dev/null || echo 0)"
+      # A restart-count-<id> file holds the count of one instance.
+      printf '/%s|%s\n' "$f_name" "$(cat "$fake_state/restart-count-$fake_id" 2>/dev/null ||
+        cat "$fake_state/restart-count" 2>/dev/null || echo 0)"
       ;;
     *State.Status*)
       printf '%s|%s|%s|2026-01-01T00:00:00Z\n' "$f_state" "$fake_code" "$fake_oom"
       ;;
     *State.OOMKilled*) printf '%s|%s|\n' "$fake_oom" "$fake_code" ;;
-    *Config.Image*) printf '%s|sha256:%s\n' "$f_image" "$fake_id" ;;
+    # An image-id file of the state directory gives every instance one image.
+    *Config.Image*)
+      printf '%s|%s\n' "$f_image" "$(cat "$fake_state/image-id" 2>/dev/null ||
+        printf 'sha256:%s' "$fake_id")"
+      ;;
     *Config.Hostname*) printf 'host-%s\n' "$fake_id" ;;
     *HostConfig.Memory*) printf '/%s|1073741824\n' "$f_name" ;;
     *) printf '\n' ;;
@@ -874,10 +993,20 @@ start)
   ;;
 logs)
   fake_id=${!#}
+  # A log file of the state directory replaces the fixed lines for one id.
+  if [ -f "$fake_state/logs-$fake_id.txt" ]; then
+    cat "$fake_state/logs-$fake_id.txt"
+    exit 0
+  fi
   printf 'fake log out %s\n' "$fake_id"
   printf 'fake log err %s\n' "$fake_id" >&2
   ;;
 build)
+  # A builder that knows the provenance option says so in its help text.
+  if [ "${1:-}" = --help ]; then
+    [ ! -e "$fake_state/build-provenance" ] || printf '      --provenance string\n'
+    exit 0
+  fi
   if [ -e "$fake_state/build-fails" ]; then
     printf 'fake: the build failed\n' >&2
     exit 1
@@ -900,16 +1029,12 @@ buildx)
     printf ' sha256:%s\n' "$(printf 'c%.0s' $(seq 1 64))"
   fi
   ;;
-events)
-  if [ -e "$fake_state/no-events" ]; then
-    printf 'fake: no events\n' >&2
-    exit 1
-  fi
-  cat "$fake_state/events.txt" 2>/dev/null || true
-  ;;
 network)
   if [ "${1:-}" = ls ]; then
     cat "$fake_state/networks.txt" 2>/dev/null || true
+  elif [ "${1:-}" = rm ]; then
+    grep -vx "${2:-}" "$fake_state/networks.txt" >"$fake_state/networks.new" || true
+    mv -f "$fake_state/networks.new" "$fake_state/networks.txt"
   fi
   ;;
 volume)
@@ -921,9 +1046,11 @@ volume)
   fi
   ;;
 compose)
+  fake_project=""
   while [ $# -gt 0 ]; do
     case "$1" in
-    -f | --project-directory | -p) shift 2 ;;
+    -p) fake_project=${2:-} && shift 2 ;;
+    -f | --project-directory) shift 2 ;;
     *) break ;;
     esac
   done
@@ -938,14 +1065,26 @@ compose)
       printf 'fake: up failed\n' >&2
       exit 1
     fi
+    # The project network appears with the first instance of the project.
+    if [ -n "$fake_project" ] &&
+      ! grep -qx "${fake_project}_default" "$fake_state/networks.txt" 2>/dev/null; then
+      printf '%s_default\n' "$fake_project" >>"$fake_state/networks.txt"
+    fi
     case " $* " in
+    *' --no-start --no-build --no-deps '*)
+      for fake_arg in "$@"; do
+        case "$fake_arg" in -*) ;; *) fake_add "$fake_arg" ;; esac
+      done
+      ;;
     *' --no-start '*) cp "$fake_state/provision.txt" "$fake_inv" ;;
-    *' --scale '*) fake_scale "$@" ;;
     *)
       for fake_arg in "$@"; do
         case "$fake_arg" in
         -*) ;;
-        *) fake_rewrite service "$fake_arg" running 'Up 1 second (healthy)' ;;
+        *)
+          fake_add "$fake_arg"
+          fake_rewrite service "$fake_arg" running 'Up 1 second (healthy)'
+          ;;
         esac
       done
       ;;
@@ -984,13 +1123,64 @@ compose)
       esac
     done
     shift
-    exec "$@"
+    # The online regions of the cluster: one line of region-count per call,
+    # the last line repeating, and 12 without the file. Each call appends its
+    # time in milliseconds and its answer to region-count.log.
+    if [ "${1:-}" = px-region-count ]; then
+      fake_n=$(($(cat "$fake_state/region-count.log" 2>/dev/null | wc -l) + 1))
+      fake_value=12
+      if [ -f "$fake_state/region-count" ]; then
+        fake_value="$(awk -v n="$fake_n" 'NR <= n { v = $0 } END { print v }' \
+          "$fake_state/region-count")"
+      fi
+      fake_ms="$(date -u '+%s%3N' 2>/dev/null)"
+      case "$fake_ms" in
+      '' | *[!0-9]*) fake_ms="$(gdate -u '+%s%3N' 2>/dev/null || printf '0')" ;;
+      esac
+      printf '%s\t%s\n' "$fake_ms" "$fake_value" >>"$fake_state/region-count.log" 2>/dev/null
+      [ ! -e "$fake_state/region-count-fails" ] || exit 1
+      printf '%s\n' "$fake_value"
+      exit 0
+    fi
+    # The work directory of a driver, /tmp/px/<run-id> in client 0, lives in
+    # the state directory, so an exec writes nothing to the /tmp of the host.
+    fake_args=()
+    for fake_arg in "$@"; do
+      fake_args+=("${fake_arg//\/tmp\/px\//$fake_state/remote/}")
+    done
+    exec "${fake_args[@]}"
     ;;
   cp)
+    # The remote work directory /tmp/px of client 0 lives in the state
+    # directory, as for an exec, so a copy into it and out of it moves the
+    # real files. Any other remote path holds no file: a copy into it does
+    # nothing, and a copy out of it gives copy-out.txt.
     fake_target=${!#}
+    fake_source=${*: -2:1}
     case "$fake_target" in
+    *:/tmp/px/*)
+      fake_path="$fake_state/remote/${fake_target#*:/tmp/px/}"
+      rm -rf "$fake_path"
+      mkdir -p "${fake_path%/*}"
+      cp -R "$fake_source" "$fake_path"
+      ;;
     *:*) ;;
-    *) printf 'fake copy\n' >"$fake_target" ;;
+    *)
+      case "$fake_source" in
+      *:/tmp/px/*)
+        fake_path="$fake_state/remote/${fake_source#*:/tmp/px/}"
+        [ -e "$fake_path" ] || exit 1
+        cp -R "$fake_path" "$fake_target"
+        ;;
+      *)
+        if [ -f "$fake_state/copy-out.txt" ]; then
+          cp "$fake_state/copy-out.txt" "$fake_target"
+        else
+          printf 'fake copy\n' >"$fake_target"
+        fi
+        ;;
+      esac
+      ;;
     esac
     ;;
   esac
@@ -1030,14 +1220,6 @@ rs01|regionserver|px-sweep-regionserver-1|created|Created|px:selftest|regionserv
 rs02|regionserver|px-sweep-regionserver-2|created|Created|px:selftest|regionserver|2||||regionmover
 nm01|nodemanager|px-sweep-nodemanager-1|created|Created|px:selftest|nodemanager|1||yarn|on-demand|
 SWEEP_EOF
-  # Instance indices are derived from the explicit index label first, falling back to the
-  # container number.
-  cat >"$T_SWEEP_STATE/events.txt" <<'SWEEP_EOF'
-1700000000000000000|regionserver||2|container|die|px-sweep-regionserver-2
-1700000000500000000|master|0||container|start|px-sweep-master-1
-1700000000750000000|regionserver||2|container|kill|px-sweep-regionserver-2
-1700000001000000000||||network|connect|px-sweep_default
-SWEEP_EOF
   cat >"$T_DEPLOY/compose.yaml" <<'SWEEP_EOF'
 services:
   master:
@@ -1060,6 +1242,12 @@ services:
       px.harness.role: "nodemanager"
       px.harness.start: "on-demand"
 SWEEP_EOF
+  # Materialize the rendered deployment metadata files that every run bundle copies.
+  printf '%s\n' '# Rendered by compose.gen.sh. Render again instead of editing.' \
+    PX_CLUSTER_ID=sweep PX_PHOENIX_HBASE_PROFILE=2.6 PX_DIST_HBASE_VERSION=2.6.7 \
+    PX_GROUPS=yarn >"$T_DEPLOY/topology.env"
+  printf '# service role index group start mem_limit_mib heap_mib direct_mib jdk\n' \
+    >"$T_DEPLOY/services.tsv"
   printf 'PX_PORT_MASTER_UI=1\nPX_PORT_REGIONSERVER_RPC_0=2\n' \
     >"$T_DEPLOY/ports.generated.env"
 }
@@ -1104,7 +1292,6 @@ ENV_EOF
   printf 'PX_NOT_A_DECLARED_NAME=1\n' >"$T_WORK/env/undeclared.env"
   printf 'this line is not an assignment\n' >"$T_WORK/env/malformed.env"
   printf 'export PX_TIMEOUT_EXEC=9\n' >"$T_WORK/env/exported.env"
-  printf 'PX_CONTRACT_VERSION=2\n' >"$T_WORK/env/contract.env"
 }
 
 ## @description  Writes the two Layer 1 fixture trees for violations and stale allowlist entries.
@@ -1673,21 +1860,43 @@ A3_EOF
 # A fixture that stands in for getconf. The host has one processor.
 printf '1\n'
 A3_EOF
-  cat >"$T_A3/quickexit/caffeinate" <<'A3_EOF'
-#!/usr/bin/env bash
-# A fixture that stands in for a caffeinate that ends at once.
-exit 0
-A3_EOF
+  # Create a fake caffeinate binary that terminates immediately. Referencing a nonexistent
+  # interpreter causes exec to fail outright without spawning a subshell that a heavily loaded host
+  # could delay past the sleep inhibitor's liveness check.
+  printf '#!/nonexistent/px-no-interpreter\n' >"$T_A3/quickexit/caffeinate"
   chmod +x "$T_HOST_DIR"/* "$T_A3"/Darwin/* "$T_A3"/Linux/* "$T_A3"/SunOS/* "$T_A3"/lowdisk/* \
     "$T_A3"/onecpu/* "$T_A3"/quickexit/*
   cat >"$T_WORK/drivers/restart-wait.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It raises the restart count, then works on for 30 seconds.
 printf '1\n' >"$PX_FAKE_STATE_DIR/restart-count"
 exec sleep 30
 DRIVER_EOF
+  cat >"$T_WORK/drivers/exit-wait.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. The one instance exits with a failure code, not an
+# out-of-memory kill, then the driver works on for 30 seconds.
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee000001 regionserver \
+  px-selftest-regionserver-1 exited 'Exited (1) 1 second ago' \
+  phoenix-harness:selftest regionserver 1 0 >"$PX_FAKE_STATE_DIR/instances.txt"
+exec sleep 30
+DRIVER_EOF
+  cat >"$T_WORK/drivers/vanish-wait.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. It removes the one instance, then works on for 30 seconds.
+: >"$PX_FAKE_STATE_DIR/instances.txt"
+exec sleep 30
+DRIVER_EOF
   cat >"$T_WORK/drivers/oom-wait.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. An out-of-memory kill ends the one instance, then the driver
 # works on for 30 seconds.
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee000001 regionserver \
@@ -1698,6 +1907,8 @@ exec sleep 30
 DRIVER_EOF
   cat >"$T_WORK/drivers/sleep.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It records its process id in the run directory, then works
 # for the seconds its first argument names.
 [ -z "${PX_RUN_DIR:-}" ] || printf '%s\n' "$$" >"$PX_RUN_DIR/driver.pid"
@@ -1705,6 +1916,8 @@ exec sleep "${1:-30}"
 DRIVER_EOF
   cat >"$T_WORK/drivers/host-probe.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
 # A stub driver. It prints the sleep inhibitor record of its run and the
 # contamination of the run. It also prints its owner, px-run. Then it ends with
 # the status its first argument names.
@@ -1882,6 +2095,7 @@ t_setup() {
   t_fixtures_probes
   t_fixtures_a2
   t_fixtures_a3
+  t_fixtures_a5
 }
 
 # ---------------------------------------------------------------------------
@@ -2161,15 +2375,15 @@ EOF
     [ "$T_STATUS" = 2 ] || offenders="$offenders $name=$T_STATUS"
   done
   t_empty trap_resolves_in_every_command_process "$offenders"
-  # Suite test actions execute in isolated child shells and must still inherit the runtime traps
-  # through BASH_ENV.
+  # A suite test driver executes in its own child process and must still inherit the runtime trap.
   t_suite selftest-trapped --continue-on-failure "$T_WORK/suites/trapped.suite"
-  t_equals trap_reaches_a_suite_action 3 "$T_STATUS"
+  t_equals trap_reaches_a_suite_driver 3 "$T_STATUS"
   log="$PX_OUT/sessions/selftest-trapped/tests"
-  t_contains trap_reaches_a_suite_action_message 'container runtime call blocked' \
-    "$(cat "$log/blocked/stderr.log" 2>/dev/null)"
-  t_contains trap_blocks_kubectl_in_a_suite_action 'call blocked: kubectl get pods' \
-    "$(cat "$log/blocked-kubectl/stderr.log" 2>/dev/null)"
+  t_contains trap_reaches_a_suite_driver_message 'container runtime call blocked' \
+    "$(cat "$(sed -n 1p "$log/blocked/stdout.txt" 2>/dev/null)/logs/run.log" 2>/dev/null)"
+  t_contains trap_blocks_kubectl_in_a_suite_driver 'call blocked: kubectl get pods' \
+    "$(cat "$(sed -n 1p "$log/blocked-kubectl/stdout.txt" 2>/dev/null)/logs/run.log" \
+      2>/dev/null)"
   t_empty no_bypass_form_outside_the_backend "$(t_scan_bypass)"
 }
 
@@ -2194,18 +2408,18 @@ t_group_shim() {
   t_equals shim_records_each_kubernetes_tool "$(printf '%s version\n' "${names[@]}")" \
     "$(cat "$T_SHIM_LOG")"
   t_negative_control cluster_config "$T_BIN/px-cluster" config
-  t_negative_control cluster_validate "$T_BIN/px-cluster" validate --no-backend
   t_negative_control suite_dry_run "$T_BIN/px-suite" --dry-run \
     "$T_WORK/suites/order.suite"
   t_negative_control run_dry_run "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run
-  t_negative_control tool_doctor "$T_BIN/px-tool" doctor --config-only
   t_negative_control collect_list "$T_BIN/px-collect" list
   t_negative_control collect_help "$T_BIN/px-collect" start --help
   t_negative_control backend_bind "$T_WORK/probe/sb.sh" sb_bound_backend
   t_negative_control cluster_down_dry_run "$T_BIN/px-cluster" --dry-run down \
     -e PX_SCOPE_ID=px-selftest
-  # Execute a positive control through the substrate contract to confirm that a real backend call
-  # records the scope label selector in the shim log, validating the negative controls above.
+  t_negative_control cluster_build_dry_run "$T_BIN/px-cluster" --dry-run build
+  # Execute a positive control: a genuine backend call must record the scope's label selector in
+  # the call log, proving that the empty logs from the negative controls above are real evidence
+  # rather than an artifact of a broken fixture.
   t_shim_log_reset
   t_with_shim "$T_BASH" "$T_WORK/probe/sb.sh" sb_list px-selftest
   t_contains positive_control_carries_the_scope_selector \
@@ -2221,7 +2435,7 @@ t_group_shim() {
   t_contains hostile_driver_run_reaches_the_fake_runtime \
     'ps -a --filter label=px.harness.cluster=selftest' "$calls"
   t_contains hostile_driver_sees_no_engine_variable 'engine variable []' \
-    "$(cat "$T_STDOUT/driver.log" 2>/dev/null)"
+    "$(cat "$T_STDOUT/logs/run.log" 2>/dev/null)"
   t_absent hostile_driver_reaches_no_runtime 'hostile-driver' "$calls"
 }
 
@@ -2257,11 +2471,8 @@ t_group_contract() {
     "$(t_backend_verbs "$fixture")"
   t_contains contract_extra_verb_is_reported 'extra sb_not_a_contract_verb' \
     "$(t_backend_verbs "$fixture")"
-  t_equals contract_declares_30_required_verbs 30 \
-    "$(sb_contract_required | grep -c .)"
-  t_equals contract_declares_5_optional_verbs 5 \
-    "$(sb_contract_optional | grep -c .)"
-  t_equals contract_version_is_one 1 "$PX_CONTRACT_VERSION"
+  t_equals contract_declares_31_required_verbs 31 \
+    "$(sb_contract_functions | grep -c .)"
   sb_valid_value ready stopped
   t_equals ready_vocabulary_holds_the_stopped_row 0 "$?"
   t_equals schema_index_finds_the_first_field 1 "$(sb_schema_index instance role)"
@@ -2273,11 +2484,12 @@ t_group_contract() {
   t_equals schema_index_refuses_an_unknown_field 6 "$?"
 }
 
-## @description  Validates the twelve entry points for help, usage errors, and lib/common.sh use.
+## @description  Verifies help output, usage error handling, and lib/common.sh sourcing across all
+##               nine CLI entry points.
 ## @return       Records assertions. Exit 0.
 t_group_commands() {
-  local name missing="" help="" flag="" unsourced="" own=""
-  printf '# the twelve entry points\n'
+  local name missing="" help="" flag="" unsourced="" own="" stub=""
+  printf '# the nine entry points\n'
   for name in $T_COMMANDS; do
     [ -x "$T_BIN/$name" ] || missing="$missing $name"
     t_run "$T_BASH" "$T_BIN/$name" --help
@@ -2293,7 +2505,14 @@ t_group_commands() {
       own="$own $name"
     fi
   done
+  # Entry points deferred to a later implementation round must respond to --help and reject any
+  # other invocation with the unsupported exit code.
+  for name in px-profile px-jfr px-trace-count px-pherf px-k3d; do
+    t_run "$T_BASH" "$T_BIN/$name" run
+    [ "$T_STATUS" = 5 ] || stub="$stub $name=$T_STATUS"
+  done
   t_empty twelve_entry_points_are_present "$missing"
+  t_empty every_later_round_entry_point_is_unsupported "$stub"
   t_empty every_entry_point_answers_help "$help"
   t_empty every_entry_point_refuses_a_bad_flag "$flag"
   t_empty bins_source_common "$unsourced"
@@ -3039,11 +3258,7 @@ t_group_suite_regressions() {
   run_dir="$(cat "$session/selftest-args/tests/literal/stdout.txt" 2>/dev/null)"
   t_equals suite_args_reach_the_driver_as_written \
     '[*.sql][--glob][*.sql][two\back][][a b][~/data][x=~]' \
-    "$(cat "$run_dir/driver.log" 2>/dev/null)"
-  t_suite selftest-skips "$suite/skips.suite"
-  t_equals suite_all_skip_exits_one 1 "$T_STATUS"
-  t_contains suite_all_skip_is_inconclusive "result${PX_TAB}INCONCLUSIVE" \
-    "$(cat "$session/selftest-skips/summary.tsv" 2>/dev/null)"
+    "$(cat "$run_dir/logs/run.log" 2>/dev/null)"
   t_suite selftest-severity "$suite/severity.suite"
   t_equals suite_unknown_severity_exits_three 3 "$T_STATUS"
   t_contains suite_unknown_severity_is_an_error "unknown-severity${PX_TAB}ERROR" \
@@ -3055,12 +3270,8 @@ t_group_suite_regressions() {
   t_contains suite_requirement_without_scope_is_no_such_object \
     "needs-yarn${PX_TAB}ERROR${PX_TAB}6${PX_TAB}" "$T_STDOUT"
   t_empty suite_requirement_without_scope_calls_no_runtime "$(cat "$T_SHIM_LOG")"
-  t_suite selftest-speak "$suite/speak.suite"
-  t_equals suite_speak_runs 0 "$T_STATUS"
-  t_contains suite_log_holds_the_message_of_an_action 'hello from the action' \
-    "$(cat "$session/selftest-speak/suite.log" 2>/dev/null)"
   # R-037: An operator-specified run class overrides the class declared by the suite, and px-run
-  # records the run class that it executed with.
+  # records the effective run class that it executed with.
   t_suite selftest-class "$suite/class.suite"
   run_dir="$(cat "$session/selftest-class/tests/classed/stdout.txt" 2>/dev/null)"
   t_equals suite_class_of_the_suite_reaches_px_run "0 measurement" \
@@ -3087,35 +3298,6 @@ t_group_suite_regressions() {
   t_equals suite_record_class_wins_under_an_exported_class "0 validation" \
     "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "classed" { print $6 }')"
   rm -f "$PX_OUT/state/cluster-suiteclass.env"
-  # Only a GNU timeout binary terminates the entire process group of a test, whereas the fallback
-  # terminates the test process alone.
-  if [ -n "$PX_TIMEOUT_BIN" ]; then
-    t_suite selftest-slow "$suite/slow.suite"
-    t_equals suite_slow_test_expires 1 "$T_STATUS"
-    t_suite_child_gone suite_time_limit_ends_the_child_of_a_test \
-      "$session/selftest-slow/tests/slow/child.pid"
-  fi
-}
-
-## @description  Verifies that a test process (name, pid file) terminates within one second.
-## @return       Records one assertion. Exit 0.
-t_suite_child_gone() {
-  local name=$1 pid="" tries=0
-  read -r pid <"$2" 2>/dev/null || true
-  if [ -z "$pid" ]; then
-    t_fail "$name" "no process identifier in $2"
-    return 0
-  fi
-  while kill -s 0 "$pid" 2>/dev/null && [ "$tries" -lt 10 ]; do
-    sleep 0.1
-    tries=$((tries + 1))
-  done
-  if kill -s 0 "$pid" 2>/dev/null; then
-    kill -s KILL "$pid" 2>/dev/null || true
-    t_fail "$name" "process $pid outlived the time limit of its test"
-  else
-    t_pass "$name" "process $pid is gone"
-  fi
 }
 
 ## @description  Validates run wrapper status pass-through, anomaly detection, and inventory reads.
@@ -3125,14 +3307,14 @@ t_group_run() {
   printf '# the run wrapper\n'
   t_shim_state_reset
   for code in 0 1 2 3; do
-    t_run "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=1 \
-      --driver "$T_WORK/drivers/exit-code.sh" -- "$code"
+    t_run "$T_BASH" "$T_BIN/px-run" --class validation -e PX_POLL_INTERVAL_S=1 \
+      "$T_WORK/drivers/exit-code.sh" -- "$code"
     t_equals "run_propagates_driver_exit_$code" "$code" "$T_STATUS"
   done
-  # Running without an active cluster scope is a supported mode rather than an error, so the
-  # failure trap must remain silent.
-  t_run env -u PX_SCOPE_ID "$T_BASH" "$T_BIN/px-run" \
-    --driver "$T_WORK/drivers/exit-code.sh" -- 0
+  # Executing a run without a cluster is a documented mode rather than a failure, so the failure
+  # trap must emit no diagnostic for it.
+  t_run env -u PX_SCOPE_ID "$T_BASH" "$T_BIN/px-run" --class validation \
+    "$T_WORK/drivers/exit-code.sh" -- 0
   t_equals run_without_a_cluster 0 "$T_STATUS"
   t_absent run_without_a_cluster_reports_no_error 'ERROR' "$T_STDERR"
   # Have the stub driver increment the fake runtime's reported restart count so the post-run
@@ -3145,7 +3327,17 @@ t_group_run() {
     "regionserver${PX_TAB}0${PX_TAB}0${PX_TAB}4${PX_TAB}unplanned" \
     "$(grep '^diff' "$record" 2>/dev/null)"
   t_shim_state_reset
-  t_px_run bump-restart --disrupt 'phase:driver_start,kill,regionserver,0' -- 4
+  # The recovery gate restarts the killed RegionServer via the region mover, requiring the drain
+  # label on that instance, and the post-recovery check executes the bootstrap probe in client 0.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||regionmover\n' c0ffee000001 regionserver \
+    px-selftest-regionserver-1 running 'Up 3 minutes (healthy)' \
+    phoenix-harness:selftest regionserver 1 0 >"$T_SHIM_STATE/instances.txt"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee000002 client px-selftest-client-1 \
+    running 'Up 3 minutes (healthy)' phoenix-harness:selftest client 1 0 \
+    >>"$T_SHIM_STATE/instances.txt"
+  printf '0\n' >"$T_SHIM_STATE/restart-count-c0ffee000002"
+  t_px_run bump-restart -e PX_PORT_REGIONSERVER_RPC_0=16020 \
+    --disrupt 'phase:driver_start,kill,regionserver,0' -- 4
   t_equals run_accepts_a_planned_restart 0 "$T_STATUS"
   record="$T_STDOUT/run-record.tsv"
   t_contains run_records_the_planned_verdict \
@@ -3219,16 +3411,14 @@ t_group_config() {
   t_run env "PX_ENV_DIR=$env_dir" "$T_BASH" "$T_WORK/probe/config-strict.sh" \
     "$env_dir/absent.env"
   t_equals config_absent_named_file_is_no_such_object 6 "$T_STATUS"
-  # PX_CONTRACT_VERSION is an immutable harness constant; neither config files nor CLI overrides
-  # may alter the contract revision enforced by sb_load.
-  t_run "$T_BASH" "$T_BIN/px-cluster" --config "$env_dir/contract.env" config
-  t_equals config_file_cannot_set_the_contract_version 2 "$T_STATUS"
+  # The bundle format version is an immutable harness constant, so no configuration stage can alter
+  # which format version a bundle claims.
+  t_run "$T_BASH" "$T_BIN/px-run" -e PB_FORMAT_VERSION=2 exit-code
+  t_equals config_command_line_cannot_set_a_constant 2 "$T_STATUS"
   t_contains config_names_the_constant 'is a constant of the harness' "$T_STDERR"
-  t_run "$T_BASH" "$T_BIN/px-cluster" -e PX_CONTRACT_VERSION=2 config
-  t_equals config_command_line_cannot_set_the_contract_version 2 "$T_STATUS"
-  # Verify that PX_LOG_FILE adheres to the output boundary policy: running px-cluster status
-  # without an active cluster emits a diagnostic after config loading, which is mirrored to an
-  # allowed log path under PX_OUT while paths outside PX_OUT or inside the tree are rejected.
+  # The mirrored log file adheres to the output boundary policy: running px-cluster status with no
+  # active cluster emits an error line after configuration loading completes, which is captured in
+  # an admitted log file.
   t_run env "PX_LOG_FILE=selftest.log" "$T_BASH" "$T_BIN/px-cluster" status
   t_equals config_log_file_run_ends_with_no_such_object 6 "$T_STATUS"
   t_contains config_log_file_under_the_root_gets_a_copy 'no cluster default is recorded' \
@@ -3325,7 +3515,7 @@ t_group_emitters() {
 # readiness and role groups, instance access, diagnostic evidence and fault injection, scaling and
 # observation, runtime failure and teardown, and finally the px-cluster CLI subcommands.
 
-## @description  Sweeps backend identity, capabilities, scope verbs, provisioning, and inventory.
+## @description  Sweeps backend identity, the scope lifecycle verbs, provisioning, and inventory.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_scope() {
   local rows
@@ -3333,22 +3523,13 @@ t_group_sweep_scope() {
   t_shim_log_reset
   t_sb sb_backend_id
   t_outcome sweep_sb_backend_id 0 compose
-  t_sb sb_contract_version
-  t_outcome sweep_sb_contract_version 0 1
   t_sb sb_version_info
   t_outcome sweep_sb_version_info 0 "$(t_rows 2 engine_client 29.9.3 \
     engine_server 29.9.3 compose_version 2.40.0)"
-  t_sb sb_capabilities
-  t_outcome_columns sweep_sb_capabilities 0 2 "$(t_rows 2 logs_previous no \
-    resource_sampling yes signal_delivery yes previous_termination no events yes \
-    drain_restart yes port_forward no scale yes group_switch yes oom_evidence yes \
-    image_digest no node_placement no)"
   t_sb_codes sweep_scope_refusals "
-2 sb_scope_args
 2 sb_scope_create Bad
 2 sb_scope_exists not-a-scope
-6 sb_scope_exists px-sweep
-6 sb_scope_args px-sweep"
+6 sb_scope_exists px-sweep"
   t_sweep PX_DRY_RUN=1 "$T_BASH" "$T_WORK/probe/sb.sh" sb_scope_create sweep
   t_outcome sweep_sb_scope_create_dry_run 0 px-sweep
   t_empty sweep_scope_create_dry_run_writes_no_record \
@@ -3395,10 +3576,6 @@ t_group_sweep_scope() {
 6 sb_list px-sweep regionserver 7
 2 sb_list px-sweep regionserver x
 2 sb_list px-sweep regionserver 0 extra"
-  t_sb sb_scope_args px-sweep
-  t_outcome sweep_sb_scope_args 0 "$(t_rows 2 project px-sweep \
-    label_selector px.harness.cluster=sweep compose_file "$T_DEPLOY/compose.yaml" \
-    network px-sweep_default)"
 }
 
 ## @description  Sweeps readiness checks and role groups, including stopped and crashed groups.
@@ -3565,19 +3742,13 @@ t_group_sweep_evidence() {
   t_sb_codes sweep_signal_refusals "
 2 sb_signal px-sweep master 0 BOGUS
 6 sb_signal px-sweep master 9 TERM"
-  # A capability probe during a runtime outage fails without caching the result, allowing signal
-  # delivery to succeed once the runtime responds again.
-  rm -f "$T_SWEEP_OUT/state/compose/capabilities.tsv"
+  # Delivering a signal during a runtime outage fails and succeeds again once the runtime responds.
   : >"$T_SWEEP_STATE/unreachable"
   t_sb sb_signal px-sweep master 0 QUIT
   t_equals sweep_signal_on_an_unreachable_runtime_is_failure 1 "$T_STATUS"
-  t_sb sb_capabilities
   rm -f "$T_SWEEP_STATE/unreachable"
-  t_equals sweep_capabilities_do_not_cache_an_outage no \
-    "$(t_exists "$T_SWEEP_OUT/state/compose/capabilities.tsv")"
   t_sb sb_signal px-sweep master 0 QUIT
   t_equals sweep_signal_after_an_outage 0 "$T_STATUS"
-  t_sb sb_capabilities
   t_sb sb_restart_drain px-sweep regionserver 0 10 5
   t_outcome_columns sweep_sb_restart_drain 0 2 \
     "$(t_rows 2 drain ok stop ok start ok ready ok rebalance ok)"
@@ -3593,20 +3764,21 @@ t_group_sweep_evidence() {
 ## @description  Sweeps scaling, kill operations, event queries, resource samples, and preflight.
 ## @return       Records assertions. Exit 0.
 t_group_sweep_scale() {
-  printf '# verb sweep: scale, kill, events, samples and preflight\n'
-  t_shim_log_reset
-  t_sb sb_scale px-sweep regionserver 3 10
-  t_outcome_columns sweep_sb_scale 0 4 "$(t_rows 4 regionserver 0 rs01 running \
-    regionserver 1 rs02 running regionserver 2 rs03 running)"
-  t_called sweep_scale_names_the_service_operand "compose -p px-sweep up -d \
---no-recreate --no-build --no-deps --scale regionserver=3 regionserver"
+  printf '# verb sweep: scale refusals, kill, samples and preflight\n'
+  # Scaling requires the rendered service table, which this hand-written deployment does not carry;
+  # the a2 cluster test group exercises scaling against a rendered deployment.
   t_sb_codes sweep_scale_refusals "
 2 sb_scale px-sweep regionserver 10 10
+2 sb_scale px-sweep regionserver 3 10
 2 sb_scale px-sweep nosuch 2 10
 2 sb_scale px-sweep regionserver 2 0"
+  # Seed a third RegionServer instance required by the test cases below.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s||||regionmover\n' rs03 regionserver \
+    px-sweep-regionserver-3 running 'Up 1 second (healthy)' px:selftest regionserver 3 \
+    >>"$T_SWEEP_STATE/instances.txt"
   # Because an exited instance runs no active process, restarting it skips the drain, stop, and
-  # rebalance phases even when an earlier restart previously drained that instance. In this fixture
-  # port map, only regionserver 0 defines an rpc port.
+  # rebalance phases even after an earlier drain of that instance. Only regionserver 0 defines an
+  # rpc port in this port map.
   t_sb sb_kill px-sweep regionserver 0 hard
   t_shim_log_reset
   t_sb sb_restart_drain px-sweep regionserver 0 10 5
@@ -3659,24 +3831,15 @@ t_group_sweep_scale() {
 6 sb_list px-sweep regionserver 2
 6 sb_kill px-sweep regionserver 2 hard
 2 sb_kill px-sweep regionserver 0 gentle"
-  t_sb sb_events px-sweep 60
-  t_outcome sweep_sb_events_derive_the_index 0 "$(t_rows 6 \
-    1700000000000 regionserver 1 container die px-sweep-regionserver-2 \
-    1700000000500 master 0 container start px-sweep-master-1 \
-    1700000000750 regionserver 1 container kill px-sweep-regionserver-2 \
-    1700000001000 '' '' network connect px-sweep_default)"
   t_sb sb_sample_resources px-sweep
   t_equals sweep_sb_sample_resources 0 "$T_STATUS"
   t_contains sweep_sample_converts_the_units \
     "$(t_rows 9 master 0 1.50 134217728 1073741824 1200 3400 5600 7800)" \
     "$(printf '%s\n' "$T_STDOUT" | cut -f 2-)"
-  : >"$T_SWEEP_STATE/no-events"
   : >"$T_SWEEP_STATE/no-stats"
   t_sb_codes sweep_observation_refusals "
-2 sb_events px-sweep soon
-5 sb_events px-sweep 60
 5 sb_sample_resources px-sweep"
-  rm -f "$T_SWEEP_STATE/no-events" "$T_SWEEP_STATE/no-stats"
+  rm -f "$T_SWEEP_STATE/no-stats"
   t_sb sb_preflight px-sweep
   t_outcome_columns sweep_sb_preflight 0 2 "$(t_rows 2 engine_binary ok \
     engine_responsive ok engine_version ok engine_credentials ok \
@@ -3704,7 +3867,6 @@ t_group_sweep_teardown() {
 1 sb_group_status px-sweep yarn
 1 sb_group_start px-sweep yarn 5
 1 sb_group_stop px-sweep yarn 5
-1 sb_scale px-sweep regionserver 2 5
 1 sb_kill px-sweep master 0 hard
 1 sb_signal px-sweep master 0 TERM
 1 sb_logs px-sweep master 0 - 0 0
@@ -3718,12 +3880,10 @@ t_group_sweep_teardown() {
 1 sb_restart_drain px-sweep regionserver 0 10 5
 1 sb_teardown px-sweep 0
 125 sb_exec px-sweep master 0 30 -- true
-5 sb_events px-sweep 60
 5 sb_sample_resources px-sweep"
-  # When an unrecorded scope is queried while the runtime is unreachable, commands must report the
-  # runtime failure (exit 1) because scope absence cannot be confirmed.
-  t_sweep "$T_BASH" "$T_BIN/px-tool" --scope px-other shell --role regionserver \
-    --index 0 -- true
+  # When an unrecorded scope is queried while the runtime is unreachable, its absence cannot be
+  # confirmed, so commands must report the runtime failure rather than a missing scope.
+  t_sweep "$T_BASH" "$T_BIN/px-tool" --scope px-other monitor
   t_equals sweep_tool_on_an_unreachable_runtime_is_failure 1 "$T_STATUS"
   t_sweep "$T_BASH" "$T_BIN/px-collect" --scope px-other --duration 1 \
     --out "$T_SWEEP_OUT/collect"
@@ -3768,11 +3928,6 @@ t_group_cluster() {
   printf '# verb sweep: every px-cluster subcommand\n'
   t_pc up
   t_equals cluster_up_needs_a_deployment_directory 2 "$T_STATUS"
-  # Before a scope record exists, px-cluster validate must load the generated port map directly
-  # from the deployment directory argument.
-  t_pc validate "$T_DEPLOY"
-  t_contains cluster_validate_loads_the_port_map_of_its_directory \
-    'port_availability ok' "$(t_squeeze "$T_STDOUT")"
   t_shim_log_reset
   t_pc up --timeout 5 "$T_DEPLOY"
   t_equals cluster_up 0 "$T_STATUS"
@@ -3783,25 +3938,32 @@ t_group_cluster() {
     'nodemanager 0 nm01 pending unready px:selftest localhost' "$text"
   t_contains cluster_up_waits_past_a_stopped_group 'nodemanager 0 stopped' "$text"
   t_equals cluster_up_records_the_scope px-sweep "$(cat "$record" 2>/dev/null)"
-  # A command running in a new process discovers the scope through the persisted scope record.
-  t_sweep PX_TEARDOWN=0 "$T_BASH" "$T_BIN/px-run" --driver "$T_WORK/drivers/exit-code.sh" \
+  t_equals up_writes_the_cluster_record "yes yes" "$(t_exists \
+    "$T_SWEEP_OUT/state/cluster-sweep.env") $(t_flag "PX_BACKEND='compose'" \
+    "$(cat "$T_SWEEP_OUT/state/cluster-sweep.env" 2>/dev/null)")"
+  # A command executing in a separate process discovers the active scope via the persisted record.
+  t_sweep "$T_BASH" "$T_BIN/px-run" --class validation \
+    "$T_WORK/drivers/exit-code.sh" \
     -- 0
   t_equals run_resolves_the_recorded_scope 0 "$T_STATUS"
   t_contains run_snapshots_the_recorded_scope "$(t_rows 4 instance pre master 0)" \
     "$(cat "$T_STDOUT/run-record.tsv" 2>/dev/null)"
   t_shim_log_reset
-  t_sweep PX_SESSION_ID=selftest-requires PX_TEARDOWN=0 "$T_BASH" "$T_BIN/px-suite" \
+  t_sweep PX_SESSION_ID=selftest-requires "$T_BASH" "$T_BIN/px-suite" \
     "$T_WORK/suites/requires.suite"
   t_equals suite_requirement_runs_with_its_group 0 "$T_STATUS"
   t_called suite_requirement_starts_the_group 'compose -p px-sweep start nodemanager'
   t_called suite_requirement_stops_the_group_after_the_test \
     'compose -p px-sweep stop --timeout 120 nodemanager'
-  t_pc status --group yarn
+  t_equals session_leaves_the_cluster_up "0 yes" \
+    "$(t_calls 'compose -p px-sweep down') $(t_exists "$record")"
+  t_pc status
   text="$(t_squeeze "$T_STDOUT")"
   t_equals cluster_status 0 "$T_STATUS"
   t_contains cluster_status_reports_an_instance \
     'regionserver 1 rs02 running ready px:selftest localhost' "$text"
-  t_contains cluster_status_reports_a_group 'yarn 0 1 down' "$text"
+  t_pc group status yarn
+  t_contains cluster_status_reports_a_group 'yarn 0 1 down' "$(t_squeeze "$T_STDOUT")"
   t_pc ready --timeout 5
   t_equals cluster_ready 0 "$T_STATUS"
   t_contains cluster_ready_reports_the_stopped_group 'nodemanager 0 stopped' \
@@ -3811,10 +3973,6 @@ t_group_cluster() {
   t_pc config
   t_equals cluster_config 0 "$T_STATUS"
   t_contains cluster_config_reports_the_cluster "PX_CLUSTER_ID${PX_TAB}sweep" "$T_STDOUT"
-  t_pc validate
-  t_equals cluster_validate 0 "$T_STATUS"
-  t_contains cluster_validate_runs_the_preflight 'engine_binary ok' \
-    "$(t_squeeze "$T_STDOUT")"
   t_pc logs regionserver 0
   t_outcome cluster_logs 0 "$(printf 'fake log out rs01\nfake log err rs01')"
   t_pc logs --previous regionserver 0
@@ -3823,25 +3981,12 @@ t_group_cluster() {
   t_outcome cluster_exec_passes_the_status_through 7 cluster-exec
   t_equals cli_exec_status_passes_without_exit_line 0 "$(printf '%s\n' "$T_STDERR" |
     grep -c 'ends (exit ')"
-  t_pc cp-in regionserver 0 "$T_DEPLOY/compose.yaml" /tmp/staged
-  t_equals cluster_cp_in 0 "$T_STATUS"
-  t_pc cp-out regionserver 0 /etc/hosts cluster/hosts
-  t_equals cluster_cp_out 0 "$T_STATUS"
-  t_equals cluster_cp_out_lands_under_the_output_root 'fake copy' \
-    "$(cat "$T_SWEEP_OUT/cluster/hosts" 2>/dev/null)"
-  t_pc cp-out regionserver 0 /etc/hosts /tmp/px-selftest-escape
-  t_equals cluster_cp_out_refuses_an_escape 2 "$T_STATUS"
   t_pc endpoint master 0 ui
   t_outcome cluster_endpoint 0 "$(t_rows 2 127.0.0.1 1)"
   t_pc endpoint master 0 nosuch
   t_equals cluster_endpoint_unknown_port_is_no_such_object 6 "$T_STATUS"
   t_pc endpoint --release master 0 ui
   t_equals cluster_endpoint_release 0 "$T_STATUS"
-  t_pc version
-  text="$(t_squeeze "$T_STDOUT")"
-  t_equals cluster_version 0 "$T_STATUS"
-  t_contains cluster_version_reports_the_contract 'harness_contract 1' "$text"
-  t_contains cluster_version_reports_the_backend 'backend compose' "$text"
   t_group_cluster_faults
 }
 
@@ -3877,12 +4022,19 @@ t_group_cluster_faults() {
   t_equals cluster_signal 0 "$T_STATUS"
   t_contains cluster_signal_is_planned "$(t_rows 4 signal master 0 'signal QUIT')" \
     "$(t_sweep_planned)"
+  # Because this hand-written deployment was not produced by the generator with per-instance
+  # RegionServer services, re-rendering for a scale operation alters other instances; the scale is
+  # refused and the deployment directory is restored unchanged. The a2 cluster test group exercises
+  # scaling against a rendered deployment.
+  text="$(cat "$T_DEPLOY/compose.yaml")"
   t_pc scale regionserver 3 --timeout 10
-  t_equals cluster_scale 0 "$T_STATUS"
-  t_contains cluster_scale_reports_the_new_instance \
-    'regionserver 2 rs03 running ready' "$(t_squeeze "$T_STDOUT")"
-  t_contains cluster_scale_is_planned "$(t_rows 4 scale regionserver '' 'count 3')" \
-    "$(t_sweep_planned)"
+  t_equals cluster_scale_of_a_hand_written_deployment_is_refused 2 "$T_STATUS"
+  t_equals cluster_refused_scale_keeps_the_deployment "$text" \
+    "$(cat "$T_DEPLOY/compose.yaml" 2>/dev/null)"
+  t_absent cluster_refused_scale_is_not_planned 'count 3' "$(t_sweep_planned)"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s||||regionmover\n' rs03 regionserver \
+    px-sweep-regionserver-3 running 'Up 1 second (healthy)' px:selftest regionserver 3 \
+    >>"$T_SWEEP_STATE/instances.txt"
   t_pc kill regionserver 2
   t_equals cluster_kill 0 "$T_STATUS"
   t_contains cluster_kill_is_planned "$(t_rows 4 kill regionserver 2 'mode hard')" \
@@ -3921,6 +4073,11 @@ t_group_cluster_faults() {
   t_equals cluster_down_after_a_kept_failure 0 "$T_STATUS"
   text="$(find "$T_SWEEP_OUT/state" -name 'scope-*' -o -name 'cluster-*.env' 2>/dev/null)"
   t_empty cluster_down_leaves_no_scope_record "$text"
+  # R-057: After teardown completes, the runtime retains no container, network, or volume belonging
+  # to the cluster, allowing the single-cluster admission gate to permit the next bring-up.
+  t_equals teardown_leaves_no_labelled_object "0 0 0" "$(grep -c . \
+    "$T_SWEEP_STATE/instances.txt") $(grep -c . "$T_SWEEP_STATE/networks.txt") $(grep -c . \
+    "$T_SWEEP_STATE/volumes.txt")"
 }
 
 ## @description  Verifies that no command created any path under the working tree root.
@@ -5094,9 +5251,23 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     [ -f "$ctx/$line" ] || bad="$bad $line"
   done
   t_empty stage_artifacts_context_holds_every_part "$bad"
-  # Verify that the bundled ZooKeeper and Hadoop client versions recorded during staging are
-  # extracted from the actual jar entries inside the HBase archive rather than matched from
-  # similarly named files.
+  # RQ-094: Any enabled plug-in is staged into the image build context and copied by the Dockerfile,
+  # whereas disabled plug-ins are omitted from the context.
+  t_equals stage_artifacts_without_a_plugin_stages_none "yes no" \
+    "$(t_exists "$ctx/plugins") $(t_exists "$ctx/plugins/example")"
+  t_a2 "${pins_env[@]}" PX_PLUGINS=example "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_stages_an_enabled_plugin "0 yes yes" "$T_STATUS $(t_exists \
+    "$ctx/plugins/example/plugin.env") $(t_exists "$ctx/plugins/example/hooks/fetch-data")"
+  t_equals stage_artifacts_keeps_the_hook_executable yes \
+    "$([ -x "$ctx/plugins/example/hooks/fetch-data" ] && echo yes || echo no)"
+  t_contains image_copies_the_staged_plugins 'COPY plugins/ /opt/px/plugins/' \
+    "$(cat "$ctx/Dockerfile")"
+  t_contains image_context_admits_the_plugins '!plugins/' "$(cat "$ctx/.dockerignore")"
+  t_a2 "${pins_env[@]}" "$T_BASH" "$sa" --stage-only
+  t_equals stage_artifacts_drops_a_plugin_that_is_no_longer_enabled no \
+    "$(t_exists "$ctx/plugins/example")"
+  # The bundled ZooKeeper and Hadoop client versions are extracted from the actual jar entries in
+  # the archive rather than matched from similarly named files.
   t_equals staging_record_reads_the_shipped_jars "2.6 2.6.4 2.6.7 3.4.3 3.8.6 3.4.1" \
     "$(t_tsv_values "$ctx.staged.tsv" hbase_profile compat_module hbase_version hadoop_version \
       zookeeper_version hbase_hadoop_version)"
@@ -5124,9 +5295,19 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
     '--build-arg PX_STAGED_HBASE=dist/hbase-2.6.7-hadoop3-bin.tar.gz' "$text"
   t_contains image_build_names_the_context "--file $ctx/Dockerfile $ctx" "$text"
   t_absent image_build_defaults_to_the_host_architecture '--platform' "$text"
-  # Verify that rendering a deployment for a staged image records the exact jar versions carried by
-  # that image, and that a staging record produced for a different version set causes the generator
-  # to refuse the render.
+  # R-066: When the container builder supports the provenance flag, image builds disable provenance
+  # attestations to keep the resulting image ID deterministic; builders lacking that option receive
+  # no provenance flag.
+  : >"$T_A2_STATE/build-provenance"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$T_WORK/probe/sb.sh" sb_image_build "$ctx" px-harness:x
+  t_contains image_build_turns_the_provenance_off '--provenance=false' "$(cat "$T_SHIM_LOG")"
+  rm -f "$T_A2_STATE/build-provenance"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$T_WORK/probe/sb.sh" sb_image_build "$ctx" px-harness:x
+  t_absent image_build_without_the_option_passes_none '--provenance' "$(cat "$T_SHIM_LOG")"
+  # Rendering a deployment for a staged image records the component versions packaged into that
+  # image, whereas a staging record from a mismatched version set causes the render to be refused.
   t_gen --class validation --cluster staged
   t_equals topology_records_the_shipped_jars "2.6 2.6.7 3.4.3 3.8.6 3.4.1" \
     "$(t_env_value "$T_A2_OUT/deploy/staged/topology.env" PX_PHOENIX_HBASE_PROFILE \
@@ -5387,10 +5568,7 @@ t_group_a2_cluster() {
   t_a2 "$T_BASH" "$pc" --cluster a2 --class validation render
   t_equals cluster_render_refuses_the_deployment_of_a_cluster_that_is_up 2 "$T_STATUS"
   t_empty cluster_refused_render_calls_no_runtime "$(cat "$T_SHIM_LOG")"
-  t_a2 "$T_BASH" "$pc" --cluster a2 scale datanode 2
-  t_equals scale_refuses_a_role_with_a_service_per_instance 2 "$T_STATUS"
-  t_contains scale_names_the_render_as_the_remedy 'Render the deployment with the new count' \
-    "$T_STDERR"
+  t_a2_scale "$dir"
   t_shim_log_reset
   t_a2 "$T_BASH" "$pc" --cluster a2 down
   t_equals cluster_down_after_a_class_bring_up 0 "$T_STATUS"
@@ -5447,9 +5625,152 @@ t_group_a2_cluster() {
   printf '25165824000\n' >"$T_A2_STATE/mem-total"
 }
 
-## @description  Verifies end-to-end version matrix execution: running a test suite sequentially
-##               across two distinct component version sets.
-## @return       Records the version matrix assertions. Exit 0.
+## @description  Verifies px-cluster scale on the rendered deployment (dir) of the a2 cluster (up
+##               with one RegionServer): re-renders per scale and mutates only the changed instance.
+## @return       Records assertions. Exit 0.
+t_a2_scale() {
+  local dir=$1 pc="$T_BIN/px-cluster" before
+  local -a a2=(--cluster a2)
+  # RQ-008, RQ-009: Re-rendering records the updated instance count, and the backend creates and
+  # starts only the single newly added instance.
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" "${a2[@]}" scale regionserver 2 --timeout 5
+  t_equals scale_adds_an_instance_to_a_render 0 "$T_STATUS"
+  t_equals scale_renders_the_new_count 2 \
+    "$(awk -F '\t' '$2 == "regionserver"' "$dir/services.tsv" | grep -c .)"
+  t_contains scale_writes_the_count "PX_RS_COUNT='2'" \
+    "$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)"
+  t_called scale_starts_only_the_new_instance \
+    'compose -p px-a2 up -d --no-recreate --no-build --no-deps regionserver-1'
+  t_contains scale_reports_the_new_instance 'regionserver 1 new-regionserver-1 running ready' \
+    "$(t_squeeze "$T_STDOUT")"
+  t_contains scale_is_planned 'count 2' "$(cat "$T_A2_OUT/state/planned-px-a2.tsv" 2>/dev/null)"
+  t_equals scale_keeps_no_copy_of_the_render no "$(t_exists "$dir.before-scale")"
+  # Re-rendering with modified configuration parameters would diverge from the running instances,
+  # and the memory preflight check validates the newly rendered topology: failures in either check
+  # refuse the scale operation and leave the existing deployment intact.
+  before="$(cat "$dir/services.tsv")"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" "${a2[@]}" -e PX_DN_COUNT=2 scale regionserver 3 --timeout 5
+  t_equals scale_refuses_a_render_that_changes_another_instance "2 yes" \
+    "$T_STATUS $(t_flag 'changes instances other than regionserver' "$T_STDERR")"
+  t_contains scale_refuses_drift_from_the_record \
+    "differs from the cluster record $T_A2_OUT/state/cluster-a2.env, so drop it" "$T_STDERR"
+  printf '%s\n' "$((6 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_a2 "$T_BASH" "$pc" "${a2[@]}" scale regionserver 3 --timeout 5
+  t_equals scale_refuses_what_the_memory_check_refuses 3 "$T_STATUS"
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_equals scale_refusals_keep_the_deployment "$before" "$(cat "$dir/services.tsv")"
+  t_absent scale_refusals_change_no_instance ' up ' "$(cat "$T_SHIM_LOG")"
+  # Scaling back down stops and removes only the single instance exceeding the target count.
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" "${a2[@]}" scale regionserver 1 --timeout 5
+  t_equals scale_removes_an_instance 0 "$T_STATUS"
+  t_called scale_stops_the_removed_instance 'stop --time 120 new-regionserver-1'
+  t_called scale_removes_the_removed_instance 'rm -f new-regionserver-1'
+  t_contains scale_writes_the_lower_count "PX_RS_COUNT='1'" \
+    "$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)"
+  t_a2 "$T_BASH" "$pc" --cluster a2 status regionserver
+  t_equals scale_leaves_the_other_instances "regionserver 0" \
+    "$(printf '%s\n' "$T_STDOUT" | awk 'NR > 1 { print $1, $2 }')"
+  t_a2 "$T_BASH" "$pc" --cluster a2 scale datanode 10
+  t_equals scale_refuses_a_count_above_nine 2 "$T_STATUS"
+}
+
+## @description  Verifies the cluster record written during class-based bring-up of the a2 cluster,
+##               its reported origin, and its precedence among the configuration stages.
+## @return       Records test assertions. Exit 0.
+t_a2_record() {
+  local pc="$T_BIN/px-cluster" text out="$T_A2/u3-out"
+  text="$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)"
+  t_equals record_holds_the_backend_and_class "yes yes yes" "$(t_flag "PX_BACKEND='compose'" \
+    "$text") $(t_flag "PX_RUN_CLASS='validation'" "$text") $(t_flag "PX_RS_COUNT='1'" "$text")"
+  t_empty record_leaves_out_the_locating_names "$(printf '%s\n' "$text" |
+    grep -E '^(PX_OUT|PX_STATE_DIR|PX_CLUSTER_ID)=')"
+  t_a2 "$T_BASH" "$pc" --cluster a2 config
+  t_equals record_values_have_origin_cluster "yes yes" "$(t_flag \
+    "PX_RS_COUNT${PX_TAB}1${PX_TAB}cluster" "$T_STDOUT") $(t_flag \
+    "PX_RUN_CLASS${PX_TAB}validation${PX_TAB}cluster" "$T_STDOUT")"
+  t_contains record_round_trips_a_quoted_value \
+    "PX_U3_QUOTED${PX_TAB}a 'b' \"c\" # d = e${PX_TAB}cluster" "$T_STDOUT"
+  printf 'PX_RS_COUNT=3\n' >"$T_A2/topology.env"
+  t_a2 "$T_BASH" "$pc" --cluster a2 config PX_RS_COUNT
+  printf 'PX_RS_COUNT=1\n' >"$T_A2/topology.env"
+  t_outcome record_is_flattened 0 "$(t_rows 3 PX_RS_COUNT 1 cluster)"
+  t_a2 "$T_BASH" "$pc" --cluster a2 config PX_RS_COUNT -e PX_RS_COUNT=4
+  t_outcome cli_beats_the_record 0 "$(t_rows 3 PX_RS_COUNT 4 cli)"
+  t_a2 PX_RS_COUNT=5 "$T_BASH" "$pc" --cluster a2 config PX_RS_COUNT
+  t_outcome environment_beats_the_record 0 "$(t_rows 3 PX_RS_COUNT 5 environment)"
+  printf 'PX_RS_COUNT=7\nPX_U3_LOCAL=1\n' >"$T_A2/u3-local.env"
+  t_a2 "PX_LOCAL_ENV=$T_A2/u3-local.env" "$T_BASH" "$pc" --cluster a2 config PX_RS_COUNT \
+    PX_U3_LOCAL
+  t_outcome record_beats_local_env 0 "$(t_rows 3 PX_RS_COUNT 1 cluster PX_U3_LOCAL 1 local)"
+  # An output root specified solely in local.env still suffices to locate the cluster record.
+  mkdir -p "$out/state"
+  printf "PX_U3_SEEN='1'\n" >"$out/state/cluster-u3l.env"
+  printf 'PX_OUT=%s\n' "$out" >"$T_A2/u3-local-out.env"
+  t_a2 env -u PX_OUT "PX_LOCAL_ENV=$T_A2/u3-local-out.env" "$T_BASH" "$pc" --cluster u3l \
+    config PX_U3_SEEN
+  t_outcome record_located_through_local_env_out 0 "$(t_rows 3 PX_U3_SEEN 1 cluster)"
+  rm -rf "$out"
+  t_a2 "$T_BASH" "$pc" --cluster a2 config 'PX_RS_*' PX_RUN_CLASS
+  t_equals config_pattern_selects_names "0 yes" "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk \
+    -F '\t' '$1 !~ /^PX_RS_/ && $1 != "PX_RUN_CLASS" { bad = 1 } $1 == "PX_RUN_CLASS" { c = 1 }
+      $1 == "PX_RS_COUNT" { r = 1 } END { print (!bad && c && r) ? "yes" : "no" }')"
+  t_a2 "$T_BASH" "$pc" --cluster a2 config 'PX_NO_SUCH_*'
+  t_equals config_pattern_without_match_is_6 "6 yes" "$T_STATUS $(t_flag \
+    'no configuration value matches PX_NO_SUCH_*' "$T_STDERR")"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --backend k8s status
+  t_equals record_refuses_another_backend "2 yes yes" "$T_STATUS $(t_flag \
+    "cluster a2 is recorded on the compose backend in $T_A2_OUT/state/cluster-a2.env" \
+    "$T_STDERR") $(t_flag "PX_BACKEND='k8s' comes from the command line" "$T_STDERR")"
+  t_a2 PX_BACKEND=k8s "$T_BASH" "$pc" --cluster a2 status
+  t_contains record_refusal_names_the_origin "PX_BACKEND='k8s' comes from the environment" \
+    "$T_STDERR"
+  t_a2 "$T_BASH" "$T_BIN/px-run" --cluster a2 "$T_WORK/drivers/exit-code.sh" -n
+  t_contains run_takes_the_class_from_the_record "run_class${PX_TAB}validation" "$T_STDOUT"
+}
+
+## @description  Verifies that up rejects a stale a2 cluster record (dir) unless PX_FORCE=1, omits
+##               per-invocation settings, and that down cleans up a record lacking an active scope.
+## @return       Records test assertions. Exit 0.
+t_a2_record_stale() {
+  local dir=$1 pc="$T_BIN/px-cluster" file="$T_A2_OUT/state/cluster-a2.env" text name bad=""
+  printf "# stale\nPX_RUN_CLASS='measurement'\nPX_U3_STALE='1'\n" >"$file"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation --config "$T_A2/topology.env" up \
+    --no-wait
+  t_equals up_refuses_a_stale_record "2 no" "$T_STATUS $(t_flag ' up --no-start' \
+    "$(cat "$T_SHIM_LOG")")"
+  t_a2_provision "$dir"
+  # The rendered configuration from the earlier class bring-up includes the undeclared PX_U3_QUOTED
+  # setting, which a strict child process of this bring-up would reject if persisted in the record.
+  rm -f "$dir/render.env"
+  t_a2 "$T_BASH" "$pc" --cluster a2 --class validation --config "$T_A2/topology.env" -v \
+    --keep --strict -e PX_FORCE=1 -e PX_LOG_FILE=u3-up.log -e "PX_DEPLOYMENT_DIR=$dir" \
+    -e PX_DRY_RUN=0 up --no-wait
+  text="$(cat "$file" 2>/dev/null)"
+  t_equals up_force_replaces_a_stale_record "0 no yes" "$T_STATUS $(t_flag PX_U3_STALE \
+    "$text") $(t_flag "PX_RUN_CLASS='validation'" "$text")"
+  for name in PX_VERBOSE PX_DRY_RUN PX_STRICT_CONFIG PX_KEEP PX_SCOPE_ID PX_DEPLOYMENT_DIR \
+    PX_OUT PX_STATE_DIR PX_CLUSTER_ID PX_FORCE PX_LOG_FILE; do
+    case "$PX_NL$text" in
+    *"$PX_NL$name="*) bad="$bad $name" ;;
+    esac
+  done
+  t_equals record_holds_no_invocation_name "" "$bad"
+  # When the recorded scope is already gone, as after a crash, down still exits with status 0 and
+  # removes both state records.
+  : >"$T_A2_STATE/instances.txt"
+  : >"$T_A2_STATE/networks.txt"
+  : >"$T_A2_STATE/volumes.txt"
+  t_a2 "$T_BASH" "$pc" --cluster a2 down
+  t_equals down_of_a_stale_record_cleans_up "0 no no" "$T_STATUS $(t_exists "$file")\
+ $(t_exists "$T_A2_OUT/state/scope-compose-a2")"
+}
+
+## @description  Verifies end-to-end version matrix execution of a suite across two version sets.
+## @return       Records assertions. Exit 0.
 t_group_a2_matrix() {
   local home="$T_A2/tree/dev/harness" a="$T_A2/set-a.env" b="$T_A2/set-b.env"
   local suite="$T_A2/matrix.suite" archive=https://archive.apache.org/dist rows line bad=""
@@ -5469,7 +5790,10 @@ t_group_a2_matrix() {
   printf '%s\n' PX_DIST_HBASE_VERSION=2.6.6 PX_DIST_HADOOP_VERSION=3.4.2 PX_RS_JDK=17 >"$a"
   printf '%s\n' PX_PHOENIX_HBASE_PROFILE=2.5 PX_DIST_HBASE_VERSION=2.5.15 \
     PX_DIST_HADOOP_VERSION=3.4.2 PX_RS_JDK=21 >"$b"
-  printf 'suite: selftest-matrix\ntimeout: 60\n\ntest: one\n  action: exit 0\n' >"$suite"
+  # Configure the suite test to invoke a stub driver so that each matrix entry produces a run bundle
+  # whose manifest records that entry's version pins.
+  printf 'suite: selftest-matrix\ntimeout: 60\nclass: validation\n\ntest: one\n' >"$suite"
+  printf '  driver: %s\n  args: 0\n' "$T_WORK/drivers/exit-code.sh" >>"$suite"
   printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
   t_gen --class validation --cluster a2
   t_a2_provision "$T_A2_OUT/deploy/a2"
@@ -5507,6 +5831,18 @@ t_group_a2_matrix() {
     esac
   done
   t_empty matrix_session_records_its_version_set "$bad"
+  # R-039: The run bundle produced under each matrix entry's session directory records that version
+  # set's pins in its bundle manifest.
+  bad=""
+  for line in "1:2.6 2.6.6 17" "2:2.5 2.5.15 21"; do
+    n=${line%%:*}
+    file="$(sed -n 1p "$T_A2_OUT/sessions/$(printf '%s\n' "$rows" | awk -F '\t' -v n="$n" \
+      '$1 == n { print $7 }')/tests/one/stdout.txt" 2>/dev/null)"
+    [ "$(t_manifest "$file" /versions/phoenix_hbase_profile) $(t_manifest "$file" \
+      /versions/hbase) $(t_manifest "$file" /versions/jdk/regionserver)" = "${line#*:}" ] ||
+      bad="$bad set $n: ${file:-no bundle};"
+  done
+  t_empty version_sets_are_recorded_in_each_manifest "$bad"
   t_equals matrix_topology_records_the_last_set "2.5 2.5.15 3.4.2 3.8.4 3.3.6" \
     "$(t_env_value "$T_A2_OUT/deploy/a2/topology.env" PX_PHOENIX_HBASE_PROFILE \
       PX_DIST_HBASE_VERSION PX_DIST_HADOOP_VERSION PX_ZOOKEEPER_VERSION PX_HBASE_HADOOP_VERSION)"
@@ -5516,6 +5852,54 @@ t_group_a2_matrix() {
   t_equals matrix_refuses_a_missing_set 6 "$T_STATUS"
   t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" matrix "$suite"
   t_equals matrix_needs_a_set 2 "$T_STATUS"
+  # RQ-008: Invoking px-cluster build executes the complete image build pipeline for a single
+  # configuration: compiling Phoenix for the active profile, staging the artifacts, and building the
+  # container image.
+  : >"$T_A2_MVN_LOG"
+  t_shim_log_reset
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$T_A2/jdk/17" "${pins_env[@]}" "$T_BASH" \
+    "$home/bin/px-cluster" --config "$b" build
+  t_equals cluster_build_builds_phoenix_then_the_image "0 2.5 1" "$T_STATUS $(sed -n \
+    's/.*-Dhbase.profile=\([^ ]*\).*/\1/p' "$T_A2_MVN_LOG" | sed -n 1p) $(grep -c '^build --tag' \
+    "$T_SHIM_LOG")"
+  t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" build extra
+  t_equals cluster_build_takes_no_argument 2 "$T_STATUS"
+  t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" build --tree "$T_A2/tree" -n
+  t_contains build_passes_the_tree \
+    "build${PX_TAB}scripts/build-phoenix.sh --tree $T_A2/tree" "$T_STDOUT"
+  t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" build --backend k8s -n
+  t_contains build_on_k8s_plans_the_import "import${PX_TAB}px-k3d import" "$T_STDOUT"
+  # Verify that a build dry run validates the configured version set just like an actual build,
+  # exiting with code 2 and emitting no plan rows when a version falls outside its profile range.
+  printf 'PX_PHOENIX_HBASE_PROFILE=2.6.0\nPX_DIST_HBASE_VERSION=2.6.7\n' >"$T_A2/bad-range.env"
+  t_a2 "PX_HOME=$home" "$T_BASH" "$home/bin/px-cluster" --config "$T_A2/bad-range.env" \
+    --dry-run build
+  t_equals build_dry_run_refuses_a_version_outside_the_profile "2 yes 0 yes" "$T_STATUS $(t_flag \
+    "HBase '2.6.7' (PX_DIST_HBASE_VERSION) is outside the range of profile 2.6.0" \
+    "$T_STDERR") $(printf '%s\n' "$T_STDOUT" | grep -c '^plan') $(t_flag \
+    'build ends (exit 2, usage)' "$(t_last_line "$T_STDERR")")"
+  # Delivering a signal to the matrix execution tears down the cluster of the running set.
+  printf 'suite: selftest-slow\ntimeout: 60\nclass: validation\n\ntest: one\n' >"$T_A2/slow.suite"
+  printf '  driver: %s\n  args: 3\n' "$T_WORK/drivers/sleep.sh" >>"$T_A2/slow.suite"
+  t_shim_log_reset
+  : >"$T_A2/slow.mark"
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$T_A2/jdk/17" PX_TIMEOUT_READY=30 "${pins_env[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$T_WORK/probe/term-when.sh" \
+    "$T_A2_OUT/runs" driver.pid "$T_A2/slow.mark" "$home/bin/px-cluster" --cluster a2 \
+    --class validation matrix "$T_A2/slow.suite" "$a"
+  t_equals matrix_tears_down_after_a_term "143 1 1" "$T_STATUS $(grep -c ' up --no-start' \
+    "$T_SHIM_LOG") $(grep -c ' down --volumes' "$T_SHIM_LOG")"
+  # Receiving a signal while a version set is still bringing its cluster up tears down that cluster
+  # as well.
+  t_shim_log_reset
+  : >"$T_A2/slow.mark"
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$T_A2/jdk/17" PX_TIMEOUT_READY=30 "${pins_env[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$T_WORK/probe/term-when.sh" \
+    "$T_A2_OUT/state" scope-compose-a2 "$T_A2/slow.mark" "$home/bin/px-cluster" --cluster a2 \
+    --class validation matrix "$T_A2/slow.suite" "$a"
+  t_equals matrix_tears_down_after_a_term_during_up "143 1 1 no" "$T_STATUS $(grep -c \
+    ' up --no-start' "$T_SHIM_LOG") $(grep -c ' down --volumes' "$T_SHIM_LOG") $(t_exists \
+    "$T_A2_OUT/state/scope-compose-a2")"
   printf '25165824000\n' >"$T_A2_STATE/mem-total"
 }
 
@@ -5727,18 +6111,19 @@ t_a3_inhibit_cases() {
     [ "$os" = Darwin ] || prog=systemd-inhibit
     : >"$T_HOST_DIR/inhibit.log"
     t_with_shim "PATH=$T_A3/$os:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
+      "${T_SELFTEST_RUN[@]}" \
       -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh" -- 0
     run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
-    pid="$(cut -f 1 "$run/driver.log" 2>/dev/null | sed -n 1p)"
+    pid="$(cut -f 1 "$run/logs/run.log" 2>/dev/null | sed -n 1p)"
     logs="$logs$(cat "$T_HOST_DIR/inhibit.log")$PX_NL"
     t_equals "inhibit_${os}_uses_$prog" "0 yes" "$T_STATUS $(t_flag "$prog " \
       "$(cat "$T_HOST_DIR/inhibit.log")")"
     t_contains "inhibit_${os}_records_the_pid" "$prog${PX_TAB}run-${run##*/}" \
-      "$(cat "$run/driver.log" 2>/dev/null)"
+      "$(cat "$run/logs/run.log" 2>/dev/null)"
     t_equals "inhibit_${os}_released_after_the_run" "no no" \
       "$(t_alive "$pid") $(t_exists "$PX_OUT/state/inhibit-run-${run##*/}")"
     if [ "$os" = Linux ]; then
-      owner="$(sed -n 's/^owner //p' "$run/driver.log" 2>/dev/null)"
+      owner="$(sed -n 's/^owner //p' "$run/logs/run.log" 2>/dev/null)"
       t_contains inhibit_linux_follows_its_owner \
         "sh -c while kill -0 \"\$1\" 2>/dev/null; do sleep 1; done px-inhibit ${owner:-none}" \
         "$(cat "$T_HOST_DIR/inhibit.log")"
@@ -5764,26 +6149,28 @@ t_a3_inhibit_cases() {
   # When a sleep inhibitor process exits immediately, it holds no lock, so the run emits a warning
   # and leaves no inhibitor state record.
   t_with_shim "PATH=$T_A3/quickexit:$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" \
-    "$T_BIN/px-run" -e PX_TEARDOWN=0 --scope px-selftest \
+    "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_TEARDOWN=0 --scope px-selftest \
     --driver "$T_WORK/drivers/host-probe.sh" -- 0
   run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
   t_equals inhibit_that_ends_at_once_is_a_warning "0 yes yes" "$T_STATUS $(t_flag \
     'the sleep inhibitor caffeinate ended at once' "$T_STDERR") $(t_flag 'no record' \
-    "$(cat "$run/driver.log" 2>/dev/null)")"
+    "$(cat "$run/logs/run.log" 2>/dev/null)")"
   t_empty inhibit_that_ends_at_once_leaves_no_record \
     "$(find "$PX_OUT/state" -name "inhibit-run-${run##*/}" 2>/dev/null)"
   t_with_shim "PATH=$T_A3/SunOS:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
+    "${T_SELFTEST_RUN[@]}" \
     -e PX_TEARDOWN=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh" -- 0
   t_equals inhibit_absent_is_a_warning "0 yes yes" "$T_STATUS $(t_flag \
     'no sleep inhibitor on this host (SunOS' "$T_STDERR") $(t_flag 'no record' \
-    "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/driver.log" 2>/dev/null)")"
+    "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/logs/run.log" 2>/dev/null)")"
   # Verify that an injected driver failure still releases the active sleep inhibitor on exit.
   t_with_shim "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-run" \
+    "${T_SELFTEST_RUN[@]}" \
     -e PX_TEARDOWN=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh" -- 1
   run="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
-  pid="$(cut -f 1 "$run/driver.log" 2>/dev/null | sed -n 1p)"
+  pid="$(cut -f 1 "$run/logs/run.log" 2>/dev/null | sed -n 1p)"
   t_contains inhibit_failed_run_recorded_its_inhibitor "caffeinate${PX_TAB}run-${run##*/}" \
-    "$(cat "$run/driver.log" 2>/dev/null)"
+    "$(cat "$run/logs/run.log" 2>/dev/null)"
   t_equals inhibit_released_after_a_failure "1 no" "$T_STATUS $(t_alive "$pid")"
   # Delivering an interrupt signal releases the sleep inhibitor, terminates the active driver, and
   # tears down the cluster. If the parent shell started with INT ignored, INT cannot reach the run,
@@ -5798,7 +6185,8 @@ t_a3_inhibit_cases() {
   T_A3_INHIBITOR=""
   t_run_interrupted "$sig" env "PATH=$T_A3/Darwin:$T_SHIM_DIR:$PATH" \
     "PX_DOCKER_BIN=$T_SHIM_DIR/docker" "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" \
-    "PX_FAKE_STATE_DIR=$T_SHIM_STATE" "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=0.2 \
+    "PX_FAKE_STATE_DIR=$T_SHIM_STATE" "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" \
+    -e PX_POLL_INTERVAL_S=0.2 \
     -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/sleep.sh" -- 30
   t_nonempty inhibit_interrupted_run_recorded_its_inhibitor "$T_A3_INHIBITOR"
   t_equals "inhibit_released_after_$name" "$code no" "$T_STATUS $(t_alive "$T_A3_INHIBITOR")"
@@ -5846,52 +6234,51 @@ t_a3_inhibit_cases() {
     "$(t_exists "$run/state/inhibit-cluster-px-sweep") $(t_exists "$run/state/monitor-px-sweep")"
 }
 
-## @description  Verifies default cluster teardown behavior after individual runs and full suite
-##               sessions (R-051).
+## @description  Verifies that individual runs and suite sessions leave an existing cluster running,
+##               because each command tears down only resources it brought up (R-051).
 ## @return       Records test assertions. Exit 0.
 t_a3_teardown_cases() {
   local suite="$T_A3/teardown.suite" code pid
-  printf '# teardown by default\n'
+  printf '# ownership: a command tears down only what it brought up\n'
   for code in 0 1; do
     t_shim_state_reset
     t_shim_log_reset
-    t_with_shim "$T_BASH" "$T_BIN/px-run" --scope px-selftest \
-      --driver "$T_WORK/drivers/exit-code.sh" -- "$code"
-    t_equals "teardown_after_a_run_with_exit_$code" "$code 1" \
+    t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_SCOPE_ID=px-selftest \
+      "$T_WORK/drivers/exit-code.sh" -- "$code"
+    t_equals "run_leaves_the_cluster_up_after_exit_$code" "$code 0" \
       "$T_STATUS $(t_calls 'compose -p px-selftest down')"
-    t_contains "teardown_${code}_is_recorded" "$(t_rows 3 teardown 0 ok)" "$(t_record)"
   done
+  t_empty run_records_no_teardown "$(t_record | awk -F '\t' '$1 == "teardown" || $3 == "teardown"')"
   t_shim_state_reset
   t_shim_log_reset
-  t_with_shim "$T_BASH" "$T_BIN/px-run" --keep --scope px-selftest \
-    --driver "$T_WORK/drivers/exit-code.sh" -- 0
-  t_equals teardown_skipped_with_keep "0 0" \
-    "$T_STATUS $(t_calls 'compose -p px-selftest down')"
-  t_contains teardown_skip_is_recorded "$(t_rows 4 skip run teardown 'the cluster is kept')" \
-    "$(t_record)"
-  # During a suite session, the session itself owns the cluster lifecycle: individual tests leave
-  # the cluster running, and session completion tears it down once.
-  printf 'suite: a3-teardown\ntimeout: 60\n\ntest: one\n  driver: %s\n  args: 0\n\n' \
-    "$T_WORK/drivers/exit-code.sh" >"$suite"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" --keep -e PX_SCOPE_ID=px-selftest \
+    "$T_WORK/drivers/exit-code.sh" -- 0
+  t_equals px_run_refuses_keep "2 yes 0" "$T_STATUS $(t_flag 'unknown option --keep' \
+    "$T_STDERR") $(t_calls 'compose -p px-selftest down')"
+  # A suite session likewise leaves the cluster up; invoking px-cluster down removes it.
+  printf 'suite: a3-teardown\nclass: validation\ntimeout: 60\n\n' >"$suite"
+  printf 'test: one\n  driver: %s\n  args: 0\n\n' \
+    "$T_WORK/drivers/exit-code.sh" >>"$suite"
   printf 'test: two\n  needs: one\n  driver: %s\n  args: 0\n' \
     "$T_WORK/drivers/exit-code.sh" >>"$suite"
   t_shim_state_reset
   t_shim_log_reset
-  t_with_shim PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-teardown "$T_BASH" "$T_BIN/px-suite" \
-    "$suite"
-  t_equals teardown_once_after_a_session "0 1" \
+  t_with_shim PX_SCOPE_ID=px-selftest PX_CLUSTER_ID=selftest PX_SESSION_ID=a3-teardown \
+    "$T_BASH" "$T_BIN/px-suite" "$suite"
+  t_equals session_leaves_the_cluster_up_after_its_tests "0 0" \
     "$T_STATUS $(t_calls 'compose -p px-selftest down')"
   t_shim_state_reset
   t_shim_log_reset
-  t_with_shim PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-teardown-keep "$T_BASH" \
-    "$T_BIN/px-suite" --keep "$suite"
-  t_equals teardown_skipped_after_a_kept_session "0 0" \
+  t_with_shim PX_SCOPE_ID=px-selftest PX_CLUSTER_ID=selftest \
+    PX_SESSION_ID=a3-teardown-keep "$T_BASH" "$T_BIN/px-suite" --keep "$suite"
+  t_equals kept_session_leaves_the_cluster_up "0 0" \
     "$T_STATUS $(t_calls 'compose -p px-selftest down')"
-  # Delivering a TERM signal immediately aborts the session's wait on its active test. The session
-  # exit hook then terminates the test process, its driver, and its sleep inhibitor before tearing
-  # down the cluster.
-  printf 'suite: a3-interrupt\ntimeout: 60\n\ntest: one\n  driver: %s\n  args: 30\n' \
-    "$T_WORK/drivers/sleep.sh" >"$suite"
+  # Delivering a termination signal immediately aborts the session's wait on its active test; the
+  # exit hook then terminates the test process, its driver, and its sleep inhibitor while leaving
+  # the cluster up.
+  printf 'suite: a3-interrupt\nclass: validation\ntimeout: 60\n\n' >"$suite"
+  printf 'test: one\n  driver: %s\n  args: 30\n' \
+    "$T_WORK/drivers/sleep.sh" >>"$suite"
   t_shim_state_reset
   t_shim_log_reset
   T_A3_RUN=""
@@ -5899,8 +6286,8 @@ t_a3_teardown_cases() {
   T_A3_RUN_OUT="$PX_OUT/sessions/a3-interrupt/tests/one/stdout.txt"
   t_run_interrupted TERM env "PATH=$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
     "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_SHIM_STATE" \
-    PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-interrupt PX_POLL_INTERVAL_S=0.2 "$T_BASH" \
-    "$T_BIN/px-suite" "$suite"
+    PX_SCOPE_ID=px-selftest PX_CLUSTER_ID=selftest PX_SESSION_ID=a3-interrupt \
+    PX_POLL_INTERVAL_S=0.2 "$T_BASH" "$T_BIN/px-suite" "$suite"
   T_A3_RUN_OUT=""
   pid="$(cat "$T_A3_RUN/driver.pid" 2>/dev/null)"
   t_equals terminated_session_leaves_the_cluster_up "143 yes 0" "$T_STATUS $(t_within 10000 \
@@ -5908,15 +6295,16 @@ t_a3_teardown_cases() {
   t_equals teardown_terminated_session_stops_driver_and_inhibitor "no no" \
     "$(t_alive "${pid:-x}") $(t_alive "${T_A3_INHIBITOR:-x}")"
   t_nonempty teardown_terminated_session_found_its_driver "$pid$T_A3_INHIBITOR"
-  # The overall execution time bound enforced on px-run combines the test timeout with a safety
-  # margin, plus the quiet-host wait window and one poll interval for the test's run class.
+  # The overall execution time bound enforced on px-run combines the test time limit, the safety
+  # margin, and six short-verb bounds, plus the quiet-host wait window and one poll interval for the
+  # test's run class when neither plug-ins nor disruptions add terms.
   printf 'suite: a3-bound\ntimeout: 60\n\ntest: one\n  driver: %s\n  class: %s\n' \
     "$T_WORK/drivers/exit-code.sh" measurement >"$suite"
   t_shim_state_reset
-  t_with_shim PX_SCOPE_ID=px-selftest PX_SESSION_ID=a3-bound PX_POLL_INTERVAL_S=0.5 \
-    "$T_BASH" "$T_BIN/px-suite" -v "$suite"
+  t_with_shim PX_SCOPE_ID=px-selftest PX_CLUSTER_ID=selftest PX_SESSION_ID=a3-bound \
+    PX_POLL_INTERVAL_S=0.5 "$T_BASH" "$T_BIN/px-suite" -v "$suite"
   t_equals teardown_session_bound_covers_the_quiet_wait "0 yes" "$T_STATUS $(t_flag \
-    "test one: px-run gets a bound of $((60 + 300 + 300 + 1))s" "$T_STDERR")"
+    "test one: px-run gets a bound of $((60 + 300 + 6 * 300 + 300 + 1))s" "$T_STDERR")"
   t_shim_state_reset
 }
 
@@ -5980,30 +6368,47 @@ t_a3_down_lock_cases() {
 ##               an immediate run abort (R-052).
 ## @return       Records test assertions. Exit 0.
 t_a3_abort_cases() {
-  local start record driver name change
+  local start record driver name change bundle
   printf '# the immediate abort\n'
-  # Iterate over one three-field tuple per fault scenario: the fault-injecting driver script, the
-  # test case identifier, and the expected state transition in the abort record row. The OOM kill
-  # scenario runs last so that its run record remains available for the post-loop evidence
-  # assertions.
+  # Iterate over one three-field tuple per fault scenario: the fault-injecting driver, the test case
+  # name, and the expected state transition in the abort record row. The OOM kill scenario runs last
+  # so its record retains the evidence inspected by the post-loop assertions, and the bundle
+  # manifest records the abort under its anomaly member.
   while read -r driver name change; do
     t_shim_state_reset
     start="$(px_epoch_ms)"
-    # Because px-run honors the first value assigned to any configuration variable, pass the fast
-    # poll interval explicitly on this invocation.
-    t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=0.2 -e PX_TEARDOWN=0 \
+    # Because px-run honors the first value assigned to a configuration variable, pass the fast poll
+    # interval explicitly on this invocation.
+    t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_POLL_INTERVAL_S=0.2 \
       -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/$driver.sh"
     t_equals "abort_on_${name}_is_at_once" yes "$(t_within 15000 "$start")"
     record="$(t_record)"
+    bundle="$(t_bundle)"
     t_equals "abort_on_$name" 3 "$T_STATUS"
     t_contains "abort_${name}_records_its_change" "$(t_rows 3 regionserver 0 "$change")" \
       "$(printf '%s\n' "$record" | grep '^abort' | cut -f 3-)"
+    t_equals "abort_${name}_is_the_manifest_anomaly" "true regionserver/$change" \
+      "$(t_manifest "$bundle" /anomaly/aborted) $(t_manifest "$bundle" \
+        /anomaly/instances/0/role)/$(t_manifest "$bundle" /anomaly/instances/0/change)"
+    # RQ-080: Both the cluster verdict and the bundle manifest identify the affected instance, and
+    # the run bundle produced by an aborted run still passes bundle validation.
+    t_contains "abort_${name}_is_in_the_cluster_verdict" "regionserver/0 ($change; restarts" \
+      "$(awk -F '\t' '$1 == "cluster.restart" { print $5 }' "$bundle/verdicts.tsv")"
+    t_equals "abort_${name}_bundle_validates" 0 \
+      "$(t_validate "$bundle" >/dev/null; printf '%s' "$T_STATUS")"
   done <<'A3_EOF'
 restart-wait an_unplanned_restart restarted 0 to 1
+exit-wait an_unplanned_exit went from running to exited
+vanish-wait a_lost_instance vanished
 oom-wait an_oom_kill went from running to exited
 A3_EOF
   t_contains abort_records_the_oom_reason "$(t_rows 4 term regionserver 0 oom)" "$record"
   t_contains abort_records_the_oom_evidence "$(t_rows 4 oom regionserver 0 yes)" "$record"
+  t_equals abort_manifest_carries_the_oom_evidence "0 0 oom 137 true" \
+    "$(for change in restarts_before restarts_after termination_reason exit_code oom; do
+      t_manifest "$bundle" "/anomaly/instances/0/$change"; done | tr '\n' ' ' | sed 's/ $//')"
+  t_contains abort_cluster_verdict_carries_the_oom_evidence 'reason oom, exit 137; oom yes' \
+    "$(awk -F '\t' '$1 == "cluster.restart" { print $5 }' "$bundle/verdicts.tsv")"
   t_contains abort_code_is_documented_in_the_readme '| 3 | anomaly |' \
     "$(cat "$PX_HOME/README.md")"
   t_contains abort_code_is_documented_for_backends 'aborts the run at once with exit 3' \
@@ -6019,7 +6424,7 @@ t_a3_quiet_cases() {
   t_shim_state_reset
   : >"$T_HOST_DIR/uptime.log"
   printf '0.00\n' >"$T_HOST_DIR/load"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" --class validation -e PX_TEARDOWN=0 \
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class validation \
     -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
   t_equals quiet_validation_takes_no_sample "0 0" \
     "$T_STATUS $(grep -c . "$T_HOST_DIR/uptime.log")"
@@ -6027,7 +6432,7 @@ t_a3_quiet_cases() {
   t_contains quiet_validation_records_the_check_off "$(t_rows 3 quiet quiet_host off)" "$record"
   t_contains quiet_off_check_contaminates_the_run \
     "$(t_rows 3 contamination quiet-host 'the quiet-host check is off')" "$record"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class measurement \
     -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
   record="$(t_record)"
   t_equals quiet_measurement_on_a_quiet_host "0 1" \
@@ -6040,7 +6445,7 @@ t_a3_quiet_cases() {
   printf '99.00\n' >"$T_HOST_DIR/load"
   want="load $((9900 / $(px_nproc)))% of its processors is above 25%"
   : >"$T_HOST_DIR/uptime.log"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class measurement \
     -e PX_QUIET_HOST_WAIT_S=1 -e PX_POLL_INTERVAL_S=0.2 -e PX_SCOPE_ID=px-selftest \
     "$T_WORK/drivers/host-probe.sh"
   record="$(t_record)"
@@ -6049,23 +6454,24 @@ t_a3_quiet_cases() {
   t_equals quiet_busy_host_pauses_and_retries yes \
     "$([ "$(grep -c . "$T_HOST_DIR/uptime.log")" -ge 2 ] && echo yes || echo no)"
   t_contains quiet_records_the_refusal "$(t_rows 3 quiet quiet_host refused)" "$record"
-  t_equals quiet_refusal_runs_no_driver 0 "$(printf '%s\n' "$record" | grep -c "^driver$PX_TAB")"
-  # Configuring a quiet-host wait duration of 0 takes a single load sample and immediately enforces
-  # the quiet-host requirement.
+  t_equals quiet_refusal_runs_no_driver 0 \
+    "$(printf '%s\n' "$record" | grep -c "^verb${PX_TAB}run$PX_TAB")"
+  # A quiet-host wait duration of 0 takes a single load sample and still enforces the quiet-host
+  # requirement.
   : >"$T_HOST_DIR/uptime.log"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
-    -e PX_QUIET_HOST_WAIT_S=0 --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh"
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class measurement \
+    -e PX_QUIET_HOST_WAIT_S=0 -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
   t_equals quiet_wait_0_takes_one_sample_and_decides "4 1" \
     "$T_STATUS $(grep -c . "$T_HOST_DIR/uptime.log")"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_TEARDOWN=0 \
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_CLUSTER[@]}" --class measurement \
     -e PX_QUIET_HOST_WAIT_S=1 -e PX_REQUIRE_QUIET_HOST=0 -e PX_POLL_INTERVAL_S=0.2 \
-    --scope px-selftest --driver "$T_WORK/drivers/host-probe.sh"
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/host-probe.sh"
   record="$(t_record)"
   t_equals quiet_not_required_proceeds 0 "$T_STATUS"
   t_contains quiet_contaminated_run_carries_the_tag \
     "$(t_rows 2 contamination quiet-host)" "$record"
   t_contains quiet_driver_learns_the_contamination 'contamination [quiet-host]' \
-    "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/driver.log" 2>/dev/null)"
+    "$(cat "$(printf '%s\n' "$T_STDOUT" | sed -n 1p)/logs/run.log" 2>/dev/null)"
   t_contains quiet_measurement_requires_by_default 'PX_REQUIRE_QUIET_HOST=1' \
     "$(cat "$T_ENVD/class-measurement.env")"
   # Verify O4 and O5: the check states are reported in the quiet_host row, and the stream
@@ -6156,7 +6562,7 @@ t_a3_monitor_cases() {
   mkdir -p "$seed"
   px_tsv_row breach 'the host has 3 MiB free, below the floor of 1024 MiB' >"$seed/breach.tsv"
   px_tsv_row 1 "px-tool monitor" "$seed" >"$PX_OUT/state/monitor-px-selftest"
-  t_with_shim "$T_BASH" "$T_BIN/px-run" -e PX_POLL_INTERVAL_S=0.2 -e PX_TEARDOWN=0 \
+  t_with_shim "$T_BASH" "$T_BIN/px-run" "${T_SELFTEST_RUN[@]}" -e PX_POLL_INTERVAL_S=0.2 \
     -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/oom-wait.sh"
   rm -f "$PX_OUT/state/monitor-px-selftest"
   record="$(t_record)"
@@ -6220,6 +6626,2258 @@ t_group_a3() {
   t_a3_down_lock_cases
   t_a3_inhibit_cases
 }
+
+## @description  Writes the A5 fixtures: a fake cluster with client 0, a fake java binary and
+##               probe, stub drivers for disruption cases, fixture plug-ins, and verdict streams.
+## @return       Exit 0.
+t_fixtures_a5() {
+  local name
+  T_A5="$T_WORK/a5"
+  T_A5_STATE="$T_A5/state"
+  mkdir -p "$T_A5/bin" "$T_A5/jdk/fake/bin" "$T_A5/conf" "$T_A5/plugins" "$T_A5_STATE" \
+    "$T_A5/sql" "$T_A5/verdicts"
+  # Materialize the bootstrap probe for client 0. Because the fake runtime executes container
+  # commands directly on the host, placing this shim first on PATH for every fake-runtime call
+  # allows it to stand in for the container image probe. It logs its arguments and fails when a
+  # fault flag file is present.
+  cat >"$T_SHIM_DIR/px-bootstrap-probe" <<'A5_EOF'
+#!/usr/bin/env bash
+printf 'probe %s\n' "$*" >>"$PX_FAKE_STATE_DIR/probe.log"
+[ ! -e "$PX_FAKE_STATE_DIR/probe-fails" ] || exit 1
+printf 'done every subject is verified\n'
+A5_EOF
+  # Materialize the fake JDK for client 0, which logs its command line and emulates the requested
+  # Java main class. PhoenixRuntime returns SYSTEM.CATALOG rows with UPDATE_CACHE_FREQUENCY set to
+  # 60000 for each table named in a catalog query, or otherwise emits the output of a two-statement
+  # script. Pherf loads pherf.properties from the first classpath entry (matching the real Pherf
+  # classpath lookup) and, during its -q query phase, writes an aggregate CSV with the Header.java
+  # column header to the configured result directory or to RESULTS in the working directory. Any
+  # other main class emits two ad hoc metric lines.
+  cat >"$T_A5/jdk/fake/bin/java" <<'A5_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$PX_FAKE_STATE_DIR/java.log"
+java_cp=""
+java_prev=""
+for java_arg in "$@"; do
+  [ "$java_prev" != -cp ] || java_cp=$java_arg
+  java_prev=$java_arg
+  case "$java_arg" in
+  org.apache.phoenix.util.PhoenixRuntime)
+    java_sql=${!#}
+    if grep -q 'SYSTEM.CATALOG' "$java_sql" 2>/dev/null; then
+      printf 'TABLE_SCHEM TABLE_NAME UPDATE_CACHE_FREQUENCY \n----- ----- ----- \n'
+      sed -n "s/.*TABLE_NAME IN (\(.*\));.*/\1/p" "$java_sql" | tr ',' '\n' | tr -d "'" |
+        awk 'NF { print "<null> " $1 " 60000" }'
+      printf 'Time: 0.005 sec(s)\n\n'
+      exit 0
+    fi
+    printf '3 rows upserted\nTime: 0.012 sec(s)\n\n'
+    printf 'ID  NAME \n--- ----- \n1   a     \n2   b     \nTime: 0.034 sec(s)\n\n'
+    exit 0
+    ;;
+  org.apache.phoenix.pherf.Pherf)
+    case " $* " in
+    *' -q '*)
+      java_dir="$(sed -n 's/^pherf\.default\.results\.dir=//p' "${java_cp%%:*}/pherf.properties" \
+        2>/dev/null)"
+      java_dir=${java_dir//\/tmp\/px\//$PX_FAKE_STATE_DIR/remote/}
+      java_dir=${java_dir:-RESULTS}
+      mkdir -p "$java_dir"
+      {
+        printf '%s\n' "START_TIME,QUERY_GROUP,QUERY,TENANT_ID,AVG_MAX_TIME_MS,AVG_TIME_MS,\
+AVG_MIN_TIME_MS,RUN_COUNT,EXPLAIN_PLAN,RESULT_ROW_COUNT"
+        printf '%s,serial,"SELECT COUNT(*) FROM T",,12,10,8,5,"SCAN T",1\n' \
+          "$(date -u '+%Y-%m-%d %H:%M:%S')"
+      } >"$java_dir/RESULT_px_functional_aggregate.csv"
+      ;;
+    esac
+    printf 'Pherf done\n'
+    exit 0
+    ;;
+  org.example.Exit2) exit 2 ;;
+  org.example.Exit6) exit 6 ;;
+  org.example.Sleep) exec sleep 30 ;;
+  esac
+done
+printf 'starting the fixture class\n'
+printf 'px-metric fixture.rows count 42 rows\n'
+printf 'px-metric fixture.share share 0.5 ratio\n'
+printf 'the fixture class is done\n'
+A5_EOF
+  chmod +x "$T_SHIM_DIR/px-bootstrap-probe" "$T_A5/jdk/fake/bin/java"
+  printf '%s\n' -Xmx64m >"$T_A5/conf/jvm.opts"
+  printf '%s\n' 'phoenix.jdbc.url=jdbc:phoenix:zookeeper-0:2181' \
+    >"$T_A5/conf/phoenix-client.properties"
+  printf '%s\n' 'UPSERT INTO T1 VALUES (1, 2);' 'SELECT ID, NAME FROM T1;' \
+    >"$T_A5/sql/fixture.sql"
+  # Materialize a stub driver whose run verb holds the phase@kill milestone anchor open for two
+  # seconds so a disruption targeting that anchor fires while the phase is active.
+  cat >"$T_WORK/drivers/phase-kill.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. Its run holds the anchor phase@kill open for two seconds. It
+# records one steady-state metric inside the steady window, and one table.
+pb_stage begin phase@kill
+sleep 2
+pb_stage end phase@kill
+stub_window="$(pb_stage_window steady@stub)"
+pb_metric query_errors count 0 errors steady@stub "${stub_window%%"$PX_TAB"*}" \
+  "${stub_window#*"$PX_TAB"}"
+pb_table "" T1 60000
+DRIVER_EOF
+  # Materialize a stub driver whose run verb opens steady@script after 1.5 seconds and holds it open
+  # for half a second, creating an anchor window shorter than the main poll interval.
+  cat >"$T_WORK/drivers/brief.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+sleep 1.5
+pb_stage begin steady@script
+sleep 0.5
+pb_stage end steady@script
+DRIVER_EOF
+  chmod +x "$T_WORK/drivers/phase-kill.sh" "$T_WORK/drivers/brief.sh"
+  # Create an external plug-in outside the default plug-in directory containing one failing check,
+  # one broken check that exits with code 3, and a custom threshold hook.
+  mkdir -p "$T_A5/plugins/extra/checks" "$T_A5/plugins/extra/hooks"
+  printf '%s\n' PX_PLUGIN_ID=extra PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=thresholds \
+    >"$T_A5/plugins/extra/plugin.env"
+  printf '#!/usr/bin/env bash\nprintf "extra.limit=7\\n"\n' >"$T_A5/plugins/extra/hooks/thresholds"
+  cat >"$T_A5/plugins/extra/checks/a-fail" <<'A5_EOF'
+#!/usr/bin/env bash
+. "$PX_HOME/suites/lib/common.sh"
+sx_verdict_row plugin.extra.a-fail FAIL count "limit $(sx_threshold extra.limit)"
+A5_EOF
+  printf '#!/usr/bin/env bash\nexit 3\n' >"$T_A5/plugins/extra/checks/b-broken"
+  chmod +x "$T_A5/plugins/extra/hooks"/* "$T_A5/plugins/extra/checks"/*
+  # Create invalid plug-in manifests that must be rejected: each omits a required key, targets an
+  # unsupported contract version, specifies an unknown key, or collides with a built-in driver id.
+  for name in noid nocontract contract2 badkey psql; do
+    mkdir -p "$T_A5/refused/$name"
+  done
+  printf 'PX_PLUGIN_CONTRACT=1\n' >"$T_A5/refused/noid/plugin.env"
+  printf 'PX_PLUGIN_ID=nocontract\n' >"$T_A5/refused/nocontract/plugin.env"
+  printf 'PX_PLUGIN_ID=contract2\nPX_PLUGIN_CONTRACT=2\n' >"$T_A5/refused/contract2/plugin.env"
+  printf 'PX_PLUGIN_ID=badkey\nPX_PLUGIN_CONTRACT=1\nPX_RS_HEAP=1\n' \
+    >"$T_A5/refused/badkey/plugin.env"
+  printf 'PX_PLUGIN_ID=psql\nPX_PLUGIN_CONTRACT=1\n' >"$T_A5/refused/psql/plugin.env"
+  # Materialize the helper probe script for testing the bundle and plug-in libraries; it invokes a
+  # single target function and propagates that function's exit status.
+  cat >"$T_WORK/probe/a5.sh" <<'PROBE_EOF'
+#!/usr/bin/env bash
+. "$PX_HOME/lib/common.sh"
+. "$PX_HOME/lib/plugin.sh"
+
+## @description  Reports one value (file, JSON pointer) of a JSON document.
+## @return       Writes the value to stdout. Exit 0, 1 not JSON, 6 absent.
+t_a5_json_get() { local rows; rows="$(pb_json_flat "$1")" || return; pb_json_get "$2" "$rows"; }
+
+## @description  Reports the type of one value (file, JSON pointer) of a JSON document.
+## @return       Writes the type to stdout. Exit 0, 1 not JSON, 6 absent.
+t_a5_json_type() { local rows; rows="$(pb_json_flat "$1")" || return; pb_json_type "$2" "$rows"; }
+
+## @description  Reports one TSV row per element (file, array pointer, field...) of a JSON array.
+## @return       Writes the rows to stdout. Exit 0, 1 not JSON.
+t_a5_json_rows() {
+  local rows
+  rows="$(pb_json_flat "$1")" || return
+  pb_json_rows "$rows" "${@:2}"
+}
+
+## @description  Mints run directories (count) under PX_OUT/runs, one after the other.
+## @return       Writes each directory to stdout. Exit 0, else the status of px_run_dir.
+t_a5_run_ids() {
+  local n=0
+  while [ "$n" -lt "$1" ]; do
+    px_run_dir runs || return
+    n=$((n + 1))
+  done
+}
+
+"$@"
+PROBE_EOF
+  t_a5_state_reset
+}
+
+## @description  Resets the A5 fake cluster to a running and ready RegionServer with the region
+##               mover and a running and ready client 0, with no fault flag set.
+## @return       Exit 0.
+t_a5_state_reset() {
+  rm -rf "${T_A5_STATE:?}"/*
+  {
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||regionmover\n' c0ffee00a501 regionserver \
+      px-selftest-regionserver-1 running 'Up 3 minutes (healthy)' phoenix-harness:selftest \
+      regionserver 1 0
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee00a502 client px-selftest-client-1 running \
+      'Up 3 minutes (healthy)' phoenix-harness:selftest client 1 0
+  } >"$T_A5_STATE/instances.txt"
+  printf '0\n' >"$T_A5_STATE/restart-count"
+  printf 'sha256:f00dfeed00a5\n' >"$T_A5_STATE/image-id"
+  t_seed_deployment "$PX_OUT"
+}
+
+## @description  Executes a command against the A5 fake cluster using the fake bootstrap probe and
+##               the fake JDK of client 0.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a5() {
+  t_with_shim "PATH=$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_FAKE_STATE_DIR=$T_A5_STATE" \
+    "PX_JDK_ROOT=$T_A5/jdk" PX_JDK=fake "PX_CONF_DIR=$T_A5/conf" PX_LOG_DIR=/var/log/px \
+    PX_POLL_INTERVAL_S=0.2 PX_CLUSTER_ID=selftest PX_PORT_REGIONSERVER_RPC_0=16020 "$@"
+}
+
+## @description  Executes a validation-class px-run invocation against the A5 fake cluster (driver,
+##               option...) and leaves the cluster running.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a5_run() {
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class validation -e PX_SCOPE_ID=px-selftest \
+    "$T_WORK/drivers/$1.sh" "${@:2}"
+}
+
+## @description  Reports the run bundle directory emitted on the first stdout line of the last
+##               px-run invocation.
+## @return       Writes the directory path to stdout. Exit 0.
+t_bundle() { printf '%s\n' "$T_STDOUT" | sed -n 1p; }
+
+## @description  Reports the worst status among px-bundle validate rows for a check (rows, check):
+##               fail, skip, or ok, or an empty string when no row matches.
+## @return       Writes the status word to stdout. Exit 0.
+t_check_status() {
+  printf '%s\n' "$1" | awk -F '\t' -v c="$2" '$1 == c { s[$2] = 1 }
+    END { if ("fail" in s) print "fail"; else if ("skip" in s) print "skip"
+      else if ("ok" in s) print "ok" }'
+}
+
+## @description  Executes a function from lib/bundle.sh or lib/plugin.sh inside the A5 probe script
+##               (function, args).
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_lib() { t_run "$T_BASH" "$T_WORK/probe/a5.sh" "$@"; }
+
+## @description  Copies a bundle (source, case) to <PX_OUT>/copies/<case>/<run-id> so a test case
+##               can mutate the copy and validate it under the original run identifier.
+## @return       Writes the destination path to stdout. Exit 0.
+t_bundle_copy() {
+  local target="${3:-$PX_OUT}/copies/$2/${1##*/}"
+  rm -rf "$target"
+  mkdir -p "${target%/*}"
+  cp -R "$1" "$target"
+  printf '%s\n' "$target"
+}
+
+# ---------------------------------------------------------------------------
+# A5: Contract verification suite
+# ---------------------------------------------------------------------------
+# All test cases execute against fake fixtures: stub drivers, fixture bundles, fixture verdict
+# streams, the fake runtime hosting client 0, a fake JDK, and a fake bootstrap probe. Any test case
+# identifier referenced by a requirement retains that exact name.
+
+## @description  Lists the shipped drivers, including built-in drivers and the example plug-in
+##               driver, as name and path pairs.
+## @return       Writes one "name path" line per driver to stdout. Exit 0.
+t_a5_drivers() {
+  printf '%s %s\n' psql "$PX_HOME/drivers/psql/driver.sh" pherf "$PX_HOME/drivers/pherf/driver.sh" \
+    java-main "$PX_HOME/drivers/java-main/driver.sh" example "$PX_HOME/plugins/example/driver.sh"
+}
+
+## @description  Executes the describe verb of a driver (name, path) in the minimal environment used
+##               by px-run, passing only PX_HOME, PX_DRIVER_NAME, and PX_VERB.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a5_describe() {
+  t_run env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" "PX_HOME=$PX_HOME" \
+    "PX_DRIVER_NAME=$1" PX_VERB=describe "$T_BASH" "$2" describe
+}
+
+## @description  Verifies the driver contract (R-058, R-059, R-060): contract documentation, the
+##               six verbs and exit codes of each shipped driver, describe JSON, and boundary G4.
+## @return       Records test assertions. Exit 0.
+t_group_a5_contract() {
+  local doc="$PX_HOME/docs/driver-contract.md" verb code name path missing="" bad="" rows
+  local json="$T_A5/describe" hits
+  printf '# A5: the driver contract\n'
+  mkdir -p "$json"
+  for verb in describe validate prepare run restore report; do
+    grep -q "^| \`$verb\` |" "$doc" || missing="$missing $verb"
+  done
+  t_empty contract_doc_lists_the_six_verbs "$missing"
+  missing=""
+  for code in '| 0 | ok |' '| 1 | failure |' '| 2 | usage |' '| 3 | anomaly |'; do
+    grep -qF "$code" "$doc" || missing="$missing [$code]"
+  done
+  t_empty contract_doc_lists_the_four_codes "$missing"
+  t_contains contract_doc_names_the_abort_code "abort code of \`px-run\`" "$(cat "$doc")"
+  while read -r name path; do
+    missing=""
+    for verb in describe validate prepare run restore report; do
+      grep -q "^verb_$verb() {" "$path" || missing="$missing $verb"
+    done
+    [ -z "$missing" ] || bad="$bad $name lacks$missing;"
+    t_run env -i "PATH=$PATH" "PX_HOME=$PX_HOME" "PX_DRIVER_NAME=$name" "$T_BASH" "$path" frobnicate
+    [ "$T_STATUS" = 2 ] || bad="$bad $name gave $T_STATUS for an unknown verb;"
+    t_run env -i "PATH=$PATH" "PX_HOME=$PX_HOME" "PX_DRIVER_NAME=$name" "$T_BASH" "$path"
+    [ "$T_STATUS" = 2 ] || bad="$bad $name gave $T_STATUS for no verb;"
+  done <<EOF
+$(t_a5_drivers)
+EOF
+  t_empty drivers_implement_six_verbs_and_refuse_an_unknown_one "$bad"
+  # Verify requirement R-059: each driver describe document parses as valid JSON and contains the
+  # phases, metrics, and unsupported top-level members.
+  bad=""
+  while read -r name path; do
+    t_a5_describe "$name" "$path"
+    printf '%s\n' "$T_STDOUT" >"$json/$name.json"
+    [ "$T_STATUS" = 0 ] || bad="$bad $name: describe gave $T_STATUS;"
+    t_lib pb_json_flat "$json/$name.json"
+    rows=$T_STDOUT
+    [ "$T_STATUS" = 0 ] || bad="$bad $name: not JSON;"
+    for path in /phases:array /metrics:object /metrics/count:array /metrics/share:array \
+      /metrics/duration:array /unsupported:object /unsupported/checks:array \
+      /unsupported/artifacts:array; do
+      printf '%s\n' "$rows" | grep -q "^${path%%:*}$PX_TAB${path#*:}$PX_TAB" ||
+        bad="$bad $name: no ${path%%:*} of type ${path#*:};"
+    done
+    t_lib pb_describe_load "$json/$name.json"
+    [ "$T_STATUS" = 0 ] || bad="$bad $name: pb_describe_load gave $T_STATUS;"
+  done <<EOF
+$(t_a5_drivers)
+EOF
+  t_empty describe_of_every_driver_parses_with_phases_metrics_unsupported "$bad"
+  printf '{"contract": 2}\n' >"$json/two.json"
+  t_lib pb_describe_load "$json/two.json"
+  t_equals describe_of_another_contract_is_refused 2 "$T_STATUS"
+  # Verify requirement R-060: no driver or plug-in references a container runtime or Kubernetes CLI
+  # tool directly. Any match fails this assertion, directly mirroring the acceptance criterion.
+  hits="$(grep -rnE "$T_RUNTIME_RE" "$PX_HOME/drivers" "$PX_HOME/plugins" 2>/dev/null)"
+  t_empty drivers_use_contract_only "$hits"
+  hits="$(grep -rnE "$T_K8S_RE" "$PX_HOME/drivers" "$PX_HOME/plugins" 2>/dev/null)"
+  t_empty drivers_name_no_kubernetes_tool "$hits"
+}
+
+## @description  Executes one verb of a built-in driver (driver, verb, run dir, argument...) against
+##               the A5 fake cluster with the px-run verb environment and client 0 home directories.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a5_verb() {
+  local driver=$1 verb=$2 run=$3
+  shift 3
+  t_a5 "PX_RUN_DIR=$run" "PX_RUN_ID=${run##*/}" "PX_DRIVER_NAME=$driver" \
+    "PX_DRIVER_DIR=$run/drivers/$driver" "PX_VERB=$verb" "PX_RECORD_SOURCE=driver:$driver" \
+    PX_RUN_CLASS=validation PX_BACKEND=compose PX_SCOPE_ID=px-selftest \
+    "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" \
+    "$T_BASH" "$PX_HOME/drivers/$driver/driver.sh" "$verb" "$@"
+}
+
+## @description  Reports the classpath passed to the most recent fake Java invocation that executed
+##               the specified class (class).
+## @return       Writes the -cp argument value to stdout, or empty if no call ran the class. Exit 0.
+t_java_cp() {
+  awk -v c="$1" '{ cp = ""; for (i = 1; i < NF; i++) if ($i == "-cp") cp = $(i + 1)
+    for (i = 1; i <= NF; i++) if ($i == c) { last = cp; break } }
+    END { print last }' "$T_A5_STATE/java.log" 2>/dev/null
+}
+
+## @description  Creates an empty run bundle for a driver fixture and outputs its directory path.
+## @return       Writes the bundle directory path to stdout. Exit 0.
+t_a5_bundle() {
+  t_run "$T_BASH" "$T_WORK/probe/a5.sh" pb_bundle_create
+  printf '%s\n' "$T_STDOUT"
+}
+
+## @description  Verifies the three built-in drivers against the fake cluster (R-061, R-062, R-063).
+## @return       Records test assertions. Exit 0.
+t_group_a5_drivers() {
+  local run statements aggregate csv groups line
+  printf '# A5: the built-in drivers\n'
+  t_a5_state_reset
+  # Verify requirement R-061: the psql driver executes a fixture SQL script through the fake
+  # PhoenixRuntime, and its report verb records per-statement row counts and total script duration.
+  run="$(t_a5_bundle)"
+  t_a5_verb psql run "$run" "$T_A5/sql/fixture.sql"
+  t_equals psql_run_exits_0 0 "$T_STATUS"
+  t_a5_verb psql report "$run" "$T_A5/sql/fixture.sql"
+  t_equals psql_report_exits_0 0 "$T_STATUS"
+  statements="$(cat "$run/drivers/psql/statements.tsv" 2>/dev/null)"
+  t_contains psql_records_the_rows_of_the_update \
+    "$(t_rows 6 "$T_A5/sql/fixture.sql" 1 1 upserted 3 12)" "$statements"
+  t_contains psql_records_the_rows_of_the_query \
+    "$(t_rows 6 "$T_A5/sql/fixture.sql" 1 2 selected 2 34)" "$statements"
+  aggregate="$(cat "$run/metrics/aggregate.tsv" 2>/dev/null)"
+  t_contains psql_records_the_file_duration \
+    "driver:psql${PX_TAB}steady@script${PX_TAB}psql.file_duration_ms${PX_TAB}duration" \
+    "$aggregate"
+  t_contains psql_records_the_statement_count \
+    "steady@script${PX_TAB}psql.statements${PX_TAB}count${PX_TAB}2${PX_TAB}" "$aggregate"
+  t_contains psql_lists_scans_unsupported '"key": "driver.storage_scans"' \
+    "$(cat "$T_A5/describe/psql.json")"
+  t_contains psql_lists_rpcs_unsupported '"key": "driver.rpc_calls"' \
+    "$(cat "$T_A5/describe/psql.json")"
+  t_contains psql_runs_phoenix_runtime_in_client_0 'org.apache.phoenix.util.PhoenixRuntime' \
+    "$(cat "$T_A5_STATE/java.log" 2>/dev/null)"
+  t_contains psql_puts_the_phoenix_client_jars_on_the_class_path ":$T_A5/phoenix/client/*:" \
+    ":$(t_java_cp org.apache.phoenix.util.PhoenixRuntime):"
+  # Verify requirement R-062: the pherf driver converts a RESULT_*_aggregate.csv file carrying the
+  # Header.java header into one aggregated metric interval per query group.
+  run="$(t_a5_bundle)"
+  mkdir -p "$run/drivers/pherf/results"
+  csv="$run/drivers/pherf/results/RESULT_px_functional_aggregate.csv"
+  {
+    printf '%s\n' "START_TIME,QUERY_GROUP,QUERY,TENANT_ID,AVG_MAX_TIME_MS,AVG_TIME_MS,\
+AVG_MIN_TIME_MS,RUN_COUNT,EXPLAIN_PLAN,RESULT_ROW_COUNT"
+    printf '%s\n' '2026-11-20 17:00:01,count,"SELECT COUNT(*) FROM T",,12,10,8,5,"SCAN T",1'
+    printf '%s\n' '2026-11-20 17:00:02,scan,"SELECT * FROM T, U",,30,20,10,4,"FULL, SCAN",250'
+  } >"$csv"
+  printf 'start_ms\tend_ms\tstatus\n%s\t%s\t0\n' 1795194000000 1795194600000 \
+    >"$run/drivers/pherf/run.tsv"
+  printf '%s\tbegin\tsteady@pherf\tdriver:pherf\t\n%s\tend\tsteady@pherf\tdriver:pherf\t\n' \
+    1795194000000 1795194600000 >"$run/stages.tsv"
+  t_a5_verb pherf report "$run" --scenario "$T_A5/sql/fixture.sql"
+  t_equals pherf_report_exits_0 0 "$T_STATUS"
+  groups="$(cat "$run/drivers/pherf/groups.tsv" 2>/dev/null)"
+  t_contains pherf_emits_the_count_group "count${PX_TAB}group@count${PX_TAB}" "$groups"
+  t_contains pherf_emits_the_scan_group "scan${PX_TAB}group@scan${PX_TAB}" "$groups"
+  aggregate="$(cat "$run/metrics/aggregate.tsv" 2>/dev/null)"
+  line="$(printf '%s\n' "$aggregate" |
+    awk -F '\t' '$4 == "group@scan" && $5 == "pherf.result_rows"')"
+  t_contains pherf_group_interval_carries_its_rows "${PX_TAB}count${PX_TAB}250${PX_TAB}" "$line"
+  t_equals pherf_group_interval_lies_in_the_steady_window yes \
+    "$(printf '%s\n' "$line" | awk -F '\t' '{ print ($1 >= 1795194000000 && \
+      $2 <= 1795194600000 && $1 <= $2) ? "yes" : "no" }')"
+  # Verify requirement R-063: the java-main driver executes a fixture class that emits two ad hoc
+  # metrics, passes the JDBC URL with RequestMetric=true via px.jdbc.url, and exports both metrics
+  # to the aggregate metric table.
+  run="$(t_a5_bundle)"
+  : >"$T_A5_STATE/java.log"
+  t_a5_verb java-main run "$run" org.example.Fixture one two
+  t_equals java_main_run_exits_0 0 "$T_STATUS"
+  t_contains java_main_turns_request_metrics_on \
+    '-Dpx.jdbc.url=jdbc:phoenix:zookeeper-0:2181;RequestMetric=true' \
+    "$(cat "$T_A5_STATE/java.log" 2>/dev/null)"
+  t_contains java_main_runs_the_class_with_its_arguments 'org.example.Fixture one two' \
+    "$(cat "$T_A5_STATE/java.log" 2>/dev/null)"
+  t_contains java_main_puts_the_phoenix_client_jars_on_the_class_path \
+    ":$T_A5/phoenix/client/*:" ":$(t_java_cp org.example.Fixture):"
+  t_a5_verb java-main report "$run" org.example.Fixture one two
+  aggregate="$(cat "$run/metrics/aggregate.tsv" 2>/dev/null)"
+  t_contains java_main_records_the_first_metric \
+    "steady@main${PX_TAB}fixture.rows${PX_TAB}count${PX_TAB}42${PX_TAB}rows" "$aggregate"
+  t_contains java_main_records_the_second_metric \
+    "steady@main${PX_TAB}fixture.share${PX_TAB}share${PX_TAB}0.5${PX_TAB}ratio" "$aggregate"
+  t_absent java_main_keeps_program_lines_out_of_the_metrics 'starting the fixture' "$aggregate"
+  # Confirm that remote staging for fake client 0 writes only inside the fake state directory and
+  # never directly under /tmp/px on the host.
+  t_equals drivers_stage_only_below_the_fake_client 0 \
+    "$(find /tmp/px -maxdepth 1 -name "${run##*/}" 2>/dev/null | grep -c .)"
+}
+## @description  Executes px-bundle validate against a run bundle directory (dir).
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_validate() {
+  local root=${1%/runs/*}
+  [ "$root" != "$1" ] || root=${1%/copies/*}
+  [ "$root" != "$1" ] || root=$PX_OUT
+  t_run env "PX_OUT=$root" "$T_BASH" "$T_BIN/px-bundle" validate "$1"
+}
+
+## @description  Extracts a value (bundle, JSON pointer) from the manifest.json file of a bundle.
+## @return       Writes the resolved value to stdout, or empty when absent. Exit 0.
+t_manifest() {
+  t_lib t_a5_json_get "$1/manifest.json" "$2"
+  printf '%s\n' "$T_STDOUT"
+}
+
+## @description  Replaces literal old text with new text (file, anchor, old, new) on the first line
+##               containing the old text at or after the first line matching the literal anchor.
+## @return       Exit 0.
+t_json_edit() {
+  awk -v a="$2" -v o="$3" -v n="$4" '
+    !hit && index($0, a) { seen = 1 }
+    seen && !hit && (i = index($0, o)) {
+      $0 = substr($0, 1, i - 1) n substr($0, i + length(o)); hit = 1
+    }
+    { print }' "$1" >"$1.new" && mv -f "$1.new" "$1"
+}
+
+## @description  Verifies milestone-triggered disruption (R-080) and validates the resulting base
+##               run bundle and its mutated copies (R-064 to R-068, R-279).
+## @return       Records test assertions. Exit 0.
+t_group_a5_bundle() {
+  local base run record stages begin end inj rec act copy rows path bad="" one two sum
+  printf '# A5: the disruption and the bundle\n'
+  t_a5_state_reset
+  t_shim_log_reset
+  # Verify requirement R-080: inject a RegionServer kill at the phase@kill milestone anchor opened
+  # during the driver's run verb.
+  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,0'
+  base="$(t_bundle)"
+  T_A5_BASE=$base
+  t_equals disruption_run_exits_0 0 "$T_STATUS"
+  record="$(cat "$base/run-record.tsv" 2>/dev/null)"
+  stages="$(cat "$base/stages.tsv" 2>/dev/null)"
+  begin="$(printf '%s\n' "$stages" |
+    awk -F '\t' '$2 == "begin" && $3 == "phase@kill" { print $1 }')"
+  end="$(printf '%s\n' "$stages" | awk -F '\t' '$2 == "end" && $3 == "phase@kill" { print $1 }')"
+  act="$(printf '%s\n' "$record" | awk -F '\t' '$1 == "action" && $3 == "kill" { print $2 }')"
+  inj="$(printf '%s\n' "$record" | awk -F '\t' '$1 == "recover" { print $3 }')"
+  rec="$(printf '%s\n' "$record" | awk -F '\t' '$1 == "recover" { print $4 }')"
+  t_equals disruption_fires_inside_its_milestone yes "$(awk -v b="${begin:-0}" \
+    -v e="${end:-0}" -v i="${inj:-0}" -v a="${act:-0}" \
+    'BEGIN { print (b > 0 && i >= b && a >= i && i <= e) ? "yes" : "no" }')"
+  t_contains disruption_kills_the_named_instance 'KILL c0ffee00a501' \
+    "$(cat "$T_SHIM_LOG")"
+  t_contains recovery_gate_starts_the_killed_instance 'start c0ffee00a501' "$(cat "$T_SHIM_LOG")"
+  t_contains recovery_gate_passes "$(t_rows 5 recover 1 "$inj" "$rec" ok)" "$record"
+  t_equals recovery_gate_ends_after_the_injection yes \
+    "$([ "${rec:-0}" -ge "${inj:-1}" ] && echo yes || echo no)"
+  t_equals disruption_is_in_the_manifest "kill regionserver phase:phase@kill ok" \
+    "$(t_manifest "$base" /disruptions/0/action) $(t_manifest "$base" /disruptions/0/role)\
+ $(t_manifest "$base" /disruptions/0/when) $(t_manifest "$base" /disruptions/0/recovery)"
+  t_equals disruption_mttr_is_a_number number \
+    "$(t_lib t_a5_json_type "$base/manifest.json" /disruptions/0/mttr_seconds; echo "$T_STDOUT")"
+  t_equals disruption_mttr_is_the_recovery_time \
+    "$(awk -v r="${rec:-0}" -v i="${inj:-0}" 'BEGIN { printf "%.3f", (r - i) / 1000 }')" \
+    "$(t_manifest "$base" /disruptions/0/mttr_seconds)"
+  t_contains recovery_check_passes "cluster.recovery${PX_TAB}PASS${PX_TAB}none" \
+    "$(cat "$base/verdicts.tsv" 2>/dev/null)"
+  t_contains post_recovery_check_passes "cluster.post_recovery${PX_TAB}PASS${PX_TAB}count" \
+    "$(cat "$base/verdicts.tsv" 2>/dev/null)"
+  t_contains post_recovery_runs_the_bootstrap_probe 'probe ' \
+    "$(cat "$T_A5_STATE/probe.log" 2>/dev/null)"
+  # Confirm that the recovery gate blocks until the target role becomes ready: an instance that
+  # remains unready holds the gate until the readiness timeout expires, leaving mttr_seconds null.
+  t_a5_state_reset
+  : >"$T_A5_STATE/start-unready"
+  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,0' -e PX_TIMEOUT_READY=2
+  run="$(t_bundle)"
+  t_equals recovery_gate_waits_for_readiness_then_fails 1 "$T_STATUS"
+  t_contains recovery_gate_records_the_timeout "recover${PX_TAB}1${PX_TAB}" \
+    "$(grep "${PX_TAB}timeout\$" "$run/run-record.tsv" 2>/dev/null)"
+  t_equals recovery_timeout_has_no_mttr null "$(t_lib t_a5_json_type "$run/manifest.json" \
+    /disruptions/0/mttr_seconds; echo "$T_STDOUT")"
+  t_contains recovery_timeout_fails_the_check "cluster.recovery${PX_TAB}FAIL" \
+    "$(cat "$run/verdicts.tsv" 2>/dev/null)"
+  t_validate "$run"
+  t_equals null_mttr_still_validates ok "$(t_check_status "$T_STDOUT" disruptions)"
+  rm -f "$T_A5_STATE/start-unready"
+
+  # Verify requirements R-064 through R-068: the base bundle passes validation, whereas each
+  # structural or schema defect introduced below is rejected.
+  # Verify requirement R-059: checks and artifacts declared unsupported by the driver's describe
+  # document are recorded as unavailable, and the overall run still passes.
+  t_contains unsupported_check_is_recorded_unavailable \
+    "query_latency.p50_ms${PX_TAB}SKIP${PX_TAB}none${PX_TAB}px-run${PX_TAB}unavailable: a stub" \
+    "$(cat "$base/verdicts.tsv" 2>/dev/null)"
+  t_lib t_a5_json_rows "$base/manifest.json" /artifacts path status required
+  t_contains unsupported_artifact_is_unavailable_in_the_manifest \
+    "oplog/${PX_TAB}unavailable${PX_TAB}false" "$T_STDOUT"
+  t_validate "$base"
+  t_equals bundle_of_a_full_run_validates 0 "$T_STATUS"
+  rows=$T_STDOUT
+  copy="$(t_bundle_copy "$base" nomanifest)"
+  rm -f "$copy/manifest.json"
+  t_validate "$copy"
+  t_equals bundle_without_manifest_is_refused "1 fail" "$T_STATUS $(t_check_status \
+    "$T_STDOUT" manifest)"
+  copy="$(t_bundle_copy "$base" noversion)"
+  t_json_edit "$copy/manifest.json" '"bundle_format_version"' bundle_format_version bundle_format
+  t_validate "$copy"
+  t_equals bundle_without_format_version_is_refused "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" format)"
+  copy="$(t_bundle_copy "$base" version2)"
+  t_json_edit "$copy/manifest.json" '"bundle_format_version"' ': 1,' ': 2,'
+  t_validate "$copy"
+  t_equals bundle_of_an_unknown_format_version_is_refused "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" format)"
+  t_contains bundle_doc_states_the_run_id_grammar '^[0-9]{8}T[0-9]{6}Z-[0-9a-z]{4}$' \
+    "$(cat "$PX_HOME/docs/bundle-format.md")"
+  t_lib t_a5_run_ids 12
+  one=$T_STDOUT
+  t_equals run_ids_of_one_second_never_collide 12 \
+    "$(printf '%s\n' "$one" | sort -u | grep -cE '/[0-9]{8}T[0-9]{6}Z-[0-9a-z]{4}$')"
+  # Verify requirement RQ-111: generated run identifiers sort lexicographically in creation order,
+  # even when minted within the same second.
+  t_equals run_ids_sort_in_creation_order "$one" "$(printf '%s\n' "$one" | LC_ALL=C sort)"
+  "$T_BASH" "$T_WORK/probe/a5.sh" t_a5_run_ids 3 >"$T_A5/ids-1" &
+  one=$!
+  "$T_BASH" "$T_WORK/probe/a5.sh" t_a5_run_ids 3 >"$T_A5/ids-2"
+  wait "$one"
+  t_equals run_ids_of_two_processes_never_collide 6 \
+    "$(cat "$T_A5/ids-1" "$T_A5/ids-2" | sort -u | grep -c .)"
+  # Verify requirement R-065: the manifest must include all five steady-state metric keys, the
+  # disruption mttr_seconds key, and a steady@ phase anchor.
+  for path in query_latency.p50_ms query_latency.p99_ms query_errors offered_rate achieved_qps; do
+    copy="$(t_bundle_copy "$base" "nokey-$path")"
+    t_json_edit "$copy/manifest.json" '"steady"' "\"$path\"" "\"x-$path\""
+    t_validate "$copy"
+    [ "$T_STATUS $(t_check_status "$T_STDOUT" steady)" = "1 fail" ] ||
+      bad="$bad $path gave $T_STATUS;"
+  done
+  copy="$(t_bundle_copy "$base" nomttr)"
+  t_json_edit "$copy/manifest.json" '"disruptions"' '"mttr_seconds"' '"mttr"'
+  t_validate "$copy"
+  [ "$T_STATUS $(t_check_status "$T_STDOUT" disruptions)" = "1 fail" ] || bad="$bad mttr;"
+  t_empty bundle_without_a_steady_metric_key_is_refused "$bad"
+  copy="$(t_bundle_copy "$base" nosteady)"
+  t_json_edit "$copy/manifest.json" '"steady"' '"steady@stub"' '"other@stub"'
+  t_validate "$copy"
+  t_equals bundle_without_a_steady_anchor_is_refused "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" steady)"
+  t_equals bundle_steady_metric_has_a_value 0 "$(t_manifest "$base" \
+    '/steady/0/metrics/query_errors/value')"
+  copy="$(t_bundle_copy "$base" outside)"
+  t_json_edit "$copy/manifest.json" '"query_errors": {' '"start_ms": ' '"start_ms": 1, "x_ms": '
+  t_validate "$copy"
+  t_equals bundle_metric_outside_its_window_is_refused "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" steady)"
+  # Verify requirement R-066: the manifest records the run class, backend, container image digests,
+  # table UPDATE_CACHE_FREQUENCY property, and quiet-host contamination tags.
+  t_equals bundle_records_class_backend_image_table_tags \
+    "validation compose sha256:f00dfeed00a5 60000 quiet-host" \
+    "$(t_manifest "$base" /run/class) $(t_manifest "$base" /run/backend)\
+ $(t_manifest "$base" /images/0/image_id) $(t_manifest "$base" /tables/0/update_cache_frequency)\
+ $(t_manifest "$base" /quiet_host/tags/0)"
+  bad=""
+  for path in '"run"|"class"|"klass"|class' '"run"|"backend": "compose"|"backend": ""|backend' \
+    '"images"|"image_id"|"image"|images' \
+    '"tables"|"update_cache_frequency"|"ucf"|tables' '"quiet_host"|"tags"|"tag"|quiet_host'; do
+    IFS='|' read -r one two sum rows <<<"$path"
+    copy="$(t_bundle_copy "$base" "field-$rows")"
+    t_json_edit "$copy/manifest.json" "$one" "$two" "$sum"
+    t_validate "$copy"
+    [ "$T_STATUS $(t_check_status "$T_STDOUT" "$rows")" = "1 fail" ] ||
+      bad="$bad $rows gave $T_STATUS $(t_check_status "$T_STDOUT" "$rows");"
+  done
+  rows="$(t_validate "$base"; printf '%s\n' "$T_STDOUT")"
+  t_empty bundle_without_a_recorded_field_is_refused "$bad"
+  # Verify requirement R-052 and invariant G16: a run that completes without an abort sets the
+  # anomaly field to null, and a manifest omitting the anomaly member is rejected.
+  t_equals clean_run_has_no_anomaly null \
+    "$(t_lib t_a5_json_type "$base/manifest.json" /anomaly; echo "$T_STDOUT")"
+  copy="$(t_bundle_copy "$base" noanomaly)"
+  grep -v '^  "anomaly": null,$' "$copy/manifest.json" >"$copy/m.json"
+  mv -f "$copy/m.json" "$copy/manifest.json"
+  t_validate "$copy"
+  t_equals manifest_without_the_anomaly_is_refused "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" anomaly)"
+  # Verify requirement R-067: px-bundle validate checks every required path and identifies missing
+  # entries by name. The expected list is derived directly from the layout table in
+  # docs/bundle-format.md for a cluster run with a surviving instance and the phase-kill driver,
+  # rather than from the bundle's own manifest, so a faulty requirement condition in the validator
+  # code is caught by this test.
+  bad=""
+  for path in run-record.tsv stages.tsv verdicts.tsv metrics/timeline.tsv \
+    metrics/aggregate.tsv cluster/images.tsv report/verdicts.tsv report/run-summary.tsv \
+    report/cluster-summary.tsv cluster/topology.env cluster/services.tsv logs/instance/ \
+    drivers/phase-kill/describe.json logs/describe.log logs/validate.log logs/prepare.log \
+    logs/run.log logs/restore.log logs/report.log; do
+    copy="$(t_bundle_copy "$base" "path-${path//\//-}")"
+    rm -rf "${copy:?}/$path"
+    t_validate "$copy"
+    if [ "$T_STATUS" != 1 ] || ! printf '%s\n' "$T_STDOUT" |
+      grep -q "^path${PX_TAB}fail${PX_TAB}$path"; then
+      bad="$bad $path;"
+    fi
+  done
+  t_empty bundle_without_a_required_path_is_refused_by_name "$bad"
+  t_equals bundle_requires_the_documented_paths 0 "$(for path in run-record.tsv stages.tsv \
+    verdicts.tsv metrics/timeline.tsv metrics/aggregate.tsv cluster/images.tsv \
+    cluster/topology.env cluster/services.tsv logs/instance/ report/verdicts.tsv \
+    report/run-summary.tsv report/cluster-summary.tsv manifest.json; do
+      grep -q "^| \`$path\` |" "$PX_HOME/docs/bundle-format.md" || echo "$path"
+      [ -e "$base/$path" ] || echo "$path"
+    done | grep -c .)"
+  # Verify requirement R-068: a bundle missing all optional artifacts still passes validation, and
+  # each absent optional path is reported as a skip row.
+  copy="$(t_bundle_copy "$base" nooptional)"
+  rm -rf "$copy/breach.tsv" "$copy/tables.tsv" "$copy/thresholds.properties" \
+    "$copy/cluster/plugins" "$copy/logs/gc" "$copy/metrics/index.tsv" \
+    "$copy/profiles" "$copy/jfr" "$copy/traces" "$copy/oplog" "$copy/host" "$copy/meta" \
+    "$copy/plugins"
+  t_validate "$copy"
+  t_equals bundle_without_optional_artifacts_validates 0 "$T_STATUS"
+  bad=""
+  for path in breach.tsv tables.tsv thresholds.properties cluster/plugins/ logs/gc/ \
+    metrics/index.tsv profiles/ jfr/ traces/ host/ meta/; do
+    printf '%s\n' "$T_STDOUT" | grep -q "^path${PX_TAB}skip${PX_TAB}$path" || bad="$bad $path"
+  done
+  # Verify requirement R-064: the plugins context row in run-record.tsv lists the enabled plug-ins,
+  # so an enabled plug-in that wrote no manifest.tsv or omitted a file listed in its manifest.tsv
+  # produces a skip row rather than a validation failure.
+  printf 'context\tplugins\texample\n' >>"$copy/run-record.tsv"
+  t_validate "$copy"
+  printf '%s\n' "$T_STDOUT" | grep -q "^path${PX_TAB}skip${PX_TAB}plugins/example/manifest.tsv" ||
+    bad="$bad plugins/example/manifest.tsv"
+  mkdir -p "$copy/plugins/example"
+  printf 'path\tdescription\nlost.txt\tone file that the plug-in never wrote\n' \
+    >"$copy/plugins/example/manifest.tsv"
+  t_validate "$copy"
+  printf '%s\n' "$T_STDOUT" | grep -q "^path${PX_TAB}skip${PX_TAB}plugins/example/lost.txt" ||
+    bad="$bad plugins/example/lost.txt"
+  printf '%s\n' "$T_STDOUT" | grep -q "^path${PX_TAB}ok${PX_TAB}plugins/example/manifest.tsv" ||
+    bad="$bad present plugins/example/manifest.tsv"
+  t_empty bundle_reports_each_absent_optional_path_skipped "$bad"
+  t_contains bundle_reports_an_unsupported_artifact_unavailable \
+    "path${PX_TAB}skip${PX_TAB}oplog/ is unavailable" "$T_STDOUT"
+
+  # Verify requirement R-279: two consecutive runs produce two independent, versioned bundles
+  # without mutating any file in the earlier bundle.
+  t_a5_state_reset
+  t_a5_run exit-code -- 0
+  one="$(t_bundle)"
+  sum="$(find "$one" -type f -exec cksum {} + | sort)"
+  t_a5_run exit-code -- 0
+  two="$(t_bundle)"
+  t_equals two_runs_write_two_bundles yes \
+    "$([ -n "$one" ] && [ -d "$two" ] && [ "$one" != "$two" ] && echo yes || echo no)"
+  t_equals second_run_changes_no_file_of_the_first "$sum" \
+    "$(find "$one" -type f -exec cksum {} + | sort)"
+  t_equals each_manifest_carries_the_format_version "1 1" \
+    "$(t_manifest "$one" /bundle_format_version) $(t_manifest "$two" /bundle_format_version)"
+  t_empty harness_holds_no_workload_logic_outside_a_driver "$(grep -nE \
+    'PhoenixRuntime|org\.apache\.phoenix\.pherf|jdbc:phoenix|UPSERT|SELECT ' "$T_BIN/px-run" \
+    "$T_BIN/px-report" "$T_BIN/px-bundle" "$PX_HOME/lib/bundle.sh" "$PX_HOME/lib/plugin.sh" \
+    "$PX_HOME/suites/check-cluster.sh" "$PX_HOME/suites/checks/cluster.sh" 2>/dev/null)"
+  # Verify invariant G23 and requirement R-048: every metric record carries the run class and
+  # contamination tags in force when the record was written.
+  t_equals metric_records_carry_class_and_contamination "validation quiet-host" \
+    "$(awk -F '\t' 'NR == 2 { print $9 " " $10 }' "$base/metrics/aggregate.tsv" 2>/dev/null)"
+  t_a5_state_reset
+}
+## @description  Reports the numeric lattice rank of a verdict severity, from 0 (PASS) to 4 (ERROR).
+## @return       Writes the numeric rank to stdout. Exit 0.
+t_rank() {
+  case "$1" in
+  PASS) echo 0 ;;
+  SKIP) echo 1 ;;
+  ADVISORY) echo 2 ;;
+  FAIL) echo 3 ;;
+  *) echo 4 ;;
+  esac
+}
+
+## @description  Reports the documented process exit code for a merged result word: 0, 1, or 3.
+## @return       Writes the exit code to stdout. Exit 0.
+t_code_of() { case "$1" in PASS | SKIP | ADVISORY) echo 0 ;; ERROR) echo 3 ;; *) echo 1 ;; esac; }
+
+## @description  Executes px-report against fixture verdict streams (class, contamination,
+##               argument...).
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_report() {
+  t_run env "PX_RUN_CLASS=$1" "PX_CONTAMINATION=$2" "$T_BASH" "$T_BIN/px-report" "${@:3}"
+}
+
+## @description  Extracts the overall result word from the most recent px-report stdout stream.
+## @return       Writes the result word to stdout. Exit 0.
+t_result() { printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "result" { print $2 }'; }
+
+## @description  Verifies verdict lattice merging and contamination rules (R-069, R-070, R-071, and
+##               the merge behavior of R-078).
+## @return       Records test assertions. Exit 0.
+t_group_a5_report() {
+  local dir="$T_A5/verdicts" a b want bad="" copy run base=$T_A5_BASE
+  printf '# A5: the verdict merge\n'
+  # Verify requirement R-069: every pair of severities in the lattice merges to the higher-ranked
+  # severity, while a stream consisting solely of SKIP rows resolves to INCONCLUSIVE.
+  for a in PASS SKIP ADVISORY FAIL ERROR; do
+    for b in PASS SKIP ADVISORY FAIL ERROR; do
+      printf 'one\t%s\tnone\taction\tleft\n' "$a" >"$dir/$a-$b.tsv"
+      printf 'two\t%s\tcount\tdriver:x\tright\n' "$b" >"$dir/$a-$b.d.tsv"
+      want=$a
+      [ "$(t_rank "$b")" -le "$(t_rank "$a")" ] || want=$b
+      [ "$a$b" != SKIPSKIP ] || want=INCONCLUSIVE
+      t_report measurement "" --verdict "$dir/$a-$b.tsv" --verdict "$dir/$a-$b.d.tsv"
+      if [ "$(t_result)" != "$want" ] ||
+        [ "$T_STATUS" != "$(t_code_of "$want")" ]; then
+        bad="$bad $a+$b gave $(t_result) $T_STATUS, not $want;"
+      fi
+    done
+  done
+  t_empty report_merges_every_pair_to_the_documented_maximum "$bad"
+  t_report measurement "" --verdict "$dir/ADVISORY-PASS.tsv" --verdict "$dir/ADVISORY-PASS.d.tsv"
+  t_equals report_advisory_and_pass_pass_the_run "0 ADVISORY" "$T_STATUS $(t_result)"
+  # Verify requirement R-170: the harness and all verdict writers share a single severity
+  # vocabulary.
+  t_equals severity_vocabulary_is_the_shared_set "PASS SKIP ADVISORY FAIL ERROR" \
+    "$(sed -n 's/^SX_SEVERITIES="\(.*\)"$/\1/p' "$PX_HOME/suites/lib/common.sh")"
+  t_contains report_doc_orders_the_lattice 'PASS  <  SKIP  <  ADVISORY  <  FAIL  <  ERROR' \
+    "$(cat "$PX_HOME/docs/bundle-format.md")"
+  printf 'one\tPASS\tnone\taction\tok\nodd\tWARNING\tnone\taction\tx\n' >"$dir/unknown.tsv"
+  t_report measurement "" --verdict "$dir/unknown.tsv"
+  t_equals report_unknown_severity_is_an_error "3 ERROR" "$T_STATUS $(t_result)"
+  printf 'odd\tFAIL\ttime\taction\tx\n' >"$dir/class.tsv"
+  t_report measurement "" --verdict "$dir/class.tsv"
+  t_equals report_unknown_class_is_an_error "3 ERROR" "$T_STATUS $(t_result)"
+  t_report measurement "" --verdict "$dir/none.tsv"
+  t_equals report_absent_stream_is_6 6 "$T_STATUS"
+  # Verify requirement R-071: in a contaminated run, a duration-class FAIL is downgraded to
+  # ADVISORY, whereas a count-class FAIL remains authoritative and fails the run.
+  printf 'latency\tFAIL\tduration\tdriver:x\tslow\nrows\tFAIL\tcount\tdriver:x\tshort\n' \
+    >"$dir/mixed.tsv"
+  t_report measurement quiet-host --verdict "$dir/mixed.tsv"
+  t_equals report_contaminated_run_fails_on_the_count "1 FAIL" "$T_STATUS $(t_result)"
+  t_contains report_contaminated_time_verdict_is_advisory \
+    "latency${PX_TAB}ADVISORY${PX_TAB}duration" "$T_STDOUT"
+  t_contains report_count_verdict_stays_authoritative "rows${PX_TAB}FAIL${PX_TAB}count" \
+    "$T_STDOUT"
+  t_report measurement "" --verdict "$dir/mixed.tsv"
+  t_contains report_quiet_measurement_keeps_the_time_fail \
+    "latency${PX_TAB}FAIL${PX_TAB}duration" "$T_STDOUT"
+  t_report validation "" --verdict "$dir/mixed.tsv"
+  t_contains report_validation_time_verdict_is_advisory \
+    "latency${PX_TAB}ADVISORY${PX_TAB}duration" "$T_STDOUT"
+  # Confirm that evaluating a run bundle applies the same downgrade rule using the class and
+  # contamination recorded in the bundle itself rather than ambient environment variables.
+  copy="$(t_bundle_copy "$base" contaminated)"
+  cat "$dir/mixed.tsv" >>"$copy/verdicts.tsv"
+  t_report measurement "" "$copy"
+  t_equals report_bundle_reads_its_own_class "1 FAIL" "$T_STATUS $(t_result)"
+  t_contains report_bundle_writes_the_effective_rows \
+    "latency${PX_TAB}ADVISORY${PX_TAB}duration${PX_TAB}driver:x${PX_TAB}slow${PX_TAB}FAIL" \
+    "$(cat "$copy/report/verdicts.tsv" 2>/dev/null)"
+  t_contains report_bundle_writes_the_run_summary "${PX_TAB}FAIL${PX_TAB}" \
+    "$(sed -n 2p "$copy/report/run-summary.tsv" 2>/dev/null)"
+  t_equals report_bundle_writes_the_cluster_summary_header \
+    "role index image_id state_pre state_post restarts_pre restarts_post change oom" \
+    "$(head -n 1 "$copy/report/cluster-summary.tsv" 2>/dev/null | tr '\t' ' ')"
+  t_a5_resolver_cases
+}
+
+## @description  Executes px-report or px-bundle (output root, command, argument...) with PX_OUT
+##               configured to the specified output root.
+## @return       Populates T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_a5_at() {
+  local root=$1 name=$2
+  shift 2
+  t_run env "PX_OUT=$root" "$T_BASH" "$T_BIN/$name" "$@"
+}
+
+## @description  Duplicates a run bundle (source, destination) under a new run id and updates the
+##               run id recorded in its manifest.
+## @return       Copies the bundle directory and rewrites manifest.json. Exit 0.
+t_a5_rename() {
+  cp -R "$1" "$2"
+  sed "s/\"id\": \"${1##*/}\"/\"id\": \"${2##*/}\"/" "$1/manifest.json" >"$2/manifest.json"
+}
+
+## @description  Verifies the shared bundle resolver of px-report and px-bundle for run ids, paths,
+##               newest finished bundle selection, PX_OUT confinement, and closing result rows.
+## @return       Records test assertions. Exit 0.
+t_a5_resolver_cases() {
+  local base=$T_A5_BASE root="$T_A5/newest" empty="$T_A5/empty-out" old new got outside
+  rm -rf "$root" "$empty" "$T_A5/outside"
+  mkdir -p "$root/runs" "$root/copies" "$root/collect" "$empty/runs" "$T_A5/outside"
+  old="$root/runs/20991231T000000Z-0old"
+  new="$root/runs/20991231T000001Z-0new"
+  outside="$T_A5/outside/20991231T000000Z-0out"
+  t_a5_rename "$base" "$old"
+  t_a5_rename "$base" "$new"
+  cp -R "$base" "$outside"
+  cp -R "$base" "$root/copies/20991231T000002Z-copy"
+  cp -R "$base" "$root/collect/20991231T000003Z-coll"
+  rm -rf "$new/manifest.json" "$new/report" "$old/report" "$outside/report"
+  t_a5_at "$root" px-report -n
+  t_equals report_dry_run_resolves_and_plans "0 yes no" "$T_STATUS $(t_flag \
+    "plan${PX_TAB}write${PX_TAB}$old/report" "$T_STDOUT") $(t_exists "$old/report")"
+  t_a5_at "$root" px-report
+  t_equals report_defaults_to_the_newest_finished_bundle "0 $old yes no" "$T_STATUS $(t_last_line \
+    "$T_STDOUT" | cut -f 4) $(t_exists "$old/report/run-summary.tsv") $(t_exists "$new/report")"
+  t_equals report_result_row_names_the_bundle "$(t_rows 3 result 0 "$old") 1" \
+    "$(t_last_line "$T_STDOUT" | cut -f 1,3,4) $(printf '%s\n' "$T_STDOUT" |
+      grep -c "^result$PX_TAB")"
+  got=$T_STDOUT
+  t_a5_at "$root" px-report 20991231T000000Z-0old
+  t_equals report_takes_a_run_id "0 yes" "$T_STATUS $([ "$got" = "$T_STDOUT" ] && echo yes ||
+    echo no)"
+  t_a5_at "$empty" px-report
+  t_equals report_without_a_finished_bundle_is_6 "6 yes" "$T_STATUS $(t_flag \
+    'no finished bundle under' "$T_STDERR")"
+  t_run "$T_BASH" "$T_BIN/px-report" "$outside"
+  t_equals report_refuses_a_bundle_outside_px_out "2 yes no" "$T_STATUS $(t_flag \
+    'lies outside PX_OUT' "$T_STDERR") $(t_exists "$outside/report")"
+  t_run "$T_BASH" "$T_BIN/px-report" "$PX_OUT/runs/20991231T000009Z-miss"
+  t_equals report_refuses_a_missing_bundle "6 yes no" "$T_STATUS $(t_flag 'no such bundle' \
+    "$T_STDERR") $(t_exists "$PX_OUT/runs/20991231T000009Z-miss")"
+  printf 'rows\tPASS\tcount\tdriver:x\tfine\n' >"$T_A5/resolver-pass.tsv"
+  t_report validation "" --verdict "$T_A5/resolver-pass.tsv"
+  t_equals report_verdict_only_result_row_is_dash "0 $(t_rows 4 result PASS 0 -)" \
+    "$T_STATUS $(t_last_line "$T_STDOUT")"
+  t_a5_at "$root" px-report "$old" "$new"
+  t_equals report_takes_one_bundle "2 yes" "$T_STATUS $(t_flag "unexpected argument $new" \
+    "$T_STDERR")"
+  t_a5_at "$root" px-bundle validate
+  t_equals validate_defaults_to_the_newest_finished_bundle "0 $(t_rows 4 result ok 0 "$old")" \
+    "$T_STATUS $(t_last_line "$T_STDOUT")"
+  t_equals copies_are_never_the_newest "no no" "$(t_flag 20991231T000002Z-copy "$T_STDOUT") \
+$(t_flag 20991231T000003Z-coll "$T_STDOUT")"
+  t_equals validate_names_an_absent_path_once "yes no" "$(t_flag \
+    "${PX_TAB}skip${PX_TAB}breach.tsv is absent$PX_NL" "$T_STDOUT") $(t_flag 'absent: absent' \
+    "$T_STDOUT")"
+  t_a5_at "$root" px-bundle validate 20991231T000001Z-0new
+  t_equals validate_ends_with_a_result_row "1 $(t_rows 4 result fail 1 "$new") 1" \
+    "$T_STATUS $(t_last_line "$T_STDOUT") $(printf '%s\n' "$T_STDOUT" | grep -c "^result$PX_TAB")"
+  t_run_in "$root" env "PX_OUT=$root" "$T_BASH" "$T_BIN/px-bundle" validate \
+    runs/20991231T000000Z-0old
+  t_equals validate_takes_a_relative_path "0 $(t_rows 4 result ok 0 "$old")" \
+    "$T_STATUS $(t_last_line "$T_STDOUT")"
+  t_a5_at "$root" px-bundle validate 20991231T000000Z-0old
+  t_equals validate_takes_a_run_id "0 $(t_rows 4 result ok 0 "$old")" \
+    "$T_STATUS $(t_last_line "$T_STDOUT")"
+  t_a5_at "$empty" px-bundle validate
+  t_equals validate_without_a_finished_bundle_is_6 6 "$T_STATUS"
+  t_run "$T_BASH" "$T_BIN/px-bundle" validate "$outside"
+  t_equals validate_refuses_a_bundle_outside_px_out "2 yes" "$T_STATUS $(t_flag \
+    'lies outside PX_OUT' "$T_STDERR")"
+  t_a5_at "$root" px-bundle write
+  t_equals write_needs_a_bundle "2 yes" "$T_STATUS $(t_flag 'write needs BUNDLE' "$T_STDERR")"
+  t_a5_at "$root" px-bundle validate -n
+  t_equals validate_dry_run_plans_the_check "0 $(t_rows 3 plan validate "$old")" \
+    "$T_STATUS $T_STDOUT"
+  t_a5_at "$root" px-report 20991231T0000
+  t_equals a_mistyped_run_id_is_no_bundle "6 yes" "$T_STATUS $(t_flag \
+    '20991231T0000 is no bundle: neither a run id nor a path' "$T_STDERR")"
+  # When two bundles share a one-second timestamp, the bundle with the newer manifest is selected
+  # as the newest bundle regardless of its suffix.
+  t_a5_rename "$base" "$root/runs/20991231T000000Z-aaaa"
+  touch -t 209912310000 "$old/manifest.json"
+  t_a5_at "$root" px-report -n
+  t_equals newest_breaks_a_tie_by_the_manifest "0 yes" "$T_STATUS $(t_flag \
+    "plan${PX_TAB}write${PX_TAB}$old/report" "$T_STDOUT")"
+  rm -rf "$root/runs/20991231T000000Z-aaaa"
+  t_a5_metrics_cases
+}
+
+## @description  Verifies px-bundle metrics (D4), covering anchor, key, value, and unit rows, shell
+##               globs, the operand rule, and exit codes for unmatched queries or invalid operands.
+## @return       Records test assertions. Exit 0.
+t_a5_metrics_cases() {
+  local root="$T_A5/metrics-out" dir got
+  dir="$root/runs/20991231T000000Z-0met"
+  rm -rf "$root"
+  mkdir -p "$dir/metrics"
+  cp "$T_A5_BASE/manifest.json" "$dir/"
+  {
+    printf 'start_ms\tend_ms\tsource\tanchor\tkey\tclass\tvalue\tunit\trun_class\tcontamination\n'
+    t_rows 10 1 2 driver:pherf op@query_a pherf.latency.p50_us duration 120 us validation none \
+      1 2 driver:pherf op@query_a pherf.latency.p99_us duration 900 us validation none \
+      1 2 driver:pherf op@query_a pherf.rows count 10 rows validation none \
+      1 2 driver:pherf op@query_b pherf.latency.p99_us duration 950 us validation none \
+      1 2 driver:pherf steady@pherf query_errors count 0 errors validation none
+  } >"$dir/metrics/aggregate.tsv"
+  t_a5_at "$root" px-bundle metrics "$dir" op@query_a pherf.rows
+  t_equals metrics_prints_anchor_key_value_unit "0 $(t_rows 4 op@query_a pherf.rows 10 rows)" \
+    "$T_STATUS $T_STDOUT"
+  t_a5_at "$root" px-bundle metrics "$dir" 'op@*' 'pherf.latency.*_us'
+  t_equals metrics_globs_anchor_and_key "0 $(t_rows 4 op@query_a pherf.latency.p50_us 120 us \
+    op@query_a pherf.latency.p99_us 900 us op@query_b pherf.latency.p99_us 950 us)" \
+    "$T_STATUS $T_STDOUT"
+  t_a5_at "$root" px-bundle metrics 20991231T000000Z-0met steady@pherf
+  got="$T_STATUS $T_STDOUT"
+  t_a5_at "$root" px-bundle metrics op@query_b
+  t_equals metrics_first_operand_bundle_or_anchor "0 $(t_rows 4 steady@pherf query_errors 0 \
+    errors) 0 $(t_rows 4 op@query_b pherf.latency.p99_us 950 us)" "$got $T_STATUS $T_STDOUT"
+  t_a5_at "$root" px-bundle metrics
+  t_equals metrics_default_to_every_row_of_the_newest "0 5" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c .)"
+  t_a5_at "$root" px-bundle metrics "$dir" 'op@*' nosuch
+  t_equals metrics_without_match_is_6 "6 yes" "$T_STATUS $(t_flag 'no metric of' "$T_STDERR")"
+  t_a5_at "$root" px-bundle metrics op@query_a pherf.rows extra
+  t_equals metrics_three_operands_need_a_bundle "6 yes" "$T_STATUS $(t_flag \
+    'op@query_a is no bundle' "$T_STDERR")"
+  t_equals config_and_metrics_share_the_glob 1 "$(cat "$PX_HOME"/bin/* "$PX_HOME"/lib/*.sh |
+    grep -c 'function glob(')"
+  # Verify that glob patterns support shell bracket expressions while treating all other characters
+  # as literals.
+  t_a5_at "$root" px-bundle metrics "$dir" 'op@query_[ab]' '*.p99_us'
+  got="$T_STATUS $(printf '%s\n' "$T_STDOUT" | cut -f 1 | tr '\n' ' ')"
+  t_a5_at "$root" px-bundle metrics "$dir" 'op@query_[!a]' '*.p99_us'
+  got="$got| $T_STATUS $(printf '%s\n' "$T_STDOUT" | cut -f 1 | tr '\n' ' ')"
+  t_a5_at "$root" px-bundle metrics "$dir" 'op@query.a'
+  t_equals metrics_glob_takes_bracket_expressions \
+    "0 op@query_a op@query_b | 0 op@query_b | 6" "$got| $T_STATUS"
+  # Verify that a subsequent record for the same source, anchor, and key supersedes an earlier
+  # record.
+  t_rows 10 3 4 driver:pherf op@query_a pherf.rows count 12 rows validation none \
+    >>"$dir/metrics/aggregate.tsv"
+  t_a5_at "$root" px-bundle metrics "$dir" op@query_a pherf.rows
+  t_equals metrics_print_the_effective_record "0 $(t_rows 4 op@query_a pherf.rows 12 rows)" \
+    "$T_STATUS $T_STDOUT"
+  t_a5_at "$root" px-bundle metrics "$dir" 'op@*' 'pherf.*'
+  t_equals metrics_keep_the_order_of_first_records "0 p50_us p99_us rows p99_us" \
+    "$T_STATUS $(printf '%s\n' "$T_STDOUT" | cut -f 2 | sed 's/.*\.//' | tr '\n' ' ' |
+      sed 's/ $//')"
+  head -n 1 "$dir/metrics/aggregate.tsv" >"$dir/metrics/aggregate.tsv.tmp"
+  mv "$dir/metrics/aggregate.tsv.tmp" "$dir/metrics/aggregate.tsv"
+  t_a5_at "$root" px-bundle metrics "$dir"
+  t_equals metrics_of_an_empty_table_say_so "6 yes" "$T_STATUS $(t_flag \
+    "$dir holds no aggregate metrics" "$T_STDERR")"
+  t_a5_at "$root" px-bundle metrics "$dir" -n
+  t_equals metrics_dry_run_plans_the_read "0 $(t_rows 3 plan read \
+    "$dir/metrics/aggregate.tsv")" "$T_STATUS $T_STDOUT"
+}
+## @description  Creates a fixture bundle for cluster checks (name, extra record rows...) modeling a
+##               fake cluster run with one clean verb, diff, sample, and recovered disruption.
+## @return       Writes the bundle directory path to stdout. Exit 0.
+t_check_bundle() {
+  local dir="$PX_OUT/checks/$1" now
+  shift
+  now="$(px_epoch_ms)"
+  rm -rf "$dir"
+  mkdir -p "$dir/cluster"
+  cp "$T_WORK/deploy-selftest/topology.env" "$T_WORK/deploy-selftest/services.tsv" \
+    "$dir/cluster/"
+  {
+    t_rows 6 run checks validation compose px-selftest driver
+    t_rows 3 stage setup "$((now - 60000))"
+    t_rows 5 verb run 0 100 0
+    t_rows 8 diff regionserver 0 0 0 planned running running
+    t_rows 8 diff client 0 0 0 unchanged running running
+    t_rows 12 sample pre "$now" regionserver 0 5.0 1048576 4194304 0 0 0 0
+    t_rows 9 disrupt 1 phase phase:phase@kill kill regionserver 0 hard ok
+    t_rows 5 recover 1 "$((now - 50000))" "$((now - 9000))" ok
+    for row in "$@"; do
+      printf '%s\n' "$row"
+    done
+  } >"$dir/run-record.tsv"
+  : >"$dir/verdicts.tsv"
+  cp "$PX_HOME/suites/thresholds.properties" "$dir/thresholds.properties"
+  printf '%s\n' "$dir"
+}
+
+## @description  Executes the built-in cluster checks against a fixture bundle on the fake cluster.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_cluster_checks() {
+  t_a5 "PX_RUN_DIR=$1" "PX_THRESHOLDS_FILE=$1/thresholds.properties" PX_SCOPE_ID=px-selftest \
+    PX_BACKEND=compose PX_RUN_CLASS=validation "$T_BASH" "$PX_HOME/suites/checks/cluster.sh"
+}
+
+## @description  Reports the recorded severity for a check (bundle, check) in verdicts.tsv.
+## @return       Writes the severity string to stdout, or empty when no matching row exists. Exit 0.
+t_severity_of() { awk -F '\t' -v c="$2" '$1 == c { s = $2 } END { print s }' "$1/verdicts.tsv"; }
+
+## @description  Verifies the built-in and supplementary cluster checks (R-072, R-073, R-074) across
+##               fixture bundles.
+## @return       Records test assertions. Exit 0.
+t_group_a5_checks() {
+  local dir subject want got bad="" all="" base merged line key copy
+  local subjects="wrapper restart oom log gc recovery post_recovery"
+  printf '# A5: the cluster checks\n'
+  t_a5_state_reset
+  # Verify that px-run passes its configuration files to check-cluster.sh using the shared --config
+  # option spelling.
+  dir="$(t_check_bundle config)"
+  printf 'PX_THRESHOLD_GC_PAUSE_MS_MAX=777\n' >"$T_A5/check-config.env"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "$T_BASH" "$PX_HOME/suites/check-cluster.sh" --config "$T_A5/check-config.env"
+  t_equals check_cluster_takes_config "0 yes" "$T_STATUS $(grep -qx 'gc.pause_ms.max=777' \
+    "$dir/thresholds.properties" 2>/dev/null && echo yes || echo no)"
+  t_a5 "PX_RUN_DIR=$dir" "$T_BASH" "$PX_HOME/suites/check-cluster.sh" -n
+  t_equals check_scripts_dry_run_print_plan_rows "0 3 0" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c "^plan$PX_TAB") $(printf '%s\n' "$T_STDOUT" | grep -vc "^plan$PX_TAB")"
+  t_a5 "PX_RUN_DIR=$dir" "$T_BASH" "$PX_HOME/suites/checks/cluster.sh" --help
+  t_equals check_scripts_answer_help "0 yes" "$T_STATUS $(t_flag 'Usage: cluster.sh [option...]' \
+    "$T_STDOUT")"
+  # Verify requirement R-072: a clean fixture bundle passes all seven built-in cluster check
+  # subjects.
+  dir="$(t_check_bundle clean)"
+  t_cluster_checks "$dir"
+  t_equals cluster_checks_run 0 "$T_STATUS"
+  for subject in $subjects; do
+    all="$all $(t_severity_of "$dir" "cluster.$subject")"
+  done
+  t_equals cluster_checks_clean_fixture_passes_all_seven \
+    " PASS PASS PASS PASS PASS PASS PASS" "$all"
+  t_equals cluster_checks_keep_the_instance_logs yes \
+    "$([ -f "$dir/logs/instance/client-0.log" ] && echo yes || echo no)"
+  t_equals cluster_checks_keep_the_gc_logs yes \
+    "$([ -f "$dir/logs/gc/regionserver-0.log" ] && echo yes || echo no)"
+  t_equals cluster_checks_start_no_process_in_a_daemon 0 \
+    "$(grep -c 'exec .*regionserver' "$T_SHIM_LOG")"
+  # Confirm that injecting a fault for each individual check subject produces the expected failure
+  # verdict for that subject alone.
+  for subject in $subjects; do
+    t_a5_state_reset
+    case "$subject" in
+    wrapper) dir="$(t_check_bundle "$subject" "$(t_rows 5 verb run 143 900 1)")" ;;
+    restart) dir="$(t_check_bundle "$subject" \
+      "$(t_rows 8 diff client 0 0 1 unplanned running running)")" ;;
+    oom) dir="$(t_check_bundle "$subject" "$(t_rows 5 oom client 0 yes OOMKilled)")" ;;
+    log)
+      dir="$(t_check_bundle "$subject")"
+      printf '2026-11-20 17:00:00,000 ERROR [main] Server: boom\n' \
+        >"$T_A5_STATE/logs-c0ffee00a502.txt"
+      ;;
+    gc)
+      dir="$(t_check_bundle "$subject")"
+      printf '%s\n' '[1.0s][info][gc] GC(3) Pause Young (Normal) 51M->12M(256M) 1500.250ms' \
+        >"$T_A5_STATE/copy-out.txt"
+      ;;
+    recovery)
+      dir="$(t_check_bundle "$subject" "$(t_rows 5 recover 1 1000 400000 ok)")"
+      ;;
+    post_recovery)
+      dir="$(t_check_bundle "$subject")"
+      : >"$T_A5_STATE/probe-fails"
+      ;;
+    esac
+    t_cluster_checks "$dir"
+    case "$subject" in
+    restart | oom) want=ERROR ;;
+    *) want=FAIL ;;
+    esac
+    got="$(t_severity_of "$dir" "cluster.$subject")"
+    [ "$got" = "$want" ] || bad="$bad $subject gave '$got', not $want;"
+    # Ensure fault isolation: every check subject other than the faulted one must still report PASS.
+    for line in $subjects; do
+      [ "$line" != "$subject" ] || continue
+      [ "$(t_severity_of "$dir" "cluster.$line")" = PASS ] ||
+        bad="$bad the $subject fixture also moved $line;"
+    done
+  done
+  t_empty cluster_checks_fail_each_subject_distinctly "$bad"
+  t_a5_state_reset
+  dir="$(t_check_bundle peak \
+    "$(t_rows 12 sample post "$(px_epoch_ms)" regionserver 0 5.0 4100000 4194304 0 0 0 0)")"
+  t_cluster_checks "$dir"
+  t_equals cluster_oom_peak_over_the_limit_fails FAIL "$(t_severity_of "$dir" cluster.oom)"
+  dir="$(t_check_bundle warnings)"
+  awk 'BEGIN { for (i = 0; i < 101; i++) print "2026-11-20 17:00:00 WARN [x] w" }' \
+    >"$T_A5_STATE/logs-c0ffee00a502.txt"
+  t_cluster_checks "$dir"
+  t_equals cluster_log_warnings_are_advisory ADVISORY "$(t_severity_of "$dir" cluster.log)"
+  rm -f "$T_A5_STATE/logs-c0ffee00a502.txt"
+  # Verify regression A5-LIVE-2: unified JVM logging pads tag brackets to the widest tag set seen so
+  # far, so a GC pause line following a safepoint line carries a right-padded [gc       ] tag.
+  t_a5_state_reset
+  dir="$(t_check_bundle gcpad)"
+  {
+    printf '%s %s\n' '[0.5s][info][safepoint] Safepoint "G1CollectForAllocation", Time since' \
+      'last: 1 ns, Total: 1 ns'
+    printf '%s\n' '[1.0s][info][gc       ] GC(3) Pause Young (Normal) 51M->12M(256M) 1750.500ms'
+  } >"$T_A5_STATE/copy-out.txt"
+  t_cluster_checks "$dir"
+  t_equals cluster_gc_reads_a_padded_tag "FAIL yes" "$(t_severity_of "$dir" cluster.gc) $(awk \
+    -F '\t' '$1 == "cluster.gc" && index($5, "longest pause is 1750.500 ms") { f = 1 }
+    END { print f ? "yes" : "no" }' "$dir/verdicts.tsv")"
+  rm -f "$T_A5_STATE/copy-out.txt"
+  # Confirm that the post-recovery bootstrap probe includes --yarn when the yarn service group is
+  # active.
+  dir="$(t_check_bundle yarn)"
+  sed 's/^PX_GROUPS=.*/PX_GROUPS=yarn/' "$dir/cluster/topology.env" >"$dir/t.env"
+  mv -f "$dir/t.env" "$dir/cluster/topology.env"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|yarn|on-demand|\n' c0ffee00a503 nodemanager \
+    px-selftest-nodemanager-1 running 'Up 1 minute (healthy)' phoenix-harness:selftest \
+    nodemanager 1 0 >>"$T_A5_STATE/instances.txt"
+  : >"$T_A5_STATE/probe.log"
+  t_cluster_checks "$dir"
+  t_contains cluster_post_recovery_probes_yarn_when_it_is_up 'probe --yarn' \
+    "$(cat "$T_A5_STATE/probe.log" 2>/dev/null)"
+  t_a5_state_reset
+  dir="$(t_check_bundle nodisruption)"
+  grep -v '^disrupt\|^recover' "$dir/run-record.tsv" >"$dir/r.tsv"
+  mv -f "$dir/r.tsv" "$dir/run-record.tsv"
+  t_cluster_checks "$dir"
+  t_equals cluster_subjects_without_evidence_skip "SKIP SKIP" \
+    "$(t_severity_of "$dir" cluster.recovery) $(t_severity_of "$dir" cluster.post_recovery)"
+  # Verify requirement R-073: all check thresholds reside in thresholds.properties, the recovery
+  # time bound defaults to 120 seconds, and no check script embeds a hardcoded threshold literal.
+  base="$PX_HOME/suites/thresholds.properties"
+  t_equals thresholds_hold_the_recovery_bound 120 \
+    "$(sed -n 's/^recovery\.seconds\.max=//p' "$base")"
+  bad=""
+  while IFS="=" read -r key _; do
+    case "$key" in '' | '#'*) continue ;; esac
+    cat "$PX_HOME/suites/checks"/*.sh |
+      grep -qE "(ck|sc)_threshold [a-z_\$\"]+ ${key//./\\.}( |$)" ||
+      bad="$bad $key is not read through sx_threshold;"
+    grep -nE "${key//./\\.}=[0-9]" "$PX_HOME/suites/checks"/*.sh | grep -q . &&
+      bad="$bad $key has a literal value;"
+  done <"$base"
+  grep -nE '(ck_over +[^ ]+ +"?[0-9]|-v m="?[0-9])' "$PX_HOME/suites/checks"/*.sh | grep -q . &&
+    bad="$bad a comparison holds a literal;"
+  t_empty cluster_checks_hold_no_threshold_literal "$bad"
+  # Confirm that a plug-in threshold overlay overrides its target key while leaving all other
+  # default thresholds intact.
+  t_a5_state_reset
+  dir="$(t_check_bundle overlay)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    PX_PLUGINS=example "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals check_cluster_with_the_example_overlay_exits_0 0 "$T_STATUS"
+  merged="$(grep -v '^#' "$dir/thresholds.properties" | grep . | sort)"
+  t_equals plugin_overlay_changes_one_key "log.warnings.max=200" \
+    "$(LC_ALL=C comm -13 <(grep -v '^#' "$base" | grep . | sort) <(printf '%s\n' "$merged"))"
+  t_equals plugin_overlay_leaves_the_rest "log.warnings.max=100" \
+    "$(LC_ALL=C comm -23 <(grep -v '^#' "$base" | grep . | sort) <(printf '%s\n' "$merged"))"
+  # Verify requirements R-074 and R-078: a failing supplementary check contributed by a plug-in at
+  # runtime propagates into the merged run verdict, and a supplementary check that cannot execute is
+  # recorded as an ERROR row.
+  t_a5_state_reset
+  dir="$(t_check_bundle extra)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "PX_PLUGIN_DIRS=$T_A5/plugins/extra" "PX_PLUGINS=example extra" \
+    "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals check_cluster_reports_a_check_that_could_not_run 1 "$T_STATUS"
+  t_equals supplementary_checks_run_in_name_order "plugin.extra.a-fail plugin.extra.b-broken" \
+    "$(awk -F '\t' '$1 ~ /^plugin\.extra\./ { printf "%s%s", s, $1; s = " " }' \
+      "$dir/verdicts.tsv")"
+  t_equals supplementary_check_reads_its_own_threshold "limit 7" \
+    "$(awk -F '\t' '$1 == "plugin.extra.a-fail" { print $5 }' "$dir/verdicts.tsv")"
+  t_equals broken_check_is_an_error ERROR "$(t_severity_of "$dir" plugin.extra.b-broken)"
+  t_contains example_check_writes_a_parseable_record \
+    "plugin.example.marker${PX_TAB}PASS${PX_TAB}count${PX_TAB}plugin:example" \
+    "$(cat "$dir/verdicts.tsv")"
+  t_contains example_check_records_its_metric "${PX_TAB}plugin:example${PX_TAB}" \
+    "$(cat "$dir/metrics/aggregate.tsv" 2>/dev/null)"
+  t_run env PX_RUN_CLASS=validation "$T_BASH" "$T_BIN/px-report" --verdict "$dir/verdicts.tsv"
+  t_equals supplementary_failure_fails_the_merged_run "3 ERROR" "$T_STATUS $(t_result)"
+  t_contains merge_includes_the_example_check "plugin.example.marker${PX_TAB}PASS" "$T_STDOUT"
+  t_contains merge_includes_the_failing_supplementary_check "plugin.extra.a-fail${PX_TAB}FAIL" \
+    "$T_STDOUT"
+  # Verify requirement A5-REQ-08: when the broken check is removed, the failing supplementary check
+  # alone determines the merged run outcome, yielding FAIL rather than ERROR.
+  copy="$T_A5/plugins/failonly"
+  rm -rf "$copy"
+  cp -R "$T_A5/plugins/extra" "$copy"
+  rm -f "$copy/checks/b-broken"
+  sed 's/^PX_PLUGIN_ID=extra$/PX_PLUGIN_ID=failonly/' "$T_A5/plugins/extra/plugin.env" \
+    >"$copy/plugin.env"
+  t_a5_state_reset
+  dir="$(t_check_bundle failonly)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "PX_PLUGIN_DIRS=$copy" PX_PLUGINS=failonly "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_run env PX_RUN_CLASS=validation "$T_BASH" "$T_BIN/px-report" --verdict "$dir/verdicts.tsv"
+  t_equals failing_supplementary_check_fails_the_merged_run "1 FAIL" "$T_STATUS $(t_result)"
+  dir="$(t_check_bundle badline)"
+  printf '#!/usr/bin/env bash\nprintf "extra.limit=seven\\n"\n' \
+    >"$T_A5/plugins/extra/hooks/thresholds"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "PX_PLUGIN_DIRS=$T_A5/plugins/extra" PX_PLUGINS=extra "$T_BASH" \
+    "$PX_HOME/suites/check-cluster.sh"
+  t_equals bad_threshold_line_runs_no_check "2 ERROR 0" "$T_STATUS $(t_severity_of "$dir" \
+    cluster.thresholds) $(grep -c '^cluster\.wrapper' "$dir/verdicts.tsv")"
+  printf '#!/usr/bin/env bash\nprintf "extra.limit=7\\n"\n' \
+    >"$T_A5/plugins/extra/hooks/thresholds"
+  t_run env -u PX_RUN_DIR "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals check_cluster_needs_a_run_dir 2 "$T_STATUS"
+  t_a5_state_reset
+}
+## @description  Reports the line count of every marker file under a directory (dir) as sorted
+##               "hook=count" tokens.
+## @return       Writes the space-separated tokens to stdout. Exit 0.
+t_markers() {
+  find "$1" -name '*.marker' 2>/dev/null | while IFS= read -r t_file; do
+    t_file_name=${t_file##*/}
+    printf '%s=%s\n' "${t_file_name%.marker}" "$(grep -c . "$t_file")"
+  done | LC_ALL=C sort | tr '\n' ' '
+}
+
+## @description  Computes sorted cksum records for every file under the core harness code
+##               directories.
+## @return       Writes the sorted checksum lines to stdout. Exit 0.
+t_core_sums() {
+  find "$PX_HOME/bin" "$PX_HOME/lib" "$PX_HOME/suites" -type f -exec cksum {} + | LC_ALL=C sort
+}
+
+## @description  Verifies the plug-in contract (R-075 to R-077, R-280) and shipped suites (R-079),
+##               covering discovery, manifest refusal, all nine hooks in a full run, and dry runs.
+## @return       Records test assertions. Exit 0.
+t_group_a5_plugins() {
+  local deploy session run copy core bad="" kind dir all
+  printf '# A5: the plug-in contract and the suites\n'
+  # Verify requirement R-076: plug-in discovery scans only the default directory when
+  # PX_PLUGIN_DIRS is unset, and includes external directories when specified by PX_PLUGIN_DIRS.
+  t_run env -u PX_PLUGIN_DIRS "$T_BASH" "$T_WORK/probe/a5.sh" pl_discover
+  t_equals plugins_discovers_only_the_default_directory \
+    "example$PX_TAB$PX_HOME/plugins/example" "$T_STDOUT"
+  t_run env "PX_PLUGIN_DIRS=$T_A5/plugins/extra" "$T_BASH" "$T_WORK/probe/a5.sh" pl_discover
+  t_contains plugins_discovers_a_directory_outside_the_tree \
+    "extra$PX_TAB$T_A5/plugins/extra" "$T_STDOUT"
+  t_run env "PX_PLUGIN_DIRS=$T_A5/plugins/extra" PX_PLUGINS=extra "$T_BASH" \
+    "$T_WORK/probe/a5.sh" pl_enabled
+  t_equals plugins_enable_only_what_px_plugins_names "extra$PX_TAB$T_A5/plugins/extra" \
+    "$T_STDOUT"
+  t_run env PX_PLUGINS=nosuch "$T_BASH" "$T_WORK/probe/a5.sh" pl_enabled
+  t_equals plugins_refuse_an_unknown_id 2 "$T_STATUS"
+  t_run env "PX_PLUGIN_DIRS=$T_A5/no-such-dir" "$T_BASH" "$T_WORK/probe/a5.sh" pl_discover
+  t_equals plugins_refuse_an_entry_without_a_manifest 2 "$T_STATUS"
+  # Verify requirement R-075: manifests missing a required key, targeting another contract version,
+  # containing an unrecognized key, or colliding with a built-in driver name are each rejected with
+  # a distinct diagnostic message.
+  for kind in noid nocontract contract2 badkey psql; do
+    t_run env "PX_PLUGIN_DIRS=$T_A5/refused/$kind" "$T_BASH" "$T_WORK/probe/a5.sh" pl_discover
+    case "$kind" in
+    noid) all='plugin.env lacks PX_PLUGIN_ID' ;;
+    nocontract) all='plugin.env lacks PX_PLUGIN_CONTRACT' ;;
+    contract2) all='plug-in contract2 implements contract 2, this harness implements 1' ;;
+    badkey) all='PX_RS_HEAP is not a plug-in key' ;;
+    psql) all='has the name of a built-in driver' ;;
+    esac
+    if [ "$T_STATUS" != 2 ] || ! printf '%s\n' "$T_STDERR" | grep -qF "$all"; then
+      bad="$bad $kind gave $T_STATUS: $T_STDERR;"
+    fi
+  done
+  t_empty plugin_manifests_are_refused_with_distinct_messages "$bad"
+  t_run env "PX_PLUGIN_DIRS=$PX_HOME/plugins/example" "$T_BASH" "$T_WORK/probe/a5.sh" pl_discover
+  t_equals plugins_refuse_a_duplicate_id 2 "$T_STATUS"
+  t_empty plugin_doc_names_every_manifest_key "$(for kind in PX_PLUGIN_ID PX_PLUGIN_CONTRACT \
+    PX_PLUGIN_DRIVER PX_PLUGIN_HOOKS 'PX_<KEY>_HEAP_MIB' 'PX_<KEY>_JVM_OPTS'; do
+      grep -qF "| \`$kind\` |" "$PX_HOME/docs/PLUGINS.md" || echo "$kind"; done)"
+  # Confirm that plug-in heap sizing and JVM option settings participate as a configuration loader
+  # stage with origin plugin:<id>, while operator overrides continue to take precedence.
+  t_run env PX_PLUGINS=example "$T_BASH" "$T_BIN/px-cluster" --class validation config
+  t_contains plugin_sizing_is_a_loader_stage \
+    "PX_CLIENT_JVM_OPTS${PX_TAB}-Dpx.example=1${PX_TAB}plugin:example" "$T_STDOUT"
+  t_run env PX_PLUGINS=example PX_SETUP_HEAP_MIB=300 "$T_BASH" "$T_BIN/px-cluster" \
+    --class validation config
+  t_contains operator_value_wins_over_a_plugin "PX_SETUP_HEAP_MIB${PX_TAB}300${PX_TAB}environment" \
+    "$T_STDOUT"
+  # Verify the deployment render hooks: the configuration overlay is merged and bind-mounted, and
+  # both role-level and hook-emitted JVM options are propagated to the client service.
+  t_gen --class validation --cluster plug -e PX_PLUGINS=example
+  deploy="$T_A2_OUT/deploy/plug"
+  t_equals render_with_the_example_plugin 0 "$T_STATUS"
+  t_equals render_merges_the_overlay_template yes \
+    "$([ -f "$deploy/conf-overlay/hbase-site.xml.tmpl" ] && echo yes || echo no)"
+  t_contains render_mounts_the_overlay "$deploy/conf-overlay:/opt/px/conf-overlay:ro" \
+    "$(cat "$deploy/compose.yaml" 2>/dev/null)"
+  t_contains render_names_the_overlay 'PX_CONF_OVERLAY_DIR: "/opt/px/conf-overlay"' \
+    "$(cat "$deploy/compose.yaml" 2>/dev/null)"
+  t_contains render_passes_the_client_jvm_options \
+    'PX_JVM_OPTS_EXTRA: "-Dpx.example=1 -Dpx.example.hook=jvm-opts"' \
+    "$(sed -n '/^  client-0:/,/^  [a-z]/p' "$deploy/compose.yaml" 2>/dev/null)"
+  t_equals render_hooks_fire_once "conf-overlay=1 image-check=1 jvm-opts=1 " \
+    "$(t_markers "$deploy")"
+  # Verify requirement RQ-123: a failing image-check hook aborts rendering before any deployment
+  # directory is written.
+  copy="$T_A5/plugins/noimage"
+  rm -rf "$copy"
+  mkdir -p "$copy/hooks"
+  printf '%s\n' PX_PLUGIN_ID=noimage PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=image-check \
+    >"$copy/plugin.env"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$copy/hooks/image-check"
+  chmod +x "$copy/hooks/image-check"
+  t_gen --class validation --cluster noimage -e "PX_PLUGIN_DIRS=$copy" -e PX_PLUGINS=noimage
+  t_equals render_stops_at_a_failed_image_check "2 yes no" "$T_STATUS $(t_flag \
+    'image-check hook of a plug-in refused the image' "$T_STDERR") $(t_exists \
+    "$T_A2_OUT/deploy/noimage")"
+  t_gen --class validation --cluster plug2 -e PX_PLUGINS=example -e PX_CLIENT_JVM_OPTS=-Xmx1g
+  t_equals render_refuses_a_size_option_in_jvm_options 2 "$T_STATUS"
+  # Verify requirement R-077: executing the example suite through px-suite fires each of the nine
+  # plug-in hooks exactly once. The run bundle captures the run-time hook markers and copies the
+  # deployment render hook markers, while the session directory retains the suites hook marker.
+  t_a5_state_reset
+  printf '%s\n' "$deploy" >"$PX_OUT/state/deployment-compose-selftest"
+  session="$PX_OUT/sessions/a5-example"
+  t_a5 PX_PLUGINS=example PX_SESSION_ID=a5-example PX_SCOPE_ID=px-selftest \
+    "$T_BASH" "$T_BIN/px-suite" example
+  t_equals example_suite_passes 0 "$T_STATUS"
+  run="$(sed -n 1p "$session/tests/rows/stdout.txt" 2>/dev/null)"
+  all="$(t_markers "$run") $(t_markers "$session/plugins")"
+  t_equals every_hook_fires_exactly_once "collect=1 conf-overlay=1 fetch-data=1 image-check=1\
+ jvm-opts=1 post-workload=1 pre-workload=1 thresholds=1  suites=1 " "$all"
+  t_equals every_run_hook_marker_is_in_the_bundle yes "$(for kind in fetch-data pre-workload \
+    post-workload thresholds collect; do [ -f "$run/plugins/example/$kind.marker" ] || echo no
+    done; for kind in conf-overlay jvm-opts image-check; do
+      [ -f "$run/cluster/plugins/example/$kind.marker" ] || echo no; done | grep -q no &&
+      echo no || echo yes)"
+  t_contains example_driver_counts_the_staged_rows "plugin.example.rows${PX_TAB}PASS" \
+    "$(cat "$run/report/verdicts.tsv" 2>/dev/null)"
+  t_contains collect_hook_lists_its_files "path${PX_TAB}description" \
+    "$(cat "$run/plugins/example/manifest.tsv" 2>/dev/null)"
+  t_contains hook_calls_are_recorded "${PX_TAB}fetch-data${PX_TAB}0${PX_TAB}" \
+    "$(cat "$run/plugins/example/hooks.tsv" 2>/dev/null)"
+  # Verify requirement A5-REQ-10: run-time hooks are recorded in execution order with one check row
+  # per supplementary check script, and all deployment render hooks precede the run-time hooks.
+  t_equals run_hooks_are_recorded_in_run_order \
+    "fetch-data pre-workload post-workload thresholds check collect" \
+    "$(cut -f 2 "$run/plugins/example/hooks.tsv" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+  t_equals render_hooks_precede_the_run_hooks "image-check jvm-opts conf-overlay yes" \
+    "$(cut -f 2 "$run/cluster/plugins/example/hooks.tsv" 2>/dev/null | tr '\n' ' ')$(awk \
+      -F '\t' 'FNR == NR { if ($1 > last) last = $1; next } FNR == 1 { first = $1 }
+      END { print (last != "" && first != "" && last < first) ? "yes" : "no" }' \
+      "$run/cluster/plugins/example/hooks.tsv" "$run/plugins/example/hooks.tsv" 2>/dev/null)"
+  # Verify requirement RQ-124: the pre-workload hook executes before the driver's run verb begins,
+  # and the post-workload hook executes after the run verb finishes.
+  t_equals workload_hooks_bracket_the_run_verb "yes yes" "$(awk -F '\t' \
+    'FNR == NR { if ($3 == "verb@run") { if ($2 == "begin") b = $1; else e = $1 }; next }
+    $2 == "pre-workload" { p = $1 } $2 == "post-workload" { q = $1 }
+    END { print (p != "" && p <= b) ? "yes" : "no", (q != "" && q >= e) ? "yes" : "no" }' \
+    "$run/stages.tsv" "$run/plugins/example/hooks.tsv" 2>/dev/null)"
+  t_equals plugin_bundle_validates 0 "$(t_validate "$run"; printf '%s' "$T_STATUS")"
+  # Confirm that a failure in a fail-closed hook such as pre-workload prevents the run verb from
+  # executing while still running the restore and report verbs.
+  t_a5_state_reset
+  copy="$T_A5/plugins/failing"
+  rm -rf "$copy"
+  mkdir -p "$copy/hooks"
+  printf '%s\n' PX_PLUGIN_ID=failing PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=pre-workload \
+    >"$copy/plugin.env"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$copy/hooks/pre-workload"
+  chmod +x "$copy/hooks/pre-workload"
+  t_a5 "PX_PLUGIN_DIRS=$copy" PX_PLUGINS=failing "$T_BASH" "$T_BIN/px-run" --class validation \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/exit-code.sh" -- 0
+  run="$(t_bundle)"
+  t_equals failed_pre_workload_blocks_the_run_verb "1 FAIL no yes" \
+    "$T_STATUS $(t_severity_of "$run" plugin.failing.pre-workload) $(grep -q \
+      "^verb${PX_TAB}run$PX_TAB" "$run/run-record.tsv" && echo yes || echo no) $(grep -q \
+      "^verb${PX_TAB}restore$PX_TAB" "$run/run-record.tsv" && echo yes || echo no)"
+  # Verify requirement R-280: the example plug-in exercises all six extension mechanisms, and an
+  # external copy of the plug-in executes its driver without modifying any core harness file.
+  bad=""
+  for kind in 'PX_PLUGIN_DRIVER=driver.sh' 'suites' 'conf-overlay' 'jvm-opts' 'fetch-data' \
+    'collect' 'PX_CLIENT_JVM_OPTS='; do
+    grep -q -- "$kind" "$PX_HOME/plugins/example/plugin.env" || bad="$bad $kind"
+  done
+  for kind in suites/example.suite data/example.tsv conf-overlay/hbase-site.xml.tmpl \
+    driver.sh hooks/collect; do
+    [ -f "$PX_HOME/plugins/example/$kind" ] || bad="$bad $kind"
+  done
+  t_empty example_plugin_contributes_six_kinds_of_extension "$bad"
+  core="$(t_core_sums)"
+  copy="$T_A5/plugins/sample"
+  rm -rf "$copy"
+  cp -R "$PX_HOME/plugins/example" "$copy"
+  sed 's/^PX_PLUGIN_ID=example$/PX_PLUGIN_ID=sample/' "$PX_HOME/plugins/example/plugin.env" \
+    >"$copy/plugin.env"
+  t_a5_state_reset
+  t_a5 "PX_PLUGIN_DIRS=$copy" PX_PLUGINS=sample "$T_BASH" "$T_BIN/px-run" --class validation \
+    -e PX_SCOPE_ID=px-selftest sample
+  t_equals plugin_outside_the_tree_runs_its_driver 0 "$T_STATUS"
+  t_equals plugin_only_change_touches_no_core_file "$core" "$(t_core_sums)"
+  # Verify requirement R-079: all four shipped suite files exist, and a dry run of each built-in
+  # suite resolves its test steps and target drivers.
+  for kind in smoke.suite functional.suite check-cluster.sh lib/common.sh; do
+    [ -f "$PX_HOME/suites/$kind" ] || bad="$bad $kind"
+  done
+  t_empty suites_ship_the_four_files "$bad"
+  t_run "$T_BASH" "$T_BIN/px-suite" --dry-run smoke
+  t_equals smoke_suite_dry_run_resolves "0 2 psql java-main" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c .) $(printf '%s\n' "$T_STDOUT" | cut -f 5 | tr '\n' ' ' | sed 's/ $//')"
+  t_run "$T_BASH" "$T_BIN/px-suite" --dry-run functional
+  t_equals functional_suite_dry_run_resolves "0 3 psql psql pherf" "$T_STATUS $(printf '%s\n' \
+    "$T_STDOUT" | grep -c .) $(printf '%s\n' "$T_STDOUT" | cut -f 5 | tr '\n' ' ' | sed 's/ $//')"
+  dir="$T_A5/suites"
+  mkdir -p "$dir"
+  printf 'suite: broken\nclass: validation\n\ntest: one\n  driver: %s\n' \
+    "$T_WORK/drivers/no-describe.sh" >"$dir/broken.suite"
+  printf '#!/usr/bin/env bash\nprintf "not json\\n"\n' >"$T_WORK/drivers/no-describe.sh"
+  chmod +x "$T_WORK/drivers/no-describe.sh"
+  t_run "$T_BASH" "$T_BIN/px-suite" --dry-run "$dir/broken.suite"
+  t_equals suite_dry_run_refuses_a_bad_describe 2 "$T_STATUS"
+  printf 'suite: absent\nclass: validation\n\ntest: one\n  driver: nosuchdriver\n' \
+    >"$dir/absent.suite"
+  t_run "$T_BASH" "$T_BIN/px-suite" --dry-run "$dir/absent.suite"
+  t_equals suite_dry_run_refuses_an_unknown_driver 2 "$T_STATUS"
+  t_run env PX_PLUGINS=example "$T_BASH" "$T_BIN/px-suite" --dry-run example
+  t_equals plugin_suite_resolves_by_name 0 "$T_STATUS"
+  t_contains plugin_suite_plans_the_plugin_driver "driver${PX_TAB}example" "$T_STDOUT"
+  # Confirm that every suite test step must invoke a driver; raw shell action or plug-in directives
+  # are rejected as invalid test definitions.
+  bad=""
+  for kind in 'action: exit 0' 'plugin: example hello'; do
+    printf 'suite: nodriver\nclass: validation\n\ntest: one\n  %s\n' "$kind" >"$dir/nodriver.suite"
+    t_run env PX_PLUGINS=example "$T_BASH" "$T_BIN/px-suite" --dry-run "$dir/nodriver.suite"
+    [ "$T_STATUS" = 2 ] || bad="$bad $kind=$T_STATUS"
+  done
+  t_empty suite_refuses_a_step_that_is_not_a_driver "$bad"
+  t_a5_state_reset
+}
+
+## @description  Reports the verb rows recorded in run-record.tsv of a bundle (bundle) as a
+##               space-separated sequence of verb names.
+## @return       Writes the verb names to stdout. Exit 0.
+t_verbs_of() {
+  awk -F '\t' '$1 == "verb" { printf "%s%s", s, $2; s = " " }' "$1/run-record.tsv" 2>/dev/null
+}
+
+## @description  Reports whether the stop script executed after the Java invocation in the fake
+##               runtime call log.
+## @return       Writes yes or no to stdout. Exit 0.
+t_stopped_after_java() {
+  awk '/px-java/ { j = NR } /px-stop/ && j && NR > j { s = 1 } END { print s ? "yes" : "no" }' \
+    "$T_SHIM_LOG"
+}
+
+## @description  Verifies A5 review regressions on the fakes: verb order, describe exit codes,
+##               disruption recovery, Java process stop, class codes, timeout bounds, and refusals.
+## @return       Records test assertions. Exit 0.
+t_group_a5_fixes() {
+  local run line bad="" doc dir copy seed want got
+  local words=()
+  local rs='/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub=Server'
+  printf '# A5: the regressions of the review\n'
+  # Verify requirement A5-REQ-04: rule 1 of docs/driver-contract.md governs the verb sequence and
+  # exit code for each failure outcome: exit 1 when validate fails, exit 1 when prepare fails,
+  # exit 4 on a workload timeout, and exit 3 on an unplanned instance restart.
+  while IFS='|' read -r line want code; do
+    t_a5_state_reset
+    read -r -a words <<<"$line"
+    t_a5_run "${words[@]}"
+    got="$(t_verbs_of "$(t_bundle)")"
+    [ "$got $T_STATUS" = "$want $code" ] || bad="$bad $line gave '$got' $T_STATUS;"
+  done <<'A5_EOF'
+validate-fails|describe validate report|1
+prepare-fails|describe validate prepare restore report|1
+sleep --timeout 1 -- 30|describe validate prepare run restore report|4
+bump-restart -- 4|describe validate prepare run report|3
+A5_EOF
+  t_empty verbs_follow_rule_one_for_each_outcome "$bad"
+  # Verify finding F13: the describe verb keeps its own exit code. A failed describe is recorded
+  # as FAIL with exit 1, and a describe that exceeds its timeout bound exits with code 4.
+  t_a5_state_reset
+  t_a5_run describe-fails
+  t_equals describe_failure_keeps_its_code "1 FAIL" \
+    "$T_STATUS $(t_severity_of "$(t_bundle)" driver.describe)"
+  t_a5_run describe-sleeps -e PX_TIMEOUT_VERB=1
+  t_equals describe_past_its_bound_is_a_timeout 4 "$T_STATUS"
+  # Verify regression A5-LIVE-5: an omitted or empty artifacts array in a describe document
+  # declares no extra artifacts, and every path in both artifact lists must remain relative to the
+  # bundle root.
+  doc='{"contract": 1, "driver": "d", "phases": [{"anchor": "steady@x", "verb": "run"}],
+ "metrics": {"count": [], "share": [], "duration": []}, "unsupported": {"checks": []'
+  dir="$T_A5/describe-cases"
+  mkdir -p "$dir"
+  printf '%s, "artifacts": []}}\n' "$doc" >"$dir/absent.json"
+  printf '%s, "artifacts": []}, "artifacts": []}\n' "$doc" >"$dir/empty.json"
+  printf '%s, "artifacts": []}, "artifacts": [{"path": "/x"}]}\n' "$doc" >"$dir/absolute.json"
+  printf '%s, "artifacts": [{"path": "../x", "reason": "r"}]}}\n' "$doc" >"$dir/up.json"
+  got=""
+  for line in absent empty absolute up; do
+    t_lib pb_describe_load "$dir/$line.json"
+    got="$got $T_STATUS"
+  done
+  t_equals describe_artifacts_member_is_optional_and_inside " 0 0 2 2" "$got"
+  # Verify finding F5: killing a role other than regionserver or specifying a destructive delete
+  # mode is rejected because neither has a valid recovery path.
+  t_a5_state_reset
+  t_shim_log_reset
+  t_a5_run phase-kill --disrupt 'phase:setup,kill,master,0'
+  t_equals kill_of_another_role_is_refused "2 yes" \
+    "$T_STATUS $(t_flag 'only a RegionServer kill has a recovery path' "$T_STDERR")"
+  t_a5_run phase-kill --disrupt 'phase:setup,kill,regionserver,0,delete'
+  t_equals kill_with_delete_is_refused "2 yes" \
+    "$T_STATUS $(t_flag 'a deleted instance cannot start again' "$T_STDERR")"
+  t_absent refused_kill_reaches_no_runtime 'KILL' "$(cat "$T_SHIM_LOG")"
+  t_a5_run phase-kill --disrupt '+1,kill,master,0'
+  t_equals offset_kill_of_another_role_runs_no_verb "2:" \
+    "$T_STATUS:$(t_verbs_of "$(t_bundle)")"
+  # Verify regression A5-LIVE-3 (a): a failed disruption injection causes the cluster.recovery
+  # check to record a FAIL verdict.
+  t_a5_state_reset
+  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,7'
+  run="$(t_bundle)"
+  t_equals failed_injection_fails_the_recovery "1 FAIL yes" "$T_STATUS $(t_severity_of "$run" \
+    cluster.recovery) $(t_flag 'injection failed, exit' "$(cat "$run/verdicts.tsv")")"
+  # Verify requirement A5-REQ-13: when no background health monitor samples exist, the cluster.oom
+  # verdict detail explicitly notes that peak memory was derived from snapshots only.
+  t_contains oom_peak_without_monitor_names_the_snapshots 'from the snapshots only' \
+    "$(awk -F '\t' '$1 == "cluster.oom"' "$run/verdicts.tsv")"
+  # Verify regression A5-LIVE-3 (b): a milestone anchor that opens and closes between two poll
+  # checks is recorded as missed and causes the cluster.recovery check to fail.
+  t_a5_state_reset
+  t_a5_run blink --disrupt 'phase:phase@blink,kill,regionserver,0'
+  run="$(t_bundle)"
+  t_equals missed_anchor_fails_the_recovery "1 missed FAIL" "$T_STATUS $(t_manifest "$run" \
+    /disruptions/0/state) $(t_severity_of "$run" cluster.recovery)"
+  t_contains missed_anchor_names_its_begin "anchor phase@blink began at " \
+    "$(awk -F '\t' '$1 == "skip" && $3 == "disruption 1"' "$run/run-record.tsv")"
+  # Verify regression A5-LIVE-3 (a): a brief anchor that opens and closes within a single main poll
+  # interval still triggers its scheduled disruption because px-run checks stage anchors every tenth
+  # of a second.
+  t_a5_state_reset
+  t_a5_run brief -e PX_POLL_INTERVAL_S=3 --disrupt 'phase:steady@script,kill,regionserver,0'
+  run="$(t_bundle)"
+  t_equals brief_anchor_fires_its_disruption "0 ok 1 1 0" "$T_STATUS $(t_manifest "$run" \
+    /disruptions/0/state) $(awk -F '\t' '$1 == "action" { a++ } $1 == "recover" { r++ }
+    $1 == "skip" && $3 == "disruption 1" { s++ } END { print a + 0, r + 0, s + 0 }' \
+    "$run/run-record.tsv")"
+  # Confirm that disruption entries that never fired or were skipped by the backend provide no
+  # recovery evidence and result in a SKIP verdict.
+  dir="$(t_check_bundle skipped "$(t_rows 9 disrupt 1 phase phase:phase@kill kill \
+    regionserver 0 hard skip)")"
+  grep -v '^recover' "$dir/run-record.tsv" >"$dir/r.tsv"
+  mv -f "$dir/r.tsv" "$dir/run-record.tsv"
+  t_cluster_checks "$dir"
+  t_equals skipped_disruption_is_no_evidence SKIP "$(t_severity_of "$dir" cluster.recovery)"
+  # Verify requirement A5-REQ-01: the recovery gate blocks until the online region count returns to
+  # the pre-disruption baseline captured by the initial read.
+  t_a5_state_reset
+  printf '%s\n' 12 8 8 12 >"$T_A5_STATE/region-count"
+  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,0'
+  run="$(t_bundle)"
+  got="$(awk -F '\t' '$1 == "recover" { print $4 }' "$run/run-record.tsv")"
+  t_equals recovery_gate_waits_for_the_regions "0 12 8 8 12 yes" "$T_STATUS $(cut -f 2 \
+    "$T_A5_STATE/region-count.log" | tr '\n' ' ')$(awk -F '\t' -v r="${got:-0}" \
+    'NR == 3 { low = $1 } END { print (low > 0 && r >= low) ? "yes" : "no" }' \
+    "$T_A5_STATE/region-count.log")"
+  # Confirm that if the online region count remains below the baseline when the readiness timeout
+  # expires, recovery is recorded as failed.
+  t_a5_state_reset
+  printf '%s\n' 12 8 >"$T_A5_STATE/region-count"
+  t_a5_run phase-kill -e PX_TIMEOUT_READY=2 --disrupt 'phase:phase@kill,kill,regionserver,0'
+  run="$(t_bundle)"
+  t_equals lost_regions_fail_the_recovery "fail FAIL" "$(awk -F '\t' '$1 == "recover" {
+    print $5 }' "$run/run-record.tsv") $(t_severity_of "$run" cluster.recovery)"
+  t_a5_state_reset
+  t_shim_log_reset
+  : >"$T_A5_STATE/region-count-fails"
+  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,0'
+  t_equals unread_regions_inject_nothing "fail no" "$(t_manifest "$(t_bundle)" \
+    /disruptions/0/state) $(t_flag 'KILL' "$(cat "$T_SHIM_LOG")")"
+  # Confirm that px-region-count sums regionCount across all RegionServers and fails if any server
+  # fails to respond.
+  t_curl_body "http://regionserver-0:16030$rs" '{"beans":[{"regionCount" : 5}]}'
+  t_curl_body "http://regionserver-1:16030$rs" '{"beans":[{"regionCount" : 7}]}'
+  t_image PX_ROLE=client PX_RS_COUNT=2 PX_PORT_REGIONSERVER_HTTP=16030 -- "$T_BASH" \
+    "$T_IMG/bin/px-region-count"
+  t_equals region_count_sums_the_servers "0 12" "$T_STATUS $T_STDOUT"
+  t_image PX_ROLE=client PX_RS_COUNT=3 PX_PORT_REGIONSERVER_HTTP=16030 -- "$T_BASH" \
+    "$T_IMG/bin/px-region-count"
+  t_equals region_count_refuses_a_silent_server 1 "$T_STATUS"
+  # Verify regression A5-LIVE-1: when a remote exec exceeds its timeout bound or px-run receives
+  # SIGTERM, the driver invokes the stop script to terminate the Java process inside client 0.
+  t_a5_state_reset
+  t_shim_log_reset
+  run="$(t_a5_bundle)"
+  t_a5 "PX_RUN_DIR=$run" "PX_RUN_ID=${run##*/}" PX_DRIVER_NAME=java-main \
+    "PX_DRIVER_DIR=$run/drivers/java-main" PX_VERB=run PX_RECORD_SOURCE=driver:java-main \
+    PX_RUN_CLASS=validation PX_BACKEND=compose PX_SCOPE_ID=px-selftest PX_TIMEOUT_RUN=1 \
+    "$T_BASH" "$PX_HOME/drivers/java-main/driver.sh" run org.example.Sleep
+  t_equals expired_class_is_stopped_in_client_0 "1 yes" "$T_STATUS $(t_stopped_after_java)"
+  # Verify finding F1: the workload JVM for prepare and run uses the PX_TIMEOUT_RUN bound set by
+  # px-run --timeout, allowing a workload exceeding PX_TIMEOUT_DEFAULT to complete while the
+  # table-recording catalog query retains PX_TIMEOUT_DEFAULT.
+  t_a5_state_reset
+  : >"$T_A5_STATE/java-naps"
+  got=""
+  run="$(t_a5_bundle)"
+  PX_TIMEOUT_DEFAULT=1 PX_TIMEOUT_RUN=60 t_a5_verb psql run "$run" "$T_A5/sql/fixture.sql"
+  got="$got psql:$T_STATUS"
+  run="$(t_a5_bundle)"
+  PX_TIMEOUT_DEFAULT=1 PX_TIMEOUT_RUN=60 t_a5_verb java-main prepare "$run" \
+    --prepare "$T_A5/sql/jm-schema.sql" org.example.Fixture
+  got="$got java-main.prepare:$T_STATUS"
+  PX_TIMEOUT_DEFAULT=1 PX_TIMEOUT_RUN=60 t_a5_verb java-main run "$run" org.example.Fixture
+  got="$got java-main.run:$T_STATUS"
+  run="$(t_a5_bundle)"
+  PX_TIMEOUT_DEFAULT=1 PX_TIMEOUT_RUN=60 t_a5_verb pherf prepare "$run" \
+    --scenario "$PX_HOME/suites/pherf/px_functional_scenario.xml" \
+    --schema "$PX_HOME/suites/pherf/px_functional_schema.sql"
+  got="$got pherf.prepare:$T_STATUS:$(grep -c . "$run/drivers/pherf/tables.list" 2>/dev/null)"
+  rm -f "$T_A5_STATE/java-naps"
+  t_equals workload_jvm_takes_the_run_bound \
+    " psql:0 java-main.prepare:0 java-main.run:0 pherf.prepare:0:1" "$got"
+  t_a5_state_reset
+  t_shim_log_reset
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class validation -e PX_SCOPE_ID=px-selftest \
+    java-main --timeout 2 -- org.example.Sleep
+  t_equals terminated_class_is_stopped_in_client_0 "4 yes" "$T_STATUS $(t_stopped_after_java)"
+  # Verify findings F2 and F12: a non-zero exit code from the Java main class is treated as a
+  # workload failure (exit 1), and the report verb synthesizes a query_errors metric from that exit
+  # status when the class itself emitted no query_errors metric.
+  got=""
+  for line in Exit6 Exit2 Fixture; do
+    t_a5_state_reset
+    t_a5 "$T_BASH" "$T_BIN/px-run" --class validation -e PX_SCOPE_ID=px-selftest \
+      java-main -- "org.example.$line"
+    run="$(t_bundle)"
+    got="$got $line:$T_STATUS:$(t_severity_of "$run" java-main.exit):$(t_manifest "$run" \
+      /steady/0/metrics/query_errors/value)"
+  done
+  t_equals class_status_belongs_to_the_workload " Exit6:1:FAIL:1 Exit2:1:FAIL:1 Fixture:0::0" \
+    "$got"
+  # Verify finding F3: px-suite does not support an overrides directive and rejects it as unknown.
+  printf 'suite: o\nclass: validation\n\ntest: one\n  driver: psql\n  overrides: x.env\n' \
+    >"$T_A5/overrides.suite"
+  t_run "$T_BASH" "$T_BIN/px-suite" --dry-run "$T_A5/overrides.suite"
+  t_equals overrides_is_an_unknown_directive "2 yes" \
+    "$T_STATUS $(t_flag "unknown directive 'overrides'" "$T_STDERR")"
+  # Verify finding S1: px-run resolves driver names through the plug-in library and rejects unknown
+  # drivers with usage exit code 2.
+  t_run "$T_BASH" "$T_BIN/px-run" --dry-run nosuchdriver
+  t_equals unknown_driver_is_a_usage_error "2 yes" \
+    "$T_STATUS $(t_flag "no driver 'nosuchdriver'" "$T_STDERR")"
+  # Verify finding S12: rejecting an unrecognized plug-in hook lists all nine valid hook names on a
+  # single diagnostic line.
+  dir="$T_A5/badhook"
+  mkdir -p "$dir"
+  printf '%s\n' PX_PLUGIN_ID=badhook PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=bogus >"$dir/plugin.env"
+  t_run env "PX_PLUGIN_DIRS=$dir" "$T_BASH" "$T_WORK/probe/a5.sh" pl_discover
+  line='conf-overlay jvm-opts image-check fetch-data pre-workload post-workload suites thresholds'
+  t_equals unknown_hook_refusal_names_the_hooks "2 yes" \
+    "$T_STATUS $(t_flag "The hooks are: $line collect" "$T_STDERR")"
+  # Verify finding F7: the outer timeout bound computed for px-run accounts for the four bounded
+  # hooks of each enabled plug-in as well as the recovery gate budget for every test-level and
+  # session-level disruption.
+  printf 'suite: b\nclass: validation\ntimeout: 60\n\ntest: one\n  driver: %s\n  args: 0\n' \
+    "$T_WORK/drivers/exit-code.sh" >"$T_A5/bound.suite"
+  printf '  disrupt: phase:never@x,kill,regionserver,0\n' >>"$T_A5/bound.suite"
+  t_a5_state_reset
+  t_a5 PX_PLUGINS=example PX_SESSION_ID=a5-bound PX_SCOPE_ID=px-selftest \
+    PX_DISRUPT_SPEC=+900,kill,regionserver,0 PX_TIMEOUT_VERB=10 PX_TIMEOUT_FETCH=100 \
+    PX_TIMEOUT_DRAIN=20 PX_TIMEOUT_READY=30 \
+    "$T_BASH" "$T_BIN/px-suite" -v "$T_A5/bound.suite"
+  # Expected bound: 60 + 300 + 6 x 10 + 1 x (3 x 10 + 100) + 2 x (20 + 2 x 30) + 0 + 1 = 711s.
+  t_contains suite_bound_counts_hooks_checks_and_recovery 'px-run gets a bound of 711s' \
+    "$T_STDERR"
+  # Verify finding F6: heap sizing flags such as -XX:MaxHeapSize are rejected both in role JVM
+  # options and in lines emitted by a plug-in jvm-opts hook.
+  t_gen --class validation --cluster heap1 -e PX_RS_JVM_OPTS=-XX:MaxHeapSize=16g
+  t_equals render_refuses_max_heap_size_in_role_options 2 "$T_STATUS"
+  copy="$T_A5/plugins/heap"
+  mkdir -p "$copy/hooks"
+  printf '%s\n' PX_PLUGIN_ID=heap PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=jvm-opts \
+    >"$copy/plugin.env"
+  printf '#!/usr/bin/env bash\nprintf "RS -XX:MaxHeapSize=16g\\n"\n' >"$copy/hooks/jvm-opts"
+  chmod +x "$copy/hooks/jvm-opts"
+  t_gen --class validation --cluster heap2 -e "PX_PLUGIN_DIRS=$copy" -e PX_PLUGINS=heap
+  t_equals render_refuses_max_heap_size_from_the_hook 2 "$T_STATUS"
+  # Verify requirement A5-REQ-13: peak memory evaluation incorporates samples collected by the
+  # background health monitor.
+  t_a5_state_reset
+  seed="$T_A5/monitor-seed"
+  mkdir -p "$seed"
+  : >"$seed/samples.tsv"
+  px_tsv_row 1 "px-tool monitor" "$seed" >"$PX_OUT/state/monitor-px-selftest"
+  t_a5 "PX_FAKE_MONITOR_SAMPLES=$seed/samples.tsv" "$T_BASH" "$T_BIN/px-run" --class validation \
+    -e PX_SCOPE_ID=px-selftest "$T_WORK/drivers/monitor-peak.sh"
+  run="$(t_bundle)"
+  : >"$PX_OUT/state/monitor-px-selftest"
+  t_equals monitor_peak_fails_the_oom_check "FAIL yes" "$(t_severity_of "$run" \
+    cluster.oom) $(t_flag "sample${PX_TAB}monitor${PX_TAB}" "$(cat "$run/run-record.tsv")")"
+  t_a5_state_reset
+}
+
+## @description  Lists any sb_* calls in drivers under a root directory (root) outside the three G4
+##               functions and sb_load (which binds the backend), formatted as file:line:name.
+## @return       Writes matching occurrences to stdout, or nothing for a compliant tree. Exit 0.
+t_driver_sb_calls() {
+  local file
+  for file in "$1"/drivers/*/driver.sh "$1"/plugins/*/driver.sh; do
+    [ -f "$file" ] || continue
+    grep -noE 'sb_[a-z_]+' "$file" | awk -F: -v f="$file" \
+      '$2 !~ /^sb_(exec|copy_in|copy_out|load)$/ { print f ":" $1 ":" $2 }'
+  done
+}
+
+## @description  Reports the verb rows of a bundle (bundle) as space-separated verb:exit tokens.
+## @return       Writes the formatted tokens to stdout. Exit 0.
+t_verb_codes() {
+  awk -F '\t' '$1 == "verb" { printf "%s%s:%s", s, $2, $3; s = " " }' "$1/run-record.tsv" \
+    2>/dev/null
+}
+
+## @description  Counts malformed rows across both metric export tables of a bundle (bundle) that
+##               lack ten fields, a valid run class, or a non-empty contamination field.
+## @return       Writes the malformed row count to stdout. Exit 0.
+t_metric_gaps() {
+  cat "$1/metrics/aggregate.tsv" "$1/metrics/timeline.tsv" 2>/dev/null | awk -F '\t' '
+    $1 == "start_ms" { next }
+    NF != 10 || ($9 != "validation" && $9 != "measurement") || $10 == "" { n++ }
+    END { print n + 0 }'
+}
+
+## @description  Verifies A5 contract closure on the fakes: sizing contamination, threshold layers,
+##               plug-in rendering and staging, anomaly records, bundle rules, reports, and drivers.
+## @return       Records test assertions. Exit 0.
+t_group_a5_closure() {
+  local run copy dir base=$T_A5_BASE got line one two deploy cause rows
+  local sized psql pherf example
+  printf '# A5: the closure of the contracts\n'
+  # Verify requirement RQ-095: a measurement run executed with a sizing override is marked
+  # contaminated, the contamination detail names the overridden variable, and the sizing tag is
+  # propagated to every metric record.
+  t_a5_state_reset
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_SCOPE_ID=px-selftest \
+    -e PX_REQUIRE_QUIET_HOST=0 -e PX_QUIET_HOST_WAIT_S=0 -e PX_RS_HEAP_MIB=1024 \
+    "$T_WORK/drivers/phase-kill.sh"
+  sized="$(t_bundle)"
+  t_equals sizing_override_tags_the_run "0 quiet-host sizing" "$T_STATUS $(t_manifest "$sized" \
+    /quiet_host/tags/0) $(t_manifest "$sized" /quiet_host/tags/1)"
+  t_contains sizing_override_names_the_value 'overridden: PX_RS_HEAP_MIB' \
+    "$(awk -F '\t' '$1 == "contamination" && $2 == "sizing"' "$sized/run-record.tsv")"
+  t_equals sizing_override_reaches_every_metric_record "quiet-host,sizing" \
+    "$(awk -F '\t' 'NR > 1 { print $10 }' "$sized/metrics/aggregate.tsv" | sort -u)"
+  # Confirm that a sizing contamination tag is also recorded when the cluster's deployment topology
+  # records a sizing override or was rendered for a different run class.
+  printf '%s\n' PX_RUN_CLASS=measurement PX_SIZING_OVERRIDES=PX_RS_MEM_MIB \
+    >>"$T_WORK/deploy-selftest/topology.env"
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_SCOPE_ID=px-selftest \
+    -e PX_REQUIRE_QUIET_HOST=0 -e PX_QUIET_HOST_WAIT_S=0 "$T_WORK/drivers/exit-code.sh"
+  t_contains sizing_override_of_the_cluster_tags_the_run 'overridden: PX_RS_MEM_MIB' \
+    "$(grep "^contamination${PX_TAB}sizing" "$(t_bundle)/run-record.tsv")"
+  t_seed_deployment "$PX_OUT"
+  printf 'PX_RUN_CLASS=validation\n' >>"$T_WORK/deploy-selftest/topology.env"
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_SCOPE_ID=px-selftest \
+    -e PX_REQUIRE_QUIET_HOST=0 -e PX_QUIET_HOST_WAIT_S=0 "$T_WORK/drivers/exit-code.sh"
+  t_contains cluster_of_another_class_tags_the_run 'the sizing of the class validation' \
+    "$(grep "^contamination${PX_TAB}sizing" "$(t_bundle)/run-record.tsv")"
+  t_seed_deployment "$PX_OUT"
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class measurement -e PX_SCOPE_ID=px-selftest \
+    -e PX_REQUIRE_QUIET_HOST=0 -e PX_QUIET_HOST_WAIT_S=0 "$T_WORK/drivers/exit-code.sh"
+  t_equals measurement_sizing_has_no_sizing_tag 0 \
+    "$(grep -c "^contamination${PX_TAB}sizing" "$(t_bundle)/run-record.tsv")"
+  t_gen --class measurement --cluster sized -e PX_RS_HEAP_MIB=1024
+  t_equals generator_records_the_sizing_override "0 PX_RS_HEAP_MIB" "$T_STATUS $(t_env_value \
+    "$T_A2_OUT/deploy/sized/topology.env" PX_SIZING_OVERRIDES)"
+  t_gen --class validation --cluster unsized
+  t_equals generator_records_no_override_of_the_class "0 " "$T_STATUS $(t_env_value \
+    "$T_A2_OUT/deploy/unsized/topology.env" PX_SIZING_OVERRIDES)"
+  # Verify requirements RQ-095 and RQ-085: on a sizing-contaminated measurement bundle, a latency
+  # FAIL is downgraded to ADVISORY and passes the run while a count FAIL still fails the run; on an
+  # uncontaminated measurement bundle, a latency FAIL remains a run failure.
+  copy="$(t_bundle_copy "$sized" latency)"
+  printf 'latency\tFAIL\tduration\tdriver:x\tslow\n' >>"$copy/verdicts.tsv"
+  t_run "$T_BASH" "$T_BIN/px-report" "$copy"
+  t_equals contaminated_latency_fail_passes "0 ADVISORY" "$T_STATUS $(t_result)"
+  printf 'rows\tFAIL\tcount\tdriver:x\tshort\n' >>"$copy/verdicts.tsv"
+  t_run "$T_BASH" "$T_BIN/px-report" "$copy"
+  t_equals contaminated_count_fail_still_fails "1 FAIL" "$T_STATUS $(t_result)"
+  copy="$(t_bundle_copy "$sized" clean)"
+  printf 'latency\tFAIL\tduration\tdriver:x\tslow\n' >>"$copy/verdicts.tsv"
+  grep -v "^contamination$PX_TAB" "$copy/run-record.tsv" >"$copy/r.tsv"
+  mv -f "$copy/r.tsv" "$copy/run-record.tsv"
+  t_run "$T_BASH" "$T_BIN/px-report" "$copy"
+  t_equals clean_measurement_latency_fail_fails "1 FAIL" "$T_STATUS $(t_result)"
+
+  # Verify requirements RQ-120 and RQ-119: when a run-class configuration file and the example
+  # plug-in each override a threshold, the effective threshold set retains both overrides alongside
+  # all remaining defaults, and the GC pause verdict for a 750 ms pause flips under the class
+  # override. When the class file and the plug-in both set the same key, the plug-in takes
+  # precedence.
+  t_a5_state_reset
+  printf '%s\n' PX_THRESHOLD_GC_PAUSE_MS_MAX=500 PX_THRESHOLD_LOG_WARNINGS_MAX=50 \
+    >"$T_A5/class-threshold.env"
+  printf '%s\n' '[1.0s][info][gc] GC(3) Pause Young (Normal) 51M->12M(256M) 750.000ms' \
+    >"$T_A5_STATE/copy-out.txt"
+  dir="$(t_check_bundle classlayer)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "PX_CLASS_ENV=$T_A5/class-threshold.env" PX_PLUGINS=example \
+    "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  got="$(LC_ALL=C comm -3 <(grep -v '^#' "$PX_HOME/suites/thresholds.properties" | grep . |
+    LC_ALL=C sort) <(grep -v '^#' "$dir/thresholds.properties" | grep . | LC_ALL=C sort) |
+    tr -d '\t' | tr '\n' ' ')"
+  t_equals class_and_plugin_thresholds_are_in_force "0 gc.pause_ms.max=1000\
+ gc.pause_ms.max=500 log.warnings.max=100 log.warnings.max=200 " "$T_STATUS $got"
+  t_contains class_threshold_names_its_origin '# config:PX_THRESHOLD_GC_PAUSE_MS_MAX' \
+    "$(cat "$dir/thresholds.properties")"
+  t_equals class_threshold_fails_the_boundary_pause FAIL "$(t_severity_of "$dir" cluster.gc)"
+  # Confirm that an operator threshold supplied via the environment overrides the plug-in threshold.
+  dir="$(t_check_bundle operatorlayer)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "PX_CLASS_ENV=$T_A5/class-threshold.env" PX_PLUGINS=example PX_THRESHOLD_LOG_WARNINGS_MAX=5 \
+    "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals operator_threshold_wins_over_the_plugin "0 log.warnings.max=5 gc.pause_ms.max=500" \
+    "$T_STATUS $(grep -E '^(log\.warnings|gc\.pause_ms)\.max=' "$dir/thresholds.properties" |
+      LC_ALL=C sort -r | tr '\n' ' ' | sed 's/ $//')"
+  dir="$(t_check_bundle nolayer)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals default_threshold_passes_the_boundary_pause PASS "$(t_severity_of "$dir" cluster.gc)"
+  dir="$(t_check_bundle boundary)"
+  sed 's/^gc\.pause_ms\.max=.*/gc.pause_ms.max=700/' "$dir/thresholds.properties" >"$dir/t"
+  mv -f "$dir/t" "$dir/thresholds.properties"
+  t_cluster_checks "$dir"
+  t_equals changed_key_flips_the_boundary_verdict FAIL "$(t_severity_of "$dir" cluster.gc)"
+  rm -f "$T_A5_STATE/copy-out.txt"
+  dir="$(t_check_bundle typo)"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    PX_THRESHOLD_GC_PAUSE_MAX=5 "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals misspelt_threshold_name_runs_no_check "2 ERROR yes" "$T_STATUS $(t_severity_of "$dir" \
+    cluster.thresholds) $(t_flag 'PX_THRESHOLD_GC_PAUSE_MAX names no threshold key' \
+    "$(cat "$dir/verdicts.tsv")")"
+  t_run "$T_BASH" "$T_BIN/px-cluster" --class validation --config "$T_A5/class-threshold.env" \
+    config
+  t_contains class_file_takes_a_threshold "PX_THRESHOLD_GC_PAUSE_MS_MAX${PX_TAB}500" "$T_STDOUT"
+
+  # Verify requirements RQ-083 and RQ-082: when p99 query latency and throughput attainment breach
+  # their thresholds, a validation-class bundle containing only those timing breaches still passes
+  # with ADVISORY status, whereas the same breaches in a quiet measurement-class run fail the run.
+  t_a5_state_reset
+  dir="$(t_check_bundle timing)"
+  {
+    printf '%s\n' "start_ms end_ms source anchor key class value unit run_class contamination" |
+      tr ' ' '\t'
+    for line in query_latency.p99_ms:5000:ms offered_rate:100:ops/s achieved_qps:10:ops/s; do
+      IFS=: read -r one two cause <<<"$line"
+      t_rows 10 1 2 driver:x steady@x "$one" duration "$two" "$cause" validation none
+    done
+  } >"$dir/metrics.tsv"
+  mkdir -p "$dir/metrics"
+  mv -f "$dir/metrics.tsv" "$dir/metrics/aggregate.tsv"
+  t_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=px-selftest PX_BACKEND=compose PX_RUN_CLASS=validation \
+    "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals steady_checks_fail_the_breaches "FAIL FAIL" "$(t_severity_of "$dir" \
+    steady.query_latency.p99_ms) $(t_severity_of "$dir" steady.attainment)"
+  t_contains steady_attainment_names_the_share 'attains 10.0% of its offered rate' \
+    "$(cat "$dir/verdicts.tsv")"
+  t_run "$T_BASH" "$T_BIN/px-report" "$dir"
+  t_equals validation_bundle_with_only_timing_breaches_passes "0 ADVISORY" \
+    "$T_STATUS $(t_result)"
+  sed "s/^run${PX_TAB}checks${PX_TAB}validation/run${PX_TAB}checks${PX_TAB}measurement/" \
+    "$dir/run-record.tsv" >"$dir/r.tsv"
+  mv -f "$dir/r.tsv" "$dir/run-record.tsv"
+  t_run "$T_BASH" "$T_BIN/px-report" "$dir"
+  t_equals quiet_measurement_timing_breach_fails "1 FAIL" "$T_STATUS $(t_result)"
+  dir="$(t_check_bundle notiming)"
+  t_cluster_checks "$dir"
+  t_a5 "PX_RUN_DIR=$dir" PX_THRESHOLDS_FILE="$dir/thresholds.properties" \
+    "$T_BASH" "$PX_HOME/suites/checks/steady.sh"
+  t_equals steady_checks_without_evidence_skip "SKIP SKIP" "$(t_severity_of "$dir" \
+    steady.query_latency.p99_ms) $(t_severity_of "$dir" steady.attainment)"
+  # Verify requirement RQ-082: each authoritative validation gate independently fails a validation
+  # run when triggered.
+  got=""
+  for cause in restart oom log readiness; do
+    t_a5_state_reset
+    case "$cause" in
+    restart) dir="$(t_check_bundle "g-$cause" \
+      "$(t_rows 8 diff client 0 0 1 unplanned running running)")" ;;
+    oom) dir="$(t_check_bundle "g-$cause" "$(t_rows 5 oom client 0 yes OOMKilled)")" ;;
+    log)
+      dir="$(t_check_bundle "g-$cause")"
+      printf '2026-11-20 17:00:00,000 ERROR [main] Server: boom\n' \
+        >"$T_A5_STATE/logs-c0ffee00a502.txt"
+      ;;
+    readiness)
+      dir="$(t_check_bundle "g-$cause")"
+      : >"$T_A5_STATE/probe-fails"
+      ;;
+    esac
+    t_cluster_checks "$dir"
+    t_run "$T_BASH" "$T_BIN/px-report" "$dir"
+    got="$got $cause:$T_STATUS:$(t_result)"
+  done
+  dir="$T_A5/verdicts"
+  for cause in 'scenario|driver.workload_valid|none' 'assertion|driver.run|none' \
+    'count|psql.rows|count'; do
+    IFS='|' read -r one two line <<<"$cause"
+    printf '%s\tFAIL\t%s\tdriver:x\t%s\n' "$two" "$line" "$one" >"$dir/gate-$one.tsv"
+    t_report validation "" --verdict "$dir/gate-$one.tsv"
+    got="$got $one:$T_STATUS:$(t_result)"
+  done
+  t_equals validation_gates_fail_on_each_cause " restart:3:ERROR oom:3:ERROR log:1:FAIL\
+ readiness:1:FAIL scenario:1:FAIL assertion:1:FAIL count:1:FAIL" "$got"
+  t_a5_state_reset
+
+  # Verify requirements RQ-080 and A5-REQ-03: an unplanned instance restart aborts the run and
+  # populates the manifest anomaly object if and only if the run-record result row indicates an
+  # abort, recording the before and after restart counts in both the manifest and the cluster
+  # verdict.
+  t_a5_run bump-restart -- 4
+  run="$(t_bundle)"
+  t_equals restart_anomaly_is_in_the_manifest "3 true number 0 4 yes" "$T_STATUS $(t_manifest \
+    "$run" /anomaly/aborted) $(t_lib t_a5_json_type "$run/manifest.json" /anomaly/abort_ms
+    printf '%s' "$T_STDOUT") $(t_manifest "$run" /anomaly/instances/0/restarts_before)\
+ $(t_manifest "$run" /anomaly/instances/0/restarts_after) $(awk -F '\t' '$1 == "result" {
+      print $4 }' "$run/run-record.tsv")"
+  t_contains restart_anomaly_is_in_the_cluster_verdict 'restarted 0 to 4; restarts 0 to 4' \
+    "$(awk -F '\t' '$1 == "cluster.restart" { print $5 }' "$run/verdicts.tsv")"
+  t_equals restart_anomaly_bundle_validates 0 "$(t_validate "$run" >/dev/null; printf '%s' \
+    "$T_STATUS")"
+  t_a5_state_reset
+  t_a5_run exit-code -- 0
+  run="$(t_bundle)"
+  t_equals clean_run_anomaly_matches_the_result_row "null no" "$(t_lib t_a5_json_type \
+    "$run/manifest.json" /anomaly; printf '%s' "$T_STDOUT") $(awk -F '\t' '$1 == "result" {
+      print $4 }' "$run/run-record.tsv")"
+  copy="$(t_bundle_copy "$run" noinstances)"
+  line='"anomaly": {"aborted": false, "abort_ms": null, "instances": []},'
+  sed "s/^  \"anomaly\": null,\$/  $line/" \
+    "$copy/manifest.json" >"$copy/m.json"
+  mv -f "$copy/m.json" "$copy/manifest.json"
+  t_validate "$copy"
+  t_equals anomaly_without_an_instance_is_refused "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" anomaly)"
+
+  # Verify requirement RQ-112: a steady-state manifest entry missing its anchor name, start_ms, or
+  # end_ms, or having an end_ms timestamp earlier than start_ms, is rejected with a diagnostic that
+  # identifies the specific defect.
+  got=""
+  for cause in 'name|"anchor": "steady@stub"|"anchor": ""|lacks the name' \
+    'start|"start_ms"|"x_start"|lacks start_ms' 'end|"end_ms"|"x_end"|lacks end_ms'; do
+    IFS='|' read -r one two line rows <<<"$cause"
+    copy="$(t_bundle_copy "$base" "steady-$one")"
+    t_json_edit "$copy/manifest.json" '"steady": [' "$two" "$line"
+    t_validate "$copy"
+    got="$got $one:$T_STATUS:$(t_check_status "$T_STDOUT" steady):$(t_flag "$rows" "$T_STDOUT")"
+  done
+  copy="$(t_bundle_copy "$base" steady-inverted)"
+  awk '/"steady": \[/ { s = 1 } s && !a && /"start_ms":/ {
+      sub(/"start_ms": [0-9]+/, "\"start_ms\": 2000000000000"); a = 1 }
+    s && !b && /"end_ms":/ { sub(/"end_ms": [0-9]+/, "\"end_ms\": 1000000000000"); b = 1 }
+    { print }' "$copy/manifest.json" >"$copy/m.json"
+  mv -f "$copy/m.json" "$copy/manifest.json"
+  t_validate "$copy"
+  got="$got inverted:$T_STATUS:$(t_check_status "$T_STDOUT" steady):$(t_flag \
+    'ends at 1000000000000, before its start at 2000000000000' "$T_STDOUT")"
+  t_equals steady_defects_are_refused_by_name " name:1:fail:yes start:1:fail:yes\
+ end:1:fail:yes inverted:1:fail:yes" "$got"
+
+  # Verify requirement RQ-084: any metric row missing a contamination tag or a run class is
+  # rejected in both the aggregate and timeline metric exports.
+  got=""
+  for cause in aggregate timeline; do
+    copy="$(t_bundle_copy "$base" "metric-$cause")"
+    printf '1\t2\tdriver:x\trun\tk\tcount\t1\tn\tvalidation\t\n' >>"$copy/metrics/$cause.tsv"
+    t_validate "$copy"
+    got="$got $T_STATUS:$(t_check_status "$T_STDOUT" "metrics.$cause")"
+    copy="$(t_bundle_copy "$base" "metric9-$cause")"
+    printf '1\t2\tdriver:x\trun\tk\tcount\t1\tn\tnone\n' >>"$copy/metrics/$cause.tsv"
+    t_validate "$copy"
+    got="$got $T_STATUS:$(t_check_status "$T_STDOUT" "metrics.$cause")"
+  done
+  t_equals metric_row_without_its_tags_is_refused " 1:fail 1:fail 1:fail 1:fail" "$got"
+
+  # Verify requirement RQ-117: an optional artifact declared by a driver or plug-in that was not
+  # produced during the run is recorded as a SKIP row by both px-report and px-bundle validate, and
+  # never as a FAIL.
+  copy="$(t_bundle_copy "$base" declared)"
+  printf '%s\n' '{"contract": 1, "driver": "phase-kill",' \
+    ' "phases": [{"anchor": "steady@stub", "verb": "run"}],' \
+    ' "metrics": {"count": [], "share": [], "duration": []},' \
+    ' "unsupported": {"checks": [], "artifacts": []},' \
+    ' "artifacts": [{"path": "oplog/"}, {"path": "host/"}, {"path": "profiles/"},' \
+    '  {"path": "drivers/phase-kill/extra.tsv"}]}' >"$copy/drivers/phase-kill/describe.json"
+  printf 'context\tplugins\texample\n' >>"$copy/run-record.tsv"
+  t_run "$T_BASH" "$T_BIN/px-report" "$copy"
+  got="$T_STATUS"
+  for line in oplog/ host/ profiles/ drivers/phase-kill/extra.tsv plugins/example/manifest.tsv; do
+    grep -q "^artifact\.$line${PX_TAB}SKIP${PX_TAB}" "$copy/report/verdicts.tsv" ||
+      got="$got no-report-$line"
+  done
+  t_validate "$copy"
+  got="$got $T_STATUS"
+  for line in oplog/ host/ profiles/ drivers/phase-kill/extra.tsv plugins/example/manifest.tsv; do
+    printf '%s\n' "$T_STDOUT" | grep -q "^path${PX_TAB}skip${PX_TAB}$line" ||
+      got="$got no-validate-$line"
+  done
+  t_equals declared_artifacts_skip_in_report_and_validator "0 0" "$got"
+
+  # Verify requirements RQ-087, RQ-123 (a), and RQ-117: a full run of the example plug-in merges
+  # verdict rows from the driver, the cluster checks, and the plug-in, stages its dataset into
+  # client 0 via sb_copy_in, and reports a missing declared driver artifact as a SKIP in px-report.
+  # Also verify px-run threshold precedence: the example plug-in overrides a configuration file
+  # threshold, while a command-line threshold override takes precedence over every other layer.
+  t_a5_state_reset
+  t_shim_log_reset
+  printf 'PX_THRESHOLD_LOG_WARNINGS_MAX=50\n' >"$T_A5/config-threshold.env"
+  t_a5 PX_PLUGINS=example "$T_BASH" "$T_BIN/px-run" --class validation \
+    -e PX_SCOPE_ID=px-selftest example --config "$T_A5/config-threshold.env" \
+    -e PX_THRESHOLD_GC_PAUSE_MS_MAX=2000
+  example="$(t_bundle)"
+  t_equals example_run_passes 0 "$T_STATUS"
+  t_equals run_thresholds_put_the_plugin_over_the_file_and_cli_over_all \
+    "log.warnings.max=200 gc.pause_ms.max=2000" "$(grep -E \
+      '^(log\.warnings|gc\.pause_ms)\.max=' "$example/thresholds.properties" 2>/dev/null |
+      LC_ALL=C sort -r | tr '\n' ' ' | sed 's/ $//')"
+  t_equals report_merges_driver_cluster_and_plugin_rows "check:cluster driver:example\
+ plugin:example" "$(awk -F '\t' 'NR > 1 && ($4 == "driver:example" || $4 == "check:cluster" ||
+    $4 == "plugin:example") { print $4 }' "$example/report/verdicts.tsv" | sort -u | tr '\n' ' ' |
+    sed 's/ $//')"
+  t_contains example_dataset_reaches_client_0_through_the_copy \
+    "data/example.tsv client:/tmp/px/${example##*/}/example.tsv" \
+    "$(cat "$T_SHIM_LOG")"
+  t_contains example_removes_the_copy_after_the_run "rm -f /tmp/px/${example##*/}/example.tsv" \
+    "$(cat "$T_SHIM_LOG")"
+  copy="$(t_bundle_copy "$example" norows)"
+  rm -f "$copy/drivers/example/rows.tsv"
+  t_run "$T_BASH" "$T_BIN/px-report" "$copy"
+  t_equals absent_declared_file_is_a_report_skip "0 yes" "$T_STATUS $(t_flag \
+    "artifact.drivers/example/rows.tsv${PX_TAB}SKIP" "$(cat "$copy/report/verdicts.tsv")")"
+
+  # Verify requirements RQ-123 (b) and (c): the configuration overlay property is rendered into the
+  # instance's hbase-site.xml alongside all base properties, and the plug-in's client JVM option is
+  # applied exclusively to the client role.
+  t_gen --class validation --cluster overlay -e PX_PLUGINS=example
+  deploy="$T_A2_OUT/deploy/overlay"
+  t_render "$deploy" client-0 "PX_CONF_OVERLAY_DIR=$deploy/conf-overlay"
+  got="$(cat "$T_A2/render/hbase-site.xml" 2>/dev/null)"
+  t_equals overlay_key_reaches_the_rendered_hbase_site "0 yes yes 1" "$T_STATUS $(t_flag \
+    '<name>px.example.instance</name>' "$got") $(t_flag '<value>client-0</value>' "$got")\
+ $(printf '%s\n' "$got" | grep -c '</configuration>')"
+  t_contains overlay_keeps_the_base_properties '<name>hbase.cluster.distributed</name>' "$got"
+  t_equals plugin_jvm_argument_reaches_only_the_client client-0 "$(awk '
+    /^  [a-z][a-z0-9-]*:$/ { s = $1; sub(/:$/, "", s) }
+    /-Dpx\.example/ && s != "" { print s }' "$deploy/compose.yaml" | sort -u | tr '\n' ' ' |
+    sed 's/ $//')"
+
+  # Verify requirement RQ-104: no shipped driver invokes any sb_* contract function outside the
+  # three permitted by boundary G4, and the scanner detects a rogue fixture driver calling sb_kill.
+  t_empty drivers_call_only_exec_and_copy "$(t_driver_sb_calls "$PX_HOME")"
+  mkdir -p "$T_WORK/scan3/drivers/rogue"
+  cat >"$T_WORK/scan3/drivers/rogue/driver.sh" <<'A5_EOF'
+#!/usr/bin/env bash
+sb_kill "$PX_SCOPE_ID" regionserver 0 hard
+A5_EOF
+  t_contains driver_scan_finds_another_sb_call 'rogue/driver.sh:2:sb_kill' \
+    "$(t_driver_sb_calls "$T_WORK/scan3")"
+
+  # Verify requirements RQ-100, RQ-104, RQ-105, RQ-106, and RQ-115: execute the psql driver across
+  # all six lifecycle verbs against the fake cluster and inspect its runtime call log, metric
+  # records, and bundle manifest.
+  printf '%s\n' 'CREATE TABLE T1 (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR)' \
+    '  UPDATE_CACHE_FREQUENCY=60000;' >"$T_A5/sql/schema.sql"
+  t_a5_state_reset
+  t_shim_log_reset
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class validation -e PX_SCOPE_ID=px-selftest \
+    psql -- --prepare "$T_A5/sql/schema.sql" "$T_A5/sql/fixture.sql"
+  psql="$(t_bundle)"
+  t_equals psql_run_passes_every_verb "0 describe:0 validate:0 prepare:0 run:0 restore:0\
+ report:0" "$T_STATUS $(t_verb_codes "$psql")"
+  t_equals psql_run_records_the_five_manifest_fields \
+    "validation compose sha256:f00dfeed00a5 T1 60000 array" "$(t_manifest "$psql" /run/class)\
+ $(t_manifest "$psql" /run/backend) $(t_manifest "$psql" /images/0/image_id) $(t_manifest \
+    "$psql" /tables/0/table) $(t_manifest "$psql" /tables/0/update_cache_frequency) $(t_lib \
+    t_a5_json_type "$psql/manifest.json" /quiet_host/tags; printf '%s' "$T_STDOUT")"
+  t_equals psql_bundle_validates 0 "$(t_validate "$psql" >/dev/null; printf '%s' "$T_STATUS")"
+  rows="$(cat "$psql/metrics/aggregate.tsv")"
+  t_contains psql_aggregate_holds_the_rows_of_statement_one \
+    "statement@1.1${PX_TAB}psql.statement_rows${PX_TAB}count${PX_TAB}3$PX_TAB" "$rows"
+  t_contains psql_aggregate_holds_the_rows_of_statement_two \
+    "statement@1.2${PX_TAB}psql.statement_rows${PX_TAB}count${PX_TAB}2$PX_TAB" "$rows"
+  t_contains psql_aggregate_holds_the_duration_of_the_script \
+    "script@1${PX_TAB}psql.file_duration_ms${PX_TAB}duration$PX_TAB" "$rows"
+  # Exercise the prepare, run, and restore verbs of the psql driver in isolation and inspect the
+  # fake runtime log. Each runtime invocation begins with a compose line followed by the shell
+  # script lines passed to that invocation.
+  run="$(t_a5_bundle)"
+  t_shim_log_reset
+  for line in prepare run restore; do
+    t_a5_verb psql "$line" "$run" --prepare "$T_A5/sql/schema.sql" "$T_A5/sql/fixture.sql"
+  done
+  t_empty psql_calls_reach_only_client_0 "$(awk '
+    /^compose .* exec / && !/ exec -T --index=1 client / { print }
+    /^compose .* cp / && !/ client:\/tmp\/px\// { print }' "$T_SHIM_LOG")"
+  t_contains psql_calls_exec_and_copy_in_client_0 ' cp --index=1 ' "$(cat "$T_SHIM_LOG")"
+  t_empty psql_and_its_hooks_start_no_python_launcher "$(grep -E '\.py( |$)|python' \
+    "$T_SHIM_LOG")"
+  t_equals psql_java_runs_phoenix_runtime_with_the_class_path yes "$(awk '
+    /org\.apache\.phoenix\.util\.PhoenixRuntime/ { n++; if (index($0, "-cp ")) c++ }
+    END { print (n > 0 && n == c) ? "yes" : "no" }' "$T_A5_STATE/java.log")"
+  # Verify requirements RQ-096 and RQ-118: cluster checks execute only after both the run verb and
+  # the report verb have completed.
+  t_equals cluster_checks_run_after_the_run_verb yes "$(awk -F '\t' '
+    $1 == "driver.run" { r = NR } $1 == "driver.report" { p = NR }
+    $4 == "check:cluster" && !c { c = NR }
+    END { print (r && p && c > r && c > p) ? "yes" : "no" }' "$psql/verdicts.tsv")"
+
+  # Verify requirements RQ-099, RQ-100, RQ-105, and RQ-107: executing the pherf driver across all
+  # six verbs against the fake cluster confines all Pherf output to the run directory and leaves no
+  # relative RESULTS directory behind.
+  t_a5_state_reset
+  t_shim_log_reset
+  t_a5 "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$T_BIN/px-run" \
+    --class validation -e PX_SCOPE_ID=px-selftest \
+    pherf -- --scenario "$PX_HOME/suites/pherf/px_functional_scenario.xml" \
+    --schema "$PX_HOME/suites/pherf/px_functional_schema.sql"
+  pherf="$(t_bundle)"
+  t_equals pherf_run_passes_every_verb "0 describe:0 validate:0 prepare:0 run:0 restore:0\
+ report:0" "$T_STATUS $(t_verb_codes "$pherf")"
+  t_contains pherf_puts_the_phoenix_client_jars_on_the_class_path ":$T_A5/phoenix/client/*:" \
+    ":$(t_java_cp org.apache.phoenix.pherf.Pherf):"
+  t_equals pherf_result_paths_are_in_the_run_work_directory "/tmp/px/${pherf##*/}/results\
+ /tmp/px/${pherf##*/}/results/summary.html" "$(sed -n \
+    's/^pherf\.default\.results\.dir=//p' "$pherf/drivers/pherf/stage/pherf.properties")\
+ $(sed -n 's/^pherf\.default\.summary\.file=//p' "$pherf/drivers/pherf/stage/pherf.properties")"
+  t_equals pherf_results_are_copied_into_the_bundle yes \
+    "$(t_exists "$pherf/drivers/pherf/results/RESULT_px_functional_aggregate.csv")"
+  t_equals pherf_leaves_no_relative_results "no no no" "$(t_exists "$PX_TREE_ROOT/RESULTS")\
+ $(t_exists "$PWD/RESULTS") $(t_exists "$T_A5_STATE/remote/${pherf##*/}/RESULTS")"
+  t_contains pherf_run_aggregates_the_csv_group \
+    "group@serial${PX_TAB}pherf.run_count${PX_TAB}count${PX_TAB}5$PX_TAB" \
+    "$(cat "$pherf/metrics/aggregate.tsv")"
+  t_equals pherf_bundle_validates 0 "$(t_validate "$pherf" >/dev/null; printf '%s' "$T_STATUS")"
+  t_equals pherf_java_runs_the_main_class_with_the_staged_class_path yes "$(awk '
+    /org\.apache\.phoenix\.pherf\.Pherf/ { n++; if (index($0, "-cp ") && index($0, "/stage:")) c++ }
+    END { print (n > 0 && n == c) ? "yes" : "no" }' "$T_A5_STATE/java.log")"
+  t_empty pherf_starts_no_python_launcher "$(grep -E '\.py( |$)|python' "$T_SHIM_LOG")"
+  # Verify requirements RQ-100 and RQ-105: execute the java-main driver across all six verbs with
+  # its expected classpath and without invoking any Python launcher.
+  t_a5_state_reset
+  t_shim_log_reset
+  t_a5 "$T_BASH" "$T_BIN/px-run" --class validation -e PX_SCOPE_ID=px-selftest \
+    java-main -- org.example.Fixture
+  run="$(t_bundle)"
+  t_equals java_main_run_passes_every_verb "0 describe:0 validate:0 prepare:0 run:0 restore:0\
+ report:0" "$T_STATUS $(t_verb_codes "$run")"
+  t_equals java_main_runs_the_class_with_the_class_path yes "$(awk '
+    /org\.example\.Fixture/ { n++; if (index($0, "-cp ")) c++ }
+    END { print (n > 0 && n == c) ? "yes" : "no" }' "$T_A5_STATE/java.log")"
+  t_empty java_main_starts_no_python_launcher "$(grep -E '\.py( |$)|python' "$T_SHIM_LOG")"
+  # Verify requirement RQ-084: every metric record emitted by any run in this test group includes
+  # both the run class and contamination tags.
+  got=""
+  for run in "$base" "$sized" "$example" "$psql" "$pherf" "$run"; do
+    got="$got $(t_metric_gaps "$run")"
+  done
+  t_equals every_metric_record_of_a_run_carries_both_tags " 0 0 0 0 0 0" "$got"
+
+  # Verify requirement RQ-090: a driver exit code of 3 maps to verdict severity ERROR and run exit
+  # code 3, whereas a driver exit code of 1 maps to verdict severity FAIL and run exit code 1.
+  got=""
+  for line in 3 1; do
+    t_a5_state_reset
+    t_a5_run exit-code -- "$line"
+    got="$got $T_STATUS:$(t_severity_of "$(t_bundle)" driver.run)"
+  done
+  t_equals driver_codes_map_onto_the_lattice " 3:ERROR 1:FAIL" "$got"
+
+  # Verify requirement RQ-092: both px-bundle validate and px-report reject the non-contract
+  # severity WARN and name the offending severity string in their output.
+  copy="$(t_bundle_copy "$base" warn)"
+  printf 'odd\tWARN\tnone\taction\tx\n' >>"$copy/verdicts.tsv"
+  t_validate "$copy"
+  t_equals bundle_refuses_an_unknown_severity_by_name "1 fail yes" "$T_STATUS $(t_check_status \
+    "$T_STDOUT" verdicts) $(t_flag 'severity "WARN"' "$T_STDOUT")"
+  t_report validation "" --verdict "$copy/verdicts.tsv"
+  t_equals report_refuses_an_unknown_severity_by_name "3 yes" \
+    "$T_STATUS $(t_flag 'unknown severity "WARN"' "$T_STDOUT")"
+  # Verify requirement RQ-102: a driver describe document that is not valid JSON is rejected during
+  # bundle validation.
+  copy="$(t_bundle_copy "$base" notjson)"
+  printf 'not json\n' >"$copy/drivers/phase-kill/describe.json"
+  t_validate "$copy"
+  t_equals bundle_refuses_a_describe_that_is_not_json "1 fail" \
+    "$T_STATUS $(t_check_status "$T_STDOUT" describe)"
+  # Verify requirement RQ-110: px-bundle validate can validate a run bundle from a harness tree
+  # that has no drivers/ directory installed.
+  rm -rf "$T_A5/nodrivers"
+  mkdir -p "$T_A5/nodrivers"
+  cp -R "$PX_HOME/bin" "$PX_HOME/lib" "$PX_HOME/suites" "$PX_HOME/docker" "$T_A5/nodrivers/"
+  t_run "$T_BASH" "$T_A5/nodrivers/bin/px-bundle" validate "$base"
+  t_equals bundle_validates_with_no_driver_present "0 no" \
+    "$T_STATUS $(t_exists "$T_A5/nodrivers/drivers")"
+  # Verify requirement RQ-086: executing a two-step suite produces two distinct run bundles under
+  # PX_OUT/runs, each containing its own driver artifacts and merged verdict report.
+  printf 'suite: two\nclass: validation\n\ntest: one\n  driver: %s\n  args: 0\n' \
+    "$T_WORK/drivers/exit-code.sh" >"$T_A5/two.suite"
+  printf '\ntest: two\n  driver: %s\n  args: 0\n' "$T_WORK/drivers/exit-code.sh" \
+    >>"$T_A5/two.suite"
+  t_a5_state_reset
+  t_a5 PX_SESSION_ID=a5-two PX_SCOPE_ID=px-selftest "$T_BASH" "$T_BIN/px-suite" \
+    "$T_A5/two.suite"
+  one="$(sed -n 1p "$PX_OUT/sessions/a5-two/tests/one/stdout.txt" 2>/dev/null)"
+  two="$(sed -n 1p "$PX_OUT/sessions/a5-two/tests/two/stdout.txt" 2>/dev/null)"
+  t_equals two_steps_give_two_bundles "0 yes" "$T_STATUS $([ -n "$one" ] && [ -n "$two" ] &&
+    [ "$one" != "$two" ] && [ "${one%/*}" = "$PX_OUT/runs" ] && [ "${two%/*}" = "$PX_OUT/runs" ] &&
+    echo yes || echo no)"
+  t_equals each_step_bundle_holds_its_artifacts_and_report "yes yes yes yes" \
+    "$(t_exists "$one/drivers/exit-code/describe.json") $(t_exists "$one/report/verdicts.tsv")\
+ $(t_exists "$two/drivers/exit-code/describe.json") $(t_exists "$two/report/verdicts.tsv")"
+
+  # Verify requirement A5-REQ-01: waiting for region recovery after a disruption inside the run
+  # verb is capped by the shared prepare-and-run timeout bound, causing the run to terminate with
+  # timeout code 4 near that shared bound.
+  t_a5_state_reset
+  printf '%s\n' 12 8 >"$T_A5_STATE/region-count"
+  t_a5_run phase-kill --timeout 3 -e PX_TIMEOUT_READY=8 \
+    --disrupt 'phase:phase@kill,kill,regionserver,0'
+  run="$(t_bundle)"
+  t_equals region_wait_ends_at_the_shared_bound "4 1 timeout yes" "$T_STATUS $(awk -F '\t' \
+    '$1 == "verb" && $2 == "run" { print $5 }' "$run/run-record.tsv") $(awk -F '\t' \
+    '$1 == "recover" { print $5 }' "$run/run-record.tsv") $(awk -F '\t' \
+    '$1 == "verb" && $2 == "run" { print ($4 < 6000) ? "yes" : "no" }' "$run/run-record.tsv")"
+  t_equals bounded_recovery_bundle_validates 0 "$(t_validate "$run" >/dev/null; printf '%s' \
+    "$T_STATUS")"
+  t_a5_state_reset
+}
+
 
 # ---------------------------------------------------------------------------
 # Command-line option parsing and test suite execution
@@ -6288,6 +8946,14 @@ t_group_a2_platform
 t_group_a2_cluster
 t_group_a2_matrix
 t_group_a3
+t_group_a5_contract
+t_group_a5_drivers
+t_group_a5_bundle
+t_group_a5_report
+t_group_a5_checks
+t_group_a5_plugins
+t_group_a5_fixes
+t_group_a5_closure
 t_group_tree
 
 t_daemons_stop

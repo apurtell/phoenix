@@ -87,6 +87,7 @@ PX_TIMEOUT_STOP          # a stop that keeps state
 PX_POLL_INTERVAL_S       # the interval a readiness poll waits between probes
 PX_TIMEOUT_FETCH         # one download of a pinned distribution
 PX_TIMEOUT_BUILD         # the Maven build of Phoenix, or one image build
+PX_TIMEOUT_VERB          # one short verb of a driver, one plug-in hook, one check script
 
 # --- Suites, runs and drivers -----------------------------------------------
 PX_SUITE_DIR             # directory of the .suite files, default suites
@@ -96,6 +97,25 @@ PX_SUITE_FROM            # the first step to run, the lower execution boundary
 PX_SUITE_TO              # the last step to run, the upper execution boundary
 PX_DRIVERS_DIR           # directory of the built-in drivers, default drivers
 PX_DISRUPT_SPEC          # the schedule of disruptions a run injects
+
+# --- Contracts: drivers, the bundle, verdicts, plug-ins ----------------------
+# docs/driver-contract.md, docs/bundle-format.md and docs/PLUGINS.md define
+# these. px-run, px-suite and the plug-in loader set them for a child; a
+# child reads them and never sets them.
+PX_SUITE_NAME            # the suite of the current test, which px-suite exports
+PX_SUITE_FILE            # the absolute path of that suite file; a test resolves files against it
+PX_TEST_ID               # the id of the current test, which px-suite exports
+PX_DRIVER_NAME           # the name of the driver of the current run
+PX_DRIVER_DIR            # the artifact directory of that driver in the bundle
+PX_VERB                  # the verb of the driver contract that runs now
+PX_RECORD_SOURCE         # the writer of a verdict, metric or stage record, e.g. driver:psql
+PX_THRESHOLDS_FILE       # the merged cluster-check thresholds that a check script reads
+PX_THRESHOLD_*           # PX_THRESHOLD_<KEY>, a value for one cluster-check threshold key
+PX_PLUGINS               # the ids of the enabled plug-ins, empty enables none
+PX_PLUGIN_DIRS           # directories to scan for plug-ins after the default one, colon-separated
+PX_PLUGIN_*              # the keys of plugin.env and the plug-in of a hook: PX_PLUGIN_ID, _DIR
+PX_HOOK                  # the name of the plug-in hook that runs now
+PX_HOOK_OUT              # the directory that a running hook writes into
 
 # --- Host safety ------------------------------------------------------------
 # docker/env/defaults.env holds the default of each name, and a run class
@@ -110,17 +130,10 @@ PX_REQUIRE_QUIET_HOST    # 1 fails a run when the host is still busy after the w
 PX_QUIET_HOST_LOAD_PCT   # the load, a percent of the processors, of a quiet host
 PX_CONTAMINATION         # the causes that make the time results of a run ADVISORY
 
-# --- Measurement toolkit ----------------------------------------------------
-PX_TOOLKIT_DIR           # staging directory of the profiling tools under PX_OUT
+# --- Resource collector -----------------------------------------------------
 PX_COLLECT_INTERVAL_S    # sampling interval of the resource collector
 PX_COLLECT_DURATION_S    # how long the collector samples, 0 means until stopped
 PX_COLLECT_TARGETS       # the roles the collector samples
-PX_PROFILE_DURATION_S    # length of one profiling session
-PX_PROFILE_TARGETS       # the roles the profiler attaches to
-PX_JFR_DURATION_S        # length of one flight recording
-PX_JFR_TARGETS           # the roles that record a flight recording
-PX_TRACE_DURATION_S      # length of one invocation-count trace
-PX_TRACE_TARGETS         # the roles the tracer attaches to
 
 # --- Test fixtures ----------------------------------------------------------
 # The self-test sets these. No shipped component reads them.
@@ -145,19 +158,20 @@ PX_MR_AM_MIB             # the container of a MapReduce application master
 PX_MR_TASK_MIB           # the container of a MapReduce map or reduce task
 
 # --- Sizing ------------------------------------------------------------------
-# Four names for each role key, as docker/env/class-measurement.env explains.
-PX_ZK_MEM_MIB PX_ZK_HEAP_MIB PX_ZK_DIRECT_MIB PX_ZK_JDK
-PX_NN_MEM_MIB PX_NN_HEAP_MIB PX_NN_DIRECT_MIB PX_NN_JDK
-PX_SNN_MEM_MIB PX_SNN_HEAP_MIB PX_SNN_DIRECT_MIB PX_SNN_JDK
-PX_DN_MEM_MIB PX_DN_HEAP_MIB PX_DN_DIRECT_MIB PX_DN_JDK
-PX_RM_MEM_MIB PX_RM_HEAP_MIB PX_RM_DIRECT_MIB PX_RM_JDK
-PX_NM_MEM_MIB PX_NM_HEAP_MIB PX_NM_DIRECT_MIB PX_NM_JDK
-PX_JHS_MEM_MIB PX_JHS_HEAP_MIB PX_JHS_DIRECT_MIB PX_JHS_JDK
-PX_MASTER_MEM_MIB PX_MASTER_HEAP_MIB PX_MASTER_DIRECT_MIB PX_MASTER_JDK
-PX_RS_MEM_MIB PX_RS_HEAP_MIB PX_RS_DIRECT_MIB PX_RS_JDK
-PX_CLIENT_MEM_MIB PX_CLIENT_HEAP_MIB PX_CLIENT_DIRECT_MIB PX_CLIENT_JDK
-PX_TOOLING_MEM_MIB PX_TOOLING_HEAP_MIB PX_TOOLING_DIRECT_MIB PX_TOOLING_JDK
-PX_SETUP_MEM_MIB PX_SETUP_HEAP_MIB PX_SETUP_DIRECT_MIB PX_SETUP_JDK
+# Four names for each role key, as docker/env/class-measurement.env explains,
+# and a fifth, the JVM options of the role, which docs/PLUGINS.md defines.
+PX_ZK_MEM_MIB PX_ZK_HEAP_MIB PX_ZK_DIRECT_MIB PX_ZK_JDK PX_ZK_JVM_OPTS
+PX_NN_MEM_MIB PX_NN_HEAP_MIB PX_NN_DIRECT_MIB PX_NN_JDK PX_NN_JVM_OPTS
+PX_SNN_MEM_MIB PX_SNN_HEAP_MIB PX_SNN_DIRECT_MIB PX_SNN_JDK PX_SNN_JVM_OPTS
+PX_DN_MEM_MIB PX_DN_HEAP_MIB PX_DN_DIRECT_MIB PX_DN_JDK PX_DN_JVM_OPTS
+PX_RM_MEM_MIB PX_RM_HEAP_MIB PX_RM_DIRECT_MIB PX_RM_JDK PX_RM_JVM_OPTS
+PX_NM_MEM_MIB PX_NM_HEAP_MIB PX_NM_DIRECT_MIB PX_NM_JDK PX_NM_JVM_OPTS
+PX_JHS_MEM_MIB PX_JHS_HEAP_MIB PX_JHS_DIRECT_MIB PX_JHS_JDK PX_JHS_JVM_OPTS
+PX_MASTER_MEM_MIB PX_MASTER_HEAP_MIB PX_MASTER_DIRECT_MIB PX_MASTER_JDK PX_MASTER_JVM_OPTS
+PX_RS_MEM_MIB PX_RS_HEAP_MIB PX_RS_DIRECT_MIB PX_RS_JDK PX_RS_JVM_OPTS
+PX_CLIENT_MEM_MIB PX_CLIENT_HEAP_MIB PX_CLIENT_DIRECT_MIB PX_CLIENT_JDK PX_CLIENT_JVM_OPTS
+PX_TOOLING_MEM_MIB PX_TOOLING_HEAP_MIB PX_TOOLING_DIRECT_MIB PX_TOOLING_JDK PX_TOOLING_JVM_OPTS
+PX_SETUP_MEM_MIB PX_SETUP_HEAP_MIB PX_SETUP_DIRECT_MIB PX_SETUP_JDK PX_SETUP_JVM_OPTS
 
 # --- The topology record (topology.env) --------------------------------------
 # The generator writes these. Every service reads the file as environment,
@@ -167,6 +181,7 @@ PX_HDFS_REPLICATION_REQUESTED # the replication the configuration asked for
 PX_GROUPS                # the role groups of the deployment
 PX_GROUP_*               # PX_GROUP_<GROUP> its roles, PX_GROUP_<GROUP>_MEM_MIB its limits
 PX_TOPOLOGY_*            # the service count and the memory sums of the deployment
+PX_SIZING_OVERRIDES      # the sizing names that differ from the file of the run class
 
 # --- The instance environment (docker/image) ---------------------------------
 # The generator injects the first seven for each service. The image definition

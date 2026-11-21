@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Reports the total number of online regions across the cluster by summing the regionCount gauge
+# published on the JMX Server bean of each of the PX_RS_COUNT RegionServers. Before injecting a
+# disruption, px-run records this count from client 0, and the recovery gate then waits until the
+# cluster returns to that baseline count.
+#
+# Two design rules govern this script:
+#   1. No JVM invocation: it queries JMX exclusively over HTTP and never launches a JVM, making it
+#      safe to execute inside any container instance, even alongside a tightly sized daemon.
+#   2. Direct RegionServer summation: it never consults ritCount because regions-in-transition
+#      metrics lag behind the RegionServers, whereas summing the individual server gauges provides
+#      the direct online count.
+
+RC_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/image.sh
+. "$RC_HOME/lib/image.sh"
+
+set -euo pipefail
+
+RC_BEAN='/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub=Server'
+
+## @description  Prints command-line usage instructions and exit code documentation.
+## @return       Writes the usage text to stdout and exits 0.
+usage() {
+  cat <<'EOF'
+Usage: px-region-count
+
+Prints the sum of regionCount over the PX_RS_COUNT RegionServers, read
+from the JMX servlet of each RegionServer.
+
+Exit codes: 0 every RegionServer answered, 1 a RegionServer does not answer
+or publishes no regionCount, 2 usage or an incomplete environment.
+EOF
+}
+
+case "${1:-}" in
+'') ;;
+-h | --help)
+  usage
+  exit 0
+  ;;
+*)
+  img_error "px-region-count takes no argument, got '$1'"
+  usage >&2
+  exit "$IMG_EXIT_USAGE"
+  ;;
+esac
+
+RC_COUNT="$(img_count PX_RS_COUNT)" || exit "$IMG_EXIT_USAGE"
+RC_INDEX=0
+RC_TOTAL=0
+while [ "$RC_INDEX" -lt "$RC_COUNT" ]; do
+  RC_STATUS=0
+  img_fetch regionserver "$RC_INDEX" "$RC_BEAN" || RC_STATUS=$?
+  if [ "$RC_STATUS" != 0 ]; then
+    img_error "$IMG_REASON"
+    exit "$RC_STATUS"
+  fi
+  RC_VALUE="$(img_json_value "$IMG_BODY" regionCount)" || RC_VALUE=""
+  if ! [[ $RC_VALUE =~ $IMG_RE_INT ]]; then
+    img_error "regionserver $RC_INDEX publishes no regionCount"
+    exit "$IMG_EXIT_FAIL"
+  fi
+  RC_TOTAL=$((RC_TOTAL + 10#$RC_VALUE))
+  RC_INDEX=$((RC_INDEX + 1))
+done
+printf '%s\n' "$RC_TOTAL"

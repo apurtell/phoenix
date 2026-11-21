@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Implements the collect hook for the example plug-in, which px-run invokes after the cluster
+# checks while the cluster remains running. It attaches a single artifact file listing the marker
+# files written by the hooks of the current run and registers that file in manifest.tsv. It also
+# records one metric counting the rows present in hooks.tsv prior to this call, which correspond to
+# the earlier hook invocations of the plug-in in this run together with one check row per check
+# script. A failure in this hook is advisory only.
+
+set -euo pipefail
+: "${PX_HOOK_OUT:?the harness sets PX_HOOK_OUT for every hook}"
+: "${PX_HOME:?the harness sets PX_HOME for every hook}"
+# shellcheck source=SCRIPTDIR/../../../lib/bundle.sh
+. "$PX_HOME/lib/bundle.sh"
+calls=0
+if [ -f "$PX_HOOK_OUT/hooks.tsv" ]; then
+  calls="$(awk -F '\t' '$1 ~ /^[0-9]+$/ { n++ } END { print n + 0 }' "$PX_HOOK_OUT/hooks.tsv")"
+fi
+pb_metric plugin.example.hook_calls count "$calls" calls
+date -u '+%Y-%m-%dT%H:%M:%SZ' >>"$PX_HOOK_OUT/collect.marker"
+for marker in "$PX_HOOK_OUT"/*.marker; do
+  if [ -f "$marker" ]; then
+    printf '%s\n' "${marker##*/}"
+  fi
+done >"$PX_HOOK_OUT/markers.txt"
+printf 'path\tdescription\nmarkers.txt\tthe hook markers of the example plug-in in this run\n' \
+  >"$PX_HOOK_OUT/manifest.tsv"

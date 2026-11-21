@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Implements the post-workload hook for the example plugin, invoked by px-run after the run verb
+# completes and before restore begins. This check verifies that the staged dataset remains in place
+# so that the workload has not destructively consumed the input required for subsequent runs. When
+# running with a cluster, the hook then removes the remote dataset copy from client 0.
+
+set -euo pipefail
+: "${PX_HOOK_OUT:?the harness sets PX_HOOK_OUT for every hook}"
+: "${PX_HOME:?the harness sets PX_HOME for every hook}"
+if [ ! -s "$PX_HOOK_OUT/data/example.tsv" ]; then
+  printf 'example post-workload: the staged dataset is gone after the run\n' >&2
+  exit 1
+fi
+if [ -n "${PX_SCOPE_ID:-}" ]; then
+  # shellcheck source=SCRIPTDIR/../../../lib/common.sh
+  . "$PX_HOME/lib/common.sh"
+  # shellcheck source=SCRIPTDIR/../../../lib/backend/contract.sh
+  . "$PX_HOME/lib/backend/contract.sh"
+  sb_load "${PX_BACKEND:-}"
+  sb_exec "$PX_SCOPE_ID" client 0 "${PX_TIMEOUT_VERB:-300}" -- \
+    rm -f "/tmp/px/$PX_RUN_ID/example.tsv" >&2
+fi
+date -u '+%Y-%m-%dT%H:%M:%SZ' >>"$PX_HOOK_OUT/post-workload.marker"

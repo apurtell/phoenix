@@ -1,0 +1,664 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# The result bundle
+
+A result bundle is the directory generated for a single execution at `$PX_OUT/runs/<run-id>`.
+During a run, `px-run` creates the directory, the workload driver and verification checks populate
+it with evidence, `px-report` evaluates the collected verdicts, and `px-bundle` writes the manifest
+and validates the result. Each execution writes exclusively to its own bundle and no two runs ever
+share a file, making every bundle self-contained without reference to any other directory. This
+specification defines every file path, column, and key in the bundle format. The library
+`lib/bundle.sh` maintains the corresponding path lists along with the writer and reader functions,
+and the self-test verifies that the required path definitions in both locations match.
+
+The schema version is defined by `PB_FORMAT_VERSION` in `lib/bundle.sh`, which is currently 1, and
+the manifest records this value under `bundle_format_version`. Any modification to a path, column,
+or key increments the version number, and `px-bundle validate` rejects any format version that it
+does not recognize.
+
+## The run id
+
+A run identifier consists of a sortable UTC timestamp, a hyphen, and a four-character suffix in
+the format `<YYYYMMDDTHHMMSSZ>-<xxxx>`, such as `20261120T171109Z-co61`. The four suffix characters
+form a single base-36 value of digits and lowercase letters encoding the millisecond within the
+second, followed by a per-process counter, followed by one random digit. As a result, identifiers
+sort lexicographically in creation order: first by the second, next by the millisecond, and within
+the same millisecond of a single process by the counter. Only when two separate processes generate
+an identifier within the same millisecond does sorting depend on the random digit. On a host whose
+system clock does not report milliseconds, the millisecond field is 0 and the counter preserves
+creation order within a single process. The `px_run_dir` function creates the target directory
+exclusively and retries with a new identifier whenever the directory already exists, ensuring that
+two runs started in the same second—whether in one process or across two—never share a directory.
+The identifier grammar matches `^[0-9]{8}T[0-9]{6}Z-[0-9a-z]{4}$`.
+
+## Layout
+
+```text
+runs/<run-id>/
+  manifest.json                 the run manifest
+  run-record.tsv                the execution record and the runtime diagnostics
+  stages.tsv                    the stage anchors
+  verdicts.tsv                  the verdict stream
+  tables.tsv                    UPDATE_CACHE_FREQUENCY of each table               optional
+  breach.tsv                    the sample that made the health monitor tear down  optional
+  thresholds.properties         the cluster-check thresholds in force              optional
+  metrics/timeline.tsv          the timeline metric export
+  metrics/aggregate.tsv         the aggregate metric export
+  metrics/<collector>.csv       px-collect samples, with metrics/index.tsv          optional
+  cluster/images.tsv            the image of each instance
+  cluster/topology.env          the topology and version record of the deployment
+  cluster/services.tsv          the services, sizing and JDK of the deployment
+  cluster/plugins/<id>/         the render-time hook records of each plug-in         optional
+  drivers/<name>/describe.json  the describe document of the driver
+  drivers/<name>/...            the private files of the driver
+  logs/<verb>.log               the output of each verb that ran
+  logs/hook-<hook>.log          the output of each run hook of the plug-ins         optional
+  logs/check-cluster.log        the output of suites/check-cluster.sh               optional
+  logs/px-report.log            the output of px-report                            optional
+  logs/px-bundle.log            the output of px-bundle write and validate         optional
+  logs/instance/<role>-<index>.log  the daemon log of each instance
+  logs/gc/<role>-<index>.log    the garbage-collection log of each JVM instance     optional
+  plugins/<id>/                 the output of each plug-in, its hooks.tsv           optional
+  plugins/<id>/manifest.tsv     the output manifest of a plug-in                    optional
+  report/verdicts.tsv           the effective verdict rows
+  report/run-summary.tsv        the run summary table
+  report/cluster-summary.tsv    the cluster summary table
+  profiles/ jfr/ traces/        px-profile, px-jfr and px-trace-count artifacts     optional
+  oplog/                        sampled operation logs                             optional
+  host/                         host telemetry                                     optional
+  meta/                         run metadata of any shape, read by no gate         optional
+```
+
+Tabular files in the bundle fall into two categories that share a uniform field-encoding rule. A
+stream file contains no header line because either its first column or its column count identifies
+each row: `run-record.tsv`, `stages.tsv`, `verdicts.tsv`, and `plugins/<id>/hooks.tsv`. An export
+file begins with a single header line listing its column names: the metric exports,
+`cluster/images.tsv`, `tables.tsv`, `plugins/<id>/manifest.tsv`, and the report tables. A field
+never contains a tab or a newline character; the writers either reject such values or replace those
+characters with spaces, and an empty field remains in its column position.
+
+## Required paths
+
+During validation, `px-bundle validate` reports each required path that is missing and exits with
+code 1. The arrays `PB_REQUIRED` and `PB_REQUIRED_CLUSTER` in `lib/bundle.sh` define these path
+lists.
+
+| Path | Producer | Required |
+|---|---|---|
+| `manifest.json` | `px-bundle write` | always |
+| `run-record.tsv` | `px-run` | always |
+| `stages.tsv` | `px-run` and the workload driver | always |
+| `verdicts.tsv` | `px-run`, the driver, the checks, and the plug-ins | always |
+| `metrics/timeline.tsv` | `pb_sample` writers, after `px-run` writes the header | always |
+| `metrics/aggregate.tsv` | `pb_metric` writers, after `px-run` writes the header | always |
+| `cluster/images.tsv` | `px-run`, containing only the header when run without a cluster | always |
+| `report/verdicts.tsv` | `px-report` | always |
+| `report/run-summary.tsv` | `px-report` | always |
+| `report/cluster-summary.tsv` | `px-report` | always |
+| `cluster/topology.env` | `px-run`, copied from the deployment directory | runs with a cluster |
+| `cluster/services.tsv` | `px-run`, copied from the deployment directory | runs with a cluster |
+| `logs/instance/` | `suites/checks/cluster.sh`, saving one log per instance | instance after run |
+| `drivers/<name>/describe.json` | `px-run`, capturing `describe` stdout | runs with a driver |
+| `logs/<verb>.log` | `px-run`, capturing the verb stderr and stdout | every verb that ran |
+
+A run is considered to have a cluster when the `run` row of `run-record.tsv` specifies a scope, and
+it has an instance after the run when the record contains an `instance` row for the `post` phase,
+since an instance that vanished leaves no log to read. The variable `PB_REQUIRED_DAEMON` defines the
+daemon log path requirement. The six artifact classes of the harness design map directly onto these
+paths: the timeline and aggregate exports are the two metric files; the container inspection
+snapshots and runtime diagnostics are captured in `run-record.tsv` together with `cluster/`; the
+daemon logs reside in `logs/instance/` as one file per instance, which the log subject of the
+cluster checks writes for every surviving instance, including any instance covered by a planned
+action; the execution logs reside in `logs/`; and the run and cluster summary tables reside in
+`report/`.
+
+## Optional paths
+
+An absent optional path never causes bundle validation to fail. Instead, `px-bundle validate`
+reports a missing optional path as `skip`, and the manifest inventory assigns it the status
+`skipped`. The variable `PB_OPTIONAL` defines the fixed optional paths of the standard layout. A
+driver registers its own optional paths through the `artifacts` member of its describe document and
+lists the optional paths it never generates under `unsupported.artifacts`, which the manifest
+inventory records as `unavailable` along with the stated reason. A plug-in contributes the directory
+`plugins/<id>/` and enumerates its generated files in `plugins/<id>/manifest.tsv`. For every
+plug-in named in the `plugins` context row of `run-record.tsv`, the inventory includes
+`plugins/<id>/manifest.tsv`—marked as `skipped` when the plug-in wrote no manifest—followed by each
+path listed after the manifest header, resolved relative to `plugins/<id>/` and marked as either
+`present` or `skipped`. The harness reads no other files produced by a plug-in. Each declared path
+of a driver or plug-in that is absent, whether marked `skipped` or `unavailable`, also produces a
+corresponding `SKIP` row `artifact.<path>` in the report so that the validator and the report yield
+the same result.
+
+## run-record.tsv
+
+The execution record of `px-run` is stored as an unheadered stream of tab-separated rows. The first
+column identifies the row type, and rows appear in the chronological order of the events. Where a
+row type permits superseding entries, readers retain the final row of that type.
+
+| Type | Fields after the type | Writer and meaning |
+|---|---|---|
+| `run` | run_id run_class backend scope driver_path | records the core identity of the run |
+| `context` | key value | records `driver`, `suite`, `test`, `session`, and `plugins` of the run |
+| `stage` | name ts_ms | marks a `px-run` milestone that a disruption trigger can reference |
+| `verb` | verb exit_code elapsed_ms timed_out | one row per verb call, with timed_out 0 or 1 |
+| `version` | phase component version | substrate tooling versions from `sb_version_info` |
+| `instance` | phase role index instance_id state ready image_ref node | state of each instance |
+| `restart` | phase role index count | records the container restart count per snapshot |
+| `sample` | phase ts_ms role index cpu_pct mem_bytes mem_limit_bytes ... | resource usage sample |
+| `diff` | role index before after verdict pre_state post_state | state transition of an instance |
+| `term` | role index reason exit_code signal finished_at | evidence of an unplanned state change |
+| `oom` | role index oom evidence | out-of-memory evidence of an unplanned instance change |
+| `quiet` | kind, followed by the fields for that kind below | results of the quiet-host check |
+| `contamination` | cause detail | `quiet-host` or `sizing`, marking time evidence as not valid |
+| `monitor` | phase dir | records the run directory of the background health monitor |
+| `disrupt` | ordinal kind when action role index argument state | the final row for each counts |
+| `action` | ts_ms action role index argument state exit_code | one injected disruption action |
+| `phase` | role index phase status elapsed_ms | records the sub-phases of a drain-aware restart |
+| `recover` | ordinal injected_ms recovered_ms state | the recovery gate outcome of a disruption |
+| `abort` | ts_ms role index change | records the unplanned instance change that aborted the run |
+| `breach` | path | records the bundle copy of the breach sample from the health monitor |
+| `skip` | phase subject reason | a skipped step and its reason, including a missed disruption |
+| `result` | exit_code name anomaly | the final row; a record lacking this row was interrupted |
+
+A `quiet` row has the form `sample ts_ms load_pct threshold_pct` or `result state samples waited_s
+load_pct`. A `diff` verdict is `unchanged`, `planned`, `unplanned`, `vanished` or `unknown`. A
+`quiet` result state is `quiet`, `contaminated`, `refused`, `unmeasured`, or `off`. A `disrupt`
+kind is either `offset`, with `when` expressed in seconds after the `run` verb starts, or `phase`,
+naming a lifecycle milestone. A `disrupt` state is `pending`, `ok`, `skip`, `fail`, or `missed`.
+The value `missed` indicates an anchor that began and ended before `px-run` observed it open, so the
+disruption never fired; a corresponding `skip` row also identifies it. A `recover` state is `ok`,
+`timeout`, or `fail`, and recovered_ms remains empty unless the state is `ok`. A `sample` phase is
+either `pre` or `post` for the boundary snapshots around the workload, or `monitor` for a continuous
+sample collected by the health monitor from the start of the run onward. The `plugins` context row
+lists the identifiers of the enabled plug-ins separated by spaces. The fields of the `instance`,
+`sample`, `term`, `oom`, and `phase` rows follow the schemas defined in `docs/backends.md`, section
+"Schemas".
+
+## stages.tsv
+
+The stage file records one row per stage boundary in the format `ts_ms event anchor source detail`.
+The event value is either `begin` or `end`, and an anchor is formatted as `<kind>@<name>` matching
+the regular expression `^[a-z]+@[A-Za-z0-9_.-]+$`. The function `pb_stage` writes an individual
+boundary row, while `pb_stage_pairs` pairs each `begin` row with the first subsequent `end` row for
+the same anchor.
+
+| Anchor | Writer | Window |
+|---|---|---|
+| `verb@<verb>` | `px-run` | one verb invocation of the driver |
+| `steady@<name>` | the driver, during `run` | the steady-state measurement window |
+| any other `<kind>@<name>` | the driver | a custom phase declared in the describe document |
+
+Only the `steady` anchor kind carries special meaning to the harness. A `steady@<name>` window
+represents the half-open time interval from its `begin` event to its `end` event during which the
+configuration remains constant, warm-up has completed, and the driver issues its measured workload
+operations. Every base bundle carries at least one closed steady window. Whenever `px-run` stops a
+verb, it closes every open anchor by writing a terminating row with the source `px-run`, ensuring
+that a finished bundle never contains an open anchor.
+
+## verdicts.tsv
+
+The verdict stream records one row per evaluation verdict in the format
+`check severity class source detail`.
+
+* `check`: the check identifier, such as `driver.run`, `cluster.restart`, or
+  `plugin.example.marker`. A check key never contains a tab character.
+* `severity`: a single keyword from the severity lattice defined below. Because the severity always
+  occupies the second column, a consumer inspecting only the worst severity does not need to read
+  any other column.
+* `class`: the evidence classification, which is `count`, `share`, `duration`, or `none`. The value
+  `none` designates a functional or structural check. Only `duration` verdicts are ever demoted.
+* `source`: the emitting component taken from `PX_RECORD_SOURCE`—such as `px-run`, `driver:<name>`,
+  `check:cluster`, or `plugin:<id>`—or `action` when no writer identifies itself.
+* `detail`: human-readable diagnostic text for an operator. Every `SKIP` row states the reason why
+  the check did not run.
+
+The function `sx_verdict_row check severity class detail...` in `suites/lib/common.sh` is the sole
+writer for the verdict stream and rejects an unknown severity or class with exit code 2. The helper
+`sx_verdict check severity detail...` delegates to it with the class set to `none`. Conversely,
+every reader rejects any row in a verdict file that contains an unknown severity or class and
+counts that row as `ERROR`.
+
+## Metric exports
+
+Both `metrics/aggregate.tsv` and `metrics/timeline.tsv` share a single header line and column
+schema:
+
+```text
+start_ms end_ms source anchor key class value unit run_class contamination
+```
+
+* `start_ms`, `end_ms`: the time window covered by the metric value, expressed in epoch
+  milliseconds. A point-in-time timeline sample sets the start timestamp equal to the end
+  timestamp.
+* `source`: the writer identity, populated from `PX_RECORD_SOURCE`.
+* `anchor`: the lifecycle stage associated with the value, either a `<kind>@<name>` anchor or `run`
+  for the entire execution.
+* `key`: the metric identifier, matching the grammar `^[A-Za-z0-9_][A-Za-z0-9_.:@-]*$`.
+* `class`: the metric evidence class—`count`, `share`, or `duration`—as specified in
+  `docs/driver-contract.md`.
+* `value`: a JSON number, accompanied by `unit`, which is a single token such as `rows`, `ms`,
+  `ops/s`, or `ratio`.
+* `run_class`: either `validation` or `measurement`, captured from `PX_RUN_CLASS` at write time.
+* `contamination`: the active contamination causes captured from `PX_CONTAMINATION` at write time,
+  or `none` when clean.
+
+The function `pb_metric key class value unit [anchor [start_ms end_ms]]` appends a record to the
+aggregate export with one effective value per source, anchor, and key, such that a later record
+replaces an earlier one. The function `pb_sample key class value unit [anchor [ts_ms]]` appends a
+point-in-time observation to the timeline export. Both functions reject any record when no valid
+run class is set, ensuring that no metric record can lose its run class provenance. Any record
+written under the validation class, or carrying a contamination value other than `none`, never
+qualifies as authoritative time evidence regardless of which tool reads it.
+
+**Reading metrics.** The command `px-bundle metrics [BUNDLE] [ANCHOR [KEY]]` queries
+`metrics/aggregate.tsv` and outputs every row whose anchor and key match the supplied shell glob
+patterns (`*`, `?`, and `[...]`, each defaulting to `*`) in the format `anchor key value unit`,
+exiting with code 6 if no rows match or the table is empty. When multiple records share the same
+source, anchor, and key, the final record supersedes earlier ones while retaining the output
+position of the first occurrence. The first operand designates the target bundle whenever three
+operands are provided or whenever that operand is a run id or contains a `/`; otherwise, the command
+reads the newest finished bundle. For example, invoking
+`px-bundle metrics 'op@*' 'pherf.latency.*_us'` prints the latency metrics across every operation.
+
+## The other exports
+
+* `cluster/images.tsv`: contains `role index image_ref image_id` with one row per instance present
+  in the pre-run snapshot. To populate it, `px-run` obtains `image_ref` from `sb_list` and
+  `image_id` from `sb_image_ref`; on Compose the identifier is the local image ID, whereas on
+  Kubernetes it is the image digest.
+* `tables.tsv`: contains `schema table update_cache_frequency` with one row for each table that the
+  `prepare` verb created or altered, as read back from `SYSTEM.CATALOG`. The function `pb_table`
+  writes this file and records an empty schema or attribute value as `default`.
+* `cluster/topology.env` and `cluster/services.tsv`: hold copies of the corresponding files from
+  the deployment directory as defined in `docs/backends.md`. Together they record the complete
+  version set of the cluster: the HBase profile, the HBase and Hadoop releases, the ZooKeeper and
+  Hadoop client versions bundled with HBase, and the JDK version of each service.
+* `breach.tsv`: holds a copy of the breach sample captured by the health monitor whenever a
+  threshold breach terminated the run.
+* `thresholds.properties`: records the effective threshold values applied by the cluster checks
+  after merging the `PX_THRESHOLD_<KEY>` settings from the run configuration and any plug-in
+  overlays according to the precedence order defined in "The cluster checks".
+* `plugins/<id>/hooks.tsv`: contains `ts_ms hook status elapsed_ms` with one row per hook call
+  written by the plug-in loader, plus one row with the hook name `check` for each check script
+  executed by `suites/check-cluster.sh`. Alongside it, `plugins/<id>/manifest.tsv` uses the columns
+  `path description` to list the output files written by the plug-in relative to `plugins/<id>/`.
+
+## manifest.json
+
+After `px-report` finishes, `px-bundle write` assembles the manifest from the bundle files
+described above. Because the file is never edited by hand, `px-bundle write` can safely regenerate
+it at any time. Every member shown below is required; an unknown string value is represented as the
+empty string, and an unknown numeric value is represented as `null`.
+
+```json
+{
+  "bundle_format_version": 1,
+  "run": {
+    "id": "20261120T171109Z-co61", "class": "validation", "backend": "compose",
+    "scope": "px-default", "driver": "psql", "suite": "smoke", "test": "create",
+    "session": "20261120T171100Z-ab12", "started_ms": 1795194669000,
+    "ended_ms": 1795194690000, "result": "PASS"
+  },
+  "versions": {
+    "phoenix_hbase_profile": "2.6", "hbase": "2.6.7", "hadoop": "3.4.3",
+    "zookeeper": "3.8.6", "hbase_hadoop_client": "3.4.3",
+    "jdk": { "regionserver": "17", "client": "17" }
+  },
+  "images": [
+    { "role": "regionserver", "index": 0, "image_ref": "phoenix-harness:local",
+      "image_id": "sha256:..." }
+  ],
+  "tables": [ { "schema": "default", "table": "T1", "update_cache_frequency": "default" } ],
+  "quiet_host": { "state": "off", "tags": ["quiet-host"] },
+  "breach": null,
+  "anomaly": null,
+  "stages": [
+    { "anchor": "steady@script", "source": "driver:psql", "start_ms": 1795194680000,
+      "end_ms": 1795194685000 }
+  ],
+  "steady": [
+    {
+      "anchor": "steady@script", "start_ms": 1795194680000, "end_ms": 1795194685000,
+      "metrics": {
+        "query_latency.p50_ms": null,
+        "query_latency.p99_ms": null,
+        "query_errors": { "value": 0, "start_ms": 1795194685000, "end_ms": 1795194685000 },
+        "offered_rate": null,
+        "achieved_qps": null
+      }
+    }
+  ],
+  "disruptions": [
+    { "ordinal": 1, "action": "kill", "role": "regionserver", "index": 1, "argument": "hard",
+      "when": "phase:steady@script", "state": "ok", "recovery": "ok",
+      "injected_ms": 1795194681000, "recovered_ms": 1795194721450, "mttr_seconds": 40.450 }
+  ],
+  "artifacts": [
+    { "path": "run-record.tsv", "status": "present", "required": true, "reason": "" }
+  ]
+}
+```
+
+| Member | Source | Meaning |
+|---|---|---|
+| `bundle_format_version` | `PB_FORMAT_VERSION` | the schema version of this bundle |
+| `run` | `run` and `context` rows, `report/run-summary.tsv` | the run identity and final result |
+| `versions` | `cluster/topology.env`, `cluster/services.tsv` | the complete cluster version set |
+| `images` | `cluster/images.tsv` | the container image metadata of each instance |
+| `tables` | `tables.tsv` | the effective `UPDATE_CACHE_FREQUENCY` of each table |
+| `quiet_host` | the `quiet` result and `contamination` rows | host quiescence state and tags |
+| `breach` | `breach.tsv` | the relative path of the breach sample, or null |
+| `anomaly` | `abort`, `diff`, `term`, `oom` rows | every unplanned change and its evidence |
+| `stages` | `stages.tsv` | every closed stage anchor and its time window |
+| `steady` | `stages.tsv`, `metrics/aggregate.tsv` | each steady-state window and its metrics |
+| `disruptions` | `disrupt` and `recover` rows | each disruption and its recovery outcome |
+| `artifacts` | `pb_artifact_rows` | the complete file inventory of the bundle |
+
+The field `run.started_ms` records the timestamp of the first milestone of `px-run`, while
+`run.ended_ms` records the timestamp at which the manifest is written, and `run.result` holds the
+merged run outcome computed by `px-report`. The field `quiet_host.state` reflects the state of the
+`quiet` result row, defaulting to `unknown`, while `quiet_host.tags` lists all contamination
+causes; an empty array indicates that the time evidence of the run is clean. Each entry in
+`artifacts` carries a status of `present`, `missing`, `skipped`, or `unavailable`.
+
+**The anomaly.** The `anomaly` member is `null` whenever no instance changed state without a
+planned action, which corresponds exactly to the `result` row of `run-record.tsv` recording the
+anomaly flag `no`. Otherwise, it is an object with the following structure:
+
+```json
+"anomaly": {
+  "aborted": true, "abort_ms": 1795194683000,
+  "instances": [
+    { "role": "regionserver", "index": 0, "change": "went from running to exited",
+      "restarts_before": 0, "restarts_after": 0, "termination_reason": "oom",
+      "exit_code": 137, "oom": true }
+  ]
+}
+```
+
+The boolean `aborted` is `true` when an `abort` row halted execution while `prepare` or `run` was
+active, and `abort_ms` records the timestamp of the first such row, or `null` if none occurred.
+The `instances` array contains one entry for each instance referenced in an `abort` row or in a
+`diff` row marked `unplanned` or `vanished`: it records the state change description from the
+instance's `abort` row (or otherwise from its `diff` row), the before and after restart counts from
+the `diff` row, the termination reason and exit code from its `term` row, and the out-of-memory
+flag from its `oom` row. Any attribute not present in the record defaults to the empty string or
+`null`. The `cluster.restart` check reports these exact same fields in its verdict detail.
+
+**The steady window.** The `steady` array contains one entry for each `steady@` anchor. Its
+`metrics` object always includes the five steady-state metric keys—`query_latency.p50_ms`,
+`query_latency.p99_ms`, `query_errors`, `offered_rate`, and `achieved_qps`—each set either to
+`null` or to the final aggregate record emitted for that key and anchor, carrying its value and its
+own observation window. The sixth steady-state metric is recorded under
+`disruptions[].mttr_seconds`.
+
+**The recovery time.** For each disruption, `mttr_seconds` is calculated as
+`(recovered_ms - injected_ms) / 1000` formatted to three decimal places, or set to `null` when the
+recovery gate did not pass. The timestamp `injected_ms` captures the moment immediately preceding
+the substrate disruption call. Before invoking that call, `px-run` determines the baseline online
+region count of the cluster by summing `regionCount` across the RegionServers queried by
+`px-region-count` inside `client` 0; if this read fails, no disruption is injected and the
+disruption state is recorded as `fail`. The timestamp `recovered_ms` marks the time at which the
+recovery gate of `px-run` succeeds across three checks in sequence: any killed RegionServer has
+been started again through the drain-aware restart procedure, every configured instance reports
+ready, and the summed online region count has returned to the count measured before the disruption.
+Because the region-count wait uses the remainder of the post-restart `PX_TIMEOUT_READY` bound, a
+single disruption consumes at most one `PX_TIMEOUT_DRAIN` interval and two `PX_TIMEOUT_READY`
+intervals. If a restart or readiness wait expires, the recovery state is recorded as `timeout`,
+whereas if the online region count has not returned to the baseline by the end of the bound, the
+state is recorded as `fail` with both counts included in the diagnostic message. A disruption that
+fires while a verb is running waits within the time bound of that verb—the shared deadline governing
+prepare and run—so each recovery step receives at most the time remaining in the verb budget. Any
+drain, readiness, or region wait truncated by that verb bound enters the state `timeout` and
+terminates the verb at its deadline, assigning exit code 4 to the verb and causing `px-run` to exit
+with code 4. Consequently, `mttr_seconds` measures the full interval until the server is live and
+every region is back online. The recovery gate never inspects `ritCount` (the regions-in-transition
+count, which can lag by up to a minute), and region rebalancing is excluded from recovery because a
+rejoined server does not need to be balanced to serve traffic. A kill action must target a
+RegionServer—the service role whose drain label is `regionmover`—using the mode `hard`, because
+only the drain-aware restart procedure starts a killed instance again and a deleted instance cannot
+be started again; `px-run` rejects any other kill configuration with exit code 2 before any verb
+runs. Finally, the cluster check `cluster.recovery` compares the measured value against the
+threshold `recovery.seconds.max`.
+
+## Validation
+
+The command `px-bundle validate [BUNDLE]` performs offline validation of a result bundle without
+requiring a workload driver or an active cluster. The BUNDLE operand specifies either a directory
+path or a run identifier beneath `$PX_OUT/runs`, defaulting to the newest finished bundle, and must
+resolve within PX_OUT. The command emits one tab-separated row per validation check in the format
+`check status detail` (where status is `ok`, `fail`, or `skip`) followed by a summary row
+`result ok|fail CODE BUNDLE`. It exits with code 0 when all checks pass, 1 when any check fails, 2
+on a usage error or a target path outside PX_OUT, and 6 when the specified bundle is absent or no
+finished bundle exists. The validator enforces the following rules:
+
+1. `manifest.json` exists and forms a single valid JSON document.
+2. `bundle_format_version` is present and equal to `PB_FORMAT_VERSION`.
+3. `run.id` matches the bundle directory name and conforms to the run identifier grammar.
+4. `run.class` is either `validation` or `measurement`, and `run.backend` is non-empty.
+5. `versions`, `images`, `tables`, and `quiet_host.tags` are present with their expected types, each
+   entry in `images` includes an `image_id`, and each entry in `tables` includes an
+   `update_cache_frequency`. In addition, `anomaly` is either `null` or an object containing
+   `aborted`, `abort_ms`, and at least one entry in `instances`, where each entry carries every
+   member shown in the schema example above.
+6. `steady` contains at least one entry with a `steady@` anchor and a closed time window. Each
+   entry names its anchor and holds integer `start_ms` and `end_ms` timestamps such that the end
+   does not precede the start, and the validator explicitly names the defect if an entry has no
+   name, no start, no end, or an end timestamp prior to its start. Each entry also holds all five
+   steady-state metric keys, and every metric value that is not `null` lies within its enclosing
+   anchor window, with `start_ms` at or after the start of the anchor and `end_ms` at or before its
+   end.
+7. `disruptions` is present, and every entry includes the key `mttr_seconds`.
+8. No stage entry in `stages` remains open.
+9. Every required path is present in the bundle, and each absent optional path is reported as a
+   `skip` row.
+10. The captured describe document of the driver passes `pb_describe_load`.
+11. Every row in the metric exports contains ten fields, a recognized metric class, a numeric value,
+    a run class matching the manifest, and a contamination field set to `none` when the run is
+    clean. Every row in `verdicts.tsv` carries a valid severity from the lattice and a recognized
+    evidence class.
+
+The command `px-bundle write BUNDLE` generates the bundle manifest via `pb_manifest_write`. It exits
+with code 0 on success, 1 if the manifest cannot be written, 2 on a usage error or a bundle path
+outside PX_OUT, and 6 if the target bundle directory does not exist. The `write` subcommand requires
+an explicit bundle operand, and no subcommand consults `PX_RUN_DIR`.
+
+## Verdict severity
+
+Every verdict carries a single severity from the ordered lattice defined in `suites/lib/common.sh`:
+
+```text
+PASS  <  SKIP  <  ADVISORY  <  FAIL  <  ERROR
+```
+
+| Severity | Meaning | Fails the run |
+|---|---|---|
+| `PASS` | the check invariant held | no |
+| `SKIP` | the check could not run for a stated reason, or an item was unavailable | no |
+| `ADVISORY` | the check did not hold, but its timing evidence is not authoritative | no |
+| `FAIL` | the check did not hold, and its evidence is authoritative | yes |
+| `ERROR` | the harness or the infrastructure failed, so the run proves nothing | yes |
+
+The severity `ERROR` is reserved for harness or infrastructure faults, including an unplanned
+restart, an unexpected container exit or out-of-memory kill, a driver returning exit code 2 or 3, or
+a check script that could not execute. This distinction separates cluster or harness anomalies from
+workload verification failures and aligns directly with exit code 3. Because `SKIP` sits below
+`ADVISORY` in the ordering, an absent optional artifact can never obscure a genuine advisory
+verdict.
+
+The reporting tool `px-report [BUNDLE]` merges the verdict rows of a run in four steps. The BUNDLE
+operand specifies a directory path or a run identifier beneath `$PX_OUT/runs` and must resolve
+within PX_OUT; when omitted, `px-report` reads the newest finished bundle unless `--verdict`
+specifies explicit verdict streams to merge, in which case only those streams are evaluated. When
+operating on a bundle, `px-report` regenerates `report/` from all merged streams—including any
+additional `--verdict` stream—while `manifest.json` retains the original result of the run.
+
+1. **Collect.** It reads the bundle's `verdicts.tsv` along with every file supplied via
+   `--verdict FILE`. Any row whose severity or evidence class is unknown is converted to `ERROR`
+   with an explanatory detail message.
+2. **Demote.** A `FAIL` row of the `duration` class is demoted to `ADVISORY` unless the run's time
+   evidence is authoritative, which requires that the run class be `measurement` and that the run
+   contain no `contamination` row. No other verdicts change: count, share, and functional checks
+   remain authoritative under all conditions, and no rule ever elevates a severity. The function
+   `pb_effective_severity` implements this demotion rule.
+3. **Join.** The overall run result is the highest effective severity across all rows. A run with
+   no verdict rows, or with only `SKIP` rows, receives the outcome `INCONCLUSIVE`, which is a run
+   result rather than a row severity.
+4. **Write.** When operating on a bundle, it writes the three report files described below. It emits
+   the effective verdict rows followed by a closing summary row
+   `result <result> <exit code> <bundle>` on standard output, substituting `-` for the bundle field
+   when no bundle was read.
+
+The exit code of `px-report` is 0 for `PASS`, `SKIP`, and `ADVISORY`, 1 for `FAIL` and
+`INCONCLUSIVE`, 3 for `ERROR`, 2 for a usage error, a bundle path outside PX_OUT, or an unreadable
+record, and 6 when the target bundle is absent, no finished bundle exists, or the execution record
+is missing. When evaluating standalone verdict streams without a bundle, it obtains the active run
+class and contamination state directly from `PX_RUN_CLASS` and `PX_CONTAMINATION`.
+
+### The report files
+
+* `report/verdicts.tsv`: contains `check severity class source detail written` with one row per
+  merged verdict, placing the effective severity in the second column and the originally written
+  severity in the final column. The suite runner `px-suite` reads the worst severity from this file
+  when evaluating a driver test.
+* `report/run-summary.tsv`: contains a single summary row beneath the header
+  `run_id class backend driver suite test result rows pass skip advisory fail error contamination`.
+* `report/cluster-summary.tsv`: holds one row per pre-run snapshot instance under the header `role
+  index image_id state_pre state_post restarts_pre restarts_post change oom`, from the `instance`,
+  `restart`, `diff`, and `oom` rows together with `cluster/images.tsv`. When no cluster instances
+  exist, the file contains only the header line.
+
+## The cluster checks
+
+The runner `suites/check-cluster.sh` executes after the `report` verb while the cluster remains up.
+It merges the active threshold configuration, runs the built-in subjects in
+`suites/checks/cluster.sh` and the steady-state checks in `suites/checks/steady.sh`, and then runs
+the check scripts of each enabled plug-in, with every check appending verdict rows. During a run
+with a cluster, `px-run` invokes this runner automatically. Each individual plug-in check script is
+bounded by `PX_TIMEOUT_VERB`, while `px-run` bounds the entire execution of
+`suites/check-cluster.sh` by twice `PX_TIMEOUT_VERB`—a single combined budget covering the
+`thresholds` hooks, the seven built-in subjects, the two steady-state checks, and every plug-in
+check script together. If that aggregate budget expires, the remaining checks do not run and
+`px-run` records a `cluster.checks ERROR` verdict row with `exit 124`.
+
+**Thresholds.** All baseline thresholds reside in `suites/thresholds.properties` as individual
+`key=value` lines, and no check script embeds a hard-coded threshold literal. The `thresholds` hook
+of an enabled plug-in may print `key=value` lines that override existing keys or add new keys while
+leaving all other keys unchanged. The run configuration can also override individual keys through
+variables of the form `PX_THRESHOLD_<KEY>`—the threshold key converted to uppercase with each dot
+replaced by an underscore, such as `PX_THRESHOLD_LOG_WARNINGS_MAX=5`. The merge order starts with
+the base properties file, layers on values from a run-class file or configuration file, applies
+plug-in threshold lines in the order of `PX_PLUGINS`, and finishes with explicit operator values
+from the environment or `px-run -e`, where a later assignment for the same key wins. In this way, a
+plug-in overrides the run class—matching the precedence of the configuration loader—and the operator
+overrides all other sources. Any override name that matches no key defined in the base file or in an
+enabled plug-in is rejected as a usage error so that a misspelled variable name never silently
+leaves a threshold at its default value. The merged threshold set is written to
+`thresholds.properties` in the bundle, and `PX_THRESHOLDS_FILE` points each check script to that
+file. The helper `sx_threshold key` reads a single threshold value and exits with code 6 when the
+key is absent, which the calling check records as `ERROR`.
+
+| Key | Default | Subject |
+|---|---|---|
+| `wrapper.terminations.max` | 0 | verbs terminated by `px-run` at a time limit or by a signal |
+| `restart.unplanned.max` | 0 | unplanned restarts, unexpected exits, and vanished instances |
+| `oom.kills.max` | 0 | out-of-memory container kills |
+| `oom.peak_pct.max` | 95 | peak memory usage of an instance as a percentage of its limit |
+| `log.errors.max` | 0 | `ERROR` and `FATAL` lines in the daemon instance logs |
+| `log.warnings.max` | 100 | `WARN` lines in the daemon instance logs |
+| `gc.pause_ms.max` | 1000 | longest garbage-collection pause of any JVM instance, in milliseconds |
+| `recovery.seconds.max` | 120 | recovery time (mttr) of each injected disruption, in seconds |
+| `post_recovery.faults.max` | 0 | readiness or probe faults remaining after the final recovery |
+| `steady.p99_ms.max` | 1000 | highest `query_latency.p99_ms` of any steady window, in ms |
+| `steady.attainment_pct.min` | 90 | lowest `achieved_qps` of a window, as a % of `offered_rate` |
+
+**The seven subjects.** Each built-in cluster subject writes one or more verdict rows with the
+source `check:cluster`.
+
+| Check | Evidence | Over the threshold | Class |
+|---|---|---|---|
+| `cluster.wrapper` | `verb` rows with timed_out set or an exit code above 128 | `FAIL` | none |
+| `cluster.restart` | `diff` rows `unplanned` or `vanished`, plus `abort` rows | `ERROR` | count |
+| `cluster.oom` | `oom`, `sb_oom_killed`, and `sample` peaks | kill `ERROR`, peak `FAIL` | count |
+| `cluster.log` | `sb_logs` output since run start | errors `FAIL`, warnings `ADVISORY` | count |
+| `cluster.gc` | the GC log of each JVM instance retrieved via `sb_copy_out` | `FAIL` | duration |
+| `cluster.recovery` | `disrupt`, `action`, `recover` rows | `FAIL`, and `fail` or `missed` | none |
+| `cluster.post_recovery` | readiness and bootstrap probe checks after recovery | `FAIL` | count |
+
+Any subject lacking applicable evidence emits a `SKIP` verdict stating the reason, such as no
+cluster, no disruption, or no GC log. The `cluster.recovery` subject emits `FAIL` for any
+disruption whose state is `fail` (a failed fault injection) or `missed`, as well as when recovery
+time exceeds the threshold, and it emits `SKIP` only when no disruption entry is `ok`, `fail`, or
+`missed`, since entries that are `skip` or never fired provide no recovery evidence. The log
+subject saves each daemon log in `logs/instance/`, and the GC subject saves each garbage-collection
+log in `logs/gc/`. When a planned disruption action covered an instance, the log subject still
+archives its log file but excludes its lines from the error and warning counts. For each affected
+instance, the restart subject reports its state change, its restart counts, its termination reason
+and exit code, and its out-of-memory flag, matching the fields of the `anomaly` member of the
+manifest.
+
+The oom subject evaluates peak memory utilization for each role against its limit across two sample
+sources combined: the `pre` and `post` snapshots, and the continuous instance samples collected by
+the health monitor during the run window, which `px-run` copies into the execution record as
+`sample` rows of the phase `monitor`. When no monitor samples are present, the verdict detail notes
+that the peak was derived from the boundary snapshots alone. The GC subject parses pause times from
+the unified JVM garbage-collection log written by the container image to
+`$PX_LOG_DIR/gc-<role>-<index>.log`. Because every instance shares the same `PX_LOG_DIR` defined by
+the `ENV` directive of the common image, `cluster.gc` queries that path once from `client` 0 via
+`sb_exec` before copying `$PX_LOG_DIR/gc-<role>-<index>.log` from each JVM instance with
+`sb_copy_out`; accordingly, every backend must maintain a single `PX_LOG_DIR` across all service
+roles. The post-recovery subject executes only after a disruption: it requires every configured
+instance outside an intentionally stopped group to be running and ready, and it executes
+`px-bootstrap-probe`—passing `--yarn` when the `yarn` service group is active—inside `client` 0 via
+`sb_exec`.
+
+No verification check ever starts a JVM inside a daemon instance. Launching an auxiliary JVM next
+to a tightly sized daemon—for example, running `hbase hbck` inside the master container—can push the
+container over its memory limit. Any check that requires a client program executes it inside
+`client` 0.
+
+**The steady-state checks.** The script `suites/checks/steady.sh` writes two verdict rows with the
+source `check:steady`, both carrying the evidence class `duration` so that `px-report` demotes a
+`FAIL` verdict on either check to `ADVISORY` unless the run's time evidence is authoritative. The
+evaluated evidence is the final aggregate metric record for each key within each `steady@` anchor.
+
+| Check | Evidence | Over the threshold |
+|---|---|---|
+| `steady.query_latency.p99_ms` | `query_latency.p99_ms` per window | above `steady.p99_ms.max` |
+| `steady.attainment` | `achieved_qps` as % of `offered_rate` | below `steady.attainment_pct.min` |
+
+Each check emits `SKIP` with an explanatory reason when no steady window records its required keys,
+as occurs when a driver declares those metrics unsupported. Consequently, a bundle whose only
+threshold failures are these two steady-state rows still passes in the validation run class and on a
+contaminated host.
+
+By contrast, `cluster.recovery` carries the class `none` and is never demoted. Its two-minute upper
+bound acts as a structural liveness gate for the A4, A7, and K3 proofs across both run classes and
+on any host, providing a wide margin above the measured 40 to 70 seconds rather than acting as a
+timing measurement.
+
+**Plug-in checks.** Custom plug-in check scripts are defined in `docs/PLUGINS.md`, section "Check
+scripts". A check script emits verdict rows with `sx_verdict_row` and may record aggregate metrics
+with `pb_metric`. Any check script that fails to execute and returns a non-zero exit status causes
+the runner to append an `ERROR` row under the key `plugin.<id>.<name>`.
+
+The runner `suites/check-cluster.sh` exits with code 0 when every check script ran, 1 when any
+check script could not run, 2 on a usage error—such as an unset `PX_RUN_DIR` or a threshold line
+that does not match `key=number`—and 6 when a configuration file passed by `px-run` is absent.
+Because `px-run` forwards the `--config` files of the run to the script, the child process resolves
+each threshold value with its proper configuration origin.
