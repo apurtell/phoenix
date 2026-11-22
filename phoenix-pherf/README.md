@@ -44,6 +44,9 @@ mvn clean package -DskipTests
 - -allowUnknownTags _Allows scenario validation, both before a run and with -validate, to pass XML
   elements or attributes unrecognized by this version of Pherf, such as in a scenario written for a
   newer Pherf release (see Validation)._ <br />
+- -analyze DIR [DIR] _Analyzes replicate runs offline without establishing a database connection,
+  evaluating either a single set or a baseline set against a candidate set (see Offline
+  analysis)._ <br />
 - -connectionCache _Reuses connections through a cache holding at most pherf.default.threadpool
   idle connections. Each connection serves only operations with the same URL and connection
   properties (and therefore the same tenant and connection properties), allowing query sets and DDL
@@ -632,6 +635,17 @@ attainment, schedule lag and queue saturation, client thread pool exhaustion, ta
 server read skew. Verdict evaluation is purely diagnostic and never alters the process exit code.
 Check thresholds are configured through the `pherf.verdict.*` keys in pherf.properties; see
 [VERDICT.md](VERDICT.md) for full details.
+
+### Offline analysis
+Invoking `-analyze SET` or `-analyze BASELINE CANDIDATE` evaluates completed runs and writes
+`ANALYSIS_<label>.json` to the results directory. Each subdirectory within a set represents one
+replicate, consisting of either a harness run bundle or a Pherf results_HDR directory. The analysis
+computes the median and a seeded bootstrap confidence interval for each latency and throughput
+metric, requires identical operation and row counts across replicates of a co-generated scenario
+(treating other count differences as advisory), and compares the candidate set against the baseline
+set. It refuses to compare runs that belong to different run classes. The command exits with status
+0 on success, 1 for unusable input, 66 when the run classes differ, or 67 when a check fails; see
+[ANALYSIS.md](ANALYSIS.md) for full details.
 
 ## Testing
 Default quorum is localhost. If you want to override set the system variable.

@@ -46,7 +46,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.phoenix.thirdparty.com.google.common.annotations.VisibleForTesting;
 
-class MultiThreadedRunner implements Callable<Void> {
+public class MultiThreadedRunner implements Callable<Void> {
   private static final Logger LOGGER = LoggerFactory.getLogger(MultiThreadedRunner.class);
   private Query query;
   private ThreadTime threadTime;
@@ -116,7 +116,7 @@ class MultiThreadedRunner implements Callable<Void> {
    * a range query, followed by the scenario name and the query ID. The metrics sink record uses the
    * same leading operation label.
    */
-  static String latencyOperation(Query.Kind kind, String scenario, String queryId) {
+  public static String latencyOperation(Query.Kind kind, String scenario, String queryId) {
     return label(kind) + ":" + scenario + ":" + queryId;
   }
 

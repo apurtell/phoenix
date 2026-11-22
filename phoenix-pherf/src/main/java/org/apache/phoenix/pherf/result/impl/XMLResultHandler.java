@@ -72,7 +72,10 @@ public class XMLResultHandler extends DefaultResultHandler {
     return readFromResultFile(new File(resultFileName));
   }
 
-  List<Result> readFromResultFile(File resultsFile) throws Exception {
+  /**
+   * Reads and unmarshals a result file with DTD support and external entity resolution disabled.
+   */
+  public List<Result> readFromResultFile(File resultsFile) throws Exception {
     XMLInputFactory xif = XMLInputFactory.newInstance();
     xif.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
     xif.setProperty(XMLInputFactory.SUPPORT_DTD, false);

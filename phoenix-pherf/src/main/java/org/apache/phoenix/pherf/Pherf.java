@@ -28,10 +28,12 @@ import java.util.Map;
 import java.util.Properties;
 import org.apache.phoenix.pherf.PherfConstants.CompareType;
 import org.apache.phoenix.pherf.PherfConstants.GeneratePhoenixStats;
+import org.apache.phoenix.pherf.analysis.Analysis;
 import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.RunOverrides;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
+import org.apache.phoenix.pherf.exception.AnalysisException;
 import org.apache.phoenix.pherf.exception.ValidationException;
 import org.apache.phoenix.pherf.jmx.MonitorManager;
 import org.apache.phoenix.pherf.latency.LatencyRecorders;
@@ -60,6 +62,7 @@ import org.apache.phoenix.thirdparty.org.apache.commons.cli.CommandLine;
 import org.apache.phoenix.thirdparty.org.apache.commons.cli.CommandLineParser;
 import org.apache.phoenix.thirdparty.org.apache.commons.cli.DefaultParser;
 import org.apache.phoenix.thirdparty.org.apache.commons.cli.HelpFormatter;
+import org.apache.phoenix.thirdparty.org.apache.commons.cli.Option;
 import org.apache.phoenix.thirdparty.org.apache.commons.cli.Options;
 import org.apache.phoenix.thirdparty.org.apache.commons.cli.ParseException;
 
@@ -137,6 +140,14 @@ public class Pherf {
       "Let the scenario validation pass XML elements and attributes that this Pherf does not know,"
         + " as in a scenario for a newer Pherf. Each one goes to the log. Every other rule still"
         + " fails.");
+    options.addOption(Option.builder("analyze").longOpt("analyze").hasArgs().argName("DIR")
+      .desc("Analyze replicate run bundles offline, with no database connection: one DIR of"
+        + " replicates, or a baseline DIR and a candidate DIR. Each subdirectory of a DIR is one"
+        + " replicate: a harness run bundle or a Pherf results_HDR directory. Writes"
+        + " ANALYSIS_<label>.json to the results directory and exits with 0, 1 for unusable"
+        + " input, " + Analysis.EXIT_CLASS_MISMATCH + " when the run classes differ (no report),"
+        + " or " + Analysis.EXIT_FAIL + " when a check fails. Uses -label. See ANALYSIS.md.")
+      .build());
   }
 
   private final String zookeeper;
@@ -165,6 +176,7 @@ public class Pherf {
   private final RunOverrides overrides;
   private final boolean validate;
   private final boolean allowUnknownTags;
+  private final String[] analyze;
   private final VerdictSettings verdictSettings;
   private Properties properties = new Properties();
 
@@ -237,6 +249,7 @@ public class Pherf {
     connectionCache = command.hasOption("connectionCache");
     validate = command.hasOption("validate");
     allowUnknownTags = command.hasOption("allowUnknownTags");
+    analyze = command.getOptionValues("analyze");
 
     if (command.hasOption('b')) {
       // If the '-b' option was provided, set the system property for WriteWorkload to pick up.
@@ -295,6 +308,9 @@ public class Pherf {
     } catch (ValidationException e) {
       LOGGER.error(e.getMessage());
       System.exit(ScenarioValidator.EXIT_CODE);
+    } catch (AnalysisException e) {
+      LOGGER.error(e.getMessage());
+      System.exit(e.getExitCode());
     } catch (Exception e) {
       e.printStackTrace();
       LOGGER.error("Something went wrong.", e);
@@ -358,6 +374,16 @@ public class Pherf {
         for (Path path : scenarioFiles) {
           System.out.println(path);
         }
+        return;
+      }
+
+      // Offline analysis inspects completed runs exclusively and therefore establishes no database
+      // connection.
+      if (analyze != null) {
+        ResultUtil util = new ResultUtil();
+        util.ensureBaseResultDirExists();
+        File dir = new File(PherfConstants.create().getProperty("pherf.default.results.dir"));
+        Analysis.run(analyze, dir, util.getSuffix().substring(1), System.out);
         return;
       }
 
