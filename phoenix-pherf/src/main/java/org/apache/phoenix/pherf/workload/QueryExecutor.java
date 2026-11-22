@@ -28,6 +28,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.ExecutionType;
+import org.apache.phoenix.pherf.configuration.OpenLoop;
 import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.QuerySet;
 import org.apache.phoenix.pherf.configuration.Scenario;
@@ -40,6 +41,7 @@ import org.apache.phoenix.pherf.result.ScenarioResult;
 import org.apache.phoenix.pherf.result.ThreadTime;
 import org.apache.phoenix.pherf.rules.RulesApplier;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
+import org.apache.phoenix.pherf.workload.openloop.OpenLoopScheduler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,6 +55,11 @@ public class QueryExecutor implements Workload {
   private final WorkloadExecutor workloadExecutor;
   private final boolean writeRuntimeResults;
   private RulesApplier ruleApplier;
+  // Synchronizes access to the currently active open-loop query set scheduler and the cancellation
+  // flag.
+  private final Object openLoopMonitor = new Object();
+  private OpenLoopScheduler activeScheduler;
+  private boolean cancelled;
 
   public QueryExecutor(XMLConfigParser parser, PhoenixUtil util,
     WorkloadExecutor workloadExecutor) {
@@ -76,8 +83,27 @@ public class QueryExecutor implements Workload {
     this.ruleApplier = new RulesApplier(parser);
   }
 
+  /**
+   * Cancels the currently running open-loop query set and returns after its scheduler finishes
+   * reporting or the grace period of {@link OpenLoopScheduler#cancel()} elapses. The query set
+   * execution loop then terminates before advancing to the next query set.
+   */
   @Override
   public void complete() {
+    OpenLoopScheduler scheduler;
+    synchronized (openLoopMonitor) {
+      cancelled = true;
+      scheduler = activeScheduler;
+    }
+    if (scheduler != null) {
+      scheduler.cancel();
+    }
+  }
+
+  private boolean isCancelled() {
+    synchronized (openLoopMonitor) {
+      return cancelled;
+    }
   }
 
   /**
@@ -128,6 +154,7 @@ public class QueryExecutor implements Workload {
    */
   protected Callable<Void> executeAllScenarios(final DataModel dataModel) throws Exception {
     checkWarmupExecutions(dataModel);
+    checkOpenLoop(dataModel);
     return new Callable<Void>() {
       @Override
       public Void call() throws Exception {
@@ -147,12 +174,20 @@ public class QueryExecutor implements Workload {
             scenarioResult.setPhoenixProperties(phoenixProperty);
             dataModelResult.getScenarioResult().add(scenarioResult);
 
+            int position = 0;
             for (QuerySet querySet : scenario.getQuerySet()) {
+              position++;
+              if (isCancelled()) {
+                break;
+              }
               QuerySetResult querySetResult = new QuerySetResult(querySet);
               scenarioResult.getQuerySetResult().add(querySetResult);
 
               util.executeQuerySetDdls(querySet);
-              if (querySet.getExecutionType() == ExecutionType.SERIAL) {
+              if (querySet.getOpenLoop() != null && workloadExecutor.isPerformance()) {
+                executeQuerySetOpenLoop(dataModelResult, querySet, querySetResult, scenario,
+                  position);
+              } else if (querySet.getExecutionType() == ExecutionType.SERIAL) {
                 executeQuerySetSerial(dataModelResult, querySet, querySetResult, scenario);
               } else {
                 executeQuerySetParallel(dataModelResult, querySet, querySetResult, scenario);
@@ -225,6 +260,61 @@ public class QueryExecutor implements Workload {
   }
 
   /**
+   * Executes a query set using the open-loop scheduler, applying the configured concurrency as the
+   * worker limit. Arrival k executes query k mod n. Each query produces a single result containing
+   * one thread time entry named "1,C", which records one run time for each executed operation.
+   */
+  protected void executeQuerySetOpenLoop(DataModelResult dataModelResult, QuerySet querySet,
+    QuerySetResult querySetResult, Scenario scenario, int position) throws Exception {
+    int concurrency = querySet.getMinConcurrency();
+    final List<MultiThreadedRunner> runners = new ArrayList<>();
+    final List<String> responses = new ArrayList<>();
+    List<String> services = new ArrayList<>();
+    for (Query query : querySet.getQuery()) {
+      QueryResult queryResult = new QueryResult(query);
+      querySetResult.getQueryResults().add(queryResult);
+      runners.add((MultiThreadedRunner) executeRunner("1," + concurrency, dataModelResult,
+        queryResult, querySetResult, scenario));
+      // Construct the operation keys before starting worker threads, because the first call to
+      // getId() may lazily initialize the query identifier.
+      services.add("query:" + scenario.getName() + ":" + queryResult.getId());
+      responses.add("response:" + scenario.getName() + ":" + queryResult.getId());
+    }
+    final int queries = runners.size();
+    if (queries == 0) {
+      return;
+    }
+    OpenLoopScheduler.Task task = new OpenLoopScheduler.Task() {
+      @Override
+      public long execute(long sequence, boolean warmup) throws Exception {
+        return runners.get((int) (sequence % queries)).timedQuery(sequence + 1, warmup);
+      }
+
+      @Override
+      public String responseOperation(long sequence) {
+        return responses.get((int) (sequence % queries));
+      }
+    };
+    OpenLoopScheduler scheduler = OpenLoopScheduler.of(querySet.getOpenLoop(), concurrency,
+      warmupExecutions(querySet) * queries, task, scenario.getName(), position, services);
+    synchronized (openLoopMonitor) {
+      if (cancelled) {
+        return;
+      }
+      activeScheduler = scheduler;
+    }
+    try {
+      LOGGER.info("\nExecuting open loop query set " + position + " of scenario "
+        + scenario.getName() + " with concurrency " + concurrency);
+      scheduler.run();
+    } finally {
+      synchronized (openLoopMonitor) {
+        activeScheduler = null;
+      }
+    }
+  }
+
+  /**
    * Execute multi-thread runner
    */
   protected Callable<Void> executeRunner(String name, DataModelResult dataModelResult,
@@ -263,6 +353,89 @@ public class QueryExecutor implements Workload {
         }
       }
     }
+  }
+
+  /**
+   * Validates the open-loop configuration across all query sets in the data model before any query
+   * set begins execution.
+   * @throws IllegalArgumentException identifying the scenario, query set, and offending attribute
+   *                                  when validation fails.
+   */
+  static void checkOpenLoop(DataModel dataModel) {
+    for (Scenario scenario : dataModel.getScenarios()) {
+      int position = 0;
+      for (QuerySet querySet : scenario.getQuerySet()) {
+        position++;
+        OpenLoop openLoop = querySet.getOpenLoop();
+        if (openLoop == null) {
+          continue;
+        }
+        String where = "openLoop of querySet " + position + " of scenario " + scenario.getName();
+        if (!isPositiveInteger(querySet.getConcurrency())) {
+          throw new IllegalArgumentException(where + ": concurrency is not one integer of at"
+            + " least 1: " + querySet.getConcurrency());
+        }
+        List<OpenLoop.Stage> stages = openLoop.getStage();
+        if (stages == null || stages.isEmpty()) {
+          throw new IllegalArgumentException(where + ": no stage");
+        }
+        // Because the schedule operates in microseconds (us), the cumulative duration in
+        // microseconds must fit within a long.
+        long totalMs = 0;
+        double expected = 0;
+        for (int i = 0; i < stages.size(); i++) {
+          OpenLoop.Stage stage = stages.get(i);
+          String which = where + ": stage " + (i + 1) + ": ";
+          if (stage.getDurationMs() <= 0) {
+            throw new IllegalArgumentException(
+              which + "durationMs is not positive: " + stage.getDurationMs());
+          }
+          if (stage.getRate() == null) {
+            throw new IllegalArgumentException(which + "rate is absent");
+          }
+          if (!isRate(stage.getRate())) {
+            throw new IllegalArgumentException(
+              which + "rate is negative or not finite: " + stage.getRate());
+          }
+          if (stage.getEndRate() != null && !isRate(stage.getEndRate())) {
+            throw new IllegalArgumentException(
+              which + "endRate is negative or not finite: " + stage.getEndRate());
+          }
+          totalMs += stage.getDurationMs();
+          if (totalMs < 0 || totalMs > Long.MAX_VALUE / 1000) {
+            throw new IllegalArgumentException(which + "durationMs is too large: the total of the"
+              + " stages is more than " + Long.MAX_VALUE / 1000 + " ms");
+          }
+          double endRate = stage.getEndRate() == null ? stage.getRate() : stage.getEndRate();
+          expected += (stage.getRate() + endRate) / 2 * stage.getDurationMs();
+        }
+        if (expected == 0) {
+          throw new IllegalArgumentException(where + ": no arrival, the rate of all stages is 0");
+        }
+        if (openLoop.getArrival() == OpenLoop.Arrival.POISSON && openLoop.getSeed() == null) {
+          throw new IllegalArgumentException(where + ": arrival POISSON requires a seed");
+        }
+        if (openLoop.getMaxLagMs() != null && openLoop.getMaxLagMs() < 0) {
+          throw new IllegalArgumentException(
+            where + ": maxLagMs is negative: " + openLoop.getMaxLagMs());
+        }
+        if (openLoop.getMaxLagMs() != null && openLoop.getMaxLagMs() > Long.MAX_VALUE / 1000) {
+          throw new IllegalArgumentException(where + ": maxLagMs is more than "
+            + Long.MAX_VALUE / 1000 + ": " + openLoop.getMaxLagMs());
+        }
+        if (openLoop.getLagPolicy() == OpenLoop.LagPolicy.DROP && openLoop.getMaxLagMs() == null) {
+          throw new IllegalArgumentException(where + ": lagPolicy DROP requires maxLagMs");
+        }
+      }
+    }
+  }
+
+  private static boolean isPositiveInteger(String value) {
+    return value != null && value.matches("0*[1-9][0-9]{0,8}");
+  }
+
+  private static boolean isRate(double rate) {
+    return Double.isFinite(rate) && rate >= 0;
   }
 
   /**

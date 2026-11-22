@@ -115,9 +115,7 @@ class MultiThreadedRunner implements Callable<Void> {
     // target execution count or maximum execution duration.
     for (long i = 0; i < warmupExecutions; i++) {
       synchronized (workloadExecutor) {
-        if (!timedQuery(i + 1, true)) {
-          break;
-        }
+        timedQuery(i + 1, true);
       }
     }
     long threadStartTime = EnvironmentEdgeManager.currentTimeMillis();
@@ -131,9 +129,7 @@ class MultiThreadedRunner implements Callable<Void> {
       }
 
       synchronized (workloadExecutor) {
-        if (!timedQuery(i + 1, false)) {
-          break;
-        }
+        timedQuery(i + 1, false);
         if (
           writeRuntimeResults
             && (EnvironmentEdgeManager.currentTimeMillis() - lastResultWritten) > 1000
@@ -169,9 +165,13 @@ class MultiThreadedRunner implements Callable<Void> {
    * Executes a timed query iteration. A warmup execution is recorded exclusively under the "warmup"
    * latency phase; it does not contribute run times to legacy reports, emit metrics to sinks, or
    * trigger concurrent write workloads.
-   * @returns boolean true if query finished without timing out; false otherwise
+   * <p>
+   * The open-loop scheduler invokes this method directly without acquiring the closed-loop monitor
+   * lock, allowing scheduler worker threads to execute concurrently.
+   * @return the elapsed execution time in microseconds (us), measured from connection acquisition
+   *         through consumption of the last row.
    */
-  private boolean timedQuery(long iterationNumber, boolean warmup) throws Exception {
+  long timedQuery(long iterationNumber, boolean warmup) throws Exception {
     boolean isSelectCountStatement =
       query.getStatement().toUpperCase().trim().contains("COUNT(") ? true : false;
 
@@ -245,7 +245,7 @@ class MultiThreadedRunner implements Callable<Void> {
           resultRowCount);
       }
     }
-    return true;
+    return elapsedMicros;
   }
 
   @VisibleForTesting

@@ -24,6 +24,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.io.File;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -36,10 +37,20 @@ import org.HdrHistogram.HistogramLogReader;
 
 /** Parses latency output artifacts using the same approach as an external consumer. */
 public final class HdrFiles {
+  private static final String BASE_TIME = "#[BaseTime: ";
+
   private HdrFiles() {
   }
 
-  /** Parses a JSON latency report file into an object representation. */
+  /**
+   * Initializes a new latency recording run that writes its output artifacts to the specified
+   * directory with periodic interval export disabled.
+   */
+  public static void begin(File dir, String label) throws IOException {
+    LatencyRecorders.begin(dir, label, 0);
+  }
+
+  /** Reads and parses a JSON latency report file into a structured JSON object. */
   public static JsonObject json(File file) throws IOException {
     return JsonParser
       .parseString(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8))
@@ -73,7 +84,34 @@ public final class HdrFiles {
     return histograms;
   }
 
-  /** Aggregates the total sample counts across the provided histograms, grouped by tag. */
+  /**
+   * Extracts the exact [start, end] millisecond timestamps for each interval histogram in a log
+   * file, preserving file order. Because HistogramLogReader sums the logged second offsets using
+   * double-precision arithmetic before truncating to milliseconds, its computed timestamps can fall
+   * 1 ms below the values actually written. This method parses the decimal text directly from the
+   * log to recover the exact millisecond bounds.
+   */
+  public static List<long[]> boundsMs(File file) throws IOException {
+    List<long[]> bounds = new ArrayList<>();
+    BigDecimal baseSec = BigDecimal.ZERO;
+    for (String line : Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) {
+      if (line.startsWith(BASE_TIME)) {
+        int end = line.indexOf(' ', BASE_TIME.length());
+        baseSec = new BigDecimal(line.substring(BASE_TIME.length(), end));
+      } else if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith("\"")) {
+        // Each data line follows the format [Tag=<tag>,]<start s>,<length s>,<max>,<histogram>,
+        // where a tag never contains a comma.
+        String[] fields = line.split(",");
+        int i = fields[0].startsWith("Tag=") ? 1 : 0;
+        long startMs = baseSec.add(new BigDecimal(fields[i])).movePointRight(3).longValueExact();
+        long lengthMs = new BigDecimal(fields[i + 1]).movePointRight(3).longValueExact();
+        bounds.add(new long[] { startMs, startMs + lengthMs });
+      }
+    }
+    return bounds;
+  }
+
+  /** Aggregates the total sample counts across all provided histograms, grouped by tag. */
   public static Map<String, Long> countsByTag(List<Histogram> histograms) {
     Map<String, Long> counts = new HashMap<>();
     for (Histogram histogram : histograms) {

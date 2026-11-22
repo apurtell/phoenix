@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<datamodel name="open_loop">
+    <datamapping>
+        <column>
+            <type>VARCHAR</type>
+            <dataSequence>RANDOM</dataSequence>
+            <length>15</length>
+            <name>GENERAL_VARCHAR</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <!-- One open loop query set: 4 workers, 1 warmup execution of each query per worker, then
+             1000 arrivals per second for 50 ms. Arrivals alternate between o1 and o2. This file is
+             outside the scenario directory, because the fixture run of that directory uses a
+             constant clock, on which a schedule cannot advance. -->
+        <scenario tableName="PHERF.TEST_TABLE" rowCount="4" name="openLoop">
+            <querySet concurrency="4" warmupExecutions="1">
+                <openLoop>
+                    <stage durationMs="50" rate="1000"/>
+                </openLoop>
+                <query id="o1" statement="select count(*) from PHERF.TEST_TABLE"/>
+                <query id="o2" statement="select sum(SOME_INT) from PHERF.TEST_TABLE"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>

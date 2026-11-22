@@ -52,9 +52,14 @@ import org.apache.phoenix.util.EnvironmentEdgeManager;
  * comma-separated list. Consequently, the start and end timestamps recorded for each operation
  * yield those exact elapsed durations in sequential order.
  * <p>
- * In "cli" mode, the runner executes Pherf once for each argument set separated by {@link #NEXT}.
- * In "fixtures" mode, it loads and executes each scenario file named by the arguments. Finally, the
- * child process writes its result to {@link Records#OUTCOME} and exits with 0 upon success.
+ * When the {@link #REAL_CLOCK} system property is set to true, the child process skips environment
+ * edge injection and relies on the real system clock so that open-loop schedules can operate in
+ * real time.
+ * <p>
+ * In "cli" mode, the runner executes Pherf once for each group of arguments delimited by
+ * {@link #NEXT}. In "fixtures" mode, it loads and executes every scenario file specified by the
+ * command-line arguments. Finally, the child process records its execution outcome in
+ * {@link Records#OUTCOME} and terminates with exit code 0 upon success.
  */
 public final class ChildRun {
   public static final String NEXT = "--next";
@@ -62,6 +67,7 @@ public final class ChildRun {
   public static final String REJECTED = "rejected";
   public static final String FAILED = "failed";
   public static final String ELAPSED_MICROS = "pherf.test.elapsedMicros";
+  public static final String REAL_CLOCK = "pherf.test.realClock";
   private static final long NOW = 1700000000000L;
   private static final long MAX_OPERATIONS = 20;
 
@@ -72,12 +78,14 @@ public final class ChildRun {
     int exitCode = 1;
     try {
       String script = System.getProperty(ELAPSED_MICROS);
-      EnvironmentEdgeManager.injectEdge(script == null ? new EnvironmentEdge() {
-        @Override
-        public long currentTime() {
-          return NOW;
-        }
-      } : new ScriptedEdge(script));
+      if (!Boolean.getBoolean(REAL_CLOCK)) {
+        EnvironmentEdgeManager.injectEdge(script == null ? new EnvironmentEdge() {
+          @Override
+          public long currentTime() {
+            return NOW;
+          }
+        } : new ScriptedEdge(script));
+      }
       FakePhoenixDriver.install();
       List<String> rest = Arrays.asList(args).subList(1, args.length);
       if ("cli".equals(args[0])) {

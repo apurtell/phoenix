@@ -119,6 +119,59 @@ executed to a minimum of 10 times or 10 seconds (whichever comes first). QuerySe
 
 ```
 
+### Open loop query sets
+Configuring a query set with an `openLoop` element dispatches its queries according to a target
+arrival rate schedule rather than running them in a closed loop. The scheduler enqueues each
+operation at its intended dispatch timestamp, while a pool of `concurrency` worker threads pulls
+operations from the queue for execution. The configured concurrency must be a single integer value
+(rather than a range) and also defines the maximum capacity of the dispatch queue. Successive
+arrivals cycle through the queries of the query set in their declared order. Whenever worker threads
+cannot keep pace with the arrival rate, queued operations accumulate scheduling lag; the latency
+report separately captures both the database service time (under key `query`) and the end-to-end
+response time measured from the intended dispatch timestamp (under key `response`), preventing a
+slow cluster from masking client-side queueing delay. Refer to [LATENCY.md](LATENCY.md) for full
+details on latency keys and the `schedules` report entry generated for each open-loop query set.
+
+```
+
+<querySet concurrency="8" warmupExecutions="2">
+    <openLoop arrival="POISSON" seed="7" maxLagMs="50" lagPolicy="DROP">
+        <stage durationMs="10000" rate="100"/>
+        <stage durationMs="10000" rate="100" endRate="400"/>
+        <stage durationMs="10000" rate="400"/>
+    </openLoop>
+    <query id="q5" statement="select count(*) from PHERF.TEST_TABLE"/>
+</querySet>
+
+```
+
+* `stage`: defines an interval using `durationMs` and an initial target `rate` (in operations per
+  second at the beginning of the stage). Specifying `endRate` causes the arrival rate to interpolate
+  linearly to `endRate` across the stage duration, whereas omitting it maintains a flat rate.
+  Setting the rate to 0 introduces a pause. A single flat stage produces a constant arrival rate,
+  multiple flat stages produce a stepped profile, and configuring `endRate` produces a linear ramp.
+* `arrival`: selects the arrival distribution. `UNIFORM` (the default) spaces arrivals at equal
+  intervals under a constant rate, while `POISSON` generates a Poisson arrival process over the
+  configured rate curve and requires `seed` so that a given seed reproduces identical arrival
+  timestamps across runs.
+* `maxLagMs`: specifies the maximum tolerated scheduling lag, where omitting the attribute imposes
+  no limit. `lagPolicy`: controls how overdue operations are handled; `LATE` (the default) executes
+  an overdue operation and increments the late counter, whereas `DROP` skips execution, counts the
+  operation as dropped, and requires `maxLagMs` to be configured.
+* `warmupExecutions` causes each worker thread to execute the specified number of warmup runs of
+  every query in the set before the open-loop schedule begins.
+* `executionType`, `numberOfExecutions`, and `executionDurationInMs` have no effect on open-loop
+  execution because the configured stages determine the overall schedule duration. Once the schedule
+  window concludes, the remaining queue drains and all in-flight operations complete.
+* Only standard performance runs honor `openLoop`, whereas `-diff` and `-export` invocations ignore
+  it. Every executed operation contributes a single row recording its service time to the legacy CSV
+  and XML result files.
+* When running with `-connectionCache`, configure `pherf.default.threadpool` to be at least as large
+  as the open-loop concurrency, since the connection cache retains at most that many idle
+  connections.
+* Because multiple worker threads draw dynamic placeholder values (`[COL]`) concurrently, the exact
+  sequence of substituted values varies across runs.
+
 ## Results
 Results are written real time in _results_ directory. Open the result that is saved in .jpg format for real time
 visualization.

@@ -25,6 +25,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -76,6 +77,7 @@ public final class LatencyRecorders {
   // Indexed by the log tag, which uniquely identifies each operation and phase pair.
   private final ConcurrentHashMap<String, Entry> entries = new ConcurrentHashMap<>();
   private final AtomicBoolean clampLogged = new AtomicBoolean();
+  private final List<Object> schedules = new CopyOnWriteArrayList<>();
   // Remains null when periodic interval export is disabled.
   private final LatencyReport.Log intervals;
   private final ScheduledExecutorService roller;
@@ -153,6 +155,18 @@ public final class LatencyRecorders {
     LatencyRecorders run = current;
     if (run != null) {
       run.add(operation, phase, micros);
+    }
+  }
+
+  /**
+   * Appends a schedule summary entry to the "schedules" array of the JSON report in invocation
+   * order. Gson serializes the fields of the supplied entry directly. When no latency recording run
+   * is active, this method performs no action.
+   */
+  public static void addSchedule(Object entry) {
+    LatencyRecorders run = current;
+    if (run != null) {
+      run.schedules.add(entry);
     }
   }
 
@@ -249,7 +263,8 @@ public final class LatencyRecorders {
         totals.add(entry.total);
       }
     }
-    LatencyReport.write(dir, label, startMs, rolledMs, intervals != null, totals);
+    LatencyReport.write(dir, label, startMs, rolledMs, intervals != null, totals,
+      new ArrayList<>(schedules));
   }
 
   private static Histogram newHistogram() {

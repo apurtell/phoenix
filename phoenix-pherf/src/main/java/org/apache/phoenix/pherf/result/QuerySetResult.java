@@ -32,6 +32,7 @@ public class QuerySetResult extends QuerySet {
     this.setExecutionType(querySet.getExecutionType());
     this.setPhoenixProperties(querySet.getPhoenixProperties());
     this.setWarmupExecutions(querySet.getWarmupExecutions());
+    this.setOpenLoop(querySet.getOpenLoop());
   }
 
   public QuerySetResult() {

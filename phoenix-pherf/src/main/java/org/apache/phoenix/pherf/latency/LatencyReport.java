@@ -112,10 +112,11 @@ public final class LatencyReport {
 
   /**
    * Writes the JSON summary report and the cumulative run histogram log from the provided total
-   * histograms, which are already populated with their tags.
+   * histograms, which are already populated with their tags. When the schedules list is empty, the
+   * "schedules" field is omitted from the serialized JSON report.
    */
   static void write(File dir, String label, long startMs, long endMs, boolean intervals,
-    List<Histogram> totals) throws IOException {
+    List<Histogram> totals, List<Object> schedules) throws IOException {
     Log log = new Log(new File(dir, hlogName(label)), startMs);
     try {
       for (Histogram total : totals) {
@@ -133,6 +134,7 @@ public final class LatencyReport {
     for (Histogram total : totals) {
       report.histograms.add(new Summary(total));
     }
+    report.schedules = schedules.isEmpty() ? null : schedules;
     // The JSON report is materialized last so that any consumer observing it is guaranteed to find
     // a completed histogram log. Performing an atomic move ensures that readers never encounter a
     // partially written report file.
@@ -190,7 +192,8 @@ public final class LatencyReport {
   }
 
   // Defines the schema for version 1 of the JSON report. Gson serializes these fields in their
-  // declared order and omits any field with a null value.
+  // declared order and omits any field with a null value. Adding an optional field that existing
+  // readers can ignore does not increment the schema version.
   @SuppressWarnings("unused")
   private static final class Report {
     private final String format = FORMAT;
@@ -202,6 +205,8 @@ public final class LatencyReport {
     private String hlog;
     private String intervals;
     private final List<Summary> histograms = new ArrayList<>();
+    // Holds the final execution state for each open-loop query set, listed in execution order.
+    private List<Object> schedules;
   }
 
   @SuppressWarnings("unused")

@@ -262,16 +262,24 @@ public class LatencyRecordersTest {
     JsonObject report = HdrFiles.json(json());
     Map<String, Long> counts = HdrFiles.countsByTag(report);
     List<Histogram> exported = HdrFiles.hlog(intervals());
+    // Parse the exact timestamp bounds directly from the log text, because the bounds computed by
+    // HistogramLogReader can be up to 1 ms too low due to floating-point truncation.
+    List<long[]> bounds = HdrFiles.boundsMs(intervals());
+    assertEquals(exported.size(), bounds.size());
     for (int k = 0; k < operations.length; k++) {
       String tag = LatencyReport.tag(operations[k], LatencyRecorders.STEADY);
       long previousEnd = report.get("startMs").getAsLong();
       int n = 0;
       long sum = 0;
-      for (Histogram interval : exported) {
+      for (int i = 0; i < exported.size(); i++) {
+        Histogram interval = exported.get(i);
         if (tag.equals(interval.getTag())) {
-          assertTrue(interval.getStartTimeStamp() >= previousEnd);
-          assertTrue(interval.getEndTimeStamp() >= interval.getStartTimeStamp());
-          previousEnd = interval.getEndTimeStamp();
+          long startMs = bounds.get(i)[0];
+          long endMs = bounds.get(i)[1];
+          assertTrue(tag + " interval " + n + " starts at " + startMs + " before " + previousEnd,
+            startMs >= previousEnd);
+          assertTrue(tag + " interval " + n + " ends before its start", endMs >= startMs);
+          previousEnd = endMs;
           n++;
           sum += interval.getTotalCount();
         }

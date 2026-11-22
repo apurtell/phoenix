@@ -32,8 +32,9 @@ import java.util.Map;
  * Each reported Pherf execution record emits two distinct metrics, KIND.elapsed_ms and KIND.rows.
  * The supported metric kinds and their associated tags are as follows:
  * <ul>
- * <li>query: represents a single query execution on the closed-loop path, carrying the tags
- * scenario, query, tenant, and outcome (which takes the value ok, timeout, or error).</li>
+ * <li>query: represents a single query execution on either the closed-loop or open-loop path
+ * (measuring service time), carrying the tags scenario, query, tenant, and outcome (which takes the
+ * value ok, timeout, or error).</li>
  * <li>load: represents a single row in the data load summary for either a data load or a scenario
  * DDL execution, carrying the tag table.</li>
  * <li>operation: represents a single multi-tenant operation, carrying the tags scenario, operation,

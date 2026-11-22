@@ -31,6 +31,7 @@ public class QuerySet {
   private ExecutionType executionType = ExecutionType.SERIAL;
   private Map<String, String> phoenixProperties;
   private Long warmupExecutions;
+  private OpenLoop openLoop;
 
   /**
    * List of queries in each query set
@@ -131,6 +132,19 @@ public class QuerySet {
 
   public void setWarmupExecutions(Long warmupExecutions) {
     this.warmupExecutions = warmupExecutions;
+  }
+
+  /**
+   * Returns the open-loop schedule configured for this query set, or null (when absent) to execute
+   * in closed-loop mode. Only standard performance runs apply this schedule, whereas -diff and
+   * -export runs ignore it.
+   */
+  public OpenLoop getOpenLoop() {
+    return openLoop;
+  }
+
+  public void setOpenLoop(OpenLoop openLoop) {
+    this.openLoop = openLoop;
   }
 
   @Override
