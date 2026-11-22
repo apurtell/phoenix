@@ -19,8 +19,8 @@
 
 <!-- Structural and co-generation defects in one file, for the one pass test. The validator reports
      each defect once, in a fixed order. Each comment names the rule that a defect fails. -->
-<!-- xml.unknown-attribute: release. -->
-<datamodel name="validation_defects" release="192">
+<!-- xml.unknown-attribute: revision. -->
+<datamodel name="validation_defects" revision="192">
     <datamapping>
         <column>
             <type>BIGINT</type>

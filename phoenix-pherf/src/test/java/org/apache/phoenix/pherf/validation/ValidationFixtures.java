@@ -42,6 +42,7 @@ final class ValidationFixtures {
   static final String CLEAN_DESC = "clean_desc.xml";
   static final String DEFECTS = "defects.xml";
   static final String UNKNOWN_ELEMENT = "unknown_element.xml";
+  static final String RELEASE = "release_attribute.xml";
 
   private ValidationFixtures() {
   }

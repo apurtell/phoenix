@@ -27,6 +27,10 @@ import javax.xml.bind.annotation.XmlRootElement;
 @XmlRootElement(name = "datamodel")
 public class DataModel {
   private String name;
+  // Retained for backward compatibility with scenario files written by older versions of Pherf;
+  // the attribute is accepted during unmarshalling but is otherwise unused, and a null value omits
+  // the attribute when marshalling.
+  private String release;
   private List<Scenario> scenarios = new ArrayList<>();
   private List<Column> dataMappingColumns = new ArrayList<>();
 
@@ -60,6 +64,15 @@ public class DataModel {
   @XmlAttribute()
   public void setName(String name) {
     this.name = name;
+  }
+
+  public String getRelease() {
+    return release;
+  }
+
+  @XmlAttribute()
+  public void setRelease(String release) {
+    this.release = release;
   }
 
   @Override

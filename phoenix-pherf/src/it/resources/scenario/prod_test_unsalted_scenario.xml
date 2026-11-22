@@ -313,7 +313,7 @@
                     <userDefined>true</userDefined>
                     <length>15</length>
                     <dataSequence>LIST</dataSequence>
-                    <valueList>
+                    <valuelist>
                         <datavalue>
                             <value>00Dxx0000001gER</value>
                         </datavalue>
@@ -323,7 +323,7 @@
                         <datavalue>
                             <value>00Dxx0000001gET</value>
                         </datavalue>
-                    </valueList>
+                    </valuelist>
                     <name>TENANT_ID</name>
                 </column>
             </dataOverride>
@@ -368,7 +368,7 @@
                     <userDefined>true</userDefined>
                     <length>15</length>
                     <dataSequence>LIST</dataSequence>
-                    <valueList>
+                    <valuelist>
                         <datavalue>
                             <value>00Dxx0000001gER</value>
                         </datavalue>
@@ -378,7 +378,7 @@
                         <datavalue>
                             <value>00Dxx0000001gET</value>
                         </datavalue>
-                    </valueList>
+                    </valuelist>
                     <name>TENANT_ID</name>
                 </column>
             </dataOverride>

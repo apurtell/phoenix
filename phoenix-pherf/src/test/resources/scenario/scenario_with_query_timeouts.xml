@@ -17,7 +17,7 @@
   ~   limitations under the License.
   -->
 
-<datamodel release="192" name="test_scenario">
+<datamodel name="test_scenario">
     <datamapping>
         <column>
             <!-- This column type defines what will generally happen to VARCHAR fields unless they are explicitly defined or overridden elsewhere -->

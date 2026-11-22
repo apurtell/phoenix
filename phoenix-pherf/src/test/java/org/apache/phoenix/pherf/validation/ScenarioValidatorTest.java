@@ -20,6 +20,7 @@ package org.apache.phoenix.pherf.validation;
 import static org.apache.phoenix.pherf.validation.ValidationFixtures.CLEAN;
 import static org.apache.phoenix.pherf.validation.ValidationFixtures.CLEAN_PROFILE;
 import static org.apache.phoenix.pherf.validation.ValidationFixtures.DEFECTS;
+import static org.apache.phoenix.pherf.validation.ValidationFixtures.RELEASE;
 import static org.apache.phoenix.pherf.validation.ValidationFixtures.edit;
 import static org.apache.phoenix.pherf.validation.ValidationFixtures.rules;
 import static org.apache.phoenix.pherf.validation.ValidationFixtures.validate;
@@ -192,7 +193,7 @@ public class ScenarioValidatorTest {
     String path = ValidationFixtures.file(DEFECTS);
     ValidationReport report = validate(path);
     String scenario = "datamodel/scenarios/scenario[1]";
-    List<String> expected = Arrays.asList("xml.unknown-attribute datamodel/@release",
+    List<String> expected = Arrays.asList("xml.unknown-attribute datamodel/@revision",
       "xml.value datamodel/datamapping/column[3]/length",
       "xml.unknown-element " + scenario + "/notATag",
       "xml.value " + scenario + "/querySet[1]/openLoop/@arrival",
@@ -219,8 +220,27 @@ public class ScenarioValidatorTest {
   }
 
   /**
+   * Verifies RQ-152 by confirming that the release attribute from older Pherf versions on the
+   * datamodel element produces no validation finding, whereas a different unknown attribute on
+   * datamodel still produces a finding.
+   */
+  @Test
+  public void testReleaseAttributeIsKnown() throws Exception {
+    String path = ValidationFixtures.file(RELEASE);
+    assertEquals(new ArrayList<String>(), rules(validate(path)));
+
+    ValidationReport report = validate(
+      variant(folder.newFolder(), RELEASE, edit(RELEASE, "release=\"192\"", "revision=\"192\"")));
+    List<String> actual = new ArrayList<>();
+    for (Finding finding : report.getFindings()) {
+      actual.add(finding.getRule().id() + " " + finding.getWhere());
+    }
+    assertEquals(Collections.singletonList("xml.unknown-attribute datamodel/@revision"), actual);
+  }
+
+  /**
    * Verifies RQ-192, carried forward from P9, by confirming that all reference scenarios and their
-   * associated smoke profiles validate with no errors.
+   * associated smoke profiles validate with no error.
    */
   @Test
   public void testReferenceScenariosHaveNoError() throws Exception {
@@ -249,13 +269,6 @@ public class ScenarioValidatorTest {
     PhoenixUtil.setRowCountOverride(0);
     File module = ChildJvm.targetDir().getParentFile();
     Map<String, List<String>> expected = new LinkedHashMap<>();
-    expected.put("config/scenario/user_defined_scenario.xml",
-      Collections.singletonList("xml.unknown-attribute datamodel/@release"));
-    expected.put("src/test/resources/scenario/scenario_with_query_timeouts.xml",
-      Collections.singletonList("xml.unknown-attribute datamodel/@release"));
-    expected.put("src/it/resources/scenario/prod_test_unsalted_scenario.xml", Arrays.asList(
-      "xml.unknown-element datamodel/scenarios/scenario[1]/dataOverride/column[1]" + "/valueList",
-      "xml.unknown-element datamodel/scenarios/scenario[2]/dataOverride" + "/column[1]/valueList"));
     expected.put("src/test/resources/scenario/malicious_scenario_with_dtd.xml",
       Collections.singletonList("xml.parse datamodel"));
     expected.put("src/test/resources/malicious_results_with_dtd.xml",

@@ -22,7 +22,9 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import org.apache.phoenix.pherf.PherfConstants.CompareType;
 import org.apache.phoenix.pherf.PherfConstants.GeneratePhoenixStats;
@@ -41,6 +43,7 @@ import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.util.ResourceList;
 import org.apache.phoenix.pherf.validation.ScenarioValidator;
 import org.apache.phoenix.pherf.validation.ValidationReport;
+import org.apache.phoenix.pherf.validation.ValidationReport.Finding;
 import org.apache.phoenix.pherf.workload.QueryExecutor;
 import org.apache.phoenix.pherf.workload.Workload;
 import org.apache.phoenix.pherf.workload.WorkloadExecutor;
@@ -128,6 +131,10 @@ public class Pherf {
         + " each finding, write VALIDATION_<label>.json to the results directory, and exit with "
         + ScenarioValidator.EXIT_CODE + " when a rule fails. Uses -label, -schemaFile,"
         + " -disableSchemaApply and -rowCountOverride.");
+    options.addOption("allowUnknownTags", "allowUnknownTags", false,
+      "Let the scenario validation pass XML elements and attributes that this Pherf does not know,"
+        + " as in a scenario for a newer Pherf. Each one goes to the log. Every other rule still"
+        + " fails.");
   }
 
   private final String zookeeper;
@@ -155,6 +162,7 @@ public class Pherf {
   private final boolean connectionCache;
   private final RunOverrides overrides;
   private final boolean validate;
+  private final boolean allowUnknownTags;
   private Properties properties = new Properties();
 
   @VisibleForTesting
@@ -225,6 +233,7 @@ public class Pherf {
 
     connectionCache = command.hasOption("connectionCache");
     validate = command.hasOption("validate");
+    allowUnknownTags = command.hasOption("allowUnknownTags");
 
     if (command.hasOption('b')) {
       // If the '-b' option was provided, set the system property for WriteWorkload to pick up.
@@ -288,25 +297,37 @@ public class Pherf {
   }
 
   /**
-   * Validates the configured scenario files along with the DDL statements that this execution would
-   * apply, and writes out the resulting validation report.
-   * @throws ValidationException if any validation rule fails.
+   * Validates the configured scenario files and the DDL statements for the run without opening a
+   * database connection. A standard run invokes this check before executing any phase that can
+   * establish a connection. When -allowUnknownTags is specified, unrecognized XML elements and
+   * attributes are logged rather than reported as errors. Under -validate, the validation report is
+   * written to the results directory and printed to stdout; during a standard run, the report is
+   * emitted only when a validation rule fails.
+   * @param schema the schema reader for the run, or null when the run applies no schema
+   * @return the parsed data model for each scenario file, to be reused by the runtime parser
+   * @throws ValidationException if any validation rule fails
    */
-  private void validateScenarios() throws Exception {
-    if (scenarioFile == null) {
-      throw new IllegalArgumentException("-validate needs -scenarioFile");
+  private Map<Path, DataModel> validateScenarios(SchemaReader schema) throws Exception {
+    Map<Path, DataModel> models = new LinkedHashMap<>();
+    ValidationReport report = ScenarioValidator.validate(scenarioFile, schema, models);
+    if (allowUnknownTags) {
+      for (Finding finding : report.waiveUnknownNames()) {
+        LOGGER.warn("-allowUnknownTags lets this pass: " + finding);
+      }
     }
-    String schemaPattern = !applySchema ? null : schemaFile == null ? ".*.sql" : schemaFile;
-    ValidationReport report = ScenarioValidator.validate(scenarioFile, schemaPattern);
-    ResultUtil util = new ResultUtil();
-    util.ensureBaseResultDirExists();
-    File dir = new File(PherfConstants.create().getProperty("pherf.default.results.dir"));
-    Path json = report.write(dir, util.getSuffix().substring(1));
-    report.print(System.out, json);
-    if (report.getErrors() > 0) {
-      throw new ValidationException(
-        "Validation failed with " + report.getErrors() + " error(s); see " + json);
+    if (validate || report.getErrors() > 0) {
+      ResultUtil util = new ResultUtil();
+      util.ensureBaseResultDirExists();
+      File dir = new File(PherfConstants.create().getProperty("pherf.default.results.dir"));
+      Path json = report.write(dir, util.getSuffix().substring(1));
+      report.print(System.out, json);
+      if (report.getErrors() > 0) {
+        throw new ValidationException(
+          "Validation failed with " + report.getErrors() + " error(s); see " + json);
+      }
     }
+    LOGGER.info("The scenario files pass the validation: " + report.getFiles());
+    return models;
   }
 
   public void run() throws Exception {
@@ -340,11 +361,24 @@ public class Pherf {
         return;
       }
 
-      // Perform offline validation and exit prior to executing any step that could establish a
-      // database connection.
+      // Execute scenario validation as a pre-run gate before any phase that can open a database
+      // connection; when -validate is specified, exit immediately after validation completes.
+      if (validate && scenarioFile == null) {
+        throw new IllegalArgumentException("-validate needs -scenarioFile");
+      }
+      SchemaReader schema = applySchema
+        ? new SchemaReader(phoenixUtil, schemaFile == null ? ".*.sql" : schemaFile)
+        : null;
+      Map<Path, DataModel> models = scenarioFile == null ? null : validateScenarios(schema);
       if (validate) {
-        validateScenarios();
         return;
+      }
+      XMLConfigParser parser = null;
+      if (models != null) {
+        parser = new XMLConfigParser(scenarioFile, models);
+        // Apply launch overrides to the parsed query sets prior to running any data load; the
+        // query executor subsequently validates the effective query set configurations.
+        overrides.apply(parser.getDataModels());
       }
 
       // Drop tables with PHERF schema and regex comparison
@@ -354,22 +388,16 @@ public class Pherf {
         phoenixUtil.deleteTables(dropPherfTablesRegEx);
       }
 
-      if (applySchema) {
+      if (schema != null) {
         LOGGER.info("\nStarting to apply schema...");
-        SchemaReader reader =
-          (schemaFile == null) ? new SchemaReader(".*.sql") : new SchemaReader(schemaFile);
-        reader.applySchema();
+        schema.applySchema();
       }
 
       // If no scenario file specified then we are done.
-      if (scenarioFile == null) {
+      if (parser == null) {
         return;
       }
 
-      XMLConfigParser parser = new XMLConfigParser(scenarioFile);
-      // Apply launch overrides to the parsed query sets prior to running any data load; the query
-      // executor subsequently validates the effective query set configurations.
-      overrides.apply(parser.getDataModels());
       LatencyRecorders.begin(properties);
       if (connectionCache) {
         // The closed-loop workload executes at most this many concurrent operations at a time.

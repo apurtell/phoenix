@@ -54,7 +54,6 @@ import org.apache.phoenix.pherf.configuration.QuerySet;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.exception.FileLoaderException;
-import org.apache.phoenix.pherf.rules.DataValue;
 import org.apache.phoenix.pherf.rules.IndexHash;
 import org.apache.phoenix.pherf.rules.RulesApplier;
 import org.apache.phoenix.pherf.schema.SchemaReader;
@@ -128,13 +127,7 @@ public final class ScenarioValidator {
    */
   public static ValidationReport validate(String scenarioPattern, String schemaPattern)
     throws Exception {
-    Collection<Path> files =
-      new ResourceList(PherfConstants.RESOURCE_SCENARIO).getResourceList(scenarioPattern);
-    if (files.isEmpty()) {
-      throw new FileLoaderException(
-        "Could not load the resource files using the pattern: " + scenarioPattern);
-    }
-    return validate(files, schemaPattern);
+    return validate(scenarioFiles(scenarioPattern), schemaPattern);
   }
 
   /**
@@ -145,14 +138,45 @@ public final class ScenarioValidator {
    */
   public static ValidationReport validate(Collection<Path> files, String schemaPattern)
     throws Exception {
+    // Instantiate the runtime schema reader without a database connection.
+    SchemaReader schema = schemaPattern == null ? null : new SchemaReader(null, schemaPattern);
+    return validate(files, schema, new HashMap<>());
+  }
+
+  /**
+   * Validates all scenario files matching the given pattern as the pre-run validation gate of an
+   * execution, populating the parsed data models for reuse by the run so that the files do not need
+   * to be parsed a second time.
+   * @param schema the schema reader for the run, or null when the run applies no schema
+   * @param models receives the parsed data model for each scenario file that parses successfully,
+   *               in file order; when the validation report contains no findings, each model is
+   *               identical to the model produced by the runtime configuration parser
+   * @throws FileLoaderException when no scenario files match the pattern
+   */
+  public static ValidationReport validate(String scenarioPattern, SchemaReader schema,
+    Map<Path, DataModel> models) throws Exception {
+    return validate(scenarioFiles(scenarioPattern), schema, models);
+  }
+
+  /** Resolves the scenario files matching a pattern in the same manner as the runtime parser. */
+  private static Collection<Path> scenarioFiles(String scenarioPattern) throws Exception {
+    Collection<Path> files =
+      new ResourceList(PherfConstants.RESOURCE_SCENARIO).getResourceList(scenarioPattern);
+    if (files.isEmpty()) {
+      throw new FileLoaderException(
+        "Could not load the resource files using the pattern: " + scenarioPattern);
+    }
+    return files;
+  }
+
+  private static ValidationReport validate(Collection<Path> files, SchemaReader schema,
+    Map<Path, DataModel> models) throws Exception {
     ScenarioValidator validator = new ScenarioValidator();
-    if (schemaPattern != null) {
-      // Instantiate the runtime schema reader without a database connection; each schema file is
-      // processed as a single DDL statement.
-      SchemaReader reader = new SchemaReader(null, schemaPattern);
-      for (Path schema : reader.getResourceList()) {
-        validator.report.addSchemaFile(schema.toString());
-        validator.tables.add(reader.resourceToString(schema));
+    if (schema != null) {
+      // Each schema file is applied by the runtime as a single DDL statement.
+      for (Path file : schema.getResourceList()) {
+        validator.report.addSchemaFile(file.toString());
+        validator.tables.add(schema.resourceToString(file));
       }
     }
     Map<Path, XmlStructure.Walked> profiles = new HashMap<>();
@@ -160,7 +184,7 @@ public final class ScenarioValidator {
     for (Path file : files) {
       ValidationReport findings = new ValidationReport();
       perFile.add(findings);
-      validator.structure(file, findings, profiles);
+      validator.structure(file, findings, profiles, models);
     }
     for (Parsed file : validator.parsed) {
       for (Scenario scenario : file.scenarios) {
@@ -198,7 +222,7 @@ public final class ScenarioValidator {
    * semantic validation phase if it parses cleanly.
    */
   private void structure(Path path, ValidationReport findings,
-    Map<Path, XmlStructure.Walked> profiles) {
+    Map<Path, XmlStructure.Walked> profiles, Map<Path, DataModel> models) {
     String file = path.toString();
     report.addFile(file);
     // Skip further validation if the file fails structural XML inspection, as the recorded
@@ -217,13 +241,8 @@ public final class ScenarioValidator {
       return;
     }
     // Propagate each column's data type to its nested data values, matching runtime parser setup.
-    for (Column column : model.getDataMappingColumns()) {
-      if (column.getDataValues() != null) {
-        for (DataValue value : column.getDataValues()) {
-          value.setType(column.getType());
-        }
-      }
-    }
+    XMLConfigParser.updateDataValueType(model);
+    models.put(path, model);
     Parsed result = new Parsed(file, model, findings);
     int index = 0;
     for (Scenario scenario : model.getScenarios()) {

@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import javax.xml.bind.JAXBContext;
 import javax.xml.bind.JAXBException;
 import javax.xml.bind.Marshaller;
@@ -51,6 +52,26 @@ public class XMLConfigParser {
 
   public XMLConfigParser(String pattern) throws Exception {
     init(pattern);
+  }
+
+  /**
+   * Initializes the configuration parser using the data models already parsed by the pre-run
+   * validation gate for the given pattern, avoiding a redundant parse of the scenario files while
+   * emitting the same console output as a parser that reads the files directly.
+   * @param pattern the resource pattern matched by the validation gate; getScenarios() re-reads the
+   *                files matching this pattern
+   * @param models  the parsed data model for each scenario file, in file order
+   */
+  public XMLConfigParser(String pattern, Map<Path, DataModel> models) {
+    this.filePattern = pattern;
+    this.dataModels = new ArrayList<>();
+    this.resourceList = new ResourceList(PherfConstants.RESOURCE_SCENARIO);
+    this.paths = new ArrayList<>(models.keySet());
+    for (Map.Entry<Path, DataModel> entry : models.entrySet()) {
+      System.out.println("Adding model for path:" + entry.getKey().toString());
+      updateDataValueType(entry.getValue());
+      this.dataModels.add(entry.getValue());
+    }
   }
 
   public List<DataModel> getDataModels() {
@@ -292,7 +313,8 @@ public class XMLConfigParser {
     }
   }
 
-  private void updateDataValueType(DataModel dataModel) {
+  /** Propagates each data mapping column's data type to its nested data values. */
+  public static void updateDataValueType(DataModel dataModel) {
     for (Column column : dataModel.getDataMappingColumns()) {
       if (column.getDataValues() != null) {
         // DataValue type is inherited from the column

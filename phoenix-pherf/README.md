@@ -41,6 +41,9 @@ mvn clean package -DskipTests
 - -validate _Validates the scenario files offline without establishing a database connection and
   exits with status 0 when no findings are reported or 65 when a validation rule fails (see
   Validation)._ <br />
+- -allowUnknownTags _Allows scenario validation, both before a run and with -validate, to pass XML
+  elements or attributes unrecognized by this version of Pherf, such as in a scenario written for a
+  newer Pherf release (see Validation)._ <br />
 - -connectionCache _Reuses connections through a cache holding at most pherf.default.threadpool
   idle connections. Each connection serves only operations with the same URL and connection
   properties (and therefore the same tenant and connection properties), allowing query sets and DDL
@@ -476,8 +479,8 @@ schemas, loading data, nor executing queries.
 
 * Recognized options: `-scenarioFile` (required), `-label` (specifying the report name),
   `-schemaFile` (or the default schema files when omitted), `-disableSchemaApply` (disabling schema
-  file loading), and `-rowCountOverride`. All other execution options and launch overrides are
-  ignored.
+  file loading), `-rowCountOverride`, and `-allowUnknownTags`. All other execution options and
+  launch overrides are ignored.
 * Exit codes: returns 0 when all validation rules pass; returns 65 (EX_DATAERR) when any validation
   rule fails; returns 1, consistent with all other Pherf errors, for an invalid invocation or when
   no matching scenario or schema file is found.
@@ -492,9 +495,39 @@ schemas, loading data, nor executing queries.
   apply—discovered and read as single statements by the standard schema reader—and subsequently
   from the `preScenarioDdls` declared on the scenarios. Only CREATE TABLE statements define tables,
   and when a table is defined multiple times, the first definition takes precedence.
-* Parser compatibility: runtime XML parsing behavior remains unchanged and continues to ignore
-  unknown elements and attributes so that existing working scenarios continue to execute without
-  modification; only the validator reports unrecognized XML constructs.
+
+Any execution invoked with `-scenarioFile` (whether `-l`, `-q`, `-mt`, or `-diff`, using either the
+thick or thin driver) runs the same validation first as a pre-run gate. The gate validates the
+scenario files as written using the same validation rules along with the run's `-label`, schema
+options, `-rowCountOverride`, and `-allowUnknownTags`, inspecting every scenario in the matched
+files without filtering by `-scenarioName`. It executes prior to applying launch overrides,
+dropping tables, applying schemas, or loading data, ensuring that no database connection is opened
+before the scenario files pass validation. Launch overrides retain their own validation checks after
+the gate (exiting with status 1 on failure), so an open-loop query set must be valid as written in
+the file: a concurrency range that resolves to a single integer only when overridden by
+`-threadCount` fails the gate. Runs invoked without `-scenarioFile` bypass this gate.
+
+* When all validation rules pass, execution proceeds as before. The gate writes nothing to stdout
+  or to the results directory and logs a single INFO message. The execution phase reuses the data
+  models already parsed by the gate rather than parsing the scenario files a second time.
+* When any validation rule fails, the run terminates in the same manner as `-validate` (exiting
+  with status 65), and no table drop, schema application, data load, or query execution takes
+  place.
+* The underlying XML parser remains unchanged and continues to ignore unrecognized elements and
+  attributes when unmarshalling scenario files. Specifying `-allowUnknownTags` allows unrecognized
+  element and attribute names to pass both the pre-run gate and `-validate` (for example, when
+  evaluating a scenario authored for a newer version of Pherf). Each waived construct is logged at
+  WARN level and omitted from the validation report, and the validator does not inspect the nested
+  content of an unknown element. All other validation rules remain enforced, including `xml.parse`
+  and `xml.value` (such as an invalid value assigned to a recognized attribute).
+* The following errors now abort a run prior to dropping any tables: a pattern that matches no
+  scenario file or no schema file (exit 1); a scenario file that fails XML parsing, such as one
+  containing a DTD declaration (exit 65 under `xml.parse`, rather than exit 1); and an invalid
+  launch override (exit 1).
+* Pherf accepts the legacy `release` attribute on `<datamodel release="...">` produced by older
+  Pherf releases and ignores its value (unused since PHOENIX-1920). Scenarios containing this
+  attribute pass both the pre-run gate and `-validate` without requiring any flag, and execute as
+  before.
 
 All validation rules execute in a single pass, and each rule reports every configuration object
 that violates it. Whenever a validation check corresponds to a check also enforced during a live

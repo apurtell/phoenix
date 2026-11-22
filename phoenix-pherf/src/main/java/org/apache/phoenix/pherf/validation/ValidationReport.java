@@ -154,6 +154,21 @@ public final class ValidationReport {
     return Collections.unmodifiableList(findings);
   }
 
+  /**
+   * Removes all findings reported for unrecognized XML names under the xml.unknown-element and
+   * xml.unknown-attribute rules while retaining all other findings. Because the runtime XML parser
+   * ignores unknown elements and attributes, waiving these findings allows scenarios written for a
+   * newer version of Pherf to execute.
+   * @return the removed findings in report order
+   */
+  public List<Finding> waiveUnknownNames() {
+    List<Finding> waived = new ArrayList<>();
+    findings
+      .removeIf(f -> (f.rule == Rule.XML_UNKNOWN_ELEMENT || f.rule == Rule.XML_UNKNOWN_ATTRIBUTE)
+        && waived.add(f));
+    return waived;
+  }
+
   /** Returns the scenario and profile files inspected during validation. */
   public List<String> getFiles() {
     return Collections.unmodifiableList(files);
