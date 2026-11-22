@@ -164,6 +164,7 @@ public final class OpenLoopScheduler {
   String stopReason;
   long startMs;
   long endMs;
+  long lastTakeMs;
   int inFlight;
   long scheduled;
   long completed;
@@ -219,9 +220,14 @@ public final class OpenLoopScheduler {
       operations, Clock.MICROS);
   }
 
+  /** Returns the declared duration window of the arrival schedule in milliseconds (ms). */
+  long durationMs() {
+    return schedule.durationUs() / 1000;
+  }
+
   /**
-   * Configures the scheduler to halt once the clock reaches the given timestamp in microseconds
-   * (us). Must be invoked before calling {@link #run()}.
+   * Configures the scheduler to halt the run once the clock reaches the specified reading in
+   * microseconds (us). This method must be invoked before calling {@link #run()}.
    */
   public OpenLoopScheduler stopAt(long clockMicros) {
     this.stopAtUs = clockMicros;
@@ -548,6 +554,7 @@ public final class OpenLoopScheduler {
           return;
         }
         operation = queue.pollFirst();
+        lastTakeMs = EnvironmentEdgeManager.currentTimeMillis();
         driftUs = clock.nowMicros() - operation.intendedUs;
         maxDriftUs = Math.max(maxDriftUs, driftUs);
         // Notify the dispatcher that capacity is now available in the queue.

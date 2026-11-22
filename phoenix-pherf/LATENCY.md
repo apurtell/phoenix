@@ -35,10 +35,12 @@ argument value, or `_` followed by a generated timestamp.
 | `LATENCY<suffix>.hlog` | Holds one cumulative histogram for each key across the entire run. |
 | `LATENCY<suffix>_intervals.hlog` | Contains interval histograms, written only when export is on. |
 
-Every invocation that executes a scenario file generates these output files. Running again with the
-same label supersedes prior artifacts: at startup, Pherf deletes all three files to guarantee that
-a stale JSON report is never paired with newly generated logs. Invocations that do not execute a
-scenario (`-listFiles`, `-compare`, `-drop`, or schema-only runs) produce none of these files.
+Every invocation that executes a scenario file generates these output files. Executing another run
+with the same label supersedes prior artifacts: at startup, Pherf deletes all three files to
+guarantee that a stale JSON report is never paired with newly generated logs. Invocations that do
+not execute a scenario (`-listFiles`, `-compare`, `-drop`, or schema-only runs) produce none of
+these files. The run's health verdict file, `VERDICT<suffix>.tsv`, is written to the same
+directory; see [VERDICT.md](VERDICT.md).
 
 ## Recorder configuration
 
@@ -100,9 +102,9 @@ metrics are reported in microseconds at the HDR precision of 3 significant digit
 records no samples produces an empty list.
 
 Consumers must ignore any unrecognized fields. The schema version is incremented only for a change
-that an existing reader cannot parse. Accordingly, introducing the `response` keys and the
-`schedules` field did not increment the version, because they only add new keys and an optional
-field without altering any existing structure.
+that an existing reader cannot parse. Accordingly, introducing the `response` keys, the `schedules`
+field, and its `durationMs` and `lastTakeMs` fields did not increment the version, because they only
+add new keys and fields without altering any existing field.
 
 ### Schedule entries
 
@@ -113,17 +115,19 @@ set:
 |---|---|
 | `scenario`, `querySet` | Give the scenario name and the query set position in it, from 1. |
 | `operations` | Lists the `query` operations of the query set in arrival order. |
-| `concurrency` | Sets the worker limit, which also serves as the dispatch queue bound. |
+| `concurrency` | Specifies the worker limit, which also serves as the dispatch queue bound. |
 | `phase` | Is always `done` in the report (`warmup` and `steady` appear only in live state). |
 | `stopReason` | Reports `duration`, `stopTime`, `predicate`, `cancel`, `interrupt`, or `error`. |
-| `startMs`, `endMs` | Record schedule start (after warmup) and stop, in ms since the epoch. |
-| `targetRate` | Gives the declared rate at that time in operations per second; 0 once stopped. |
-| `queueDepth`, `inFlight`, `driftUs` | Give queued, running, and oldest due lag; all 0 at stop. |
+| `startMs`, `endMs` | Record the schedule start (after warmup) and stop, in ms since the epoch. |
+| `durationMs` | Gives the declared window, which is the sum of the stage durations in ms. |
+| `lastTakeMs` | Gives when a worker last took a queued operation (ms since epoch, or 0 if none). |
+| `targetRate` | Gives the declared rate at that time, in operations per second (0 after stop). |
+| `queueDepth`, `inFlight`, `driftUs` | Report queued, executing, and oldest due lag (0 at stop). |
 | `scheduled` | Counts operations queued, plus due arrivals held back by the queue bound at halt. |
-| `completed` | Counts operations that succeeded, matching each `response` key count of the set. |
-| `late` | Counts executed operations whose lag exceeded `maxLagMs` under the `LATE` policy. |
-| `dropped` | Counts operations not executed because lag exceeded `maxLagMs` (policy `DROP`). |
-| `aborted` | Counts failed operations, queued ones removed by a halt, and due ones held back. |
+| `completed` | Counts operations that succeeded, equal to each `response` key count of the set. |
+| `late` | Counts executed operations whose lag exceeded `maxLagMs` under the `LATE` lag policy. |
+| `dropped` | Counts operations not executed because lag exceeded `maxLagMs` (lag policy `DROP`). |
+| `aborted` | Counts failed operations, queued ones a halt removed, and due ones the bound held. |
 | `pending` | Reports unfinished operations, computed as `queueDepth + inFlight`. |
 | `maxQueueDepth`, `maxInFlight`, `maxDriftUs` | Record the peak values observed across the run. |
 

@@ -61,6 +61,8 @@ public final class OpenLoopState {
   private final String stopReason;
   private final long startMs;
   private final long endMs;
+  private final long durationMs;
+  private final long lastTakeMs;
   private final double targetRate;
   private final int queueDepth;
   private final int inFlight;
@@ -90,6 +92,8 @@ public final class OpenLoopState {
     stopReason = s.stopReason;
     startMs = s.startMs;
     endMs = s.endMs;
+    durationMs = s.durationMs();
+    lastTakeMs = s.lastTakeMs;
     targetRate = s.targetRate(nowUs);
     queueDepth = s.queueDepth();
     inFlight = s.inFlight;
@@ -160,8 +164,24 @@ public final class OpenLoopState {
   }
 
   /**
-   * Returns the currently configured target arrival rate in operations per second, or 0 when
-   * outside the active schedule.
+   * Returns the declared duration window of the schedule in milliseconds (ms), calculated as the
+   * sum of all stage durations.
+   */
+  public long getDurationMs() {
+    return durationMs;
+  }
+
+  /**
+   * Returns the timestamp at which a worker most recently took an operation from the queue, in
+   * milliseconds (ms) since the epoch, or 0 before the first operation is taken.
+   */
+  public long getLastTakeMs() {
+    return lastTakeMs;
+  }
+
+  /**
+   * Returns the currently declared target rate in operations per second, or 0 when outside the
+   * schedule.
    */
   public double getTargetRate() {
     return targetRate;

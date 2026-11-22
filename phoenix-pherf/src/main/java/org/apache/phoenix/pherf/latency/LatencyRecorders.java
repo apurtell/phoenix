@@ -118,10 +118,26 @@ public final class LatencyRecorders {
    */
   public static void begin(Properties properties) throws IOException {
     long intervalMs = intervalMs(properties.getProperty(INTERVAL_PROPERTY));
-    // Read the same base directory property used by ResultUtil so that latency outputs relocate
+    begin(outputDir(), outputLabel(), intervalMs);
+  }
+
+  /**
+   * Returns the output directory used when a latency recording run is initialized from the Pherf
+   * properties.
+   */
+  public static File outputDir() {
+    // Read the same base directory property used by ResultUtil so that this directory relocates
     // alongside the standard Pherf result files.
     String results = PherfConstants.create().getProperty(RESULTS_DIR_PROPERTY);
-    begin(new File(results + DIR_SUFFIX), new ResultUtil().getSuffix().substring(1), intervalMs);
+    return new File(results + DIR_SUFFIX);
+  }
+
+  /**
+   * Returns the run label used when a latency recording run is initialized from the Pherf
+   * properties, consisting of the result file suffix without its leading "_" character.
+   */
+  public static String outputLabel() {
+    return new ResultUtil().getSuffix().substring(1);
   }
 
   static synchronized void begin(File dir, String label, long intervalMs) throws IOException {
@@ -132,18 +148,17 @@ public final class LatencyRecorders {
   }
 
   /**
-   * Terminates the active run recorders and writes the final JSON report and run log to disk. If no
-   * run is currently active, this method performs no action.
+   * Terminates the active run recorders and writes the final JSON report and cumulative run log to
+   * disk. If no run is currently active, this method performs no action.
+   * @return the completed recording data for the run, or null when no run is active
    */
-  public static void finish() throws IOException {
+  public static Recording finish() throws IOException {
     LatencyRecorders run;
     synchronized (LatencyRecorders.class) {
       run = current;
       current = null;
     }
-    if (run != null) {
-      run.close();
-    }
+    return run == null ? null : run.close();
   }
 
   /**
@@ -245,7 +260,7 @@ public final class LatencyRecorders {
     return entry(operation, phase).total.copy();
   }
 
-  private void close() throws IOException {
+  private Recording close() throws IOException {
     if (roller != null) {
       roller.shutdownNow();
     }
@@ -263,15 +278,46 @@ public final class LatencyRecorders {
         totals.add(entry.total);
       }
     }
-    LatencyReport.write(dir, label, startMs, rolledMs, intervals != null, totals,
-      new ArrayList<>(schedules));
+    List<Object> entries = new ArrayList<>(schedules);
+    LatencyReport.write(dir, label, startMs, rolledMs, intervals != null, totals, entries);
+    return new Recording(totals, entries);
   }
 
   private static Histogram newHistogram() {
     return new Histogram(LOWEST_US, HIGHEST_US, DIGITS);
   }
 
-  /** Holds the active recorder and the cumulative run total for a single key. */
+  /**
+   * Encapsulates the completed latency histograms and schedule summaries of a finished run for
+   * consumption by the health verdict evaluator.
+   */
+  public static final class Recording {
+    private final List<Histogram> totals;
+    private final List<Object> schedules;
+
+    private Recording(List<Histogram> totals, List<Object> schedules) {
+      this.totals = totals;
+      this.schedules = schedules;
+    }
+
+    /**
+     * Returns the cumulative run-total histogram for each recorded key, tagged with its log tag and
+     * ordered by operation and then by phase.
+     */
+    public List<Histogram> getTotals() {
+      return totals;
+    }
+
+    /**
+     * Returns the schedule summary entries written to the "schedules" array of the JSON report, in
+     * execution order.
+     */
+    public List<Object> getSchedules() {
+      return schedules;
+    }
+  }
+
+  /** Holds the active recorder and the cumulative run-total histogram for a single key. */
   private static final class Entry {
     private final String operation;
     private final String phase;

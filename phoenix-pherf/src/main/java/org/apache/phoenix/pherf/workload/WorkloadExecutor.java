@@ -37,7 +37,7 @@ public class WorkloadExecutor {
   @VisibleForTesting
   public final Map<Workload, Future> jobs = new ConcurrentHashMap<>();
 
-  private final ExecutorService pool;
+  private final CountingPool pool;
 
   public WorkloadExecutor() throws Exception {
     this(PherfConstants.create().getProperties(PherfConstants.PHERF_PROPERTIES, false));
@@ -54,7 +54,7 @@ public class WorkloadExecutor {
       ? PherfConstants.DEFAULT_THREAD_POOL_SIZE
       : Integer.parseInt(properties.getProperty("pherf.default.threadpool"));
 
-    this.pool = Executors.newFixedThreadPool(this.poolSize);
+    this.pool = new CountingPool(this.poolSize);
     init(workloads);
   }
 
@@ -121,6 +121,27 @@ public class WorkloadExecutor {
     return poolSize;
   }
 
+  /** Returns the total number of tasks submitted to the execution pool. */
+  public long getSubmittedTasks() {
+    return pool.tasks();
+  }
+
+  /**
+   * Returns the number of submitted tasks that had to wait for an available thread because the
+   * number of outstanding tasks exceeded the thread count at the time of submission.
+   */
+  public long getWaitedTasks() {
+    return pool.waited();
+  }
+
+  /**
+   * Returns the peak number of tasks that were concurrently outstanding at any one time, defined as
+   * tasks that had been submitted but had not yet finished.
+   */
+  public long getPeakTasks() {
+    return pool.peak();
+  }
+
   public boolean isPerformance() {
     return isPerformance;
   }
@@ -128,6 +149,73 @@ public class WorkloadExecutor {
   private void init(List<Workload> workloads) throws Exception {
     for (Workload workload : workloads) {
       this.jobs.put(workload, pool.submit(workload.execute()));
+    }
+  }
+
+  /**
+   * Provides a fixed-size thread pool equivalent to Executors.newFixedThreadPool, augmented with
+   * task lifecycle counters used to evaluate the health verdict. The submitting thread records each
+   * task upon task creation, and the task itself decrements the outstanding count within its
+   * finally block prior to completing its future. Consequently, any caller that has received a
+   * task's result is guaranteed never to observe that task as still outstanding.
+   */
+  private static final class CountingPool extends ThreadPoolExecutor {
+    private final int threads;
+    private long tasks;
+    private long waited;
+    private long outstanding;
+    private long peak;
+
+    CountingPool(int threads) {
+      super(threads, threads, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>());
+      this.threads = threads;
+    }
+
+    @Override
+    protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+      admit();
+      return new FutureTask<>(() -> {
+        try {
+          return callable.call();
+        } finally {
+          release();
+        }
+      });
+    }
+
+    @Override
+    protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T value) {
+      return newTaskFor(Executors.callable(runnable, value));
+    }
+
+    private synchronized void admit() {
+      // Once the pool has been shut down, any incoming task will be rejected and must not be
+      // included in the task counts.
+      if (isShutdown()) {
+        return;
+      }
+      tasks++;
+      outstanding++;
+      peak = Math.max(peak, outstanding);
+      if (outstanding > threads) {
+        waited++;
+      }
+    }
+
+    private synchronized void release() {
+      outstanding--;
+    }
+
+    synchronized long tasks() {
+      return tasks;
+    }
+
+    synchronized long waited() {
+      return waited;
+    }
+
+    synchronized long peak() {
+      return peak;
     }
   }
 }

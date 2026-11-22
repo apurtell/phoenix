@@ -44,6 +44,8 @@ import org.apache.phoenix.pherf.util.ResourceList;
 import org.apache.phoenix.pherf.validation.ScenarioValidator;
 import org.apache.phoenix.pherf.validation.ValidationReport;
 import org.apache.phoenix.pherf.validation.ValidationReport.Finding;
+import org.apache.phoenix.pherf.verdict.HealthVerdict;
+import org.apache.phoenix.pherf.verdict.VerdictSettings;
 import org.apache.phoenix.pherf.workload.QueryExecutor;
 import org.apache.phoenix.pherf.workload.Workload;
 import org.apache.phoenix.pherf.workload.WorkloadExecutor;
@@ -163,6 +165,7 @@ public class Pherf {
   private final RunOverrides overrides;
   private final boolean validate;
   private final boolean allowUnknownTags;
+  private final VerdictSettings verdictSettings;
   private Properties properties = new Properties();
 
   @VisibleForTesting
@@ -261,6 +264,9 @@ public class Pherf {
     }
     ResultUtil.setFileSuffix(label);
     this.properties.putAll(globalProperties);
+    // Validate pherf.verdict.* properties eagerly so an invalid value aborts the run before any
+    // database connection is opened.
+    verdictSettings = VerdictSettings.of(properties);
   }
 
   private String getLogPerNRow(CommandLine command) {
@@ -334,6 +340,7 @@ public class Pherf {
     MonitorManager monitorManager = null;
     List<Workload> workloads = new ArrayList<>();
     workloadExecutor = new WorkloadExecutor(properties, workloads, !isFunctional);
+    HealthVerdict verdict = null;
     boolean completed = false;
     try {
       if (listFiles) {
@@ -399,6 +406,7 @@ public class Pherf {
       }
 
       LatencyRecorders.begin(properties);
+      verdict = HealthVerdict.begin(verdictSettings);
       if (connectionCache) {
         // The closed-loop workload executes at most this many concurrent operations at a time.
         ConnectionCache.begin(workloadExecutor.getPoolSize());
@@ -409,6 +417,11 @@ public class Pherf {
         workloadExecutor.add(monitorManager);
       }
 
+      // Bound the verdict read-sampling window to the measured workload so that it captures a -mt
+      // workload while excluding a -l data load.
+      if (multiTenantWorkload) {
+        verdict.startReads();
+      }
       // Schema and Data Load
       if (preLoadData || multiTenantWorkload) {
         LOGGER.info("\nStarting Data Load...");
@@ -449,6 +462,9 @@ public class Pherf {
       } else {
         LOGGER.info("\nSKIPPED: Data Load and schema creation as -l argument not specified");
       }
+      if (!multiTenantWorkload) {
+        verdict.startReads();
+      }
 
       // Execute multi-threaded query sets
       if (executeQuerySets) {
@@ -478,7 +494,12 @@ public class Pherf {
       // Close all remaining idle connections, logging any close errors without rethrowing them.
       ConnectionCache.finish();
       try {
-        LatencyRecorders.finish();
+        LatencyRecorders.Recording recording = LatencyRecorders.finish();
+        // HealthVerdict logs any write failure internally so that verdict generation never alters
+        // the outcome of the run.
+        if (verdict != null && recording != null) {
+          verdict.finish(recording, workloadExecutor);
+        }
       } catch (IOException e) {
         if (completed) {
           throw e;

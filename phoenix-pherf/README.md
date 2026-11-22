@@ -625,6 +625,14 @@ subsequent primary key column governed by a RANDOM or LIST rule produces unique 
 Results are written real time in _results_ directory. Open the result that is saved in .jpg format for real time
 visualization.
 
+### Health verdict
+Every run that executes a scenario file also writes a `VERDICT_<label>.tsv` health verdict artifact
+alongside its latency report. The verdict evaluates the run across five checks: throughput
+attainment, schedule lag and queue saturation, client thread pool exhaustion, tail latency, and
+server read skew. Verdict evaluation is purely diagnostic and never alters the process exit code.
+Check thresholds are configured through the `pherf.verdict.*` keys in pherf.properties; see
+[VERDICT.md](VERDICT.md) for full details.
+
 ## Testing
 Default quorum is localhost. If you want to override set the system variable.
 
