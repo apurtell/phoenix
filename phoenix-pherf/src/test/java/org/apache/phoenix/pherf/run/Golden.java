@@ -46,6 +46,14 @@ public final class Golden {
   private Golden() {
   }
 
+  /**
+   * Formats a cell value for golden file representation, substituting "(empty)" for an empty string
+   * so that no line in a golden file terminates with trailing whitespace.
+   */
+  public static String cell(String value) {
+    return "".equals(value) ? "(empty)" : value;
+  }
+
   /** Verifies that the normalized actual output matches the expected golden file content. */
   public static void assertMatches(String test, String name, String actual)
     throws IOException, URISyntaxException {

@@ -113,6 +113,10 @@ public class TenantOperationFactory {
   private final ReentrantReadWriteLock viewCreationLock = new ReentrantReadWriteLock();
 
   public TenantOperationFactory(PhoenixUtil phoenixUtil, DataModel model, Scenario scenario) {
+    if (scenario.getCoGeneration() != null) {
+      throw new IllegalArgumentException("coGeneration of scenario " + scenario.getName()
+        + " is not supported by the load profile path");
+    }
     this.phoenixUtil = phoenixUtil;
     this.model = model;
     this.scenario = scenario;

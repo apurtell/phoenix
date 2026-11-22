@@ -43,5 +43,6 @@ public class ScenarioResult extends Scenario {
     this.setRowCount(scenario.getRowCount());
     this.setTableName(scenario.getTableName());
     this.setName(scenario.getName());
+    this.setCoGeneration(scenario.getCoGeneration());
   }
 }

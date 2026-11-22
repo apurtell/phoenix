@@ -68,7 +68,7 @@ public final class ChildRun {
   public static final String FAILED = "failed";
   public static final String ELAPSED_MICROS = "pherf.test.elapsedMicros";
   public static final String REAL_CLOCK = "pherf.test.realClock";
-  private static final long NOW = 1700000000000L;
+  public static final long NOW = 1700000000000L;
   private static final long MAX_OPERATIONS = 20;
 
   private ChildRun() {

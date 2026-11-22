@@ -39,6 +39,7 @@ import org.apache.phoenix.pherf.result.ThreadTime;
 import org.apache.phoenix.pherf.rules.RulesApplier;
 import org.apache.phoenix.pherf.spi.Extensions;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
+import org.apache.phoenix.pherf.workload.cogen.CoGenerator;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,6 +65,7 @@ class MultiThreadedRunner implements Callable<Void> {
   private final Map<String, String> connectionProperties;
   private final String latencyOperation;
   private final long warmupExecutions;
+  private final CoGenerator.Reader reader;
 
   /**
    * MultiThreadedRunner
@@ -74,19 +76,21 @@ class MultiThreadedRunner implements Callable<Void> {
     WorkloadExecutor workloadExecutor, XMLConfigParser parser) {
     this(threadName, query, dataModelResult, threadTime, numberOfExecutions, executionDurationInMs,
       writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser,
-      scenario.getPhoenixProperties(), 0);
+      scenario.getPhoenixProperties(), 0, null);
   }
 
   /**
-   * Constructs a runner that configures its query connections with the provided properties. Prior
-   * to running the measured executions, the runner performs warmupExecutions iterations that are
-   * recorded exclusively under the "warmup" latency phase.
+   * Constructs a runner that configures its query connections with the given properties. Prior to
+   * running the measured executions, it performs warmupExecutions iterations that are recorded
+   * exclusively under the "warmup" latency phase. When a co-generation reader is supplied, query
+   * placeholders are populated from co-generated data; otherwise, they are populated using the
+   * configured rules.
    */
   MultiThreadedRunner(String threadName, Query query, DataModelResult dataModelResult,
     ThreadTime threadTime, long numberOfExecutions, long executionDurationInMs,
     boolean writeRuntimeResults, RulesApplier ruleApplier, Scenario scenario,
     WorkloadExecutor workloadExecutor, XMLConfigParser parser,
-    Map<String, String> connectionProperties, long warmupExecutions) {
+    Map<String, String> connectionProperties, long warmupExecutions, CoGenerator.Reader reader) {
     this.query = query;
     this.threadName = threadName;
     this.threadTime = threadTime;
@@ -102,6 +106,7 @@ class MultiThreadedRunner implements Callable<Void> {
     this.connectionProperties = connectionProperties;
     this.latencyOperation = "query:" + scenario.getName() + ":" + query.getId();
     this.warmupExecutions = warmupExecutions;
+    this.reader = reader;
   }
 
   /**
@@ -191,7 +196,9 @@ class MultiThreadedRunner implements Callable<Void> {
     try {
       conn = pUtil.getConnection(query.getTenantId(), connectionProperties);
       conn.setAutoCommit(true);
-      final String statementString = query.getDynamicStatement(ruleApplier, scenario);
+      final String statementString = reader == null
+        ? query.getDynamicStatement(ruleApplier, scenario)
+        : reader.statement(query.getStatement(), conn);
       statement = conn.prepareStatement(statementString);
       LOGGER.debug("Executing iteration: " + queryIteration + ": " + statementString);
 

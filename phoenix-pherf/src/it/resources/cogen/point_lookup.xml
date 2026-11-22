@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- The co-generated point lookup on a mini cluster: 300 rows in blocks of 50, and at most 2 values
+     of the leading key K1 in each block. K2 is unique for each row index. D and T are RANDOM date
+     keys with milliseconds, and B is a binary filter. -->
+<datamodel name="point_lookup">
+    <datamapping>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>LIST</dataSequence>
+            <name>K1</name>
+            <valuelist>
+                <datavalue distribution="50"><value>a</value></datavalue>
+                <datavalue distribution="30"><value>b</value></datavalue>
+                <datavalue distribution="20"><value>c</value></datavalue>
+            </valuelist>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K2</name>
+        </column>
+        <column>
+            <type>DATE</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <minValue>2000</minValue>
+            <maxValue>2001</maxValue>
+            <name>D</name>
+        </column>
+        <column>
+            <type>TIMESTAMP</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <minValue>1999</minValue>
+            <maxValue>2000</maxValue>
+            <name>T</name>
+        </column>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <length>12</length>
+            <prefix>v</prefix>
+            <name>V</name>
+        </column>
+        <column>
+            <type>VARBINARY_ENCODED</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <length>6</length>
+            <name>B</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.COGEN" rowCount="300" name="pointLookup">
+            <coGeneration seed="5" blockSize="50" clusterLimit="2"/>
+        </scenario>
+    </scenarios>
+</datamodel>

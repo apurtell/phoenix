@@ -467,10 +467,30 @@ public class PhoenixUtil {
   public PreparedStatement buildStatement(RulesApplier rulesApplier, Scenario scenario,
     List<Column> columns, PreparedStatement statement, SimpleDateFormat simpleDateFormat)
     throws Exception {
+    return bindRow(rulesApplier, scenario, null, columns, statement, simpleDateFormat);
+  }
 
+  /**
+   * Binds a single row of precomputed values to the prepared statement in column order, using the
+   * same type conversion and parameter binding logic as the rule-based generation path.
+   */
+  public PreparedStatement buildStatement(List<Column> columns, List<DataValue> values,
+    PreparedStatement statement, SimpleDateFormat simpleDateFormat) throws Exception {
+    return bindRow(null, null, values, columns, statement, simpleDateFormat);
+  }
+
+  /**
+   * Binds a single row of parameters to the prepared statement, taking values from the provided
+   * list when present or generating them via the rules applier otherwise. An empty string value is
+   * bound as a SQL NULL.
+   */
+  private PreparedStatement bindRow(RulesApplier rulesApplier, Scenario scenario,
+    List<DataValue> values, List<Column> columns, PreparedStatement statement,
+    SimpleDateFormat simpleDateFormat) throws Exception {
     int count = 1;
     for (Column column : columns) {
-      DataValue dataValue = rulesApplier.getDataForRule(scenario, column);
+      DataValue dataValue =
+        values != null ? values.get(count - 1) : rulesApplier.getDataForRule(scenario, column);
       switch (column.getType()) {
         case VARCHAR:
           if (dataValue.getValue().equals("")) {

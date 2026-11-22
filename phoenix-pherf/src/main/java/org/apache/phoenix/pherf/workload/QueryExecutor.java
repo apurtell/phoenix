@@ -41,6 +41,7 @@ import org.apache.phoenix.pherf.result.ScenarioResult;
 import org.apache.phoenix.pherf.result.ThreadTime;
 import org.apache.phoenix.pherf.rules.RulesApplier;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
+import org.apache.phoenix.pherf.workload.cogen.CoGenerator;
 import org.apache.phoenix.pherf.workload.openloop.OpenLoopScheduler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -223,7 +224,7 @@ public class QueryExecutor implements Workload {
         for (int i = 0; i < cr; i++) {
 
           Callable thread = executeRunner((i + 1) + "," + cr, dataModelResult, queryResult,
-            querySetResult, scenario);
+            querySetResult, scenario, i, cr);
           threads.add(workloadExecutor.getPool().submit(thread));
         }
 
@@ -248,7 +249,7 @@ public class QueryExecutor implements Workload {
           querySetResult.getQueryResults().add(queryResult);
 
           Callable<Void> thread = executeRunner((i + 1) + "," + cr, dataModelResult, queryResult,
-            querySetResult, scenario);
+            querySetResult, scenario, i, cr);
           threads.add(workloadExecutor.getPool().submit(thread));
         }
 
@@ -319,6 +320,15 @@ public class QueryExecutor implements Workload {
    */
   protected Callable<Void> executeRunner(String name, DataModelResult dataModelResult,
     QueryResult queryResult, QuerySet querySet, Scenario scenario) {
+    return executeRunner(name, dataModelResult, queryResult, querySet, scenario, 0, 1);
+  }
+
+  /**
+   * Creates the execution runner for worker w out of W total workers. When co-generation is
+   * enabled, each worker reads its assigned share of the committed rows.
+   */
+  private Callable<Void> executeRunner(String name, DataModelResult dataModelResult,
+    QueryResult queryResult, QuerySet querySet, Scenario scenario, int worker, int workers) {
     ThreadTime threadTime = new ThreadTime();
     queryResult.getThreadTimes().add(threadTime);
     threadTime.setThreadName(name);
@@ -329,7 +339,10 @@ public class QueryExecutor implements Workload {
       thread = new MultiThreadedRunner(threadTime.getThreadName(), queryResult, dataModelResult,
         threadTime, querySet.getNumberOfExecutions(), querySet.getExecutionDurationInMs(),
         writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser,
-        connectionProperties(scenario, querySet), warmupExecutions(querySet));
+        connectionProperties(scenario, querySet), warmupExecutions(querySet),
+        scenario.getCoGeneration() == null
+          ? null
+          : CoGenerator.of(parser, scenario).reader(worker, workers));
     } else {
       thread = new MultithreadedDiffer(threadTime.getThreadName(), queryResult, threadTime,
         querySet.getNumberOfExecutions(), querySet.getExecutionDurationInMs());

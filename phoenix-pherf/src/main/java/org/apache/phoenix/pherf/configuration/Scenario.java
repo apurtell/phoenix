@@ -42,6 +42,7 @@ public class Scenario {
   private List<IdleTime> idleTimes = new ArrayList<>();
   private List<UserDefined> udfs = new ArrayList<>();
   private LoadProfile loadProfile = null;
+  private CoGeneration coGeneration;
 
   private String name;
   private String generatorName;
@@ -262,5 +263,17 @@ public class Scenario {
 
   public void setLoadProfile(LoadProfile loadProfile) {
     this.loadProfile = loadProfile;
+  }
+
+  /**
+   * Returns the co-generation configuration for this scenario, or null when the scenario uses the
+   * standard rule-based generators.
+   */
+  public CoGeneration getCoGeneration() {
+    return coGeneration;
+  }
+
+  public void setCoGeneration(CoGeneration coGeneration) {
+    this.coGeneration = coGeneration;
   }
 }

@@ -1,0 +1,524 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+write	0	TENANT_ID	xxxxxxxxxxxxxx0
+write	0	PARENT_ID	bBByYhnNbBs9kWu
+write	0	CREATED_DATE	<date>
+write	0	SOME_DATE	<date>
+write	0	RND_DATE	<date>
+write	0	TS_DATE	<date>
+write	0	PRESENT_DATE	<date>
+write	0	OTHER_ID	z0Oxx000
+write	0	FIELD	<alnum 10>
+write	0	VAR_ARRAY	Foo,Bar
+write	0	VAR_BIN	VBOxx000
+write	0	DIVISION	(empty)
+write	0	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	0	NEWVAL_STRING	0F90000000000X0
+write	0	CONNECTION_ID	<alnum 15>
+write	0	SOME_INT	(empty)
+write	1	TENANT_ID	xxxxxxxxxxxxxx1
+write	1	PARENT_ID	bBByYhnNbBs9kWu
+write	1	CREATED_DATE	<date>
+write	1	SOME_DATE	<date>
+write	1	RND_DATE	<date>
+write	1	TS_DATE	<date>
+write	1	PRESENT_DATE	<date>
+write	1	OTHER_ID	z0Oxx001
+write	1	FIELD	<alnum 10>
+write	1	VAR_ARRAY	Foo,Bar
+write	1	VAR_BIN	VBOxx001
+write	1	DIVISION	(empty)
+write	1	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	1	NEWVAL_STRING	0F90000000000X1
+write	1	CONNECTION_ID	<alnum 15>
+write	1	SOME_INT	(empty)
+write	2	TENANT_ID	xxxxxxxxxxxxxx2
+write	2	PARENT_ID	cCCyYhnNbBs9kWr
+write	2	CREATED_DATE	<date>
+write	2	SOME_DATE	<date>
+write	2	RND_DATE	<date>
+write	2	TS_DATE	<date>
+write	2	PRESENT_DATE	<date>
+write	2	OTHER_ID	z0Oxx002
+write	2	FIELD	<alnum 10>
+write	2	VAR_ARRAY	Foo,Bar
+write	2	VAR_BIN	VBOxx002
+write	2	DIVISION	(empty)
+write	2	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	2	NEWVAL_STRING	0F90000000000X2
+write	2	CONNECTION_ID	<alnum 15>
+write	2	SOME_INT	(empty)
+write	3	TENANT_ID	xxxxxxxxxxxxxx3
+write	3	PARENT_ID	aAAyYhnNbBs9kWk
+write	3	CREATED_DATE	<date>
+write	3	SOME_DATE	<date>
+write	3	RND_DATE	<date>
+write	3	TS_DATE	<date>
+write	3	PRESENT_DATE	<date>
+write	3	OTHER_ID	z0Oxx003
+write	3	FIELD	<alnum 10>
+write	3	VAR_ARRAY	Foo,Bar
+write	3	VAR_BIN	VBOxx003
+write	3	DIVISION	(empty)
+write	3	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	3	NEWVAL_STRING	0F90000000000X3
+write	3	CONNECTION_ID	<alnum 15>
+write	3	SOME_INT	(empty)
+write	4	TENANT_ID	xxxxxxxxxxxxxx4
+write	4	PARENT_ID	aAAyYhnNbBs9kWk
+write	4	CREATED_DATE	<date>
+write	4	SOME_DATE	<date>
+write	4	RND_DATE	<date>
+write	4	TS_DATE	<date>
+write	4	PRESENT_DATE	<date>
+write	4	OTHER_ID	z0Oxx004
+write	4	FIELD	<alnum 10>
+write	4	VAR_ARRAY	Foo,Bar
+write	4	VAR_BIN	VBOxx004
+write	4	DIVISION	(empty)
+write	4	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	4	NEWVAL_STRING	0F90000000000X4
+write	4	CONNECTION_ID	<alnum 15>
+write	4	SOME_INT	(empty)
+write	5	TENANT_ID	xxxxxxxxxxxxxx5
+write	5	PARENT_ID	cCCyYhnNbBs9kWr
+write	5	CREATED_DATE	<date>
+write	5	SOME_DATE	<date>
+write	5	RND_DATE	<date>
+write	5	TS_DATE	<date>
+write	5	PRESENT_DATE	<date>
+write	5	OTHER_ID	z0Oxx005
+write	5	FIELD	<alnum 10>
+write	5	VAR_ARRAY	Foo,Bar
+write	5	VAR_BIN	VBOxx005
+write	5	DIVISION	(empty)
+write	5	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	5	NEWVAL_STRING	0F90000000000X5
+write	5	CONNECTION_ID	<alnum 15>
+write	5	SOME_INT	(empty)
+write	6	TENANT_ID	xxxxxxxxxxxxxx6
+write	6	PARENT_ID	aAAyYhnNbBs9kWk
+write	6	CREATED_DATE	<date>
+write	6	SOME_DATE	<date>
+write	6	RND_DATE	<date>
+write	6	TS_DATE	<date>
+write	6	PRESENT_DATE	<date>
+write	6	OTHER_ID	z0Oxx006
+write	6	FIELD	<alnum 10>
+write	6	VAR_ARRAY	Foo,Bar
+write	6	VAR_BIN	VBOxx006
+write	6	DIVISION	(empty)
+write	6	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	6	NEWVAL_STRING	0F90000000000X6
+write	6	CONNECTION_ID	<alnum 15>
+write	6	SOME_INT	(empty)
+write	7	TENANT_ID	xxxxxxxxxxxxxx7
+write	7	PARENT_ID	cCCyYhnNbBs9kWr
+write	7	CREATED_DATE	<date>
+write	7	SOME_DATE	<date>
+write	7	RND_DATE	<date>
+write	7	TS_DATE	<date>
+write	7	PRESENT_DATE	<date>
+write	7	OTHER_ID	z0Oxx007
+write	7	FIELD	<alnum 10>
+write	7	VAR_ARRAY	Foo,Bar
+write	7	VAR_BIN	VBOxx007
+write	7	DIVISION	(empty)
+write	7	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	7	NEWVAL_STRING	0F90000000000X7
+write	7	CONNECTION_ID	<alnum 15>
+write	7	SOME_INT	(empty)
+write	8	TENANT_ID	xxxxxxxxxxxxxx8
+write	8	PARENT_ID	aAAyYhnNbBs9kWk
+write	8	CREATED_DATE	<date>
+write	8	SOME_DATE	<date>
+write	8	RND_DATE	<date>
+write	8	TS_DATE	<date>
+write	8	PRESENT_DATE	<date>
+write	8	OTHER_ID	z0Oxx008
+write	8	FIELD	<alnum 10>
+write	8	VAR_ARRAY	Foo,Bar
+write	8	VAR_BIN	VBOxx008
+write	8	DIVISION	(empty)
+write	8	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	8	NEWVAL_STRING	0F90000000000X8
+write	8	CONNECTION_ID	<alnum 15>
+write	8	SOME_INT	(empty)
+write	9	TENANT_ID	xxxxxxxxxxxxxx9
+write	9	PARENT_ID	aAAyYhnNbBs9kWk
+write	9	CREATED_DATE	<date>
+write	9	SOME_DATE	<date>
+write	9	RND_DATE	<date>
+write	9	TS_DATE	<date>
+write	9	PRESENT_DATE	<date>
+write	9	OTHER_ID	z0Oxx009
+write	9	FIELD	<alnum 10>
+write	9	VAR_ARRAY	Foo,Bar
+write	9	VAR_BIN	VBOxx009
+write	9	DIVISION	(empty)
+write	9	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	9	NEWVAL_STRING	0F90000000000X9
+write	9	CONNECTION_ID	<alnum 15>
+write	9	SOME_INT	(empty)
+write	10	TENANT_ID	xxxxxxxxxxxxx10
+write	10	PARENT_ID	cCCyYhnNbBs9kWr
+write	10	CREATED_DATE	<date>
+write	10	SOME_DATE	<date>
+write	10	RND_DATE	<date>
+write	10	TS_DATE	<date>
+write	10	PRESENT_DATE	<date>
+write	10	OTHER_ID	z0Oxx000
+write	10	FIELD	<alnum 10>
+write	10	VAR_ARRAY	Foo,Bar
+write	10	VAR_BIN	VBOxx000
+write	10	DIVISION	(empty)
+write	10	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	10	NEWVAL_STRING	0F90000000000X0
+write	10	CONNECTION_ID	<alnum 15>
+write	10	SOME_INT	(empty)
+write	11	TENANT_ID	xxxxxxxxxxxxx11
+write	11	PARENT_ID	aAAyYhnNbBs9kWk
+write	11	CREATED_DATE	<date>
+write	11	SOME_DATE	<date>
+write	11	RND_DATE	<date>
+write	11	TS_DATE	<date>
+write	11	PRESENT_DATE	<date>
+write	11	OTHER_ID	z0Oxx001
+write	11	FIELD	<alnum 10>
+write	11	VAR_ARRAY	Foo,Bar
+write	11	VAR_BIN	VBOxx001
+write	11	DIVISION	(empty)
+write	11	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	11	NEWVAL_STRING	0F90000000000X1
+write	11	CONNECTION_ID	<alnum 15>
+write	11	SOME_INT	(empty)
+write	12	TENANT_ID	xxxxxxxxxxxxx12
+write	12	PARENT_ID	bBByYhnNbBs9kWu
+write	12	CREATED_DATE	<date>
+write	12	SOME_DATE	<date>
+write	12	RND_DATE	<date>
+write	12	TS_DATE	<date>
+write	12	PRESENT_DATE	<date>
+write	12	OTHER_ID	z0Oxx002
+write	12	FIELD	<alnum 10>
+write	12	VAR_ARRAY	Foo,Bar
+write	12	VAR_BIN	VBOxx002
+write	12	DIVISION	(empty)
+write	12	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	12	NEWVAL_STRING	0F90000000000X2
+write	12	CONNECTION_ID	<alnum 15>
+write	12	SOME_INT	(empty)
+write	13	TENANT_ID	xxxxxxxxxxxxx13
+write	13	PARENT_ID	aAAyYhnNbBs9kWk
+write	13	CREATED_DATE	<date>
+write	13	SOME_DATE	<date>
+write	13	RND_DATE	<date>
+write	13	TS_DATE	<date>
+write	13	PRESENT_DATE	<date>
+write	13	OTHER_ID	z0Oxx003
+write	13	FIELD	<alnum 10>
+write	13	VAR_ARRAY	Foo,Bar
+write	13	VAR_BIN	VBOxx003
+write	13	DIVISION	(empty)
+write	13	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	13	NEWVAL_STRING	0F90000000000X3
+write	13	CONNECTION_ID	<alnum 15>
+write	13	SOME_INT	(empty)
+write	14	TENANT_ID	xxxxxxxxxxxxx14
+write	14	PARENT_ID	aAAyYhnNbBs9kWk
+write	14	CREATED_DATE	<date>
+write	14	SOME_DATE	<date>
+write	14	RND_DATE	<date>
+write	14	TS_DATE	<date>
+write	14	PRESENT_DATE	<date>
+write	14	OTHER_ID	z0Oxx004
+write	14	FIELD	<alnum 10>
+write	14	VAR_ARRAY	Foo,Bar
+write	14	VAR_BIN	VBOxx004
+write	14	DIVISION	(empty)
+write	14	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	14	NEWVAL_STRING	0F90000000000X4
+write	14	CONNECTION_ID	<alnum 15>
+write	14	SOME_INT	(empty)
+write	15	TENANT_ID	xxxxxxxxxxxxx15
+write	15	PARENT_ID	aAAyYhnNbBs9kWk
+write	15	CREATED_DATE	<date>
+write	15	SOME_DATE	<date>
+write	15	RND_DATE	<date>
+write	15	TS_DATE	<date>
+write	15	PRESENT_DATE	<date>
+write	15	OTHER_ID	z0Oxx005
+write	15	FIELD	<alnum 10>
+write	15	VAR_ARRAY	Foo,Bar
+write	15	VAR_BIN	VBOxx005
+write	15	DIVISION	(empty)
+write	15	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	15	NEWVAL_STRING	0F90000000000X5
+write	15	CONNECTION_ID	<alnum 15>
+write	15	SOME_INT	(empty)
+write	16	TENANT_ID	xxxxxxxxxxxxx16
+write	16	PARENT_ID	aAAyYhnNbBs9kWk
+write	16	CREATED_DATE	<date>
+write	16	SOME_DATE	<date>
+write	16	RND_DATE	<date>
+write	16	TS_DATE	<date>
+write	16	PRESENT_DATE	<date>
+write	16	OTHER_ID	z0Oxx006
+write	16	FIELD	<alnum 10>
+write	16	VAR_ARRAY	Foo,Bar
+write	16	VAR_BIN	VBOxx006
+write	16	DIVISION	(empty)
+write	16	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	16	NEWVAL_STRING	0F90000000000X6
+write	16	CONNECTION_ID	<alnum 15>
+write	16	SOME_INT	(empty)
+write	17	TENANT_ID	xxxxxxxxxxxxx17
+write	17	PARENT_ID	aAAyYhnNbBs9kWk
+write	17	CREATED_DATE	<date>
+write	17	SOME_DATE	<date>
+write	17	RND_DATE	<date>
+write	17	TS_DATE	<date>
+write	17	PRESENT_DATE	<date>
+write	17	OTHER_ID	z0Oxx007
+write	17	FIELD	<alnum 10>
+write	17	VAR_ARRAY	Foo,Bar
+write	17	VAR_BIN	VBOxx007
+write	17	DIVISION	(empty)
+write	17	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	17	NEWVAL_STRING	0F90000000000X7
+write	17	CONNECTION_ID	<alnum 15>
+write	17	SOME_INT	(empty)
+write	18	TENANT_ID	xxxxxxxxxxxxx18
+write	18	PARENT_ID	aAAyYhnNbBs9kWk
+write	18	CREATED_DATE	<date>
+write	18	SOME_DATE	<date>
+write	18	RND_DATE	<date>
+write	18	TS_DATE	<date>
+write	18	PRESENT_DATE	<date>
+write	18	OTHER_ID	z0Oxx008
+write	18	FIELD	<alnum 10>
+write	18	VAR_ARRAY	Foo,Bar
+write	18	VAR_BIN	VBOxx008
+write	18	DIVISION	(empty)
+write	18	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	18	NEWVAL_STRING	0F90000000000X8
+write	18	CONNECTION_ID	<alnum 15>
+write	18	SOME_INT	(empty)
+write	19	TENANT_ID	xxxxxxxxxxxxx19
+write	19	PARENT_ID	cCCyYhnNbBs9kWr
+write	19	CREATED_DATE	<date>
+write	19	SOME_DATE	<date>
+write	19	RND_DATE	<date>
+write	19	TS_DATE	<date>
+write	19	PRESENT_DATE	<date>
+write	19	OTHER_ID	z0Oxx009
+write	19	FIELD	<alnum 10>
+write	19	VAR_ARRAY	Foo,Bar
+write	19	VAR_BIN	VBOxx009
+write	19	DIVISION	(empty)
+write	19	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	19	NEWVAL_STRING	0F90000000000X9
+write	19	CONNECTION_ID	<alnum 15>
+write	19	SOME_INT	(empty)
+write	20	TENANT_ID	xxxxxxxxxxxxx20
+write	20	PARENT_ID	cCCyYhnNbBs9kWr
+write	20	CREATED_DATE	<date>
+write	20	SOME_DATE	<date>
+write	20	RND_DATE	<date>
+write	20	TS_DATE	<date>
+write	20	PRESENT_DATE	<date>
+write	20	OTHER_ID	z0Oxx000
+write	20	FIELD	<alnum 10>
+write	20	VAR_ARRAY	Foo,Bar
+write	20	VAR_BIN	VBOxx000
+write	20	DIVISION	(empty)
+write	20	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	20	NEWVAL_STRING	0F90000000000X0
+write	20	CONNECTION_ID	<alnum 15>
+write	20	SOME_INT	(empty)
+write	21	TENANT_ID	xxxxxxxxxxxxx21
+write	21	PARENT_ID	aAAyYhnNbBs9kWk
+write	21	CREATED_DATE	<date>
+write	21	SOME_DATE	<date>
+write	21	RND_DATE	<date>
+write	21	TS_DATE	<date>
+write	21	PRESENT_DATE	<date>
+write	21	OTHER_ID	z0Oxx001
+write	21	FIELD	<alnum 10>
+write	21	VAR_ARRAY	Foo,Bar
+write	21	VAR_BIN	VBOxx001
+write	21	DIVISION	(empty)
+write	21	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	21	NEWVAL_STRING	0F90000000000X1
+write	21	CONNECTION_ID	<alnum 15>
+write	21	SOME_INT	(empty)
+write	22	TENANT_ID	xxxxxxxxxxxxx22
+write	22	PARENT_ID	cCCyYhnNbBs9kWr
+write	22	CREATED_DATE	<date>
+write	22	SOME_DATE	<date>
+write	22	RND_DATE	<date>
+write	22	TS_DATE	<date>
+write	22	PRESENT_DATE	<date>
+write	22	OTHER_ID	z0Oxx002
+write	22	FIELD	<alnum 10>
+write	22	VAR_ARRAY	Foo,Bar
+write	22	VAR_BIN	VBOxx002
+write	22	DIVISION	(empty)
+write	22	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	22	NEWVAL_STRING	0F90000000000X2
+write	22	CONNECTION_ID	<alnum 15>
+write	22	SOME_INT	(empty)
+write	23	TENANT_ID	xxxxxxxxxxxxx23
+write	23	PARENT_ID	cCCyYhnNbBs9kWr
+write	23	CREATED_DATE	<date>
+write	23	SOME_DATE	<date>
+write	23	RND_DATE	<date>
+write	23	TS_DATE	<date>
+write	23	PRESENT_DATE	<date>
+write	23	OTHER_ID	z0Oxx003
+write	23	FIELD	<alnum 10>
+write	23	VAR_ARRAY	Foo,Bar
+write	23	VAR_BIN	VBOxx003
+write	23	DIVISION	(empty)
+write	23	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	23	NEWVAL_STRING	0F90000000000X3
+write	23	CONNECTION_ID	<alnum 15>
+write	23	SOME_INT	(empty)
+write	24	TENANT_ID	xxxxxxxxxxxxx24
+write	24	PARENT_ID	bBByYhnNbBs9kWu
+write	24	CREATED_DATE	<date>
+write	24	SOME_DATE	<date>
+write	24	RND_DATE	<date>
+write	24	TS_DATE	<date>
+write	24	PRESENT_DATE	<date>
+write	24	OTHER_ID	z0Oxx004
+write	24	FIELD	<alnum 10>
+write	24	VAR_ARRAY	Foo,Bar
+write	24	VAR_BIN	VBOxx004
+write	24	DIVISION	(empty)
+write	24	OLDVAL_STRING	<alnum 10 prefix MYPRFX>
+write	24	NEWVAL_STRING	0F90000000000X4
+write	24	CONNECTION_ID	<alnum 15>
+write	24	SOME_INT	(empty)
+read	0	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk' AND NEWVAL_STRING = '0F90000000000X0' AND OTHER_ID = 'z0Oxx000'
+read	1	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk' AND NEWVAL_STRING = '0F90000000000X1' AND OTHER_ID = 'z0Oxx001'
+read	2	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'bBByYhnNbBs9kWu' AND NEWVAL_STRING = '0F90000000000X2' AND OTHER_ID = 'z0Oxx002'
+read	3	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk' AND NEWVAL_STRING = '0F90000000000X3' AND OTHER_ID = 'z0Oxx003'
+read	4	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'cCCyYhnNbBs9kWr' AND NEWVAL_STRING = '0F90000000000X4' AND OTHER_ID = 'z0Oxx004'
+read	5	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk' AND NEWVAL_STRING = '0F90000000000X5' AND OTHER_ID = 'z0Oxx005'
+read	6	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk' AND NEWVAL_STRING = '0F90000000000X6' AND OTHER_ID = 'z0Oxx006'
+read	7	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'cCCyYhnNbBs9kWr' AND NEWVAL_STRING = '0F90000000000X7' AND OTHER_ID = 'z0Oxx007'
+read	8	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'bBByYhnNbBs9kWu' AND NEWVAL_STRING = '0F90000000000X8' AND OTHER_ID = 'z0Oxx008'
+read	9	SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk' AND NEWVAL_STRING = '0F90000000000X9' AND OTHER_ID = 'z0Oxx009'
+native	0	ID	1302902d4339555c60a3c836a363f624
+native	0	VB_L	00ff00
+native	0	FA	94.608955,-50.692974,13.655292,18.444614
+native	0	FA_L	1.5,-2.25,0.0
+native	0	DA	415.7990877534172,497.32636747609894,734.7658236953032
+native	0	DA_L	0.125,999.5
+native	0	DOC	{"s":"pmJ4nLz2","n":52557,"d":628.2273568299356,"b":false,"a":[530,232,136],"o":{"s":"65jLJ1sQ","n":662481}}
+native	0	DOC_L	{"k":"a","n":1}
+native	0	BDOC	{"s":"eKtlO7wt","n":440308,"d":717.4723920985496,"b":true,"a":[348,594,847],"o":{"s":"yWHVU8LU","n":967467}}
+native	0	BDOC_L	{"k":"c","o":{"x":true}}
+native	1	ID	27dfa47aaaa1207cce7b8f98182f92dc
+native	1	VB_L	00ff00
+native	1	FA	-58.642742,-74.233665,61.24878,-16.72795
+native	1	FA_L	1.5,-2.25,0.0
+native	1	DA	286.7908630927207,140.04002526583216,213.93608764336847
+native	1	DA_L	0.125,999.5
+native	1	DOC	{"s":"pEk1gwY9","n":453193,"d":77.87119260930464,"b":true,"a":[797,245,213],"o":{"s":"OdsMiDqA","n":465410}}
+native	1	DOC_L	{"k":"a","n":1}
+native	1	BDOC	{"s":"9XXwg45k","n":772152,"d":423.45692582179527,"b":true,"a":[827,506,496],"o":{"s":"d54Qx01e","n":981456}}
+native	1	BDOC_L	{"k":"d","d":2.5}
+native	2	ID	feda8c0d4ebfa59550e1a6927d224479
+native	2	VB_L	ff00
+native	2	FA	-42.277626,58.45697,52.716446,-62.22872
+native	2	FA_L	1.5,-2.25,0.0
+native	2	DA	870.4628059591274,586.4556232126605,564.8041809523854
+native	2	DA_L	0.125,999.5
+native	2	DOC	{"s":"pSmpEPAb","n":223091,"d":472.9402653475171,"b":false,"a":[449,268,350],"o":{"s":"buzEGO2d","n":551707}}
+native	2	DOC_L	{"k":"a","n":1}
+native	2	BDOC	{"s":"IBUrlDwV","n":102963,"d":802.8282547156596,"b":true,"a":[687,848,952],"o":{"s":"9hSiMWW8","n":865453}}
+native	2	BDOC_L	{"k":"c","o":{"x":true}}
+native	3	ID	36a41c23b0e8069ddb2c8f6fee4e43ec
+native	3	VB_L	ff00
+native	3	FA	-14.89848,-47.116352,-1.0571789,-4.327751
+native	3	FA_L	1.5,-2.25,0.0
+native	3	DA	266.4395367656901,547.8047001607971,258.77032044511196
+native	3	DA_L	0.125,999.5
+native	3	DOC	{"s":"pVoH9GGO","n":231739,"d":226.4523617486931,"b":true,"a":[198,982,47],"o":{"s":"b6lIcUCV","n":573834}}
+native	3	DOC_L	{"k":"b","v":[1,2]}
+native	3	BDOC	{"s":"1PdBXS65","n":415437,"d":240.4277758252158,"b":true,"a":[294,367,468],"o":{"s":"8VVTjl2k","n":349395}}
+native	3	BDOC_L	{"k":"d","d":2.5}
+native	4	ID	6d770a861357e5362be32f7f4b532569
+native	4	VB_L	0a
+native	4	FA	65.88134,-22.352402,6.26918,90.36053
+native	4	FA_L	1.5,-2.25,0.0
+native	4	DA	817.0226827954641,706.3582171342026,377.68829201776754
+native	4	DA_L	0.125,999.5
+native	4	DOC	{"s":"ps4mTOQc","n":77837,"d":805.7242307265211,"b":true,"a":[856,788,181],"o":{"s":"fE1y0yOJ","n":719257}}
+native	4	DOC_L	{"k":"a","n":1}
+native	4	BDOC	{"s":"g4zNCJr1","n":86654,"d":657.5437165148496,"b":false,"a":[6,968,748],"o":{"s":"iKN38EH8","n":434402}}
+native	4	BDOC_L	{"k":"d","d":2.5}
+native	5	ID	1c3cca902a18d7a70123c0f5c1332fc9
+native	5	VB_L	0a
+native	5	FA	22.074366,16.86466,-64.83495,-98.010025
+native	5	FA_L	1.5,-2.25,0.0
+native	5	DA	861.7968341248612,484.18030541939106,477.3977109708769
+native	5	DA_L	0.125,999.5
+native	5	DOC	{"s":"plc8VtHn","n":220839,"d":660.5236971717894,"b":true,"a":[889,519,409],"o":{"s":"IBjcElYB","n":402468}}
+native	5	DOC_L	{"k":"a","n":1}
+native	5	BDOC	{"s":"UKVsGgst","n":419649,"d":624.7694273322993,"b":false,"a":[549,880,785],"o":{"s":"yDKomvXh","n":152859}}
+native	5	BDOC_L	{"k":"c","o":{"x":true}}
+native	6	ID	af47e4a6fc487397a1c37bee9bbc260e
+native	6	VB_L	0a
+native	6	FA	-90.26501,93.92487,52.73047,-37.62806
+native	6	FA_L	1.5,-2.25,0.0
+native	6	DA	208.57040774328394,438.60187819401665,3.3995744764893088
+native	6	DA_L	0.125,999.5
+native	6	DOC	{"s":"paxvcvt2","n":261585,"d":841.3010056260522,"b":true,"a":[559,663,513],"o":{"s":"f0O6U5xr","n":899435}}
+native	6	DOC_L	{"k":"a","n":1}
+native	6	BDOC	{"s":"kr0ElUoa","n":803819,"d":295.98067841701226,"b":false,"a":[818,776,128],"o":{"s":"SoG9fyH6","n":941017}}
+native	6	BDOC_L	{"k":"d","d":2.5}
+native	7	ID	e92251a81ac6855a86df7c044a7ce7d6
+native	7	VB_L	00ff00
+native	7	FA	41.80491,78.29356,-40.4435,43.29166
+native	7	FA_L	1.5,-2.25,0.0
+native	7	DA	615.7411765072701,197.88697665996602,163.92899854559852
+native	7	DA_L	0.125,999.5
+native	7	DOC	{"s":"pxo544jh","n":932977,"d":816.6887743296707,"b":false,"a":[333,97,45],"o":{"s":"lMzM4L5j","n":72782}}
+native	7	DOC_L	{"k":"a","n":1}
+native	7	BDOC	{"s":"ORdP0LOD","n":776868,"d":385.0048154739989,"b":true,"a":[883,915,954],"o":{"s":"St6TAv7V","n":834468}}
+native	7	BDOC_L	{"k":"c","o":{"x":true}}
+native	8	ID	77edb20905bdccee67c7a98ab1a05180
+native	8	VB_L	0a
+native	8	FA	-28.071457,96.30153,-83.70361,-7.521181
+native	8	FA_L	1.5,-2.25,0.0
+native	8	DA	109.07258075625737,695.7529042803783,592.0746960629036
+native	8	DA_L	0.125,999.5
+native	8	DOC	{"s":"pE0VXFsW","n":558272,"d":319.53209537166504,"b":true,"a":[977,123,370],"o":{"s":"I3DbVOKg","n":460059}}
+native	8	DOC_L	{"k":"a","n":1}
+native	8	BDOC	{"s":"RrKZK8ru","n":962617,"d":587.2829777091553,"b":false,"a":[772,981,489],"o":{"s":"bq1Ujaky","n":481705}}
+native	8	BDOC_L	{"k":"c","o":{"x":true}}
+native	9	ID	d13b6f4cd8ca1faa6e997bb3b54308f4
+native	9	VB_L	0a
+native	9	FA	-61.310772,-18.130928,-37.426476,65.90187
+native	9	FA_L	1.5,-2.25,0.0
+native	9	DA	157.5315216560369,897.8876682939359,24.655766676202617
+native	9	DA_L	0.125,999.5
+native	9	DOC	{"s":"pEbR15DH","n":37668,"d":135.36984813924823,"b":true,"a":[674,930,702],"o":{"s":"G2XCVZ0H","n":804941}}
+native	9	DOC_L	{"k":"a","n":1}
+native	9	BDOC	{"s":"RcgNTa5q","n":995604,"d":633.0109197736562,"b":false,"a":[49,583,848],"o":{"s":"ZlnqIgNF","n":298961}}
+native	9	BDOC_L	{"k":"c","o":{"x":true}}

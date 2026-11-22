@@ -35,6 +35,7 @@ public class Column {
   private List<DataValue> dataValues = new ArrayList<>();
   private DataTypeMapping type;
   private boolean useCurrentDate;
+  private String generatorClass;
 
   public Column() {
     super();
@@ -189,6 +190,10 @@ public class Column {
     if (column.getUseCurrentDate()) {
       setUseCurrentDate(column.getUseCurrentDate());
     }
+
+    if (column.getGeneratorClass() != null) {
+      setGeneratorClass(column.getGeneratorClass());
+    }
   }
 
   public int getNullChance() {
@@ -223,5 +228,19 @@ public class Column {
 
   public void setPrefix(String prefix) {
     this.prefix = prefix;
+  }
+
+  /**
+   * Returns the fully qualified name of the custom class that generates values for this column, or
+   * null when using the built-in rules. The specified class must implement
+   * {@link org.apache.phoenix.pherf.rules.RuleBasedDataGenerator} and expose a public constructor
+   * accepting a single {@link Column} argument representing the rule.
+   */
+  public String getGeneratorClass() {
+    return generatorClass;
+  }
+
+  public void setGeneratorClass(String generatorClass) {
+    this.generatorClass = generatorClass;
   }
 }

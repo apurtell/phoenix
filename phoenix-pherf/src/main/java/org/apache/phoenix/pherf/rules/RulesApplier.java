@@ -164,41 +164,82 @@ public class RulesApplier {
       LOGGER.debug("We found a correct Scenario" + scenario.getName() + "column "
         + phxMetaColumn.getName() + " " + phxMetaColumn.getType());
 
-      Map<DataTypeMapping, List> overrideRuleMap = this.getCachedScenarioOverrides(scenario);
-
-      if (overrideRuleMap != null) {
-        List<Column> overrideRuleList =
-          this.getCachedScenarioOverrides(scenario).get(phxMetaColumn.getType());
-
-        if (overrideRuleList != null && overrideRuleList.contains(phxMetaColumn)) {
-          LOGGER.debug("We found a correct override column rule" + overrideRuleList);
-          Column columnRule = getColumnForRuleOverride(overrideRuleList, phxMetaColumn);
-          if (columnRule != null) {
-            // Allocate a separate sequence for rules overridden at the scenario level.
-            return getDataValue(columnRule, generatorKey + "#" + scenario.getName());
-          }
-        }
-      }
-
-      // Assume the first rule map
-      Map<DataTypeMapping, List> ruleMap = modelList.get(0);
-      List<Column> ruleList = ruleMap.get(phxMetaColumn.getType());
-
-      // Make sure Column from Phoenix Metadata matches a rule column
-      Column columnRule = getColumnForRule(ruleList, phxMetaColumn);
+      Column columnRule = getOverrideRule(scenario, phxMetaColumn);
       if (columnRule != null) {
-        // Generate some random data based on this rule
-        LOGGER.debug("We found a correct column rule" + ruleList);
-        value = getDataValue(columnRule, generatorKey);
-      } else {
-        throw new IllegalStateException(
-          String.format("No datamapping rule for column %s of type %s", phxMetaColumn.getName(),
-            phxMetaColumn.getType()));
+        // Allocate a dedicated value generation sequence for scenario-level rule overrides.
+        return getDataValue(columnRule, generatorKey + "#" + scenario.getName());
       }
 
+      // Generate a data value using the resolved column rule.
+      value = getDataValue(getMergedRule(phxMetaColumn), generatorKey);
     }
 
     return value;
+  }
+
+  /**
+   * Resolves the effective rule for a Phoenix metadata column using the same precedence as
+   * {@link #getDataForRule}: returns the scenario-specific override rule if one is defined, or
+   * otherwise falls back to the merged rules matching the column type and name.
+   * @throws IllegalStateException when no applicable rule is found for the column.
+   */
+  public Column getRuleForColumn(Scenario scenario, Column phxMetaColumn) {
+    Column columnRule = getOverrideRule(scenario, phxMetaColumn);
+    return columnRule != null ? columnRule : getMergedRule(phxMetaColumn);
+  }
+
+  /** Returns the scenario-level override rule for the specified column, or null if none exists. */
+  private Column getOverrideRule(Scenario scenario, Column phxMetaColumn) {
+    Map<DataTypeMapping, List> overrideRuleMap = this.getCachedScenarioOverrides(scenario);
+
+    if (overrideRuleMap != null) {
+      List<Column> overrideRuleList =
+        this.getCachedScenarioOverrides(scenario).get(phxMetaColumn.getType());
+
+      if (overrideRuleList != null && overrideRuleList.contains(phxMetaColumn)) {
+        LOGGER.debug("We found a correct override column rule" + overrideRuleList);
+        return getColumnForRuleOverride(overrideRuleList, phxMetaColumn);
+      }
+    }
+    return null;
+  }
+
+  /** Resolves the merged general and user-defined rule configuration for the specified column. */
+  private Column getMergedRule(Column phxMetaColumn) {
+    // Retrieve the primary rule mapping from the active data model.
+    Map<DataTypeMapping, List> ruleMap = modelList.get(0);
+    List<Column> ruleList = ruleMap.get(phxMetaColumn.getType());
+
+    // Verify that the Phoenix metadata column resolves to a valid rule definition.
+    Column columnRule = getColumnForRule(ruleList, phxMetaColumn);
+    if (columnRule == null) {
+      throw new IllegalStateException(String.format("No datamapping rule for column %s of type %s",
+        phxMetaColumn.getName(), phxMetaColumn.getType()));
+    }
+    LOGGER.debug("We found a correct column rule" + ruleList);
+    return columnRule;
+  }
+
+  /**
+   * Instantiates the data generator class configured on a column rule. The target class must
+   * implement {@link RuleBasedDataGenerator} and expose a public constructor accepting a single
+   * {@link Column} argument.
+   * @throws IllegalArgumentException identifying the column and generator class if instantiation
+   *                                  fails.
+   */
+  public static RuleBasedDataGenerator newGenerator(Column column) {
+    String name = column.getGeneratorClass();
+    try {
+      Class<?> type = Class.forName(name);
+      if (!RuleBasedDataGenerator.class.isAssignableFrom(type)) {
+        throw new IllegalArgumentException("generatorClass " + name + " of column "
+          + column.getName() + " does not implement " + RuleBasedDataGenerator.class.getName());
+      }
+      return (RuleBasedDataGenerator) type.getConstructor(Column.class).newInstance(column);
+    } catch (ReflectiveOperationException | LinkageError e) {
+      throw new IllegalArgumentException(
+        "Cannot make generatorClass " + name + " of column " + column.getName() + ": " + e, e);
+    }
   }
 
   /**
@@ -225,6 +266,19 @@ public class RulesApplier {
     // Return an empty value if we fall within the configured probability of null
     if ((nullChance != Integer.MIN_VALUE) && (isValueNull(nullChance))) {
       return new DataValue(column.getType(), "");
+    }
+
+    // Delegate value production entirely to the configured generator class, maintaining an
+    // isolated generator instance per generator key.
+    if (column.getGeneratorClass() != null) {
+      RuleBasedDataGenerator generator = columnRuleBasedDataGeneratorMap.get(generatorKey);
+      if (generator == null) {
+        generator = newGenerator(column);
+        RuleBasedDataGenerator oldGenerator =
+          columnRuleBasedDataGeneratorMap.putIfAbsent(generatorKey, generator);
+        generator = oldGenerator != null ? oldGenerator : generator;
+      }
+      return generator.getDataValue();
     }
 
     if (column.getPrefix() != null) {

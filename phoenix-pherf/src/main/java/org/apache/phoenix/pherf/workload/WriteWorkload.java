@@ -43,6 +43,9 @@ import org.apache.phoenix.pherf.result.ResultUtil;
 import org.apache.phoenix.pherf.rules.RulesApplier;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.util.RowCalculator;
+import org.apache.phoenix.pherf.workload.cogen.CoGenerator;
+import org.apache.phoenix.pherf.workload.cogen.IndexDecoder;
+import org.apache.phoenix.pherf.workload.cogen.RowCursor;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -171,14 +174,26 @@ public class WriteWorkload implements Workload {
     DataLoadThreadTime dataLoadThreadTime, Scenario scenario) throws Exception {
     LOGGER.info("\nLoading " + scenario.getRowCount() + " rows for " + scenario.getTableName());
 
+    // Co-generation validates its configuration settings prior to executing any DDL, and a data
+    // load begins at row index 0.
+    CoGenerator coGenerator =
+      scenario.getCoGeneration() == null ? null : CoGenerator.of(parser, scenario);
+    if (coGenerator != null && this.scenario == null) {
+      coGenerator.beginLoad();
+    }
+    RowCursor.Load load = coGenerator == null ? null : coGenerator.load();
+
     // Execute any pre dataload scenario DDLs
     pUtil.executeScenarioDdl(scenario.getPreScenarioDdls(), scenario.getTenantId(),
       dataLoadTimeSummary);
 
     // Write data
-    List<Future<Info>> writeBatches = getBatches(dataLoadThreadTime, scenario);
+    List<Future<Info>> writeBatches = getBatches(dataLoadThreadTime, scenario, coGenerator, load);
     waitForBatches(dataLoadTimeSummary, scenario, EnvironmentEdgeManager.currentTimeMillis(),
       writeBatches);
+    if (load != null) {
+      load.finish();
+    }
 
     // Update Phoenix Statistics
     if (this.generateStatistics == GeneratePhoenixStats.YES) {
@@ -194,8 +209,8 @@ public class WriteWorkload implements Workload {
       dataLoadTimeSummary);
   }
 
-  private List<Future<Info>> getBatches(DataLoadThreadTime dataLoadThreadTime, Scenario scenario)
-    throws Exception {
+  private List<Future<Info>> getBatches(DataLoadThreadTime dataLoadThreadTime, Scenario scenario,
+    CoGenerator coGenerator, RowCursor.Load load) throws Exception {
     RowCalculator rowCalculator = new RowCalculator(getThreadPoolSize(), scenario.getRowCount());
     List<Future<Info>> writeBatches = new ArrayList<>();
 
@@ -204,8 +219,10 @@ public class WriteWorkload implements Workload {
         scenario.getTableNameWithoutSchemaName(), pUtil.getConnection(scenario.getTenantId()));
       int threadRowCount = rowCalculator.getNext();
       LOGGER.info("Kick off thread (#" + i + ")for upsert with (" + threadRowCount + ") rows.");
-      Future<Info> write = upsertData(scenario, phxMetaCols, scenario.getTableName(),
-        threadRowCount, dataLoadThreadTime, this.useBatchApi);
+      Future<Info> write = coGenerator == null
+        ? upsertData(scenario, phxMetaCols, scenario.getTableName(), threadRowCount,
+          dataLoadThreadTime, this.useBatchApi)
+        : upsertBlocks(scenario, phxMetaCols, threadRowCount, coGenerator, load);
       writeBatches.add(write);
     }
     if (writeBatches.isEmpty()) {
@@ -358,6 +375,67 @@ public class WriteWorkload implements Workload {
       }
     });
     return future;
+  }
+
+  /**
+   * Executes the co-generated row writes for a single writer thread. The thread claims blocks of
+   * row indexes until it fulfills its assigned row count, committing each block as a single batch.
+   * Because the execution duration limit is evaluated between blocks, every claimed block is
+   * completely written and committed. Following each JDBC commit, the completed block is reported
+   * to the load so that the watermark can be updated.
+   */
+  private Future<Info> upsertBlocks(final Scenario scenario, final List<Column> columns,
+    final int rowCount, final CoGenerator coGenerator, final RowCursor.Load load) {
+    return pool.submit(new Callable<Info>() {
+      @Override
+      public Info call() throws Exception {
+        String tableName = scenario.getTableName();
+        String latencyOperation = "load:" + scenario.getName() + ":" + tableName;
+        SimpleDateFormat simpleDateFormat = IndexDecoder.dateFormat();
+        long maxDuration =
+          (writeParams == null) ? Long.MAX_VALUE : writeParams.getExecutionDurationInMs();
+        long start = EnvironmentEdgeManager.currentTimeMillis();
+        int rowsCreated = 0;
+        try (Connection connection = pUtil.getConnection(scenario.getTenantId(), properties);
+          PreparedStatement stmt =
+            connection.prepareStatement(pUtil.buildSql(columns, tableName))) {
+          IndexDecoder decoder = coGenerator.decoder(connection);
+          long left = rowCount;
+          while (left > 0 && (EnvironmentEdgeManager.currentTimeMillis() - start) < maxDuration) {
+            long batchStartMicros = Micros.now();
+            RowCursor.Block block = load.claim(left);
+            for (long i = block.start; i < block.end; i++) {
+              pUtil.buildStatement(columns, decoder.row(columns, i), stmt, simpleDateFormat);
+              if (useBatchApi) {
+                stmt.addBatch();
+              } else {
+                rowsCreated += stmt.executeUpdate();
+              }
+            }
+            if (useBatchApi) {
+              for (int result : stmt.executeBatch()) {
+                if (result < 1) {
+                  throw new RuntimeException(
+                    "Failed to write update in batch (update count=" + result + ")");
+                }
+                rowsCreated += result;
+              }
+            }
+            connection.commit();
+            LatencyRecorders.record(latencyOperation, LatencyRecorders.STEADY,
+              Micros.now() - batchStartMicros);
+            load.committed(block);
+            left -= block.size();
+            // Pause for the configured throttling duration between committed blocks.
+            Thread.sleep(threadSleepDuration);
+          }
+        } catch (SQLException e) {
+          LOGGER.error("Scenario " + scenario.getName() + " failed with exception ", e);
+          throw e;
+        }
+        return new Info(EnvironmentEdgeManager.currentTimeMillis() - start, rowsCreated);
+      }
+    });
   }
 
   public XMLConfigParser getParser() {

@@ -172,6 +172,106 @@ details on latency keys and the `schedules` report entry generated for each open
 * Because multiple worker threads draw dynamic placeholder values (`[COL]`) concurrently, the exact
   sequence of substituted values varies across runs.
 
+### Co-generation
+Configuring a scenario with a `coGeneration` element computes every column value as a deterministic
+pure function of the row index, the column rule, and the seed. Writer threads claim disjoint blocks
+of row indexes while readers sample exclusively from committed index ranges, enabling queries to
+read keys produced by writers running in another thread, JVM, or process without maintaining shared
+key state. Scenarios that omit this element continue to use the standard rule-based generators
+unchanged; no other configuration switch is required.
+
+```
+
+<scenario tableName="PHERF.COGEN" rowCount="100000" name="lookups">
+    <coGeneration seed="7" offset="0" blockSize="1000" clusterLimit="4" watermark="COMMIT" walk="MULTIPLICATIVE"/>
+    <querySet concurrency="4" executionType="SERIAL" numberOfExecutions="1000">
+        <query id="get" statement="SELECT V FROM PHERF.COGEN WHERE K1 = [K1] AND K2 = [K2]"/>
+    </querySet>
+</scenario>
+
+```
+
+Every attribute on the element is optional. Supplying a value that fails to parse, such as
+`walk="SEQUENTAIL"`, aborts the run with an error message identifying the scenario, the attribute,
+and the invalid value:
+
+* `seed` (default 0): specifies the seed governing both column value generation and the read
+  traversal order.
+* `offset` (default 0, minimum 0): defines the starting row index for the current process. The
+  effective row index for any generated value equals this offset plus the process-local index,
+  which begins at 0 in each process. Separate processes generate disjoint keys only when their
+  offsets are separated by at least the total number of rows written per process (including rows
+  written by `writeParams` writers) and the primary key includes a column that yields distinct
+  values for every row index across the two ranges. Pherf does not enforce or validate this
+  requirement; for example, a SEQUENTIAL VARCHAR column wraps and repeats after 10 to the power of
+  its unprefixed length (its length without the prefix).
+* `blockSize` (default 1000, minimum 1): specifies the number of rows in a single writer block.
+  Each block constitutes a single commit batch and never crosses an integer multiple of
+  `blockSize`. The execution duration limit configured on `writeParams` is evaluated at block
+  boundaries.
+* `clusterLimit` (omitted for no clustering, otherwise at least 1): caps the maximum number of
+  distinct values generated for the leading primary key column within each block. Pherf determines
+  the leading column from the primary key metadata. Specifying a value smaller than `blockSize` on
+  a single-column primary key fails validation. In addition, the primary key must contain a
+  subsequent column that produces a unique value for each row index (such as a SEQUENTIAL column);
+  otherwise, generated rows will collide.
+* `watermark`: controls when written rows become visible to readers. `COMMIT` (the default) exposes
+  each block immediately after it is committed, whereas `LOAD` defers visibility until all writers
+  in the data load phase have completed.
+* `walk`: selects the order in which readers traverse committed rows. `MULTIPLICATIVE` (the
+  default) visits committed rows in a hashed sequence using a stride coprime to the row count so
+  that each pass visits every row exactly once before repeating any row, whereas `SEQUENTIAL`
+  traverses rows in ascending index order.
+
+Column rules retain their standard semantics, subject to the following differences from the
+traditional rule-based generators:
+
+* SEQUENTIAL derives each value directly from the row index within the rule's sequence and is
+  additionally supported for BIGINT and UNSIGNED_LONG columns. SEQUENTIAL DATE and TIMESTAMP rules
+  begin at 1970-01-01 00:00:00.000 and advance by one second per row.
+* LIST selects entries according to their declared distribution weights, RANDOM honors the
+  configured numeric bounds, length, and prefix of the rule, and `nullChance` preserves its
+  configured null probability.
+* `useCurrentDate` cannot be expressed as a pure function of the row index, so any column rule or
+  list entry that enables it is rejected.
+* A column rule may specify a custom generator class via `<generatorClass>`, referencing a class
+  that implements `org.apache.phoenix.pherf.rules.RuleBasedDataGenerator` and provides a public
+  single-argument constructor accepting a `Column`. Both the traditional and co-generation paths
+  instantiate this class. Under co-generation, if the class also implements
+  `org.apache.phoenix.pherf.rules.IndexedDataGenerator`, values are computed deterministically via
+  `valueAt(index, seed)`; otherwise, the generator falls back to its standard value generation,
+  whose results are not a pure function of the row index.
+
+Read and write coordination behavior:
+
+* A data load (`-l`) writes rows starting at index 0. An execution invoked without a data load
+  (such as `-q` by itself) reads across the `rowCount` rows that a data load of the same scenario
+  would produce. Because this range is assumed rather than observed from live commits, the prior
+  load must have run to completion with identical settings and `rowCount`; otherwise, point lookups
+  return no matching rows without reporting an error, and the validator must be used to confirm the
+  results. Configuring `rowCount="0"` in such a run leaves no rows available to read, causing every
+  read to fail. Concurrent writers configured via `writeParams` append new rows at indexes above
+  that initial range.
+* All placeholders within a single statement are resolved from the same row index, ensuring that a
+  point query receives a complete, consistent primary key for one row. A statement draws a row
+  index only when it contains at least one placeholder associated with a column rule.
+* Under closed-loop execution, thread i at concurrency level C reads exclusively from row indexes
+  matching i mod C, so concurrent reader threads access disjoint sets of rows. Under open-loop
+  execution, worker threads share a single traversal sequence across the query set: a complete pass
+  still visits each row once, but the specific row bound to a given arrival depends on worker
+  scheduling order.
+* Report explain plan generation, `-diff`, and `-export` continue to use the rule-based generators.
+  The load profile execution path (`-mt`) rejects scenarios configured with `coGeneration`.
+* Each value substituted into a statement is rendered as a SQL literal matching the exact value
+  bound by the writer. CHAR and VARCHAR values are enclosed in quotes, DATE and TIMESTAMP values
+  are formatted as typed UTC literals with millisecond precision
+  (`TIMESTAMP '2000-01-01 00:00:00.123'`), VARBINARY and VARBINARY_ENCODED values are formatted as
+  hexadecimal literals (`X'0aff'`), and numeric values are emitted without quotes. DECIMAL values
+  and array elements use a canonical decimal string representation that does not vary across JDK
+  versions.
+* Every scenario configured with `coGeneration` must have a unique scenario name across all data
+  models included in the run.
+
 ## Results
 Results are written real time in _results_ directory. Open the result that is saved in .jpg format for real time
 visualization.

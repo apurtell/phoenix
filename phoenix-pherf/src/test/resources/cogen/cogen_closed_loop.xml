@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- One closed loop point lookup with co-generation. 20 executions on one thread read each of the 20
+     loaded rows once. -->
+<datamodel name="cogen_closed_loop">
+    <datamapping>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>LIST</dataSequence>
+            <name>K1</name>
+            <valuelist>
+                <datavalue distribution="50"><value>a</value></datavalue>
+                <datavalue distribution="30"><value>b</value></datavalue>
+                <datavalue distribution="20"><value>c</value></datavalue>
+            </valuelist>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K2</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.COGEN" rowCount="20" name="cogenRun">
+            <coGeneration seed="11"/>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="20"
+                      executionDurationInMs="600000">
+                <query id="lookup" statement="SELECT V FROM PHERF.COGEN WHERE K1 = [K1] AND K2 = [K2]"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>
