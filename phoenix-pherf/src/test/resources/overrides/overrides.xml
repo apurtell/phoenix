@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- The launch overrides. Without an override, the open loop query set runs 50 arrivals (1000/s for
+     50 ms) on 1 worker, and the closed loop query set runs 1 thread for 600 s. This file is outside
+     the scenario directory, because the fixture run of that directory uses a constant clock. -->
+<datamodel name="run_overrides">
+    <datamapping>
+        <column>
+            <type>VARCHAR</type>
+            <dataSequence>RANDOM</dataSequence>
+            <length>15</length>
+            <name>GENERAL_VARCHAR</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.TEST_TABLE" rowCount="4" name="overrides">
+            <querySet concurrency="1">
+                <openLoop>
+                    <stage durationMs="50" rate="1000"/>
+                </openLoop>
+                <query id="open" statement="select count(*) from PHERF.TEST_TABLE"/>
+            </querySet>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="1000000000"
+                      executionDurationInMs="600000">
+                <query id="closed" statement="select sum(SOME_INT) from PHERF.TEST_TABLE"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>

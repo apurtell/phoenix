@@ -36,6 +36,8 @@ mvn clean package -DskipTests
 - -hint _Executes all queries with specified hint. Example SMALL_ <br />
 - -rowCountOverride
 - -rowCountOverride [number of rows] _Specify number of rows to be upserted rather than using row count specified in schema_ </br>
+- -runDurationMs [ms], -threadCount [n], -targetRate [ops/s] _Overrides the execution duration,
+  concurrency, and peak arrival rate of every query set at launch (see Launch overrides)._ <br />
 - -connectionCache _Reuses connections through a cache holding at most pherf.default.threadpool
   idle connections. Each connection serves only operations with the same URL and connection
   properties (and therefore the same tenant and connection properties), allowing query sets and DDL
@@ -322,6 +324,141 @@ specifies the lower bound and the second specifies the upper bound.
 * The load profile execution path (`-mt`) runs SCAN and DELETE operations using rule-based
   generation, while query operations that omit the attribute continue to execute their statement as
   written.
+
+### Workload profiles
+A workload profile is a configuration file that defines the arrival rate curve and operation mix for
+a query set, allowing a single rate curve and mix to be reused across multiple scenarios. Its root
+element is `workloadProfile`, which contains a single `openLoop` element (configured identically to
+a query set) and an optional `mix` element:
+
+```
+
+<workloadProfile>
+    <openLoop>
+        <stage durationMs="60000" rate="500"/>
+    </openLoop>
+    <mix>
+        <operation kind="SELECT" weight="70"/>
+        <operation kind="SCAN" weight="20"/>
+        <operation kind="DELETE" weight="10"/>
+    </mix>
+</workloadProfile>
+
+```
+
+A query set references a workload profile using the `profile` attribute:
+
+```
+
+<querySet concurrency="4" profile="smoke_profile.xml">
+    <query id="get" statement="SELECT V FROM PHERF.T WHERE K1 = [K1] AND K2 = [K2]"/>
+    <query id="scan" kind="SCAN" statement="SELECT V FROM PHERF.T WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+    <query id="delete" kind="DELETE" statement="DELETE FROM PHERF.T WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+</querySet>
+
+```
+
+* The profile path may be specified relative to the scenario file or as an absolute path, and is
+  opened in the same manner as the scenario file (from the filesystem, the classpath, or a JAR). The
+  parser reads the profile anew for each query set that references it.
+* The profile serves as the sole source of the `openLoop` schedule and `mix` configuration for that
+  query set. Specifying a profile on a query set that also declares its own `openLoop` or `mix`
+  causes parsing to fail rather than merging the definitions. The scenario retains the queries and
+  their kinds, `concurrency`, `warmupExecutions`, properties, DDL, `coGeneration`, and row
+  definitions; a profile never specifies concurrency. A missing or unreadable profile file, an
+  unexpected root element, a profile that omits `openLoop`, or a DTD declaration in the profile
+  causes parsing to fail with an error message identifying the scenario, the query set, and the
+  profile path.
+* The launch overrides described below modify the rate curve after parsing completes, so they also
+  transform curves loaded from a profile. Launch overrides take precedence over both the profile and
+  the query set. Because a profile cannot be combined with an inline `openLoop` or `mix`, no
+  precedence order exists between them.
+* The XML result file records the `profile` attribute along with the effective `openLoop` and `mix`
+  configurations that were executed.
+
+The `mix` element defines the relative share of arrivals allocated to each query kind. A query set
+may also declare an inline `mix` directly alongside its own `openLoop` element.
+
+* `kind` must be `SELECT`, `SCAN`, or `DELETE`, with each kind appearing at most once. `weight` must
+  be an integer of at least 1, and the sum of all weights must not exceed 10000.
+* Every kind declared in the mix must match at least one query of that kind in the query set, and
+  every query in the query set must belong to a kind present in the mix, since an unmatched query
+  would never be executed.
+* The configured weights are divided by their greatest common divisor to form a repeating cycle of W
+  arrivals. Smooth weighted round-robin scheduling populates each cycle so that a kind with reduced
+  weight w receives w arrivals distributed evenly across the cycle, while multiple queries of the
+  same kind are dispatched in turn in their declared order. Consequently, the dispatch sequence is
+  identical across runs and independent of worker thread scheduling.
+* Each cycle is exact: after N arrivals, the operation count for a kind with reduced weight w is
+  within 1 of N * w / W, and equals N * w / W exactly whenever W divides N. For example, a 70/20/10
+  mix (W = 10) over 1000 arrivals dispatches 700, 200, and 100 operations.
+* Warmup executions continue to run the queries in turn, just as when no mix is configured.
+* Limitations: an operation mix requires an open-loop query set; closed-loop execution and the load
+  profile execution path (`-mt`) do not support a mix. When DELETE operations run alongside readers
+  at a concurrency greater than 1, a read can execute concurrently with a DELETE targeting its rows,
+  so returned row counts may vary between runs whereas operation counts do not. Pherf validates the
+  mix alongside `openLoop`, after the `-l` data load and before the first query set starts, while
+  `-diff` and `-export` runs ignore it.
+
+### Launch overrides
+Three command-line options override the execution parameters of every query set at launch without
+modifying the scenario file. These options require `-q` and affect only query set execution; the
+data load phase (`-l`) and the load profile execution path (`-mt`) remain unchanged. Each option
+value is validated at launch, and an invalid value aborts the run with an error message identifying
+the option and the offending value. When `-runDurationMs` or `-targetRate` is specified, open-loop
+validation runs at launch prior to scaling so that a malformed open-loop configuration fails before
+any data load with its validation error message.
+
+* `-runDurationMs <ms>` (1 to 9223372036854775): scales the stages of an open-loop query set so that
+  their durations total the specified value while preserving the shape of the schedule. Each stage
+  is assigned `floor(d * D / T)` ms and the final stage receives the remainder; any stage whose
+  scaled duration falls below 1 ms is reported as an error. On a closed-loop query set, this option
+  sets `executionDurationInMs`, while `numberOfExecutions` continues to stop a thread earlier if it
+  is reached first.
+* `-threadCount <n>` (1 to 999999999): sets the `concurrency` of every query set—including any
+  configured concurrency range—to n. This value defines the thread count for closed-loop query sets
+  (which remains bounded by `pherf.default.threadpool`) and both the worker pool size and dispatch
+  queue capacity for open-loop query sets.
+* `-targetRate <ops/s>` (above 0): multiplies every `rate` and `endRate` in an open-loop schedule by
+  R / peak, where peak is the maximum rate across all stages, so that the curve retains its relative
+  shape, its peak rate becomes R, and any pause stage remains at 0. If the run contains no open-loop
+  query set, execution fails because the option would have no effect.
+
+Launch overrides are applied after scenario parsing and profile resolution, taking precedence over
+both. The XML result file and the `schedules` entry in the latency report record the effective
+values that were executed.
+
+### Reference scenarios
+The `config/reference` directory provides three co-generated reference scenarios, each paired with a
+companion smoke profile in the same directory:
+
+| Scenario | Table | Smoke profile | Arrivals | SELECT / SCAN / DELETE | Rows left |
+|---|---|---|---|---|---|
+| `relational_scenario.xml` | `PHERF.REF_RELATIONAL`: BIGINT and INTEGER keys, VARCHAR, INTEGER, DOUBLE ARRAY | 2000 ms at 50/s, mix 70/20/10 | 100 | 70 / 20 / 10 | 500 |
+| `json_scenario.xml` | `PHERF.REF_JSON`: BIGINT and INTEGER keys, JSON document | 1000 ms at 20/s, then 1000 ms from 20/s to 60/s, mix 50/30/20 | 60 | 30 / 18 / 12 | 520 |
+| `bson_scenario.xml` | `PHERF.REF_BSON`: BIGINT and INTEGER keys, BSON document | 1500 ms at 40/s, mix 60/20/20 | 60 | 36 / 12 / 12 | 700 |
+
+Each scenario loads 1000 rows using `coGeneration` and executes a single open-loop query set at
+concurrency 1 consisting of a point lookup on the full primary key (1 row), a range SCAN, and a
+range DELETE on the leading key column K1 (spanning one block of 50, 40, or 25 rows). Because the
+scenario DDL creates the target table directly, no separate schema file is required. From the source
+tree:
+
+`bin/pherf-standalone.py -l -q -z localhost -disableSchemaApply -scenarioFile phoenix-pherf/config/reference/relational_scenario.xml`
+
+In the cluster distribution archive, the scenario path is
+`config/reference/relational_scenario.xml`. Because DELETE operations remove rows from the table,
+subsequent runs should include `-l` to reload the dataset. Workload intensity can be scaled up using
+`-threadCount`, `-runDurationMs`, or `-targetRate`. Increasing the total number of arrivals
+proportionally increases the number of delete operations, and because read operations fail if no
+committed rows remain, the total row count must always exceed the number of deletes multiplied by
+the block size. Consequently, `-rowCountOverride` must be increased by at least the arrival scaling
+factor (the `-runDurationMs` factor multiplied by the `-targetRate` / peak factor). For example,
+running `relational_scenario.xml` with `-runDurationMs 20000` produces 10 times as many arrivals and
+requires `-rowCountOverride 10000` or greater.
+These files are not packaged inside the JAR, and resource discovery does not scan
+`config/reference`, so `-listFiles`, regex patterns passed to `-scenarioFile`, and default schema
+application do not locate them.
 
 ## Results
 Results are written real time in _results_ directory. Open the result that is saved in .jpg format for real time

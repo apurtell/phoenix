@@ -21,6 +21,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import javax.xml.bind.annotation.XmlAttribute;
+import javax.xml.bind.annotation.XmlElement;
+import javax.xml.bind.annotation.XmlElementWrapper;
 import org.apache.phoenix.pherf.PherfConstants;
 
 public class QuerySet {
@@ -32,6 +34,8 @@ public class QuerySet {
   private Map<String, String> phoenixProperties;
   private Long warmupExecutions;
   private OpenLoop openLoop;
+  private String profile;
+  private List<OperationMix> mix;
 
   /**
    * List of queries in each query set
@@ -145,6 +149,36 @@ public class QuerySet {
 
   public void setOpenLoop(OpenLoop openLoop) {
     this.openLoop = openLoop;
+  }
+
+  /**
+   * Returns the path to the workload profile file for this query set, specified either relative to
+   * the scenario file or as an absolute path, or null (when absent) if no profile is configured.
+   * During parsing, the open-loop schedule and operation mix defined in the profile are copied into
+   * this query set.
+   */
+  @XmlAttribute
+  public String getProfile() {
+    return profile;
+  }
+
+  public void setProfile(String profile) {
+    this.profile = profile;
+  }
+
+  /**
+   * Returns the operation mix configured for an open-loop query set, where each scheduled arrival
+   * executes a query of the kind selected by the mix, or null (when absent) to execute the queries
+   * in turn.
+   */
+  @XmlElementWrapper(name = "mix")
+  @XmlElement(name = "operation")
+  public List<OperationMix> getMix() {
+    return mix;
+  }
+
+  public void setMix(List<OperationMix> mix) {
+    this.mix = mix;
   }
 
   @Override

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- Smoke profile of bson_scenario.xml: 1500 ms at 40/s, so 60 arrivals. The mix gives 36 SELECT,
+     12 SCAN and 12 DELETE operations. LATE with no lag limit runs every arrival. -->
+<workloadProfile>
+    <openLoop arrival="UNIFORM" lagPolicy="LATE">
+        <stage durationMs="1500" rate="40"/>
+    </openLoop>
+    <mix>
+        <operation kind="SELECT" weight="60"/>
+        <operation kind="SCAN" weight="20"/>
+        <operation kind="DELETE" weight="20"/>
+    </mix>
+</workloadProfile>

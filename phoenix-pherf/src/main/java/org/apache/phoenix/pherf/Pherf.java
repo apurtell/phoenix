@@ -26,6 +26,7 @@ import java.util.Properties;
 import org.apache.phoenix.pherf.PherfConstants.CompareType;
 import org.apache.phoenix.pherf.PherfConstants.GeneratePhoenixStats;
 import org.apache.phoenix.pherf.configuration.DataModel;
+import org.apache.phoenix.pherf.configuration.RunOverrides;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.jmx.MonitorManager;
@@ -110,6 +111,14 @@ public class Pherf {
     options.addOption("b", "batchApi", false, "Use JDBC Batch API for writes");
     options.addOption("connectionCache", "connectionCache", false,
       "Reuse connections through a cache of at most pherf.default.threadpool idle connections");
+    options.addOption("runDurationMs", "runDurationMs", true,
+      "Override the run duration of every query set, in ms: the open loop stages keep their shape."
+        + " Needs -q.");
+    options.addOption("threadCount", "threadCount", true,
+      "Override the concurrency of every query set. Needs -q.");
+    options.addOption("targetRate", "targetRate", true,
+      "Override the peak rate of every open loop query set, in operations per second: the other"
+        + " rates scale with it. Needs -q.");
   }
 
   private final String zookeeper;
@@ -135,6 +144,7 @@ public class Pherf {
   private final boolean thinDriver;
   private final String queryServerUrl;
   private final boolean connectionCache;
+  private final RunOverrides overrides;
   private Properties properties = new Properties();
 
   @VisibleForTesting
@@ -217,6 +227,9 @@ public class Pherf {
       hf.printHelp("Pherf", options);
       System.exit(1);
     }
+    overrides = RunOverrides.of(command.getOptionValue("runDurationMs"),
+      command.getOptionValue("threadCount"), command.getOptionValue("targetRate"),
+      executeQuerySets);
     PhoenixUtil.setRowCountOverride(rowCountOverride);
     if (!thinDriver) {
       LOGGER.info("Using thick driver with ZooKeepers '{}'", zookeeper);
@@ -311,6 +324,9 @@ public class Pherf {
       }
 
       XMLConfigParser parser = new XMLConfigParser(scenarioFile);
+      // Apply launch overrides to the parsed query sets prior to running any data load; the query
+      // executor subsequently validates the effective query set configurations.
+      overrides.apply(parser.getDataModels());
       LatencyRecorders.begin(properties);
       if (connectionCache) {
         // The closed-loop workload executes at most this many concurrent operations at a time.

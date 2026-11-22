@@ -33,6 +33,8 @@ public class QuerySetResult extends QuerySet {
     this.setPhoenixProperties(querySet.getPhoenixProperties());
     this.setWarmupExecutions(querySet.getWarmupExecutions());
     this.setOpenLoop(querySet.getOpenLoop());
+    this.setProfile(querySet.getProfile());
+    this.setMix(querySet.getMix());
   }
 
   public QuerySetResult() {

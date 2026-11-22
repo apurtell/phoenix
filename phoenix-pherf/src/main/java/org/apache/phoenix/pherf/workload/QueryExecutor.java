@@ -19,6 +19,7 @@ package org.apache.phoenix.pherf.workload;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -29,6 +30,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.ExecutionType;
 import org.apache.phoenix.pherf.configuration.OpenLoop;
+import org.apache.phoenix.pherf.configuration.OperationMix;
 import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.QuerySet;
 import org.apache.phoenix.pherf.configuration.Scenario;
@@ -42,6 +44,7 @@ import org.apache.phoenix.pherf.result.ThreadTime;
 import org.apache.phoenix.pherf.rules.RulesApplier;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.workload.cogen.CoGenerator;
+import org.apache.phoenix.pherf.workload.openloop.MixOrder;
 import org.apache.phoenix.pherf.workload.openloop.OpenLoopScheduler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -157,6 +160,7 @@ public class QueryExecutor implements Workload {
     checkWarmupExecutions(dataModel);
     checkOpenLoop(dataModel);
     checkKinds(dataModel);
+    checkMix(dataModel);
     return new Callable<Void>() {
       @Override
       public Void call() throws Exception {
@@ -263,8 +267,9 @@ public class QueryExecutor implements Workload {
 
   /**
    * Executes a query set using the open-loop scheduler, applying the configured concurrency as the
-   * worker limit. Arrival k executes query k mod n. Each query produces a single result containing
-   * one thread time entry named "1,C", which records one run time for each executed operation.
+   * worker limit. Arrival k executes query k mod n, or the query determined by the mix order.
+   * Warmup execution i executes query i mod n. Each query produces a single result containing one
+   * thread time entry named "1,C", which records one run time for each executed operation.
    */
   protected void executeQuerySetOpenLoop(DataModelResult dataModelResult, QuerySet querySet,
     QuerySetResult querySetResult, Scenario scenario, int position) throws Exception {
@@ -287,15 +292,21 @@ public class QueryExecutor implements Workload {
     if (queries == 0) {
       return;
     }
+    final MixOrder mix = mixOrder(querySet);
     OpenLoopScheduler.Task task = new OpenLoopScheduler.Task() {
       @Override
       public long execute(long sequence, boolean warmup) throws Exception {
-        return runners.get((int) (sequence % queries)).timedQuery(sequence + 1, warmup);
+        return runners.get(warmup ? (int) (sequence % queries) : query(sequence))
+          .timedQuery(sequence + 1, warmup);
       }
 
       @Override
       public String responseOperation(long sequence) {
-        return responses.get((int) (sequence % queries));
+        return responses.get(query(sequence));
+      }
+
+      private int query(long sequence) {
+        return mix == null ? (int) (sequence % queries) : mix.query(sequence);
       }
     };
     OpenLoopScheduler scheduler = OpenLoopScheduler.of(querySet.getOpenLoop(), concurrency,
@@ -372,11 +383,11 @@ public class QueryExecutor implements Workload {
 
   /**
    * Validates the open-loop configuration across all query sets in the data model before any query
-   * set begins execution.
-   * @throws IllegalArgumentException identifying the scenario, query set, and offending attribute
-   *                                  when validation fails.
+   * set begins execution and before any launch override scales the stages.
+   * @throws IllegalArgumentException identifying the scenario, the query set, and the offending
+   *                                  attribute when validation fails.
    */
-  static void checkOpenLoop(DataModel dataModel) {
+  public static void checkOpenLoop(DataModel dataModel) {
     for (Scenario scenario : dataModel.getScenarios()) {
       int position = 0;
       for (QuerySet querySet : scenario.getQuerySet()) {
@@ -457,6 +468,128 @@ public class QueryExecutor implements Workload {
         }
       }
     }
+  }
+
+  /**
+   * Validates the operation mix configuration across all query sets in the data model before any
+   * query set begins execution. An operation mix requires an open-loop schedule. The mix may
+   * specify the SELECT, SCAN, or DELETE kinds at most once each, with an integer weight of at least
+   * 1 per kind and a combined weight of at most {@link MixOrder#MAX_TOTAL_WEIGHT}. Every kind in
+   * the mix must match at least one query, and every query must belong to a kind included in the
+   * mix or it would never run.
+   * @throws IllegalArgumentException identifying the scenario, the query set, and the profile when
+   *                                  validation fails.
+   */
+  static void checkMix(DataModel dataModel) {
+    for (Scenario scenario : dataModel.getScenarios()) {
+      int position = 0;
+      for (QuerySet querySet : scenario.getQuerySet()) {
+        position++;
+        if (querySet.getMix() == null) {
+          continue;
+        }
+        String where = "mix of querySet " + position + " of scenario " + scenario.getName()
+          + (querySet.getProfile() == null ? "" : " (profile " + querySet.getProfile() + ")");
+        if (querySet.getOpenLoop() == null) {
+          throw new IllegalArgumentException(
+            where + ": a mix needs an openLoop; the closed loop runs each query in turn");
+        }
+        Map<Query.Kind, Integer> weights = weights(where, querySet.getMix());
+        Map<Query.Kind, List<Integer>> queries =
+          queriesByKind(where, weights, querySet, scenario.getName());
+        for (Map.Entry<Query.Kind, List<Integer>> entry : queries.entrySet()) {
+          if (entry.getValue().isEmpty()) {
+            throw new IllegalArgumentException(where + ": no query of kind " + entry.getKey());
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Groups the query indexes of a query set by their weighted operation kind, preserving the
+   * declared order of the kinds.
+   * @throws IllegalArgumentException if any query has a kind without an assigned weight and would
+   *                                  therefore never run.
+   */
+  private static Map<Query.Kind, List<Integer>> queriesByKind(String where,
+    Map<Query.Kind, Integer> weights, QuerySet querySet, String scenarioName) {
+    Map<Query.Kind, List<Integer>> queries = new LinkedHashMap<>();
+    for (Query.Kind kind : weights.keySet()) {
+      queries.put(kind, new ArrayList<>());
+    }
+    for (int q = 0; q < querySet.getQuery().size(); q++) {
+      Query query = querySet.getQuery().get(q);
+      Query.Kind kind = query.kind(scenarioName);
+      if (!queries.containsKey(kind)) {
+        throw new IllegalArgumentException(where + ": query " + query.getId() + " has kind " + kind
+          + ", which has no weight, so it never runs");
+      }
+      queries.get(kind).add(q);
+    }
+    return queries;
+  }
+
+  /**
+   * Parses and validates the operation mix, returning a map from each operation kind to its weight
+   * in declared order.
+   */
+  private static Map<Query.Kind, Integer> weights(String where, List<OperationMix> mix) {
+    if (mix.isEmpty()) {
+      throw new IllegalArgumentException(where + ": no operation");
+    }
+    Map<Query.Kind, Integer> weights = new LinkedHashMap<>();
+    long total = 0;
+    for (OperationMix operation : mix) {
+      String text = operation.getKind();
+      Query.Kind kind;
+      try {
+        kind = Query.Kind.valueOf(text == null ? "" : text.trim());
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException(
+          where + ": kind is not SELECT, SCAN or DELETE: '" + text + "'", e);
+      }
+      int weight;
+      try {
+        weight =
+          Integer.parseInt(operation.getWeight() == null ? "" : operation.getWeight().trim());
+      } catch (NumberFormatException e) {
+        weight = 0;
+      }
+      if (weight < 1) {
+        throw new IllegalArgumentException(where + ": weight of kind " + kind
+          + " is not an integer of at least 1: '" + operation.getWeight() + "'");
+      }
+      if (weights.put(kind, weight) != null) {
+        throw new IllegalArgumentException(where + ": kind " + kind + " is given twice");
+      }
+      total += weight;
+    }
+    if (total > MixOrder.MAX_TOTAL_WEIGHT) {
+      throw new IllegalArgumentException(
+        where + ": the total weight " + total + " is more than " + MixOrder.MAX_TOTAL_WEIGHT);
+    }
+    return weights;
+  }
+
+  /**
+   * Constructs the mix order over the query indexes of a query set validated by
+   * {@link #checkMix(DataModel)}, or returns null when the query set does not define a mix.
+   */
+  static MixOrder mixOrder(QuerySet querySet) {
+    if (querySet.getMix() == null) {
+      return null;
+    }
+    Map<Query.Kind, Integer> weights = weights("mix", querySet.getMix());
+    Map<Query.Kind, List<Integer>> indexes = queriesByKind("mix", weights, querySet, "");
+    int[] values = new int[weights.size()];
+    int[][] queries = new int[weights.size()][];
+    int i = 0;
+    for (Map.Entry<Query.Kind, List<Integer>> entry : indexes.entrySet()) {
+      values[i] = weights.get(entry.getKey());
+      queries[i++] = entry.getValue().stream().mapToInt(Integer::intValue).toArray();
+    }
+    return new MixOrder(values, queries);
   }
 
   private static boolean isPositiveInteger(String value) {
