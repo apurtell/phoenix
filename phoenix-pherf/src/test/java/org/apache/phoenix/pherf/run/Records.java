@@ -41,6 +41,7 @@ import java.util.TreeMap;
 public final class Records {
   public static final String DIR_PROPERTY = "pherf.test.record.dir";
   public static final String CONNECTIONS = "connections.log";
+  public static final String CLOSES = "closes.log";
   public static final String PROVIDER = "provider.log";
   public static final String SINK = "sink.log";
   public static final String OUTCOME = "outcome.log";
@@ -79,7 +80,7 @@ public final class Records {
    * partitioned by invocation.
    */
   public static void mark(int n) {
-    for (String file : new String[] { CONNECTIONS, PROVIDER, SINK }) {
+    for (String file : new String[] { CONNECTIONS, CLOSES, PROVIDER, SINK }) {
       append(file, MARK + n);
     }
   }

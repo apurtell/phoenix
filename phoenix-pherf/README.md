@@ -36,6 +36,12 @@ mvn clean package -DskipTests
 - -hint _Executes all queries with specified hint. Example SMALL_ <br />
 - -rowCountOverride
 - -rowCountOverride [number of rows] _Specify number of rows to be upserted rather than using row count specified in schema_ </br>
+- -connectionCache _Reuses connections through a cache holding at most pherf.default.threadpool
+  idle connections. Each connection serves only operations with the same URL and connection
+  properties (and therefore the same tenant and connection properties), allowing query sets and DDL
+  statements with matching properties to share connections. The cache does not reset session state
+  modified by SQL (such as ALTER SESSION), which persists for the lifetime of the cached
+  connection._ <br />
 
 ## Running from IDE
 Ex. Load data and execute queries. Specify the following as your IDE debug arguments:<br/>
@@ -89,7 +95,11 @@ Scenario can have multiple querySets. Consider following example, concurrency of
 executed starting with concurrency level of 1 and reach up to maximum concurrency of 4. Per thread, query would be
 executed to a minimum of 10 times or 10 seconds (whichever comes first). QuerySet by defult is executed serially but you
  can change executionType to PARALLEL so queries are executed concurrently. Scenarios are defined in XMLs stored
- in the resource directory.
+ in the resource directory. The optional warmupExecutions attribute specifies how many warmup
+ executions of each query each thread runs prior to the measured executions. Warmup executions are
+ recorded exclusively under the "warmup" latency phase (see [LATENCY.md](LATENCY.md)) and are
+ excluded from the CSV and XML results. When this attribute is omitted or set to 0, no warmup is
+ performed.
 
 ```
 
@@ -100,7 +110,8 @@ executed to a minimum of 10 times or 10 seconds (whichever comes first). QuerySe
         <query id="q2" tenantId="1234567890" ddl="create view if not exists
         myview(mypk varchar not null primary key, mycol varchar)" statement="upsert select ..."/>
     </querySet>
-    <querySet concurrency="3" executionType="SERIAL" executionDurationInMs="20000" numberOfExecutions="100">
+    <querySet concurrency="3" executionType="SERIAL" executionDurationInMs="20000" numberOfExecutions="100"
+              warmupExecutions="10">
         <query id="q3" verifyRowCount="false" statement="select count(*) from PHERF.TEST_TABLE"/>
         <query id="q4" statement="select count(*) from PHERF.TEST_TABLE WHERE TENANT_ID='00D000000000062'"/>
     </querySet>

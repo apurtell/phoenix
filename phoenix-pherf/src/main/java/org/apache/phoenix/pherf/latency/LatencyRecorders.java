@@ -53,6 +53,8 @@ public final class LatencyRecorders {
   private static final Logger LOGGER = LoggerFactory.getLogger(LatencyRecorders.class);
   /** Identifies the execution phase for measured steady-state operations. */
   public static final String STEADY = "steady";
+  /** Identifies the execution phase for warmup operations executed before measured operations. */
+  public static final String WARMUP = "warmup";
   /**
    * The pherf.properties configuration key specifying the interval export period in ms. Interval
    * export is disabled when this property is absent or set to 0.

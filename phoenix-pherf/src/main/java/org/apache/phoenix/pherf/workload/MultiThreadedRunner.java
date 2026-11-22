@@ -63,6 +63,7 @@ class MultiThreadedRunner implements Callable<Void> {
   private final boolean writeRuntimeResults;
   private final Map<String, String> connectionProperties;
   private final String latencyOperation;
+  private final long warmupExecutions;
 
   /**
    * MultiThreadedRunner
@@ -73,15 +74,19 @@ class MultiThreadedRunner implements Callable<Void> {
     WorkloadExecutor workloadExecutor, XMLConfigParser parser) {
     this(threadName, query, dataModelResult, threadTime, numberOfExecutions, executionDurationInMs,
       writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser,
-      scenario.getPhoenixProperties());
+      scenario.getPhoenixProperties(), 0);
   }
 
-  /** Constructs a runner that configures its query connections with the provided properties. */
+  /**
+   * Constructs a runner that configures its query connections with the provided properties. Prior
+   * to running the measured executions, the runner performs warmupExecutions iterations that are
+   * recorded exclusively under the "warmup" latency phase.
+   */
   MultiThreadedRunner(String threadName, Query query, DataModelResult dataModelResult,
     ThreadTime threadTime, long numberOfExecutions, long executionDurationInMs,
     boolean writeRuntimeResults, RulesApplier ruleApplier, Scenario scenario,
     WorkloadExecutor workloadExecutor, XMLConfigParser parser,
-    Map<String, String> connectionProperties) {
+    Map<String, String> connectionProperties, long warmupExecutions) {
     this.query = query;
     this.threadName = threadName;
     this.threadTime = threadTime;
@@ -96,6 +101,7 @@ class MultiThreadedRunner implements Callable<Void> {
     this.writeRuntimeResults = writeRuntimeResults;
     this.connectionProperties = connectionProperties;
     this.latencyOperation = "query:" + scenario.getName() + ":" + query.getId();
+    this.warmupExecutions = warmupExecutions;
   }
 
   /**
@@ -105,6 +111,15 @@ class MultiThreadedRunner implements Callable<Void> {
   public Void call() throws Exception {
     LOGGER.info("\n\nThread Starting " + threadName + " ; '" + query.getStatement() + "' for "
       + numberOfExecutions + " times\n\n");
+    // Execute warmup iterations through the same query path without counting against the thread's
+    // target execution count or maximum execution duration.
+    for (long i = 0; i < warmupExecutions; i++) {
+      synchronized (workloadExecutor) {
+        if (!timedQuery(i + 1, true)) {
+          break;
+        }
+      }
+    }
     long threadStartTime = EnvironmentEdgeManager.currentTimeMillis();
     for (long i = 0; i < numberOfExecutions; i++) {
       long threadElapsedTime = EnvironmentEdgeManager.currentTimeMillis() - threadStartTime;
@@ -116,7 +131,7 @@ class MultiThreadedRunner implements Callable<Void> {
       }
 
       synchronized (workloadExecutor) {
-        if (!timedQuery(i + 1)) {
+        if (!timedQuery(i + 1, false)) {
           break;
         }
         if (
@@ -151,10 +166,12 @@ class MultiThreadedRunner implements Callable<Void> {
   }
 
   /**
-   * Timed query execution
+   * Executes a timed query iteration. A warmup execution is recorded exclusively under the "warmup"
+   * latency phase; it does not contribute run times to legacy reports, emit metrics to sinks, or
+   * trigger concurrent write workloads.
    * @returns boolean true if query finished without timing out; false otherwise
    */
-  private boolean timedQuery(long iterationNumber) throws Exception {
+  private boolean timedQuery(long iterationNumber, boolean warmup) throws Exception {
     boolean isSelectCountStatement =
       query.getStatement().toUpperCase().trim().contains("COUNT(") ? true : false;
 
@@ -168,7 +185,7 @@ class MultiThreadedRunner implements Callable<Void> {
     String exception = null;
     boolean failed = false;
     Long resultRowCount = 0L;
-    String queryIteration = threadName + ":" + iterationNumber;
+    String queryIteration = threadName + (warmup ? ":warmup:" : ":") + iterationNumber;
     Long queryElapsedTime = 0L;
 
     try {
@@ -178,7 +195,7 @@ class MultiThreadedRunner implements Callable<Void> {
       statement = conn.prepareStatement(statementString);
       LOGGER.debug("Executing iteration: " + queryIteration + ": " + statementString);
 
-      if (scenario.getWriteParams() != null) {
+      if (!warmup && scenario.getWriteParams() != null) {
         Workload writes = new WriteWorkload(PhoenixUtil.create(), parser,
           PherfConstants.create().getProperties(PherfConstants.PHERF_PROPERTIES, true), scenario,
           GeneratePhoenixStats.NO);
@@ -203,19 +220,24 @@ class MultiThreadedRunner implements Callable<Void> {
       failed = true;
       throw e;
     } finally {
-      getThreadTime().getRunTimesInMs().add(new RunTime(exception, startDate, resultRowCount,
-        queryElapsedTime, queryElapsedTime > query.getTimeoutDuration()));
+      // Legacy reports derive exclusively from the thread run times list, so warmup iterations are
+      // excluded from this collection.
+      if (!warmup) {
+        getThreadTime().getRunTimesInMs().add(new RunTime(exception, startDate, resultRowCount,
+          queryElapsedTime, queryElapsedTime > query.getTimeoutDuration()));
+      }
       // Record the latency measurement before closing JDBC resources or invoking metrics sinks so
       // that a downstream failure does not discard the sample.
       if (!failed) {
-        LatencyRecorders.record(latencyOperation, LatencyRecorders.STEADY, elapsedMicros);
+        LatencyRecorders.record(latencyOperation,
+          warmup ? LatencyRecorders.WARMUP : LatencyRecorders.STEADY, elapsedMicros);
       }
 
       if (rs != null) rs.close();
       if (statement != null) statement.close();
       if (conn != null) conn.close();
-      // Close the connection first to ensure that a failure in a metrics sink cannot leak it.
-      if (Extensions.hasMetricsSinks()) {
+      // Close the connection before notifying metrics sinks so that a sink failure cannot leak it.
+      if (!warmup && Extensions.hasMetricsSinks()) {
         String outcome =
           failed ? "error" : queryElapsedTime > query.getTimeoutDuration() ? "timeout" : "ok";
         Extensions.record("query", Extensions.tags("scenario", scenario.getName(), "query",

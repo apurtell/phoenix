@@ -32,6 +32,7 @@ import org.apache.phoenix.pherf.jmx.MonitorManager;
 import org.apache.phoenix.pherf.latency.LatencyRecorders;
 import org.apache.phoenix.pherf.result.ResultUtil;
 import org.apache.phoenix.pherf.schema.SchemaReader;
+import org.apache.phoenix.pherf.spi.ConnectionCache;
 import org.apache.phoenix.pherf.util.GoogleChartGenerator;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.util.ResourceList;
@@ -107,6 +108,8 @@ public class Pherf {
     options.addOption("t", "thin", false, "Use the Phoenix Thin Driver");
     options.addOption("s", "server", true, "The URL for the Phoenix QueryServer");
     options.addOption("b", "batchApi", false, "Use JDBC Batch API for writes");
+    options.addOption("connectionCache", "connectionCache", false,
+      "Reuse connections through a cache of at most pherf.default.threadpool idle connections");
   }
 
   private final String zookeeper;
@@ -131,6 +134,7 @@ public class Pherf {
   private final CompareType compareType;
   private final boolean thinDriver;
   private final String queryServerUrl;
+  private final boolean connectionCache;
   private Properties properties = new Properties();
 
   @VisibleForTesting
@@ -198,6 +202,8 @@ public class Pherf {
     } else {
       queryServerUrl = null;
     }
+
+    connectionCache = command.hasOption("connectionCache");
 
     if (command.hasOption('b')) {
       // If the '-b' option was provided, set the system property for WriteWorkload to pick up.
@@ -306,6 +312,10 @@ public class Pherf {
 
       XMLConfigParser parser = new XMLConfigParser(scenarioFile);
       LatencyRecorders.begin(properties);
+      if (connectionCache) {
+        // The closed-loop workload executes at most this many concurrent operations at a time.
+        ConnectionCache.begin(workloadExecutor.getPoolSize());
+      }
       if (monitor) {
         monitorManager = new MonitorManager(
           Integer.parseInt(globalProperties.getProperty("pherf.default.monitorFrequency")));
@@ -378,6 +388,8 @@ public class Pherf {
         LOGGER.info("Run completed. Shutting down thread pool.");
         workloadExecutor.shutdown();
       }
+      // Close all remaining idle connections, logging any close errors without rethrowing them.
+      ConnectionCache.finish();
       try {
         LatencyRecorders.finish();
       } catch (IOException e) {

@@ -51,9 +51,13 @@ embeds this configuration.
 
 ## Keys
 
-Each histogram key pairs an operation identifier with an execution phase. Pherf currently records
-only the `steady` phase, while future warmup support will introduce the `warmup` phase. The
-operation identifier follows the `<kind>:<scenario>:<name>` format:
+Each histogram key pairs an operation identifier with an execution phase, using `steady` for
+measured operations and `warmup` for warmup operations. When a query set configures
+`warmupExecutions="K"`, each thread executes K warmup runs of every query prior to the measured
+executions; only those runs produce `warmup` keys, so a run without warmup omits any `warmup` key.
+Warmup applies exclusively to query sets, whereas data load and load profile operations are always
+recorded under the `steady` phase. The operation identifier follows the `<kind>:<scenario>:<name>`
+format:
 
 | Kind | Name | One sample |
 |---|---|---|
@@ -63,10 +67,11 @@ operation identifier follows the `<kind>:<scenario>:<name>` format:
 
 Failed operations are omitted from recording and produce no sample. Similarly, idle intervals and
 user-defined operations in a load profile are excluded because they do not measure database work. A
-query that reaches its configured `timeoutDuration` stops fetching rows and is treated as a normal
+query that reaches its configured `timeoutDuration` stops reading rows and is treated as a normal
 completion rather than a failure: its recorded sample captures the elapsed time until termination,
 near the timeout bound. Consequently, a latency tail at the timeout threshold indicates queries that
-timed out.
+timed out. When `-connectionCache` is enabled, a query sample that reuses a cached connection does
+not include opening a connection.
 
 ## JSON report, version 1
 
@@ -136,3 +141,8 @@ rounds to 0 ms. This derivation applies to query execution durations (`RUN_TIME_
 `elapsedDurationInMs`) as well as the `durationInMs` field of the `-mt` operation log. The `AVG_*`
 columns continue to compute averages using integer division, while data load summary and detail
 records, scenario DDL rows, and `-diff` timings remain measured on the millisecond clock.
+
+Legacy reports and metrics sinks receive only measured steady-state operations. Warmup executions do
+not contribute to recorded run times, ensuring that `RUN_COUNT`, detail rows, `AVG_*` aggregations,
+and XML run time entries reflect only measured executions. In addition, warmup executions emit no
+metrics and do not trigger a write workload.

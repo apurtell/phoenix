@@ -38,9 +38,10 @@ import org.mockito.stubbing.Answer;
 
 /**
  * Provides an in-memory fake JDBC driver that handles both thick and thin Phoenix URLs without
- * requiring a live cluster. Every connection request is recorded in {@link Records#CONNECTIONS}.
- * Connections synthesized by this driver maintain no underlying dataset: metadata lookups and SQL
- * queries return empty result sets, while each update statement reports modifying a single row.
+ * requiring a live cluster. It records every connection request in {@link Records#CONNECTIONS} and
+ * records the first close of each connection in {@link Records#CLOSES} using the identical entry
+ * line. Connections synthesized by this driver maintain no underlying data: metadata lookups and
+ * SQL queries return empty result sets, while each update statement reports modifying one row.
  */
 public final class FakePhoenixDriver implements Driver {
   private static final String PREFIX = "jdbc:phoenix:";
@@ -66,8 +67,10 @@ public final class FakePhoenixDriver implements Driver {
     if (!acceptsURL(url)) {
       return null;
     }
-    Records.append(Records.CONNECTIONS, Records.connectionLine(url, info));
-    return mock(Connection.class, null);
+    String line = Records.connectionLine(url, info);
+    Records.append(Records.CONNECTIONS, line);
+    return Mockito.mock(Connection.class,
+      Mockito.withSettings().stubOnly().defaultAnswer(new FakeConnection(line)));
   }
 
   @Override
@@ -107,6 +110,38 @@ public final class FakePhoenixDriver implements Driver {
   private static boolean isQuery(String sql) {
     String head = sql == null ? "" : sql.trim().toUpperCase(Locale.ROOT);
     return head.startsWith("SELECT") || head.startsWith("EXPLAIN");
+  }
+
+  /**
+   * Provides the Mockito default answer for a synthesized connection, tracking its closed state and
+   * recording its initial close operation.
+   */
+  private static final class FakeConnection implements Answer<Object> {
+    private final String line;
+    private final Fake fake = new Fake(null);
+    private volatile boolean closed;
+
+    FakeConnection(String line) {
+      this.line = line;
+    }
+
+    @Override
+    public Object answer(InvocationOnMock invocation) throws Throwable {
+      String name = invocation.getMethod().getName();
+      if ("isClosed".equals(name)) {
+        return closed;
+      }
+      if ("close".equals(name)) {
+        synchronized (this) {
+          if (!closed) {
+            closed = true;
+            Records.append(Records.CLOSES, line);
+          }
+        }
+        return null;
+      }
+      return fake.answer(invocation);
+    }
   }
 
   /**

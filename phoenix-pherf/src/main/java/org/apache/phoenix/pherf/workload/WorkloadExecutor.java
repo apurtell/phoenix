@@ -113,6 +113,14 @@ public class WorkloadExecutor {
     return pool;
   }
 
+  /**
+   * Returns the configured thread count of the underlying execution pool, which defines the number
+   * of concurrent workers in the closed-loop workload.
+   */
+  public int getPoolSize() {
+    return poolSize;
+  }
+
   public boolean isPerformance() {
     return isPerformance;
   }

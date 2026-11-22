@@ -30,6 +30,7 @@ public class QuerySet {
   private long executionDurationInMs = PherfConstants.DEFAULT_THREAD_DURATION_IN_MS;
   private ExecutionType executionType = ExecutionType.SERIAL;
   private Map<String, String> phoenixProperties;
+  private Long warmupExecutions;
 
   /**
    * List of queries in each query set
@@ -116,6 +117,20 @@ public class QuerySet {
 
   public void setExecutionDurationInMs(long executionDurationInMs) {
     this.executionDurationInMs = executionDurationInMs;
+  }
+
+  /**
+   * Returns the number of warmup executions to run for each query per thread prior to the measured
+   * executions. Warmup samples are recorded exclusively under the "warmup" latency phase. A null
+   * (absent) or 0 value disables warmup.
+   */
+  @XmlAttribute
+  public Long getWarmupExecutions() {
+    return warmupExecutions;
+  }
+
+  public void setWarmupExecutions(Long warmupExecutions) {
+    this.warmupExecutions = warmupExecutions;
   }
 
   @Override

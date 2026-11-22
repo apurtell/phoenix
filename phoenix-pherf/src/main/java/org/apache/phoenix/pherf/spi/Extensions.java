@@ -48,11 +48,23 @@ public final class Extensions {
   }
 
   /**
-   * Returns the registered connection provider, or {@link ConnectionProvider#DEFAULT} if no custom
-   * provider is registered.
+   * Returns the active {@link ConnectionCache} if one is present; otherwise, returns the registered
+   * connection provider, or {@link ConnectionProvider#DEFAULT} when no custom provider is
+   * registered.
    * @throws IllegalStateException if more than one connection provider is registered.
    */
   public static ConnectionProvider connectionProvider() {
+    ConnectionCache cache = ConnectionCache.active();
+    return cache != null ? cache : registeredConnectionProvider();
+  }
+
+  /**
+   * Returns the registered connection provider, or {@link ConnectionProvider#DEFAULT} when no
+   * custom provider is registered. The connection cache delegates underlying connection creation to
+   * this provider.
+   * @throws IllegalStateException if more than one connection provider is registered.
+   */
+  static ConnectionProvider registeredConnectionProvider() {
     List<ConnectionProvider> providers = PROVIDERS.get();
     if (providers.isEmpty()) {
       return ConnectionProvider.DEFAULT;

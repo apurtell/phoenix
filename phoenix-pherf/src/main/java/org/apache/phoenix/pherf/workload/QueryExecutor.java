@@ -127,6 +127,7 @@ public class QueryExecutor implements Workload {
    * Execute all scenarios
    */
   protected Callable<Void> executeAllScenarios(final DataModel dataModel) throws Exception {
+    checkWarmupExecutions(dataModel);
     return new Callable<Void>() {
       @Override
       public Void call() throws Exception {
@@ -238,12 +239,39 @@ public class QueryExecutor implements Workload {
       thread = new MultiThreadedRunner(threadTime.getThreadName(), queryResult, dataModelResult,
         threadTime, querySet.getNumberOfExecutions(), querySet.getExecutionDurationInMs(),
         writeRuntimeResults, ruleApplier, scenario, workloadExecutor, parser,
-        connectionProperties(scenario, querySet));
+        connectionProperties(scenario, querySet), warmupExecutions(querySet));
     } else {
       thread = new MultithreadedDiffer(threadTime.getThreadName(), queryResult, threadTime,
         querySet.getNumberOfExecutions(), querySet.getExecutionDurationInMs());
     }
     return thread;
+  }
+
+  /**
+   * Validates the configured warmup execution counts across all query sets in the data model before
+   * any query set begins execution.
+   * @throws IllegalArgumentException if any warmup execution count is negative, halting execution
+   *                                  of the query executor.
+   */
+  static void checkWarmupExecutions(DataModel dataModel) {
+    for (Scenario scenario : dataModel.getScenarios()) {
+      for (QuerySet querySet : scenario.getQuerySet()) {
+        Long warmup = querySet.getWarmupExecutions();
+        if (warmup != null && warmup < 0) {
+          throw new IllegalArgumentException("warmupExecutions of a querySet of scenario "
+            + scenario.getName() + " is negative: " + warmup);
+        }
+      }
+    }
+  }
+
+  /**
+   * Returns the number of warmup executions to run per thread for each query in the query set,
+   * defaulting to 0 when unspecified.
+   */
+  static long warmupExecutions(QuerySet querySet) {
+    Long warmup = querySet.getWarmupExecutions();
+    return warmup == null ? 0 : warmup;
   }
 
   /**
