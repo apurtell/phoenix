@@ -234,9 +234,10 @@ The verdict stream records one row per evaluation verdict in the format
   any other column.
 * `class`: the evidence classification, which is `count`, `share`, `duration`, or `none`. The value
   `none` designates a functional or structural check. Only `duration` verdicts are ever demoted.
-* `source`: the emitting component taken from `PX_RECORD_SOURCE`—`px-run`, `driver:<name>`,
-  `check:cluster`, `plugin:<id>`, or `collector:<name>`—or `action` when no writer identifies
-  itself.
+* `source`: the emitting component taken from `PX_RECORD_SOURCE` (`px-run`, `driver:<name>`,
+  `check:cluster`, `plugin:<id>`, or `collector:<name>`), or `action` when no writer identifies
+  itself. The source `pherf` identifies rows originating from the Pherf verdict file, which the
+  pherf driver copies verbatim.
 * `detail`: human-readable diagnostic text for an operator. Every `SKIP` row states the reason why
   the check did not run.
 
@@ -310,6 +311,27 @@ reads the newest finished bundle. For example, invoking
   written by the plug-in loader, plus one row with the hook name `check` for each check script
   executed by `suites/check-cluster.sh`. Alongside it, `plugins/<id>/manifest.tsv` uses the columns
   `path description` to list the output files written by the plug-in relative to `plugins/<id>/`.
+
+**The pherf driver files.** The pherf driver copies two Pherf output directories into the bundle
+without modification: the legacy result reports and the HDR latency and verdict artifacts. Because
+the driver declares each path in its describe document, the manifest inventory tracks them and
+reports any absent file as a standard `SKIP` row. The schemas for these files are defined in
+`phoenix-pherf/LATENCY.md` and `phoenix-pherf/VERDICT.md`.
+
+| Path | Content |
+|---|---|
+| `drivers/pherf/results/` | legacy result reports containing the `RESULT_*_aggregate.csv` files |
+| `drivers/pherf/groups.tsv` | summary table with one row per query group from the aggregate CSV |
+| `drivers/pherf/results_HDR/` | verbatim copy of `<pherf.default.results.dir>_HDR` |
+| `drivers/pherf/results_HDR/LATENCY_run.json` | JSON latency report emitted for the `run` verb |
+| `drivers/pherf/results_HDR/LATENCY_run.hlog` | run histogram log with one HDR histogram per key |
+| `drivers/pherf/results_HDR/LATENCY_run_intervals.hlog` | interval log, written when exported |
+| `drivers/pherf/results_HDR/VERDICT_run.tsv` | Pherf health verdicts emitted for the `run` verb |
+
+Because the `prepare` verb executes Pherf with the label `load`, the `results_HDR/` directory also
+contains the corresponding `LATENCY_load.*` and `VERDICT_load.tsv` files, which no downstream
+consumer reads. The interval histogram log is generated only when `pherf.default.hdr.intervalMs` is
+configured.
 
 ## The collectors
 

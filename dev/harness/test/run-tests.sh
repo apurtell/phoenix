@@ -6836,10 +6836,14 @@ A5_EOF
   # Materialize the fake JDK for client 0, which logs its command line and emulates the requested
   # Java main class. PhoenixRuntime returns SYSTEM.CATALOG rows with UPDATE_CACHE_FREQUENCY set to
   # 60000 for each table named in a catalog query, or otherwise emits the output of a two-statement
-  # script. Pherf loads pherf.properties from the first classpath entry (matching the real Pherf
-  # classpath lookup) and, during its -q query phase, writes an aggregate CSV with the Header.java
-  # column header to the configured result directory or to RESULTS in the working directory. Any
-  # other main class emits two ad hoc metric lines.
+  # script. Pherf loads pherf.properties from the first classpath entry (matching how the real
+  # Pherf reads it from the classpath) and, during its -q query phase, writes one aggregate CSV
+  # with the Header.java column header to the result directory configured in that file or to
+  # RESULTS in its working directory. When the hdr directory exists in the fake state, -q also
+  # copies its files into the sibling <results>_HDR directory, mirroring how Pherf writes its
+  # latency report and verdict. When the pherf-gate-fails flag file is present, Pherf exits with
+  # code 65, mirroring how its pre-run gate rejects a refused scenario. Any other main class prints
+  # two ad hoc metrics.
   cat >"$T_A5/jdk/fake/bin/java" <<'A5_EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$PX_FAKE_STATE_DIR/java.log"
@@ -6863,6 +6867,10 @@ for java_arg in "$@"; do
     exit 0
     ;;
   org.apache.phoenix.pherf.Pherf)
+    if [ -e "$PX_FAKE_STATE_DIR/pherf-gate-fails" ]; then
+      printf 'ERROR the scenario files have validation findings\n' >&2
+      exit 65
+    fi
     case " $* " in
     *' -q '*)
       java_dir="$(sed -n 's/^pherf\.default\.results\.dir=//p' "${java_cp%%:*}/pherf.properties" \
@@ -6876,6 +6884,10 @@ AVG_MIN_TIME_MS,RUN_COUNT,EXPLAIN_PLAN,RESULT_ROW_COUNT"
         printf '%s,serial,"SELECT COUNT(*) FROM T",,12,10,8,5,"SCAN T",1\n' \
           "$(date -u '+%Y-%m-%d %H:%M:%S')"
       } >"$java_dir/RESULT_px_functional_aggregate.csv"
+      if [ -d "$PX_FAKE_STATE_DIR/hdr" ]; then
+        mkdir -p "${java_dir}_HDR"
+        cp "$PX_FAKE_STATE_DIR/hdr/"* "${java_dir}_HDR/"
+      fi
       ;;
     esac
     printf 'Pherf done\n'
@@ -6984,6 +6996,7 @@ t_a5_run_ids() {
 
 "$@"
 PROBE_EOF
+  t_pherf_hdr_fixture "$T_A5/h2"
   t_a5_state_reset
 }
 
@@ -7229,9 +7242,17 @@ AVG_MIN_TIME_MS,RUN_COUNT,EXPLAIN_PLAN,RESULT_ROW_COUNT"
   t_equals pherf_group_interval_lies_in_the_steady_window yes \
     "$(printf '%s\n' "$line" | awk -F '\t' '{ print ($1 >= 1795194000000 && \
       $2 <= 1795194600000 && $1 <= $2) ? "yes" : "no" }')"
-  # Verify requirement R-063: the java-main driver executes a fixture class that emits two ad hoc
-  # metrics, passes the JDBC URL with RequestMetric=true via px.jdbc.url, and exports both metrics
-  # to the aggregate metric table.
+  # Verify requirement RQ-207: a Pherf run that produces only the aggregate CSV without the latency
+  # report or verdict file still emits the query-group metrics and run rate, without any latency
+  # percentiles.
+  t_equals pherf_csv_only_fixture_still_produces_metrics "PASS 9 0.015 SKIP SKIP" \
+    "$(t_severity_of "$run" pherf.results) $(t_h2_value "$run" steady@pherf pherf.run_count)\
+ $(t_h2_value "$run" steady@pherf achieved_qps) $(t_severity_of "$run" pherf.latency)\
+ $(t_severity_of "$run" pherf.verdict)"
+  t_absent pherf_csv_only_fixture_has_no_percentile "${PX_TAB}query_latency." "$aggregate"
+  # Verify requirement R-063: the java-main driver executes a fixture class that prints two ad hoc
+  # metrics, passes the JDBC URL and its request metrics attribute via px.jdbc.url, and exports
+  # both metrics to the aggregate metric table.
   run="$(t_a5_bundle)"
   : >"$T_A5_STATE/java.log"
   t_a5_verb java-main run "$run" org.example.Fixture one two
@@ -9027,8 +9048,11 @@ A5_EOF
     /org\.apache\.phoenix\.pherf\.Pherf/ { n++; if (index($0, "-cp ") && index($0, "/stage:")) c++ }
     END { print (n > 0 && n == c) ? "yes" : "no" }' "$T_A5_STATE/java.log")"
   t_empty pherf_starts_no_python_launcher "$(grep -E '\.py( |$)|python' "$T_SHIM_LOG")"
-  # Verify requirements RQ-100 and RQ-105: execute the java-main driver across all six verbs with
-  # its expected classpath and without invoking any Python launcher.
+  # Verify requirements RQ-207 and RQ-208: execute the same full-lifecycle test against the new
+  # Pherf outputs.
+  t_h2_hdr_run
+  # Verify requirements RQ-100 and RQ-105: execute the java-main driver across every lifecycle verb
+  # with the expected classpath.
   t_a5_state_reset
   t_shim_log_reset
   t_a5 "$T_BASH" "$T_BIN/px-run" --class validation -e PX_SCOPE_ID=px-selftest \
@@ -9043,10 +9067,10 @@ A5_EOF
   # Verify requirement RQ-084: every metric record emitted by any run in this test group includes
   # both the run class and contamination tags.
   got=""
-  for run in "$base" "$sized" "$example" "$psql" "$pherf" "$run"; do
+  for run in "$base" "$sized" "$example" "$psql" "$pherf" "$T_H2_HDR" "$run"; do
     got="$got $(t_metric_gaps "$run")"
   done
-  t_equals every_metric_record_of_a_run_carries_both_tags " 0 0 0 0 0 0" "$got"
+  t_equals every_metric_record_of_a_run_carries_both_tags " 0 0 0 0 0 0 0" "$got"
 
   # Verify requirement RQ-090: a driver exit code of 3 maps to verdict severity ERROR and run exit
   # code 3, whereas a driver exit code of 1 maps to verdict severity FAIL and run exit code 1.
@@ -10000,6 +10024,526 @@ t_group_a6() {
 }
 
 # ---------------------------------------------------------------------------
+# H2: Pherf driver verification against new Pherf outputs
+# ---------------------------------------------------------------------------
+# These test cases feed the pherf driver the captured outputs of a real Pherf execution for the
+# run label: the latency report, run log, interval log, and verdict file. Test cases that require a
+# cluster execute against the A5 fake fixtures.
+
+## @description  Concatenates each backslash-terminated line from stdin with the following line.
+## @return       Writes the unfolded text to stdout. Exit 0.
+t_unfold() { awk '/\\$/ { held = held substr($0, 1, length($0) - 1); next } { print held $0
+  held = "" }'; }
+
+## @description  Materializes the four real Pherf output files for the run label into a target
+##               directory (directory): latency report, run log, interval log, and verdict.
+## @return       Populates the target fixture directory. Exit 0.
+t_pherf_hdr_fixture() {
+  local dir=$1
+  mkdir -p "$dir"
+  # These files were captured from the P12 tree (c71fef4280) under JDK 17 by running the test class
+  # org.apache.phoenix.pherf.run.ChildRun "cli" with the fake driver and the real clock using
+  # "-q -z openloop -label run -runDurationMs 200 -targetRate 50 -disableSchemaApply" against the
+  # VerdictRunTest fixture scenario src/test/resources/openloop/open_loop.xml in phoenix-pherf with
+  # pherf.default.hdr.intervalMs=100. Each file reproduces the captured output byte for byte; a
+  # trailing backslash folds any line longer than 99 columns so t_unfold can join it back together.
+  # Because RAT rejects JSON or TSV data files without a license header, these files are not stored
+  # in the source tree.
+  t_unfold >"$dir/LATENCY_run.json" <<'H2_EOF'
+{
+  "format": "pherf-latency",
+  "version": 1,
+  "label": "run",
+  "startMs": 1795376061757,
+  "endMs": 1795376062376,
+  "recorder": {
+    "lowestUs": 1,
+    "highestUs": 600000000,
+    "significantDigits": 3
+  },
+  "hlog": "LATENCY_run.hlog",
+  "intervals": "LATENCY_run_intervals.hlog",
+  "histograms": [
+    {
+      "operation": "query:openLoop:o1",
+      "phase": "steady",
+      "count": 5,
+      "minUs": 429,
+      "maxUs": 625,
+      "meanUs": 517.2,
+      "p50Us": 515,
+      "p90Us": 625,
+      "p99Us": 625,
+      "p999Us": 625
+    },
+    {
+      "operation": "query:openLoop:o1",
+      "phase": "warmup",
+      "count": 4,
+      "minUs": 324608,
+      "maxUs": 325119,
+      "meanUs": 324800.0,
+      "p50Us": 324863,
+      "p90Us": 325119,
+      "p99Us": 325119,
+      "p999Us": 325119
+    },
+    {
+      "operation": "query:openLoop:o2",
+      "phase": "steady",
+      "count": 5,
+      "minUs": 430,
+      "maxUs": 607,
+      "meanUs": 520.6,
+      "p50Us": 518,
+      "p90Us": 607,
+      "p99Us": 607,
+      "p999Us": 607
+    },
+    {
+      "operation": "query:openLoop:o2",
+      "phase": "warmup",
+      "count": 4,
+      "minUs": 499,
+      "maxUs": 645,
+      "meanUs": 588.25,
+      "p50Us": 599,
+      "p90Us": 645,
+      "p99Us": 645,
+      "p999Us": 645
+    },
+    {
+      "operation": "response:openLoop:o1",
+      "phase": "steady",
+      "count": 5,
+      "minUs": 739,
+      "maxUs": 4391,
+      "meanUs": 2983.2,
+      "p50Us": 4231,
+      "p90Us": 4391,
+      "p99Us": 4391,
+      "p999Us": 4391
+    },
+    {
+      "operation": "response:openLoop:o2",
+      "phase": "steady",
+      "count": 5,
+      "minUs": 4328,
+      "maxUs": 5379,
+      "meanUs": 4762.0,
+      "p50Us": 4615,
+      "p90Us": 5379,
+      "p99Us": 5379,
+      "p999Us": 5379
+    }
+  ],
+  "schedules": [
+    {
+      "scenario": "openLoop",
+      "querySet": 1,
+      "operations": [
+        "query:openLoop:o1",
+        "query:openLoop:o2"
+      ],
+      "concurrency": 4,
+      "phase": "done",
+      "stopReason": "duration",
+      "startMs": 1795376062108,
+      "endMs": 1795376062312,
+      "durationMs": 200,
+      "lastTakeMs": 1795376062292,
+      "targetRate": 0.0,
+      "queueDepth": 0,
+      "inFlight": 0,
+      "driftUs": 0,
+      "scheduled": 10,
+      "completed": 10,
+      "late": 0,
+      "dropped": 0,
+      "aborted": 0,
+      "pending": 0,
+      "maxQueueDepth": 1,
+      "maxInFlight": 1,
+      "maxDriftUs": 4874
+    }
+  ]
+}
+H2_EOF
+  t_unfold >"$dir/LATENCY_run.hlog" <<'H2_EOF'
+#[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits, Tag=OPERATI\
+ON|PHASE]
+#[Histogram log format version 1.3]
+#[StartTime: 1795376061.757 (seconds since epoch), Sun Nov 22 11:34:21 PST 2026]
+#[BaseTime: 1795376061.757 (seconds since epoch)]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=query:openLoop:o1|steady,0.000,0.619,625.000,HISTFAAAACx42pNpmSzMwMDAwwABzFCaEUQoH3ZjsP8AEbjJxl\
+TNpM0kyHSUkQkAh4wGGA==
+Tag=query:openLoop:o1|warmup,0.000,0.619,325119.000,HISTFAAAACV42pNpmSzMwMDAygABzFCaEUQoH3ZjsP8AEXg\
++mZGNCQBgtgUu
+Tag=query:openLoop:o2|steady,0.000,0.619,607.000,HISTFAAAACx42pNpmSzMwMDAwwABzFCaEUQoH3ZjsP8AEbjNxt\
+TPyCTNZMxUyQQAhucF9A==
+Tag=query:openLoop:o2|warmup,0.000,0.619,645.000,HISTFAAAACp42pNpmSzMwMDAxQABzFCaEUQoH3ZjsP8AEXjKzn\
+SUkUmYyZkJAHySBcA=
+Tag=response:openLoop:o1|steady,0.000,0.619,4391.000,HISTFAAAAC142pNpmSzMwMDAywABzFCaEUQoH3ZjsP8AET\
+jKzbSXg2mnDJMwkzkTAJF2BnE=
+Tag=response:openLoop:o2|steady,0.000,0.619,5379.000,HISTFAAAAC142pNpmSzMwMDAywABzFCaEUQoH3ZjsP8AEf\
+hswOTPZMm0m5FpLyMTAJLzBuI=
+H2_EOF
+  t_unfold >"$dir/LATENCY_run_intervals.hlog" <<'H2_EOF'
+#[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits, Tag=OPERATI\
+ON|PHASE]
+#[Histogram log format version 1.3]
+#[StartTime: 1795376061.757 (seconds since epoch), Sun Nov 22 11:34:21 PST 2026]
+#[BaseTime: 1795376061.757 (seconds since epoch)]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=query:openLoop:o1|steady,0.311,0.100,525.000,HISTFAAAACV42pNpmSzMwMDAygABzFCaEUQoH3ZjsP8AEbjOzm\
+TPBABeqwTM
+Tag=query:openLoop:o1|warmup,0.311,0.100,325119.000,HISTFAAAACV42pNpmSzMwMDAygABzFCaEUQoH3ZjsP8AEXg\
++mZGNCQBgtgUu
+Tag=query:openLoop:o2|steady,0.311,0.100,545.000,HISTFAAAACV42pNpmSzMwMDAygABzFCaEUQoH3ZjsP8AEejmYD\
+JmAgBdGwR1
+Tag=query:openLoop:o2|warmup,0.311,0.100,645.000,HISTFAAAACp42pNpmSzMwMDAxQABzFCaEUQoH3ZjsP8AEXjKzn\
+SUkUmYyZkJAHySBcA=
+Tag=response:openLoop:o1|steady,0.311,0.100,4275.000,HISTFAAAACZ42pNpmSzMwMDAxgABzFCaEUQoH3ZjsP8AEW\
+gVYTovwwQAY9kFNA==
+Tag=response:openLoop:o2|steady,0.311,0.100,4995.000,HISTFAAAACZ42pNpmSzMwMDAxgABzFCaEUQoH3ZjsP8AET\
+hqyPSdkQkAZiwFng==
+Tag=query:openLoop:o1|steady,0.411,0.100,515.000,HISTFAAAACZ42pNpmSzMwMDAxgABzFCaEUQoH3ZjsP8AEbjJxr\
+SSkQkAZOMFOQ==
+Tag=query:openLoop:o2|steady,0.411,0.100,503.000,HISTFAAAACZ42pNpmSzMwMDAxgABzFCaEUQoH3ZjsP8AEbjNxt\
+TPyAQAZKEFIQ==
+Tag=response:openLoop:o1|steady,0.411,0.100,4391.000,HISTFAAAACh42pNpmSzMwMDAwQABzFCaEUQoH3ZjsP8AET\
+jKzfRThcmXCQBx4gXu
+Tag=response:openLoop:o2|steady,0.411,0.100,5379.000,HISTFAAAACZ42pNpmSzMwMDAxgABzFCaEUQoH3ZjsP8AEf\
+hswNTJwgQAZfcFYA==
+Tag=query:openLoop:o1|steady,0.511,0.098,625.000,HISTFAAAACJ42pNpmSzMwMDAzAABMJoRRCgfdmOw/wAReMjJBA\
+BU7wSV
+Tag=query:openLoop:o2|steady,0.511,0.098,607.000,HISTFAAAACJ42pNpmSzMwMDAzAABMJoRRCgfdmOw/wAR2MvJBA\
+BUgwRx
+Tag=response:openLoop:o2|steady,0.511,0.098,4615.000,HISTFAAAACJ42pNpmSzMwMDAzAABMJoRRCgfdmOw/wARaD\
+RiAgBUIQRe
+H2_EOF
+  {
+    printf '%s\t%s\t%s\t%s\t%s\n' pherf.health.attainment PASS duration pherf "lowest attainment\
+ 100.0% (scenario openLoop query set 1: 10 of 10 completed, taken in 184 ms of a 200 ms window);\
+ minimum 90%"
+    printf '%s\t%s\t%s\t%s\t%s\n' pherf.health.saturation PASS duration pherf "peak lag 4.874 ms\
+ (scenario openLoop query set 1), within 1000 ms; queue peak 1 of 4, below its bound; in-flight\
+ peak 1 of 4; late 0, dropped 0"
+    printf '%s\t%s\t%s\t%s\t%s\n' pherf.health.client_pool PASS count pherf "no task waited: tasks\
+ 1, peak demand 1 of 10 threads"
+    printf '%s\t%s\t%s\t%s\t%s\n' pherf.health.tail_latency PASS duration pherf "all 4 keys within\
+ the bounds p99 1000 ms, p99.9 5000 ms; highest response:openLoop:o2 p99 5.379 ms, p99.9\
+ 5.379 ms"
+    printf '%s\t%s\t%s\t%s\t%s\n' pherf.health.read_skew SKIP share pherf "no source:\
+ pherf.verdict.serverJmx is empty"
+  } >"$dir/VERDICT_run.tsv"
+}
+
+## @description  Extracts the value of the last aggregate metric record matching an anchor and key
+##               (bundle, anchor, key, [window]), or its "start end" window when window is set.
+## @return       Writes the value or window to stdout, or empty if no record matches. Exit 0.
+t_h2_value() {
+  awk -F '\t' -v a="$2" -v k="$3" -v w="${4:-}" '
+    $4 == a && $5 == k { v = (w == "") ? $7 : $1 " " $2 } END { print v }' \
+    "$1/metrics/aggregate.tsv" 2>/dev/null
+}
+
+## @description  Populates a bundle with the files left by a pherf run (bundle, [hdr]): aggregate
+##               CSV, run.tsv, a steady window around the fixture run, and the HDR fixture on hdr.
+## @return       Writes the pherf run files into the bundle. Exit 0.
+t_h2_report_bundle() {
+  local run=$1 dir="$1/drivers/pherf"
+  mkdir -p "$dir/results"
+  {
+    printf '%s\n' "START_TIME,QUERY_GROUP,QUERY,TENANT_ID,AVG_MAX_TIME_MS,AVG_TIME_MS,\
+AVG_MIN_TIME_MS,RUN_COUNT,EXPLAIN_PLAN,RESULT_ROW_COUNT"
+    printf '%s\n' '2026-11-22 19:34:22,openLoop,"select count(*) from T",,1,0,0,10,"SCAN T",10'
+  } >"$dir/results/RESULT_open_loop_run_aggregate.csv"
+  printf 'start_ms\tend_ms\tstatus\n%s\t%s\t0\n' 1795376061000 1795376063000 >"$dir/run.tsv"
+  printf '%s\tbegin\tsteady@pherf\tdriver:pherf\t\n%s\tend\tsteady@pherf\tdriver:pherf\t\n' \
+    1795376061000 1795376063000 >"$run/stages.tsv"
+  [ "${2:-}" != hdr ] || t_pherf_hdr_fixture "$dir/results_HDR"
+}
+
+## @description  Executes the report verb of the pherf driver against a run bundle (bundle).
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_h2_report() { t_a5_verb pherf report "$1" --scenario "$T_A5/sql/fixture.sql"; }
+
+## @description  Verifies that the pherf report verb ingests the latency report, run log, and
+##               verdict file from a real Pherf run while retaining the CSV fallback path (RQ-207).
+## @return       Records test assertions. Exit 0.
+t_group_h2_report() {
+  local run fixture got op=op@query_openLoop_o1 rows
+  printf '# H2: the pherf report on the new Pherf outputs\n'
+  t_a5_state_reset
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR"
+  t_h2_report "$run"
+  # The expected literal values match the captured fixture data in t_pherf_hdr_fixture.
+  t_equals pherf_report_reads_the_latency_report "0 5 625 5 5379" "$T_STATUS\
+ $(t_h2_value "$run" "$op" pherf.operations) $(t_h2_value "$run" "$op" pherf.latency.p99_us)\
+ $(t_h2_value "$run" op@response_openLoop_o2 pherf.operations)\
+ $(t_h2_value "$run" op@response_openLoop_o2 pherf.latency.p99_us)"
+  t_equals pherf_report_keeps_every_field_of_a_key "429 625 517.2 515 625 625 625" "$(for got in \
+    min_us max_us mean_us p50_us p90_us p99_us p999_us; do
+    t_h2_value "$run" "$op" "pherf.latency.$got"
+  done | paste -sd ' ' -)"
+  t_equals pherf_report_records_no_warmup_key "" \
+    "$(awk -F '\t' '$7 == 325119 || $7 == 324800.0' "$run/metrics/aggregate.tsv")"
+  t_equals pherf_key_window_is_the_report_window "1795376061757 1795376062376" \
+    "$(t_h2_value "$run" "$op" pherf.latency.p99_us window)"
+  t_equals pherf_steady_operations_count_the_queries_only 10 \
+    "$(t_h2_value "$run" steady@pherf pherf.operations)"
+  t_equals pherf_schedule_counters_equal_the_report "10 10 0 0 0 1 4874" "$(for got in \
+    scheduled completed late dropped aborted max_queue_depth max_drift_us; do
+    t_h2_value "$run" schedule@openLoop.1 "pherf.schedule.$got"
+  done | paste -sd ' ' -)"
+  t_equals pherf_schedule_window_is_the_schedule "1795376062108 1795376062312" \
+    "$(t_h2_value "$run" schedule@openLoop.1 pherf.schedule.completed window)"
+  t_equals pherf_achieved_rate_comes_once_from_the_report "1 5.000" "$(awk -F '\t' '
+    $4 == "steady@pherf" && $5 == "achieved_qps" { n++; v = $7 } END { print n + 0, v }' \
+    "$run/metrics/aggregate.tsv")"
+  t_equals pherf_latency_passes PASS "$(t_severity_of "$run" pherf.latency)"
+  t_contains pherf_latency_names_the_worst_key 'worst p99 5379 us at response:openLoop:o2' \
+    "$(t_detail_of "$run" pherf.latency)"
+  t_equals pherf_csv_path_runs_beside_the_report "10 PASS" \
+    "$(t_h2_value "$run" group@openLoop pherf.result_rows) $(t_severity_of "$run" pherf.results)"
+  # Verify that rows from the Pherf verdict file are appended to verdicts.tsv unchanged and in
+  # their original order.
+  t_equals pherf_report_copies_the_pherf_verdict_rows "$(cat "$fixture/VERDICT_run.tsv")" \
+    "$(awk -F '\t' '$4 == "pherf"' "$run/verdicts.tsv")"
+  t_equals pherf_verdict_copy_passes PASS "$(t_severity_of "$run" pherf.verdict)"
+  # Adding a second schedule verifies that schedule counts are summed while maximum fields record
+  # the peak across schedules. Giving one operation key the highest p50 without the highest p99
+  # verifies that the steady-state p50 is the maximum p50 across all keys rather than the p50 of
+  # the key with the worst p99.
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/LATENCY_run.json"
+  sed -e 's/: 4391,$/: 4800,/' -e 's/: 4391$/: 4800/' -e 's/"p50Us": 4231,$/"p50Us": 4700,/' \
+    "$fixture" | awk '
+    /^  "schedules": \[$/ { on = 1 }
+    on && /^    \{$/ { held = "" }
+    on { held = held $0 "\n" }
+    on && /^    \}$/ {
+      gsub(/"querySet": 1,/, "\"querySet\": 2,", held)
+      gsub(/"scheduled": 10,/, "\"scheduled\": 7,", held)
+      gsub(/"completed": 10,/, "\"completed\": 7,", held)
+      gsub(/"maxQueueDepth": 1,/, "\"maxQueueDepth\": 3,", held)
+      gsub(/"maxDriftUs": 4874/, "\"maxDriftUs\": 1200", held)
+      print "    },"
+      printf "%s", held
+      on = 0
+      next
+    }
+    { print }' >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_steady_sums_counts_and_takes_peak_maxima "0 17 3 4874" "$T_STATUS\
+ $(t_h2_value "$run" steady@pherf pherf.schedule.completed)\
+ $(t_h2_value "$run" steady@pherf pherf.schedule.max_queue_depth)\
+ $(t_h2_value "$run" steady@pherf pherf.schedule.max_drift_us)"
+  t_equals pherf_steady_percentiles_are_the_highest_over_the_keys "4.700 5.379" \
+    "$(t_h2_value "$run" steady@pherf query_latency.p50_ms)\
+ $(t_h2_value "$run" steady@pherf query_latency.p99_ms)"
+  # Verify that a latency report with an unrecognized format version or a mismatched run log is
+  # rejected.
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/LATENCY_run.json"
+  sed 's/^  "version": 1,$/  "version": 2,/' "$fixture" >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_unknown_latency_report_version_fails "0 FAIL 0" "$T_STATUS\
+ $(t_severity_of "$run" pherf.latency) $(awk -F '\t' '$4 ~ /^op@/ { n++ } END { print n + 0 }' \
+    "$run/metrics/aggregate.tsv")"
+  t_equals pherf_report_without_the_json_keeps_no_percentile "" \
+    "$(t_h2_value "$run" steady@pherf query_latency.p99_ms)"
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/LATENCY_run.hlog"
+  sed '1s/highest 600000000/highest 3600000000/' "$fixture" >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_run_log_of_another_configuration_fails FAIL \
+    "$(t_severity_of "$run" pherf.latency)"
+  rm -f "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_absent_run_log_fails FAIL "$(t_severity_of "$run" pherf.latency)"
+  # Verify that a verdict file containing an unrecognized severity is rejected without appending
+  # any rows.
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/VERDICT_run.tsv"
+  awk -F '\t' -v OFS='\t' 'NR == 2 { $2 = "WARN" } { print }' "$fixture" >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_malformed_verdict_file_is_refused "0 FAIL 0" "$T_STATUS\
+ $(t_severity_of "$run" pherf.verdict) $(awk -F '\t' '$4 == "pherf" { n++ } END { print n + 0 }' \
+    "$run/verdicts.tsv")"
+  t_contains pherf_malformed_verdict_names_the_line 'line 2: severity "WARN"' \
+    "$(t_detail_of "$run" pherf.verdict)"
+  # Verify that a verdict row declaring any source other than pherf is rejected, because Pherf
+  # emits verdict records exclusively under the pherf source.
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/VERDICT_run.tsv"
+  awk -F '\t' -v OFS='\t' 'NR == 3 { $4 = "px-run" } { print }' "$fixture" >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_verdict_of_another_source_is_refused "0 FAIL 0" "$T_STATUS\
+ $(t_severity_of "$run" pherf.verdict) $(awk -F '\t' '$4 == "pherf" || $4 == "px-run" { n++ }
+    END { print n + 0 }' "$run/verdicts.tsv")"
+  t_contains pherf_verdict_of_another_source_names_the_line 'line 3: source "px-run"' \
+    "$(t_detail_of "$run" pherf.verdict)"
+  # Verify that when an open-loop -mt execution writes no aggregate CSV, the latency report alone
+  # supplies the steady-state metrics.
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  rm -rf "$run/drivers/pherf/results"
+  t_h2_report "$run"
+  t_equals pherf_report_without_a_csv_skips_the_results "0 SKIP PASS 5.000" "$T_STATUS\
+ $(t_severity_of "$run" pherf.results) $(t_severity_of "$run" pherf.latency)\
+ $(t_h2_value "$run" steady@pherf achieved_qps)"
+  # Verify requirement R-170: the verdict severity and metric class sets defined in Pherf match
+  # those defined by the harness.
+  fixture="${PX_TREE_ROOT:-/nonexistent}/phoenix-pherf/src/main/java/org/apache/phoenix/pherf"
+  fixture="$fixture/verdict/HealthVerdict.java"
+  if [ -f "$fixture" ]; then
+    t_equals pherf_severities_equal_the_harness_lattice \
+      "$(sed -n 's/^SX_SEVERITIES="\(.*\)"$/\1/p' "$PX_HOME/suites/lib/common.sh")" "$(awk '
+      /enum Severity \{/ { on = 1; next }
+      on && /\}/ { exit }
+      on { gsub(/[ \t,]/, ""); if ($0 != "") { printf "%s%s", s, $0; s = " " } }' "$fixture")"
+    rows="$(awk '/public static final String (COUNT|SHARE|DURATION|SOURCE) = "/ {
+      split($0, q, "\""); print $5 "=" q[2] }' "$fixture" | LC_ALL=C sort | paste -sd ' ' -)"
+    t_equals pherf_classes_are_harness_classes "COUNT=count DURATION=duration SHARE=share\
+ SOURCE=pherf" "$rows"
+  else
+    t_skip pherf_severities_equal_the_harness_lattice "no phoenix-pherf source in this tree"
+  fi
+  t_report measurement "" --verdict "$T_A5/h2/VERDICT_run.tsv"
+  t_equals pherf_real_verdict_passes_px_report "0 SKIP" "$T_STATUS $(t_result)"
+  t_equals pherf_real_verdict_keeps_each_severity "PASS PASS PASS PASS SKIP" \
+    "$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$4 == "pherf" && $2 == $6 { print $2 }' |
+      paste -sd ' ' -)"
+}
+
+## @description  Verifies the staged properties, fixed labels, CLI overrides, and pre-run gate of
+##               the pherf driver against the A5 fake fixtures (RQ-207).
+## @return       Records test assertions. Exit 0.
+t_group_h2_verbs() {
+  local run props="$T_WORK/h2.properties" staged scenario schema option
+  printf '# H2: the pherf driver verbs on the new Pherf\n'
+  scenario="$PX_HOME/suites/pherf/px_functional_scenario.xml"
+  schema="$PX_HOME/suites/pherf/px_functional_schema.sql"
+  printf '%s\n' 'pherf.default.threadpool=4' 'pherf.verdict.noisyHost=false' \
+    'pherf.verdict.serverJmx=http://elsewhere:1' '  pherf.verdict.serverJmx = http://elsewhere:2' \
+    >"$props"
+  t_a5_state_reset
+  run="$(t_a5_bundle)"
+  PX_CONTAMINATION=quiet-host t_a5_verb pherf prepare "$run" --scenario "$scenario" \
+    --schema "$schema" --properties "$props"
+  staged="$(cat "$run/drivers/pherf/stage/pherf.properties" 2>/dev/null)"
+  t_equals pherf_stages_the_noisy_flag "0 pherf.verdict.noisyHost=true" \
+    "$T_STATUS $(printf '%s\n' "$staged" | grep '^pherf\.verdict\.noisyHost=' | paste -sd ' ' -)"
+  t_equals pherf_drops_a_server_list_without_read_skew pherf.verdict.serverJmx= \
+    "$(printf '%s\n' "$staged" | grep 'serverJmx')"
+  t_contains pherf_keeps_the_other_user_keys 'pherf.default.threadpool=4' "$staged"
+  run="$(t_a5_bundle)"
+  PX_CONTAMINATION='' t_a5_verb pherf prepare "$run" --scenario "$scenario" --schema "$schema"
+  t_equals pherf_quiet_host_stages_no_noisy_flag "0 pherf.verdict.noisyHost=false" "$T_STATUS\
+ $(grep '^pherf\.verdict\.noisyHost=' "$run/drivers/pherf/stage/pherf.properties" 2>/dev/null)"
+  run="$(t_a5_bundle)"
+  PX_RS_COUNT=3 PX_PORT_REGIONSERVER_HTTP_0=16030 PX_PORT_REGIONSERVER_HTTP_1=16031 \
+    PX_PORT_REGIONSERVER_HTTP_2=16032 t_a5_verb pherf prepare "$run" --scenario "$scenario" \
+    --schema "$schema" --properties "$props" --read-skew
+  t_equals pherf_read_skew_names_every_regionserver "0 pherf.verdict.serverJmx=\
+http://regionserver-0:16030,http://regionserver-1:16031,http://regionserver-2:16032" "$T_STATUS\
+ $(grep '^pherf\.verdict\.serverJmx=' "$run/drivers/pherf/stage/pherf.properties" 2>/dev/null |
+      paste -sd ' ' -)"
+  run="$(t_a5_bundle)"
+  PX_RS_COUNT='' t_a5_verb pherf prepare "$run" --scenario "$scenario" --read-skew
+  t_equals pherf_read_skew_without_a_regionserver_is_an_anomaly 3 "$T_STATUS"
+  # Verify that user-supplied label options are rejected because the driver owns the Pherf label.
+  for option in -label --label -label=x; do
+    run="$(t_a5_bundle)"
+    t_a5_verb pherf validate "$run" --scenario "$scenario" -- "$option" x
+    t_equals "pherf_label_option_is_refused${option//[-=]/_}" "2 1" "$T_STATUS\
+ $(printf '%s\n' "$T_STDERR" | grep -c 'the driver sets the Pherf -label')"
+  done
+  # Verify P11: when the pre-run gate rejects a scenario during the prepare verb, execution halts
+  # before the run verb is invoked.
+  t_a5_state_reset
+  : >"$T_A5_STATE/pherf-gate-fails"
+  t_a5 "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$T_BIN/px-run" \
+    --class validation -e PX_SCOPE_ID=px-selftest \
+    pherf -- --scenario "$scenario" --schema "$schema"
+  run="$(t_bundle)"
+  t_equals pherf_gate_refusal_fails_prepare "1 describe:0 validate:0 prepare:1 restore:0\
+ report:0 1" "$T_STATUS $(t_verb_codes "$run") $(awk -F '\t' '
+    $1 == "pherf.gate" && $2 == "FAIL" && index($5, "exit 65") { n++ } END { print n + 0 }' \
+    "$run/verdicts.tsv")"
+  t_equals pherf_gate_refusal_is_no_load_failure "" "$(t_severity_of "$run" pherf.load)"
+  t_a5_state_reset
+}
+
+## @description  Executes a pherf test across every px-run verb with the HDR fixture in fake client
+##               0, verifies the bundle copies (RQ-207, RQ-208), and sets T_H2_HDR.
+## @return       Records test assertions. Exit 0.
+t_h2_hdr_run() {
+  local run hdr java name missing=""
+  t_a5_state_reset
+  t_shim_log_reset
+  t_pherf_hdr_fixture "$T_A5_STATE/hdr"
+  t_a5 "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$T_BIN/px-run" \
+    --class validation -e PX_SCOPE_ID=px-selftest \
+    pherf -- --scenario "$PX_HOME/suites/pherf/px_functional_scenario.xml" \
+    --schema "$PX_HOME/suites/pherf/px_functional_schema.sql" -- -runDurationMs 200 \
+    --threadCount=2 -allowUnknownTags
+  run="$(t_bundle)"
+  T_H2_HDR=$run
+  hdr="$run/drivers/pherf/results_HDR"
+  t_equals pherf_hdr_run_passes_every_verb "0 describe:0 validate:0 prepare:0 run:0 restore:0\
+ report:0" "$T_STATUS $(t_verb_codes "$run")"
+  for name in LATENCY_run.json LATENCY_run.hlog LATENCY_run_intervals.hlog VERDICT_run.tsv; do
+    cmp -s "$T_A5/h2/$name" "$hdr/$name" || missing="$missing $name"
+  done
+  t_empty pherf_hdr_files_are_copied_unchanged "$missing"
+  missing=""
+  t_lib t_a5_json_rows "$run/manifest.json" /artifacts path status
+  for name in LATENCY_run.json LATENCY_run.hlog LATENCY_run_intervals.hlog VERDICT_run.tsv; do
+    case "$PX_NL$T_STDOUT$PX_NL" in
+    *"${PX_NL}drivers/pherf/results_HDR/$name${PX_TAB}present$PX_NL"*) ;;
+    *) missing="$missing $name" ;;
+    esac
+  done
+  t_empty pherf_hdr_files_are_present_artifacts "$missing"
+  t_equals pherf_hdr_run_appends_the_pherf_rows "$(cat "$T_A5/h2/VERDICT_run.tsv")" \
+    "$(awk -F '\t' '$4 == "pherf"' "$run/verdicts.tsv")"
+  t_equals pherf_hdr_manifest_carries_the_steady_p99 5.379 \
+    "$(t_manifest "$run" /steady/0/metrics/query_latency.p99_ms/value)"
+  t_equals pherf_hdr_bundle_validates 0 "$(t_validate "$run" >/dev/null; printf '%s' "$T_STATUS")"
+  java="$(grep 'org\.apache\.phoenix\.pherf\.Pherf' "$T_A5_STATE/java.log" 2>/dev/null)"
+  # Verify that run-phase CLI overrides in both two-token and "=" forms are passed exclusively to
+  # the query execution phase.
+  t_equals pherf_run_overrides_reach_only_the_run "load:0 run:2" "$(printf '%s\n' "$java" |
+    awk '{ c = (index($0, " -runDurationMs 200") > 0) + (index($0, " --threadCount=2") > 0) }
+      / -l( |$)/ { l += c }
+      / -q( |$)/ { q += c }
+      END { print "load:" l + 0, "run:" q + 0 }')"
+  t_equals pherf_passes_fixed_labels "load:1 run:1" "$(printf '%s\n' "$java" |
+    awk '/ -l( |$)/ { l += index($0, " -label load") > 0 }
+      / -q( |$)/ { q += index($0, " -label run") > 0 }
+      END { print "load:" l + 0, "run:" q + 0 }')"
+  t_equals pherf_unknown_tags_flag_reaches_both_verbs 2 \
+    "$(printf '%s\n' "$java" | grep -c -- ' -allowUnknownTags')"
+  t_a5_state_reset
+}
+
+# ---------------------------------------------------------------------------
 # Command-line option parsing and test suite execution
 # ---------------------------------------------------------------------------
 
@@ -10075,6 +10619,8 @@ t_group_a5_plugins
 t_group_a5_fixes
 t_group_a5_closure
 t_group_a6
+t_group_h2_report
+t_group_h2_verbs
 t_group_tree
 
 t_daemons_stop
