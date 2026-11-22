@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- A clean co-generated scenario with a descending leading key: PRIMARY KEY (K1 DESC, K2). The
+     range bounds compare values, so the first range placeholder is the lower bound and the second
+     is the upper bound, also on a DESC key. -->
+<datamodel name="validation_desc">
+    <datamapping>
+        <column>
+            <type>BIGINT</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000000</maxValue>
+            <name>K1</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K2</name>
+        </column>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <length>8</length>
+            <name>V</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.VALIDATION_DESC" rowCount="400" name="validationDesc">
+            <preScenarioDdls>
+                <ddl tableName="PHERF.VALIDATION_DESC"
+                     statement="CREATE TABLE IF NOT EXISTS ? (K1 BIGINT NOT NULL, K2 INTEGER NOT NULL, V VARCHAR CONSTRAINT PK PRIMARY KEY (K1 DESC, K2))"/>
+            </preScenarioDdls>
+            <coGeneration seed="11" blockSize="20"/>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="4">
+                <query id="lookup"
+                       statement="SELECT V FROM PHERF.VALIDATION_DESC WHERE K1 = [K1] AND K2 = [K2]"/>
+                <query id="scan" kind="SCAN"
+                       statement="SELECT K2, V FROM PHERF.VALIDATION_DESC WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+                <query id="scanBetween" kind="SCAN"
+                       statement="SELECT K2, V FROM PHERF.VALIDATION_DESC WHERE K1 BETWEEN [K1] AND [K1]"/>
+                <query id="delete" kind="DELETE"
+                       statement="DELETE FROM PHERF.VALIDATION_DESC WHERE [K1] &lt;= K1 AND [K1] &gt;= K1"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>

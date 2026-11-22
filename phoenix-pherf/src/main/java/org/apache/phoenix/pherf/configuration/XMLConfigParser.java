@@ -116,6 +116,17 @@ public class XMLConfigParser {
   // TODO Remove static calls
   public static DataModel readDataModel(Path file)
     throws JAXBException, XMLStreamException, IOException {
+    DataModel dataModel = parse(file);
+    resolveProfiles(dataModel, file);
+    return dataModel;
+  }
+
+  /**
+   * Unmarshals a scenario configuration file and binds scenario-level tenant identifiers without
+   * resolving referenced workload profiles. The JAXB unmarshaller silently ignores unknown elements
+   * and attributes, whereas the offline validator explicitly reports them.
+   */
+  public static DataModel parse(Path file) throws JAXBException, XMLStreamException, IOException {
     XMLInputFactory xif = secureInputFactory();
     JAXBContext jaxbContext = JAXBContext.newInstance(DataModel.class);
     Unmarshaller jaxbUnmarshaller = jaxbContext.createUnmarshaller();
@@ -126,15 +137,14 @@ public class XMLConfigParser {
       dataModel = (DataModel) jaxbUnmarshaller.unmarshal(xmlReader);
     }
     bindScenarioTenants(dataModel);
-    resolveProfiles(dataModel, file);
     return dataModel;
   }
 
   /**
-   * Creates an XML input factory configured to disable both DTD processing and external entity
+   * Creates an XML input factory configured to disallow both DTD processing and external entity
    * resolution.
    */
-  private static XMLInputFactory secureInputFactory() {
+  public static XMLInputFactory secureInputFactory() {
     XMLInputFactory xif = XMLInputFactory.newInstance();
     xif.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
     xif.setProperty(XMLInputFactory.SUPPORT_DTD, false);
@@ -155,32 +165,48 @@ public class XMLConfigParser {
       int position = 0;
       for (QuerySet querySet : scenario.getQuerySet()) {
         position++;
-        if (querySet.getProfile() == null) {
-          continue;
+        if (querySet.getProfile() != null) {
+          resolveProfile(scenario, position, querySet, file);
         }
-        Path path = file.resolveSibling(querySet.getProfile().trim()).normalize();
-        String where = "profile " + path + " of querySet " + position + " of scenario "
-          + scenario.getName() + ": ";
-        if (querySet.getOpenLoop() != null) {
-          throw new IllegalArgumentException(where + "the querySet also has its own openLoop;"
-            + " the profile is the only source of the openLoop");
-        }
-        if (querySet.getMix() != null) {
-          throw new IllegalArgumentException(
-            where + "the querySet also has its own mix; the profile is the only source of the mix");
-        }
-        WorkloadProfile profile = readProfile(path, where);
-        if (profile.getOpenLoop() == null) {
-          throw new IllegalArgumentException(where + "the profile has no openLoop");
-        }
-        querySet.setOpenLoop(profile.getOpenLoop());
-        querySet.setMix(profile.getMix());
       }
     }
   }
 
   /**
-   * Reads and unmarshals a single workload profile file; JAXB rejects any document whose root
+   * Resolves the path of a workload profile referenced by a scenario configuration file.
+   */
+  public static Path profilePath(Path file, String profile) {
+    return file.resolveSibling(profile.trim()).normalize();
+  }
+
+  /**
+   * Resolves the workload profile for a single query set and copies its open-loop schedule and
+   * operation mix into that query set, where query set positions start at 1.
+   * @throws IllegalArgumentException if profile resolution fails, with a message identifying the
+   *                                  scenario, the query set, and the profile path.
+   */
+  public static void resolveProfile(Scenario scenario, int position, QuerySet querySet, Path file) {
+    Path path = profilePath(file, querySet.getProfile());
+    String where =
+      "profile " + path + " of querySet " + position + " of scenario " + scenario.getName() + ": ";
+    if (querySet.getOpenLoop() != null) {
+      throw new IllegalArgumentException(where + "the querySet also has its own openLoop;"
+        + " the profile is the only source of the openLoop");
+    }
+    if (querySet.getMix() != null) {
+      throw new IllegalArgumentException(
+        where + "the querySet also has its own mix; the profile is the only source of the mix");
+    }
+    WorkloadProfile profile = readProfile(path, where);
+    if (profile.getOpenLoop() == null) {
+      throw new IllegalArgumentException(where + "the profile has no openLoop");
+    }
+    querySet.setOpenLoop(profile.getOpenLoop());
+    querySet.setMix(profile.getMix());
+  }
+
+  /**
+   * Reads and unmarshals a single workload profile file; JAXB rejects any XML document whose root
    * element is other than workloadProfile.
    */
   private static WorkloadProfile readProfile(Path path, String where) {

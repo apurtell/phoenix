@@ -21,6 +21,7 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.function.Function;
@@ -44,11 +45,12 @@ import org.apache.phoenix.pherf.rules.RulesApplier;
  * instead, every value is derived deterministically from the row index. The scenario name must be
  * unique across all data models loaded by the parser.
  * <p>
- * A run that does not execute a data load for the scenario begins with the row range that a full
- * load of the scenario would write, initializing both the watermark and the high-water mark to the
- * configured row count. Because this initial state is an assumption rather than an observed commit,
- * the validator must confirm it. Executing a data load resets both the watermark and the high-water
- * mark to 0 first.
+ * A run that does not execute a data load for the scenario begins with the row range that a load of
+ * the scenario writes, initializing both the watermark and the high-water mark to the scenario row
+ * count. Because this initial state is an assumption rather than an observed commit, the offline
+ * validator checks read operations against this starting state, but without database access it
+ * cannot verify that a prior load actually wrote those rows. Executing a data load resets both
+ * marks to 0 first.
  */
 public final class CoGenerator {
   // The registry maintains weak references to each parser. Because the stored values do not
@@ -84,7 +86,8 @@ public final class CoGenerator {
       }
       CoGenerator generator = scenarios.get(scenario.getName());
       if (generator == null) {
-        generator = new CoGenerator(model(parser, scenario), scenario, Settings.of(scenario));
+        generator =
+          new CoGenerator(model(parser.getDataModels(), scenario), scenario, Settings.of(scenario));
         scenarios.put(scenario.getName(), generator);
       }
       return generator;
@@ -94,11 +97,12 @@ public final class CoGenerator {
   /**
    * Resolves the data model containing the specified scenario name to provide rules for the
    * decoder. Because the scenario name uniquely identifies the scenario state, encountering a
-   * duplicate scenario with the same name is treated as an error.
+   * second scenario with the same name is treated as an error.
+   * @throws IllegalArgumentException when the scenario name is not unique across the data models
    */
-  private static DataModel model(XMLConfigParser parser, Scenario scenario) {
+  public static DataModel model(List<DataModel> models, Scenario scenario) {
     DataModel found = null;
-    for (DataModel model : parser.getDataModels()) {
+    for (DataModel model : models) {
       for (Scenario candidate : model.getScenarios()) {
         if (candidate.getName().equals(scenario.getName())) {
           if (found != null) {
@@ -154,20 +158,35 @@ public final class CoGenerator {
         }
       }
     }
+    checkLeadingKey(scenario, settings, leading, columns);
+    leadingKey = leading;
+    return leading;
+  }
+
+  /**
+   * Validates the primary key structure of the scenario table against the co-generation settings.
+   * When the cluster limit is smaller than the block size and the primary key consists of only a
+   * single column, multiple rows within the same block would be assigned identical keys.
+   * @param leading    the leading primary key column name, or null when the table defines no
+   *                   primary key
+   * @param keyColumns the total number of primary key columns
+   * @throws IllegalStateException    when the table defines no primary key
+   * @throws IllegalArgumentException when rows within a block would overwrite one another
+   */
+  public static void checkLeadingKey(Scenario scenario, Settings settings, String leading,
+    int keyColumns) {
     String where = "clusterLimit of the coGeneration of scenario " + scenario.getName();
     if (leading == null) {
       throw new IllegalStateException(
         where + " needs a primary key, and table " + scenario.getTableName() + " has none");
     }
     if (
-      columns == 1 && settings.clusterLimit != null && settings.clusterLimit < settings.blockSize
+      keyColumns == 1 && settings.clusterLimit != null && settings.clusterLimit < settings.blockSize
     ) {
       throw new IllegalArgumentException(where + " is less than blockSize, so rows of a block"
         + " overwrite each other: the primary key of table " + scenario.getTableName()
         + " has only column " + leading);
     }
-    leadingKey = leading;
-    return leading;
   }
 
   /**

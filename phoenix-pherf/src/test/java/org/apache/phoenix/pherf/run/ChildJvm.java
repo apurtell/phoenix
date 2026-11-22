@@ -30,6 +30,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import org.apache.phoenix.pherf.Pherf;
 import org.apache.phoenix.pherf.PherfConstants;
 
 /**
@@ -129,7 +130,31 @@ public final class ChildJvm {
     run(args);
   }
 
+  /**
+   * Executes Pherf.main once in the child JVM without a fake driver and using the real clock,
+   * returning the resulting process exit code. The console output produced by the child process is
+   * written to {@link #out()}.
+   */
+  public int runMain(List<String> args) throws Exception {
+    return start(Pherf.class.getName(), args);
+  }
+
+  /** Returns the file containing the console output of the most recently executed child JVM. */
+  public File out() {
+    return new File(root, "child.out");
+  }
+
   private void run(List<String> args) throws Exception {
+    File out = new File(root, "child.out");
+    File err = new File(root, "child.err");
+    int exitCode = start(ChildRun.class.getName(), args);
+    if (exitCode != 0) {
+      fail("Child JVM exit code " + exitCode + "\n" + Records.read(record(Records.OUTCOME)) + "\n"
+        + tails(out, err));
+    }
+  }
+
+  private int start(String mainClass, List<String> args) throws Exception {
     for (File dir : new File[] { work(), records(), overlay(), new File(root, "tmp") }) {
       Files.createDirectories(dir.toPath());
     }
@@ -155,7 +180,7 @@ public final class ChildJvm {
     command.add("-cp");
     command.add(overlay().getPath() + File.pathSeparator
       + System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")));
-    command.add(ChildRun.class.getName());
+    command.add(mainClass);
     command.addAll(args);
 
     File out = new File(root, "child.out");
@@ -166,10 +191,7 @@ public final class ChildJvm {
       process.destroyForcibly().waitFor();
       fail("Child JVM did not finish in " + TIMEOUT_SECONDS + " s\n" + tails(out, err));
     }
-    if (process.exitValue() != 0) {
-      fail("Child JVM exit code " + process.exitValue() + "\n"
-        + Records.read(record(Records.OUTCOME)) + "\n" + tails(out, err));
-    }
+    return process.exitValue();
   }
 
   private static String tails(File... files) throws IOException {

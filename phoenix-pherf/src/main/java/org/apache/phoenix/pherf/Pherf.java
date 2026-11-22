@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.pherf;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -29,6 +30,7 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.RunOverrides;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
+import org.apache.phoenix.pherf.exception.ValidationException;
 import org.apache.phoenix.pherf.jmx.MonitorManager;
 import org.apache.phoenix.pherf.latency.LatencyRecorders;
 import org.apache.phoenix.pherf.result.ResultUtil;
@@ -37,6 +39,8 @@ import org.apache.phoenix.pherf.spi.ConnectionCache;
 import org.apache.phoenix.pherf.util.GoogleChartGenerator;
 import org.apache.phoenix.pherf.util.PhoenixUtil;
 import org.apache.phoenix.pherf.util.ResourceList;
+import org.apache.phoenix.pherf.validation.ScenarioValidator;
+import org.apache.phoenix.pherf.validation.ValidationReport;
 import org.apache.phoenix.pherf.workload.QueryExecutor;
 import org.apache.phoenix.pherf.workload.Workload;
 import org.apache.phoenix.pherf.workload.WorkloadExecutor;
@@ -119,6 +123,11 @@ public class Pherf {
     options.addOption("targetRate", "targetRate", true,
       "Override the peak rate of every open loop query set, in operations per second: the other"
         + " rates scale with it. Needs -q.");
+    options.addOption("validate", "validate", false,
+      "Validate the -scenarioFile files and their DDL offline, with no database connection: print"
+        + " each finding, write VALIDATION_<label>.json to the results directory, and exit with "
+        + ScenarioValidator.EXIT_CODE + " when a rule fails. Uses -label, -schemaFile,"
+        + " -disableSchemaApply and -rowCountOverride.");
   }
 
   private final String zookeeper;
@@ -145,6 +154,7 @@ public class Pherf {
   private final String queryServerUrl;
   private final boolean connectionCache;
   private final RunOverrides overrides;
+  private final boolean validate;
   private Properties properties = new Properties();
 
   @VisibleForTesting
@@ -214,6 +224,7 @@ public class Pherf {
     }
 
     connectionCache = command.hasOption("connectionCache");
+    validate = command.hasOption("validate");
 
     if (command.hasOption('b')) {
       // If the '-b' option was provided, set the system property for WriteWorkload to pick up.
@@ -266,10 +277,35 @@ public class Pherf {
   public static void main(String[] args) {
     try {
       new Pherf(args).run();
+    } catch (ValidationException e) {
+      LOGGER.error(e.getMessage());
+      System.exit(ScenarioValidator.EXIT_CODE);
     } catch (Exception e) {
       e.printStackTrace();
       LOGGER.error("Something went wrong.", e);
       System.exit(1);
+    }
+  }
+
+  /**
+   * Validates the configured scenario files along with the DDL statements that this execution would
+   * apply, and writes out the resulting validation report.
+   * @throws ValidationException if any validation rule fails.
+   */
+  private void validateScenarios() throws Exception {
+    if (scenarioFile == null) {
+      throw new IllegalArgumentException("-validate needs -scenarioFile");
+    }
+    String schemaPattern = !applySchema ? null : schemaFile == null ? ".*.sql" : schemaFile;
+    ValidationReport report = ScenarioValidator.validate(scenarioFile, schemaPattern);
+    ResultUtil util = new ResultUtil();
+    util.ensureBaseResultDirExists();
+    File dir = new File(PherfConstants.create().getProperty("pherf.default.results.dir"));
+    Path json = report.write(dir, util.getSuffix().substring(1));
+    report.print(System.out, json);
+    if (report.getErrors() > 0) {
+      throw new ValidationException(
+        "Validation failed with " + report.getErrors() + " error(s); see " + json);
     }
   }
 
@@ -301,6 +337,13 @@ public class Pherf {
       if (null != compareResults) {
         LOGGER.info("\nStarting to compare results and exiting for " + compareResults);
         new GoogleChartGenerator(compareResults, compareType).readAndRender();
+        return;
+      }
+
+      // Perform offline validation and exit prior to executing any step that could establish a
+      // database connection.
+      if (validate) {
+        validateScenarios();
         return;
       }
 

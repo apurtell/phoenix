@@ -92,13 +92,21 @@ public final class Walk {
    */
   public synchronized long next(long committed) {
     if (position >= window) {
-      begin(committed > worker ? (committed - 1 - worker) / workers + 1 : 0);
+      begin(window(committed, worker, workers));
       if (window == 0) {
         return -1;
       }
     }
     long p = position++;
     return worker + workers * addmod(start, mulmod(p, step, window), window);
+  }
+
+  /**
+   * Computes the share size assigned to worker w out of W total workers across the first C
+   * committed local indexes, yielding (C - 1 - w) / W + 1 when C > w and 0 otherwise.
+   */
+  public static long window(long committed, int worker, int workers) {
+    return committed > worker ? (committed - 1 - worker) / workers + 1 : 0;
   }
 
   public synchronized State state() {

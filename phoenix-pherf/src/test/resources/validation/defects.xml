@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- Structural and co-generation defects in one file, for the one pass test. The validator reports
+     each defect once, in a fixed order. Each comment names the rule that a defect fails. -->
+<!-- xml.unknown-attribute: release. -->
+<datamodel name="validation_defects" release="192">
+    <datamapping>
+        <column>
+            <type>BIGINT</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000000</maxValue>
+            <name>K1</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K2</name>
+        </column>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <!-- xml.value: the parser reads 0. -->
+            <length>x8</length>
+            <name>V</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.VALIDATION_DEFECTS" rowCount="5" name="defectsA">
+            <preScenarioDdls>
+                <ddl tableName="PHERF.VALIDATION_DEFECTS"
+                     statement="CREATE TABLE IF NOT EXISTS ? (K1 BIGINT NOT NULL, K2 INTEGER NOT NULL, V VARCHAR CONSTRAINT PK PRIMARY KEY (K1, K2))"/>
+            </preScenarioDdls>
+            <coGeneration seed="7" blockSize="50"/>
+            <!-- xml.unknown-element. -->
+            <notATag/>
+            <querySet concurrency="1">
+                <!-- xml.value: POISON is not an arrival. openloop.rate: DROP without maxLagMs. -->
+                <openLoop arrival="POISON" lagPolicy="DROP">
+                    <!-- openloop.rate: a negative rate. -->
+                    <stage durationMs="1000" rate="-5"/>
+                </openLoop>
+                <!-- predicate.in-list: two elements of one IN list name one row. -->
+                <query id="lookupIn"
+                       statement="SELECT V FROM PHERF.VALIDATION_DEFECTS WHERE K1 IN ([K1], [K1]) AND K2 = [K2]"/>
+                <!-- query.kind. -->
+                <query id="badKind" kind="SCANN"
+                       statement="SELECT V FROM PHERF.VALIDATION_DEFECTS WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+            </querySet>
+            <!-- cogen.walk: 5 rows give worker 5 of 6 no row. key.coverage: K2 with [K1]. -->
+            <querySet concurrency="1-8" executionType="SERIAL" numberOfExecutions="1">
+                <query id="lookupK1"
+                       statement="SELECT V FROM PHERF.VALIDATION_DEFECTS WHERE K1 = [K1] AND K2 = [K1]"/>
+            </querySet>
+        </scenario>
+        <!-- cogen.offsets: the rows [3, 103) overlap the rows [0, 5) of defectsA. -->
+        <scenario tableName="PHERF.VALIDATION_DEFECTS" rowCount="100" name="defectsB">
+            <coGeneration seed="7" blockSize="50" offset="3"/>
+        </scenario>
+        <!-- cogen.watermark: a second scenario defectsA shares the row cursor of the first. -->
+        <scenario tableName="PHERF.VALIDATION_OTHER" rowCount="10" name="defectsA">
+            <coGeneration seed="7" blockSize="50"/>
+        </scenario>
+        <!-- cogen.settings: blockSize 0. -->
+        <scenario tableName="PHERF.VALIDATION_OTHER2" rowCount="10" name="defectsC">
+            <coGeneration seed="7" blockSize="0"/>
+        </scenario>
+        <!-- cogen.writer-blocks: 10 values of K1 in a block of 50, with K1 the only key column. -->
+        <scenario tableName="PHERF.VALIDATION_ONE_KEY" rowCount="100" name="defectsD">
+            <preScenarioDdls>
+                <ddl tableName="PHERF.VALIDATION_ONE_KEY"
+                     statement="CREATE TABLE IF NOT EXISTS ? (K1 BIGINT NOT NULL PRIMARY KEY, V VARCHAR)"/>
+            </preScenarioDdls>
+            <coGeneration seed="7" blockSize="50" clusterLimit="10"/>
+        </scenario>
+    </scenarios>
+</datamodel>

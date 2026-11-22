@@ -1,0 +1,2544 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+== scenario_with_query_timeouts.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_scenario">
+    <datamapping>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_CHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>GENERAL_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>1</maxValue>
+            <minValue>0</minValue>
+            <name>GENERAL_DECIMAL</name>
+            <nullChance>10</nullChance>
+            <precision>18</precision>
+            <type>DECIMAL</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>50000000</maxValue>
+            <minValue>1</minValue>
+            <name>GENERAL_INTEGER</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="80">
+                    <maxValue><TIME></maxValue>
+                    <minValue><TIME></minValue>
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                </datavalue>
+                <datavalue distribution="10">
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value><TIME></value>
+                </datavalue>
+                <datavalue distribution="10">
+                    <maxValue><TIME></maxValue>
+                    <minValue><TIME></minValue>
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>CREATED_DATE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="50">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>KjhoOmnNbBs9kWs</value>
+                </datavalue>
+                <datavalue distribution="50">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>VAL123</value>
+                </datavalue>
+            </valuelist>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>VAL_STRING</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="myscenario" rowCount="100000" tableName="PHERF.USER_DEFINED_TEST">
+            <dataOverride>
+                <column>
+                    <dataSequence>RANDOM</dataSequence>
+                    <valuelist/>
+                    <length>10</length>
+                    <maxValue>-9223372036854775808</maxValue>
+                    <minValue>-9223372036854775808</minValue>
+                    <name>DO_NOT_USE</name>
+                    <nullChance>-2147483648</nullChance>
+                    <precision>-2147483648</precision>
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <userDefined>true</userDefined>
+                </column>
+            </dataOverride>
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1-3" executionDurationInMs="5000" executionType="SERIAL" numberOfExecutions="10">
+                <query expectedAggregateRowCount="100000" id="q1" statement="SELECT COUNT(*) FROM PHERF.USER_DEFINED_TEST" timeoutDuration="0" useGlobalConnection="false"/>
+                <query expectedAggregateRowCount="100000" id="q2" statement="SELECT COUNT(*) FROM PHERF.USER_DEFINED_TEST" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query expectedAggregateRowCount="100000" id="q3" statement="SELECT COUNT(*) FROM PHERF.USER_DEFINED_TEST" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_connection_cache.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_connection_cache">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="testConnectionCache" rowCount="4" tableName="PHERF.TEST_TABLE">
+            <idleTimes/>
+            <phoenixProperties>
+                <entry>
+                    <key>pherf.test.group</key>
+                    <value>C</value>
+                </entry>
+            </phoenixProperties>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="6" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="20">
+                <query id="c1" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_evt_gen1.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="model_1">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="WEIGHTED" name="EVT_GEN1" rowCount="0" tableName="PHERF.EVT_GEN1">
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="upsertOp" weight="40"/>
+                <opDistribution id="queryOp1" weight="20"/>
+                <opDistribution id="queryOp2" weight="20"/>
+                <opDistribution id="idleOp" weight="10"/>
+                <opDistribution id="udfOp" weight="10"/>
+                <tenantDistribution id="tg1" numTenants="10" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="tg2" numTenants="10" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="tg3" numTenants="10" useGlobalConnection="false" weight="80"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" statement="select count(*) from PHERF.EVT_GEN1" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp2" statement="select sum(SOME_INT) from PHERF.EVT_GEN1" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="udfOp">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>COLUMN1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_evt_gen2.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="model_1">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="WEIGHTED" name="EVT_GEN2" rowCount="0" tableName="PHERF.EVT_GEN2">
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="upsertOp" weight="40"/>
+                <opDistribution id="queryOp1" weight="10"/>
+                <opDistribution id="queryOp2" weight="10"/>
+                <opDistribution id="queryOp3" weight="0"/>
+                <opDistribution id="queryOp4" weight="0"/>
+                <opDistribution id="queryOp5" weight="0"/>
+                <opDistribution id="queryOp6" weight="0"/>
+                <opDistribution id="queryOp7" weight="0"/>
+                <opDistribution id="queryOp8" weight="0"/>
+                <opDistribution id="idleOp" weight="10"/>
+                <opDistribution id="udfOp" weight="10"/>
+                <tenantDistribution id="tg1" numTenants="10" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="tg2" numTenants="10" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="tg3" numTenants="10" useGlobalConnection="false" weight="80"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" statement="select count(*) from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp2" statement="select sum(SOME_INT) from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp3" statement="select sum(SOME_INT) +3 from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp4" statement="select sum(SOME_INT) +4 from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp5" statement="select sum(SOME_INT) +5 from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp6" statement="select sum(SOME_INT) +6 from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp7" statement="select sum(SOME_INT) +7 from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp8" statement="select sum(SOME_INT) +8 from PHERF.EVT_GEN2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="udfOp">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>COLUMN1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_evt_gen3.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="model_1">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="UNIFORM" name="EVT_GEN3" rowCount="0" tableName="PHERF.EVT_GEN3">
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="upsertOp" weight="0"/>
+                <opDistribution id="queryOp1" weight="0"/>
+                <opDistribution id="queryOp2" weight="0"/>
+                <opDistribution id="queryOp3" weight="0"/>
+                <opDistribution id="queryOp4" weight="0"/>
+                <opDistribution id="queryOp5" weight="0"/>
+                <opDistribution id="queryOp6" weight="0"/>
+                <opDistribution id="queryOp7" weight="0"/>
+                <opDistribution id="idleOp" weight="0"/>
+                <opDistribution id="udfOp" weight="0"/>
+                <tenantDistribution id="tg1" numTenants="1" useGlobalConnection="false" weight="0"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" statement="select count(*) from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp2" statement="select sum(SOME_INT) from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp3" statement="select sum(SOME_INT) +3 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp4" statement="select sum(SOME_INT) +4 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp5" statement="select sum(SOME_INT) +5 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp6" statement="select sum(SOME_INT) +6 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp7" statement="select sum(SOME_INT) +7 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="udfOp">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>COLUMN1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_evt_gen4.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="model_1">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="SEQUENTIAL" name="EVT_GEN4" rowCount="0" tableName="PHERF.EVT_GEN4">
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="upsertOp" weight="0"/>
+                <opDistribution id="queryOp1" weight="0"/>
+                <opDistribution id="queryOp2" weight="0"/>
+                <opDistribution id="queryOp3" weight="0"/>
+                <opDistribution id="queryOp4" weight="0"/>
+                <opDistribution id="queryOp5" weight="0"/>
+                <opDistribution id="queryOp6" weight="0"/>
+                <opDistribution id="queryOp7" weight="0"/>
+                <opDistribution id="idleOp" weight="0"/>
+                <opDistribution id="udfOp" weight="0"/>
+                <tenantDistribution id="tg1" numTenants="1" useGlobalConnection="false" weight="0"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" statement="select count(*) from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp2" statement="select sum(SOME_INT) from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp3" statement="select sum(SOME_INT) +3 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp4" statement="select sum(SOME_INT) +4 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp5" statement="select sum(SOME_INT) +5 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp6" statement="select sum(SOME_INT) +6 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp7" statement="select sum(SOME_INT) +7 from PHERF.EVT_GEN3" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="udfOp">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>COLUMN1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_group_properties.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_group_properties">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="testGroupProperties" rowCount="4" tableName="PHERF.TEST_TABLE">
+            <idleTimes/>
+            <phoenixProperties>
+                <entry>
+                    <key>pherf.test.key</key>
+                    <value>scenario</value>
+                </entry>
+                <entry>
+                    <key>pherf.test.shared</key>
+                    <value>scenario</value>
+                </entry>
+            </phoenixProperties>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="3">
+                <phoenixProperties>
+                    <entry>
+                        <key>pherf.test.key</key>
+                        <value>A</value>
+                    </entry>
+                    <entry>
+                        <key>pherf.test.group</key>
+                        <value>A</value>
+                    </entry>
+                </phoenixProperties>
+                <query id="qa" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="2">
+                <phoenixProperties>
+                    <entry>
+                        <key>pherf.test.group</key>
+                        <value>B</value>
+                    </entry>
+                </phoenixProperties>
+                <query id="qb" statement="select sum(SOME_INT) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="1">
+                <query id="qc" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_mt_workload_template.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="model_1">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_CHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>50000000</maxValue>
+            <minValue>1</minValue>
+            <name>GENERAL_INTEGER</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>INT_ID</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>true</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="60">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>ABC</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>XYZ</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>LMN</value>
+                </datavalue>
+            </valuelist>
+            <length>3</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>TYPE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <valuelist/>
+            <length>3</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>IDENTIFIER</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="WEIGHTED" name="EVT_1" rowCount="0" tableName="PHERF.EVT_1">
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>10000</numOperations>
+                <opDistribution id="upsertOp" weight="20"/>
+                <opDistribution id="queryOp1" weight="20"/>
+                <opDistribution id="queryOp2" weight="20"/>
+                <opDistribution id="idleOp" weight="20"/>
+                <opDistribution id="udfOp" weight="20"/>
+                <tenantDistribution id="tg1" numTenants="1" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="tg2" numTenants="9" useGlobalConnection="false" weight="40"/>
+                <tenantDistribution id="tg3" numTenants="10" useGlobalConnection="false" weight="50"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.EVT_1 (ZID CHAR(15), TYPE VARCHAR) AS SELECT * FROM PHERF.TEST_GLOBAL_VIEW1" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" statement="select count(*) from PHERF.EVT_1" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp2" statement="select * from PHERF.EVT_1" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="udfOp">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>SOME_INT</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>INTEGER</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>GID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OTHER_INT</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>INTEGER</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>ZID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>TYPE</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+        <scenario generatorName="WEIGHTED" name="EVT_21" rowCount="0" tableName="PHERF.EVT_2">
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>10000</numOperations>
+                <opDistribution id="upsertOp" weight="20"/>
+                <opDistribution id="queryOp1" weight="20"/>
+                <opDistribution id="queryOp2" weight="20"/>
+                <opDistribution id="idleOp" weight="20"/>
+                <opDistribution id="udfOp" weight="20"/>
+                <tenantDistribution id="tg1" numTenants="1" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="tg2" numTenants="9" useGlobalConnection="false" weight="40"/>
+                <tenantDistribution id="tg3" numTenants="10" useGlobalConnection="false" weight="50"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.EVT_2 (INT_ID INTEGER, TYPE VARCHAR) AS SELECT * FROM PHERF.TEST_GLOBAL_VIEW2" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" statement="select count(*) from PHERF.EVT_2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="queryOp2" statement="select * from PHERF.EVT_2" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="udfOp">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>SOME_INT</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>INTEGER</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>GID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OTHER_INT</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>INTEGER</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>INT_ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>INTEGER</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>TYPE</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_native_types.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_native_types">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>16</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>ID</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARBINARY_ENCODED</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>VARBINARY_ENCODED</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>00ff00</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>VARBINARY_ENCODED</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>ff00</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>VARBINARY_ENCODED</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>0a</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>VB_L</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARBINARY_ENCODED</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>4</length>
+            <maxValue>100</maxValue>
+            <minValue>-100</minValue>
+            <name>FA</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>FLOAT_ARRAY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>FLOAT_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>1.5</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>FLOAT_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>-2.25</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>FLOAT_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>0.0</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>FA_L</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>FLOAT_ARRAY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>3</length>
+            <maxValue>1000</maxValue>
+            <minValue>0</minValue>
+            <name>DA</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DOUBLE_ARRAY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>DOUBLE_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>0.125</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>DOUBLE_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>999.5</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>DA_L</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DOUBLE_ARRAY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>8</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>DOC</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>p</prefix>
+            <type>JSON</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>JSON</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>{"k":"a","n":1}</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>JSON</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>{"k":"b","v":[1,2]}</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>DOC_L</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>JSON</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>8</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>BDOC</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>BSON</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>BSON</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>{"k":"c","o":{"x":true}}</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>BSON</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>{"k":"d","d":2.5}</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>BDOC_L</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>BSON</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="testNativeTypes" rowCount="20" tableName="PHERF.NATIVE_TYPES">
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_scenario.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_scenario">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_CHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>2020</minValue>
+            <name>GENERAL_TIMESTAMP</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>TIMESTAMP</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>GENERAL_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>RND_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>true</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>1</maxValue>
+            <minValue>0</minValue>
+            <name>GENERAL_DECIMAL</name>
+            <nullChance>10</nullChance>
+            <precision>18</precision>
+            <type>DECIMAL</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>50000000</maxValue>
+            <minValue>1</minValue>
+            <name>GENERAL_INTEGER</name>
+            <nullChance>100</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>CREATED_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>true</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="80">
+                    <maxValue><TIME></maxValue>
+                    <minValue><TIME></minValue>
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                </datavalue>
+                <datavalue distribution="10">
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value><TIME></value>
+                </datavalue>
+                <datavalue distribution="10">
+                    <maxValue><TIME></maxValue>
+                    <minValue><TIME></minValue>
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>SOME_DATE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="80">
+                    <type>DATE</type>
+                    <useCurrentDate>true</useCurrentDate>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>DATE</type>
+                    <useCurrentDate>true</useCurrentDate>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>PRESENT_DATE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="60">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>aAAyYhnNbBs9kWk</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>bBByYhnNbBs9kWu</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>cCCyYhnNbBs9kWr</value>
+                </datavalue>
+            </valuelist>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>PARENT_ID</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>10</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>OLDVAL_STRING</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>MYPRFX</prefix>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>NEWVAL_STRING</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>0F90000000000X</prefix>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>VARCHAR_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Foo</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>VARCHAR_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Bar</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>VAR_ARRAY</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR_ARRAY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="60">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>ABC</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>XYZ</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>LMN</value>
+                </datavalue>
+            </valuelist>
+            <length>3</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>IDENTIFIER</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>8</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>OTHER_ID</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>z0Oxx00</prefix>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>8</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>VAR_BIN</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>VBOxx00</prefix>
+            <type>VARBINARY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>1</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>FIELD</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>100000</maxValue>
+            <minValue>1</minValue>
+            <name>SEQUENTIAL_INTEGER</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="testScenarioRW" rowCount="100" tableName="PHERF.TEST_TABLE">
+            <dataOverride>
+                <column>
+                    <dataSequence>RANDOM</dataSequence>
+                    <valuelist/>
+                    <length>5</length>
+                    <maxValue>-9223372036854775808</maxValue>
+                    <minValue>-9223372036854775808</minValue>
+                    <name>FIELD</name>
+                    <nullChance>-2147483648</nullChance>
+                    <precision>-2147483648</precision>
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <userDefined>true</userDefined>
+                </column>
+            </dataOverride>
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="PARALLEL" numberOfExecutions="10">
+                <query id="q3" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="q4" statement="select sum(SOME_INT) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+            <writeParams executionDurationInMs="10000">
+                <batchSize>1</batchSize>
+                <threadSleepDuration>10</threadSleepDuration>
+                <writerThreadCount>2</writerThreadCount>
+            </writeParams>
+        </scenario>
+        <scenario name="testScenario" rowCount="30" tableName="PHERF.TEST_TABLE">
+            <dataOverride>
+                <column>
+                    <dataSequence>RANDOM</dataSequence>
+                    <valuelist/>
+                    <length>10</length>
+                    <maxValue>-9223372036854775808</maxValue>
+                    <minValue>-9223372036854775808</minValue>
+                    <name>FIELD</name>
+                    <nullChance>-2147483648</nullChance>
+                    <precision>-2147483648</precision>
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <userDefined>true</userDefined>
+                </column>
+            </dataOverride>
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1-3" executionDurationInMs="5000" executionType="SERIAL" numberOfExecutions="100">
+                <query expectedAggregateRowCount="0" id="q1" statement="select count(*) from PHERF.TEST_TABLE" tenantId="123456789012345" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="q2" queryGroup="g1" statement="select sum(SOME_INT) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <querySet concurrency="2-3" executionDurationInMs="10000" executionType="PARALLEL" numberOfExecutions="10">
+                <query id="q3" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="q4" statement="select sum(SOME_INT) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+        <scenario name="testPreAndPostDdls" rowCount="99" tableName="PHERF.TEST_TABLE">
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls>
+                <ddl statement="CREATE INDEX IDX_OLDVAL_STRING ON ? (OLDVAL_STRING)" tableName="PHERF.TEST_TABLE" useGlobalConnection="false"/>
+                <ddl statement="CREATE INDEX IDX_CONNECTION_ID ON ? (CONNECTION_ID)" tableName="PHERF.TEST_TABLE" useGlobalConnection="false"/>
+            </postScenarioDdls>
+            <preScenarioDdls>
+                <ddl statement="CREATE INDEX IDX_DIVISION ON ? (DIVISION)" tableName="PHERF.TEST_TABLE" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <querySet concurrency="1" executionDurationInMs="5000" executionType="SERIAL" numberOfExecutions="1">
+                <query expectedAggregateRowCount="99" id="q1" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+        <scenario name="testMTWriteScenario" rowCount="100" tableName="PHERF.TEST_VIEW" tenantId="xyzdefghijklmno">
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.TEST_VIEW (field1 VARCHAR, field2 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <udfs/>
+            <upserts/>
+        </scenario>
+        <scenario name="testMTDdlWriteScenario" rowCount="100" tableName="PHERF.TEST_MT_VIEW" tenantId="abcdefghijklmno">
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.TEST_MT_VIEW (field1 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_tbl_workload_template.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="TEST_MT_TABLE_MODEL">
+    <datamapping>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist>
+                <datavalue distribution="34">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>NA</value>
+                </datavalue>
+                <datavalue distribution="33">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>CS</value>
+                </datavalue>
+                <datavalue distribution="33">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>EU</value>
+                </datavalue>
+            </valuelist>
+            <length>2</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>HOST</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist>
+                <datavalue distribution="25">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Salesforce.com</value>
+                </datavalue>
+                <datavalue distribution="25">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Apple.com</value>
+                </datavalue>
+                <datavalue distribution="25">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Google.com</value>
+                </datavalue>
+                <datavalue distribution="25">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Amazon.com</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>DOMAIN</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist>
+                <datavalue distribution="20">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Login</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Report</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Dashboard</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Sales</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>VARCHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>UI</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>FEATURE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>DATE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>2020</minValue>
+            <name>DATE_O</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>100</maxValue>
+            <minValue>1</minValue>
+            <name>USAGE.CORE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>BIGINT</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2000</maxValue>
+            <minValue>1</minValue>
+            <name>USAGE.DB</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>BIGINT</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>10000</maxValue>
+            <minValue>1</minValue>
+            <name>STATS.ACTIVE_VISITOR</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="WEIGHTED" name="TEST_TABLE_WRITE" rowCount="0" tableName="PHERF.TEST_MULTI_TENANT_TABLE">
+            <idleTimes/>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1</numOperations>
+                <opDistribution id="upsertOp" weight="100"/>
+                <tenantDistribution id="GLOBAL" numTenants="1" useGlobalConnection="true" weight="100"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <udfs/>
+            <upserts>
+                <upsert id="upsertOp" timeoutDuration="9223372036854775807" upsertGroup="write" useGlobalConnection="true"/>
+            </upserts>
+        </scenario>
+        <scenario generatorName="WEIGHTED" name="TEST_TABLE_READ" rowCount="0" tableName="PHERF.TEST_MULTI_TENANT_TABLE">
+            <idleTimes/>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1</numOperations>
+                <opDistribution id="queryOp1" weight="50"/>
+                <opDistribution id="queryOp2" weight="50"/>
+                <tenantDistribution id="GLOBAL" numTenants="1" useGlobalConnection="true" weight="100"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="queryOp1" queryGroup="Aggregation" statement="select count(*) from PHERF.TEST_MULTI_TENANT_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="true"/>
+                <query id="queryOp2" queryGroup="LIMIT" statement="select * from PHERF.TEST_MULTI_TENANT_TABLE LIMIT 100" timeoutDuration="9223372036854775807" useGlobalConnection="true"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_tenant_binding.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_tenant_binding">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="testTenantBinding" rowCount="10" tableName="PHERF.TEST_VIEW" tenantId="TENANT_A">
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.TEST_VIEW (F1 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE" useGlobalConnection="false"/>
+                <ddl statement="CREATE INDEX IF NOT EXISTS IDX_BIND ON PHERF.TEST_TABLE (FIELD)" useGlobalConnection="true"/>
+            </preScenarioDdls>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="1">
+                <query ddl="CREATE VIEW IF NOT EXISTS PHERF.TEST_VIEW2 (F2 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE" id="q1" statement="select count(*) from PHERF.TEST_VIEW" tenantId="TENANT_A" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="q2" statement="select count(*) from PHERF.TEST_VIEW" tenantId="TENANT_B" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="q3" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="true"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_warmup.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="test_warmup">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario name="testWarmup" rowCount="4" tableName="PHERF.TEST_TABLE">
+            <idleTimes/>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls/>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="3" warmupExecutions="2">
+                <query id="w1" statement="select count(*) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <querySet concurrency="2" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="4" warmupExecutions="3">
+                <query id="w2" statement="select sum(SOME_INT) from PHERF.TEST_TABLE" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs/>
+            <upserts/>
+        </scenario>
+    </scenarios>
+</datamodel>
+== test_workload_with_load_profile.xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<datamodel xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" name="model_1">
+    <datamapping>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_VARCHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>GENERAL_CHAR</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>2020</minValue>
+            <name>GENERAL_TIMESTAMP</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>TIMESTAMP</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>GENERAL_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>NOW_DATE</name>
+            <nullChance>0</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>true</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>1</maxValue>
+            <minValue>0</minValue>
+            <name>GENERAL_DECIMAL</name>
+            <nullChance>10</nullChance>
+            <precision>18</precision>
+            <type>DECIMAL</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>50000000</maxValue>
+            <minValue>1</minValue>
+            <name>GENERAL_INTEGER</name>
+            <nullChance>100</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="80">
+                    <maxValue><TIME></maxValue>
+                    <minValue><TIME></minValue>
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                </datavalue>
+                <datavalue distribution="10">
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value><TIME></value>
+                </datavalue>
+                <datavalue distribution="10">
+                    <maxValue><TIME></maxValue>
+                    <minValue><TIME></minValue>
+                    <type>DATE</type>
+                    <useCurrentDate>false</useCurrentDate>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>CREATED_DATE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="80">
+                    <type>DATE</type>
+                    <useCurrentDate>true</useCurrentDate>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>DATE</type>
+                    <useCurrentDate>true</useCurrentDate>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>2025</maxValue>
+            <minValue>1975</minValue>
+            <name>PRESENT_DATE</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>DATE</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="60">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>aAAyYhnNbBs9kWk</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>bBByYhnNbBs9kWu</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>cCCyYhnNbBs9kWr</value>
+                </datavalue>
+            </valuelist>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>PARENT_ID</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>RANDOM</dataSequence>
+            <valuelist/>
+            <length>10</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>OLDVAL_STRING</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>MYPRFX</prefix>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>15</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>NEWVAL_STRING</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>0F90000000000X</prefix>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <valuelist>
+                <datavalue distribution="0">
+                    <type>VARCHAR_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Foo</value>
+                </datavalue>
+                <datavalue distribution="0">
+                    <type>VARCHAR_ARRAY</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>Bar</value>
+                </datavalue>
+            </valuelist>
+            <length>-2147483648</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>VAR_ARRAY</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR_ARRAY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>LIST</dataSequence>
+            <valuelist>
+                <datavalue distribution="60">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>ABC</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>XYZ</value>
+                </datavalue>
+                <datavalue distribution="20">
+                    <type>CHAR</type>
+                    <useCurrentDate>false</useCurrentDate>
+                    <value>LMN</value>
+                </datavalue>
+            </valuelist>
+            <length>3</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>IDENTIFIER</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>8</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>OTHER_ID</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>z0Oxx00</prefix>
+            <type>CHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>8</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>VAR_BIN</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <prefix>VBOxx00</prefix>
+            <type>VARBINARY</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>1</length>
+            <maxValue>-9223372036854775808</maxValue>
+            <minValue>-9223372036854775808</minValue>
+            <name>FIELD</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>VARCHAR</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>true</userDefined>
+        </column>
+        <column>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <valuelist/>
+            <length>-2147483648</length>
+            <maxValue>100000</maxValue>
+            <minValue>1</minValue>
+            <name>SEQUENTIAL_INTEGER</name>
+            <nullChance>-2147483648</nullChance>
+            <precision>-2147483648</precision>
+            <type>INTEGER</type>
+            <useCurrentDate>false</useCurrentDate>
+            <userDefined>false</userDefined>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario generatorName="UNIFORM" name="scenario_11" rowCount="0" tableName="PHERF.Z11">
+            <idleTimes>
+                <idleTime id="op114" idleTime="50"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="op111" weight="50"/>
+                <opDistribution id="op112" weight="0"/>
+                <opDistribution id="op113" weight="0"/>
+                <opDistribution id="op114" weight="50"/>
+                <opDistribution id="op115" weight="0"/>
+                <tenantDistribution id="t111" numTenants="10" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="t112" numTenants="10" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="t113" numTenants="1" useGlobalConnection="false" weight="80"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties>
+                <entry>
+                    <key>pherf.mt.uniform.benchmark_mode</key>
+                    <value>true</value>
+                </entry>
+                <entry>
+                    <key>pherf.mt.handlers_per_scenario</key>
+                    <value>2</value>
+                </entry>
+            </phoenixProperties>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.Z11 (field1 VARCHAR, field2 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="op112" statement="select count(*) from PHERF.Z11" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="op113" statement="select sum(SOME_INT) from PHERF.Z11" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="op115">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="op111" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>PARENT_ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>CREATED_DATE</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>DATE</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OTHER_ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OLDVAL_STRING</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>NEWVAL_STRING</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+        <scenario name="scenario_12" rowCount="0" tableName="PHERF.Z12">
+            <idleTimes>
+                <idleTime id="op124" idleTime="100"/>
+            </idleTimes>
+            <loadProfile>
+                <batchSize>5</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="op121" weight="50"/>
+                <opDistribution id="op122" weight="5"/>
+                <opDistribution id="op123" weight="5"/>
+                <opDistribution id="op124" weight="40"/>
+                <opDistribution id="op125" weight="0"/>
+                <tenantDistribution id="t121" numTenants="5" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="t122" numTenants="5" useGlobalConnection="false" weight="10"/>
+                <tenantDistribution id="t123" numTenants="5" useGlobalConnection="false" weight="80"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.Z12 (field1 VARCHAR, field2 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <querySet concurrency="1" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="10">
+                <query id="op122" statement="select count(*) from PHERF.Z12" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+                <query id="op123" statement="select sum(SOME_INT) from PHERF.Z12" timeoutDuration="9223372036854775807" useGlobalConnection="false"/>
+            </querySet>
+            <udfs>
+                <udf id="op125">
+                    <args>Hello</args>
+                    <args>World</args>
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+            <upserts>
+                <upsert id="op121" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>PARENT_ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>CREATED_DATE</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>DATE</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OTHER_ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OLDVAL_STRING</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>NEWVAL_STRING</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+        <scenario name="scenario_13" rowCount="0" tableName="PHERF.Z13">
+            <idleTimes/>
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <groupIdLength>6</groupIdLength>
+                <numOperations>1000</numOperations>
+                <opDistribution id="op131" weight="100"/>
+                <tenantDistribution id="GLOBAL" numTenants="1" useGlobalConnection="true" weight="100"/>
+                <tenantIdFormat>T%s%08d</tenantIdFormat>
+                <tenantIdLength>15</tenantIdLength>
+            </loadProfile>
+            <phoenixProperties/>
+            <postScenarioDdls/>
+            <preScenarioDdls>
+                <ddl statement="CREATE VIEW IF NOT EXISTS PHERF.Z13 (field1 VARCHAR, field2 VARCHAR) AS SELECT * FROM PHERF.TEST_TABLE WHERE PARENT_ID = 'aAAyYhnNbBs9kWk'" useGlobalConnection="false"/>
+            </preScenarioDdls>
+            <udfs/>
+            <upserts>
+                <upsert id="op131" timeoutDuration="9223372036854775807" useGlobalConnection="true">
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>PARENT_ID_SEQ</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>CHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>CREATED_DATE</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>DATE</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OTHER_ID</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>OLDVAL_STRING</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>NEWVAL_STRING</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                    <column>
+                        <valuelist/>
+                        <length>-2147483648</length>
+                        <maxValue>-9223372036854775808</maxValue>
+                        <minValue>-9223372036854775808</minValue>
+                        <name>FIELD1</name>
+                        <nullChance>-2147483648</nullChance>
+                        <precision>-2147483648</precision>
+                        <type>VARCHAR</type>
+                        <useCurrentDate>false</useCurrentDate>
+                        <userDefined>false</userDefined>
+                    </column>
+                </upsert>
+            </upserts>
+        </scenario>
+    </scenarios>
+</datamodel>

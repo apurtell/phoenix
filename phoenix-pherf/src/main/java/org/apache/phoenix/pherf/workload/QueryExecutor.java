@@ -372,12 +372,20 @@ public class QueryExecutor implements Workload {
   static void checkWarmupExecutions(DataModel dataModel) {
     for (Scenario scenario : dataModel.getScenarios()) {
       for (QuerySet querySet : scenario.getQuerySet()) {
-        Long warmup = querySet.getWarmupExecutions();
-        if (warmup != null && warmup < 0) {
-          throw new IllegalArgumentException("warmupExecutions of a querySet of scenario "
-            + scenario.getName() + " is negative: " + warmup);
-        }
+        checkWarmupExecutions(scenario, querySet);
       }
+    }
+  }
+
+  /**
+   * Validates the configured warmup execution count for a single query set.
+   * @throws IllegalArgumentException when the warmup execution count is negative
+   */
+  public static void checkWarmupExecutions(Scenario scenario, QuerySet querySet) {
+    Long warmup = querySet.getWarmupExecutions();
+    if (warmup != null && warmup < 0) {
+      throw new IllegalArgumentException("warmupExecutions of a querySet of scenario "
+        + scenario.getName() + " is negative: " + warmup);
     }
   }
 
@@ -385,7 +393,7 @@ public class QueryExecutor implements Workload {
    * Validates the open-loop configuration across all query sets in the data model before any query
    * set begins execution and before any launch override scales the stages.
    * @throws IllegalArgumentException identifying the scenario, the query set, and the offending
-   *                                  attribute when validation fails.
+   *                                  attribute
    */
   public static void checkOpenLoop(DataModel dataModel) {
     for (Scenario scenario : dataModel.getScenarios()) {
@@ -396,63 +404,100 @@ public class QueryExecutor implements Workload {
         if (openLoop == null) {
           continue;
         }
-        String where = "openLoop of querySet " + position + " of scenario " + scenario.getName();
-        if (!isPositiveInteger(querySet.getConcurrency())) {
-          throw new IllegalArgumentException(where + ": concurrency is not one integer of at"
-            + " least 1: " + querySet.getConcurrency());
-        }
-        List<OpenLoop.Stage> stages = openLoop.getStage();
-        if (stages == null || stages.isEmpty()) {
-          throw new IllegalArgumentException(where + ": no stage");
-        }
-        // Because the schedule operates in microseconds (us), the cumulative duration in
-        // microseconds must fit within a long.
-        long totalMs = 0;
-        double expected = 0;
-        for (int i = 0; i < stages.size(); i++) {
-          OpenLoop.Stage stage = stages.get(i);
-          String which = where + ": stage " + (i + 1) + ": ";
-          if (stage.getDurationMs() <= 0) {
-            throw new IllegalArgumentException(
-              which + "durationMs is not positive: " + stage.getDurationMs());
-          }
-          if (stage.getRate() == null) {
-            throw new IllegalArgumentException(which + "rate is absent");
-          }
-          if (!isRate(stage.getRate())) {
-            throw new IllegalArgumentException(
-              which + "rate is negative or not finite: " + stage.getRate());
-          }
-          if (stage.getEndRate() != null && !isRate(stage.getEndRate())) {
-            throw new IllegalArgumentException(
-              which + "endRate is negative or not finite: " + stage.getEndRate());
-          }
-          totalMs += stage.getDurationMs();
-          if (totalMs < 0 || totalMs > Long.MAX_VALUE / 1000) {
-            throw new IllegalArgumentException(which + "durationMs is too large: the total of the"
-              + " stages is more than " + Long.MAX_VALUE / 1000 + " ms");
-          }
-          double endRate = stage.getEndRate() == null ? stage.getRate() : stage.getEndRate();
-          expected += (stage.getRate() + endRate) / 2 * stage.getDurationMs();
-        }
-        if (expected == 0) {
-          throw new IllegalArgumentException(where + ": no arrival, the rate of all stages is 0");
-        }
-        if (openLoop.getArrival() == OpenLoop.Arrival.POISSON && openLoop.getSeed() == null) {
-          throw new IllegalArgumentException(where + ": arrival POISSON requires a seed");
-        }
-        if (openLoop.getMaxLagMs() != null && openLoop.getMaxLagMs() < 0) {
-          throw new IllegalArgumentException(
-            where + ": maxLagMs is negative: " + openLoop.getMaxLagMs());
-        }
-        if (openLoop.getMaxLagMs() != null && openLoop.getMaxLagMs() > Long.MAX_VALUE / 1000) {
-          throw new IllegalArgumentException(where + ": maxLagMs is more than "
-            + Long.MAX_VALUE / 1000 + ": " + openLoop.getMaxLagMs());
-        }
-        if (openLoop.getLagPolicy() == OpenLoop.LagPolicy.DROP && openLoop.getMaxLagMs() == null) {
-          throw new IllegalArgumentException(where + ": lagPolicy DROP requires maxLagMs");
-        }
+        // Execute the three checks in the original condition order so that the first reported
+        // validation error message remains unchanged.
+        String where = openLoopWhere(position, scenario);
+        checkOpenLoopRates(where, querySet);
+        checkArrivalSeed(where, openLoop);
+        checkOpenLoopLag(where, openLoop);
       }
+    }
+  }
+
+  /**
+   * Formats the location prefix used in open-loop validation messages for a single query set, where
+   * query set positions start at 1.
+   */
+  public static String openLoopWhere(int position, Scenario scenario) {
+    return "openLoop of querySet " + position + " of scenario " + scenario.getName();
+  }
+
+  /**
+   * Validates the concurrency setting and stage definitions for the open-loop schedule of a query
+   * set.
+   * @throws IllegalArgumentException with a message starting with where that identifies the
+   *                                  offending attribute
+   */
+  public static void checkOpenLoopRates(String where, QuerySet querySet) {
+    if (!isPositiveInteger(querySet.getConcurrency())) {
+      throw new IllegalArgumentException(where + ": concurrency is not one integer of at"
+        + " least 1: " + querySet.getConcurrency());
+    }
+    List<OpenLoop.Stage> stages = querySet.getOpenLoop().getStage();
+    if (stages == null || stages.isEmpty()) {
+      throw new IllegalArgumentException(where + ": no stage");
+    }
+    // Because the schedule operates in microseconds (us), the total duration in microseconds must
+    // fit within a 64-bit long.
+    long totalMs = 0;
+    double expected = 0;
+    for (int i = 0; i < stages.size(); i++) {
+      OpenLoop.Stage stage = stages.get(i);
+      String which = where + ": stage " + (i + 1) + ": ";
+      if (stage.getDurationMs() <= 0) {
+        throw new IllegalArgumentException(
+          which + "durationMs is not positive: " + stage.getDurationMs());
+      }
+      if (stage.getRate() == null) {
+        throw new IllegalArgumentException(which + "rate is absent");
+      }
+      if (!isRate(stage.getRate())) {
+        throw new IllegalArgumentException(
+          which + "rate is negative or not finite: " + stage.getRate());
+      }
+      if (stage.getEndRate() != null && !isRate(stage.getEndRate())) {
+        throw new IllegalArgumentException(
+          which + "endRate is negative or not finite: " + stage.getEndRate());
+      }
+      totalMs += stage.getDurationMs();
+      if (totalMs < 0 || totalMs > Long.MAX_VALUE / 1000) {
+        throw new IllegalArgumentException(which + "durationMs is too large: the total of the"
+          + " stages is more than " + Long.MAX_VALUE / 1000 + " ms");
+      }
+      double endRate = stage.getEndRate() == null ? stage.getRate() : stage.getEndRate();
+      expected += (stage.getRate() + endRate) / 2 * stage.getDurationMs();
+    }
+    if (expected == 0) {
+      throw new IllegalArgumentException(where + ": no arrival, the rate of all stages is 0");
+    }
+  }
+
+  /**
+   * Validates that an open-loop configuration using a POISSON arrival process specifies a seed.
+   * @throws IllegalArgumentException with a message starting with where when the seed is missing
+   */
+  public static void checkArrivalSeed(String where, OpenLoop openLoop) {
+    if (openLoop.getArrival() == OpenLoop.Arrival.POISSON && openLoop.getSeed() == null) {
+      throw new IllegalArgumentException(where + ": arrival POISSON requires a seed");
+    }
+  }
+
+  /**
+   * Validates the maximum lag threshold and lag policy of an open-loop configuration.
+   * @throws IllegalArgumentException with a message starting with where that identifies the
+   *                                  offending attribute
+   */
+  public static void checkOpenLoopLag(String where, OpenLoop openLoop) {
+    if (openLoop.getMaxLagMs() != null && openLoop.getMaxLagMs() < 0) {
+      throw new IllegalArgumentException(
+        where + ": maxLagMs is negative: " + openLoop.getMaxLagMs());
+    }
+    if (openLoop.getMaxLagMs() != null && openLoop.getMaxLagMs() > Long.MAX_VALUE / 1000) {
+      throw new IllegalArgumentException(
+        where + ": maxLagMs is more than " + Long.MAX_VALUE / 1000 + ": " + openLoop.getMaxLagMs());
+    }
+    if (openLoop.getLagPolicy() == OpenLoop.LagPolicy.DROP && openLoop.getMaxLagMs() == null) {
+      throw new IllegalArgumentException(where + ": lagPolicy DROP requires maxLagMs");
     }
   }
 
@@ -485,23 +530,32 @@ public class QueryExecutor implements Workload {
       int position = 0;
       for (QuerySet querySet : scenario.getQuerySet()) {
         position++;
-        if (querySet.getMix() == null) {
-          continue;
-        }
-        String where = "mix of querySet " + position + " of scenario " + scenario.getName()
-          + (querySet.getProfile() == null ? "" : " (profile " + querySet.getProfile() + ")");
-        if (querySet.getOpenLoop() == null) {
-          throw new IllegalArgumentException(
-            where + ": a mix needs an openLoop; the closed loop runs each query in turn");
-        }
-        Map<Query.Kind, Integer> weights = weights(where, querySet.getMix());
-        Map<Query.Kind, List<Integer>> queries =
-          queriesByKind(where, weights, querySet, scenario.getName());
-        for (Map.Entry<Query.Kind, List<Integer>> entry : queries.entrySet()) {
-          if (entry.getValue().isEmpty()) {
-            throw new IllegalArgumentException(where + ": no query of kind " + entry.getKey());
-          }
-        }
+        checkMix(scenario, position, querySet);
+      }
+    }
+  }
+
+  /**
+   * Validates the operation mix configuration of a single query set using the rules enforced by
+   * {@link #checkMix(DataModel)}, where query set positions start at 1.
+   * @throws IllegalArgumentException identifying the scenario, the query set, and the profile
+   */
+  public static void checkMix(Scenario scenario, int position, QuerySet querySet) {
+    if (querySet.getMix() == null) {
+      return;
+    }
+    String where = "mix of querySet " + position + " of scenario " + scenario.getName()
+      + (querySet.getProfile() == null ? "" : " (profile " + querySet.getProfile() + ")");
+    if (querySet.getOpenLoop() == null) {
+      throw new IllegalArgumentException(
+        where + ": a mix needs an openLoop; the closed loop runs each query in turn");
+    }
+    Map<Query.Kind, Integer> weights = weights(where, querySet.getMix());
+    Map<Query.Kind, List<Integer>> queries =
+      queriesByKind(where, weights, querySet, scenario.getName());
+    for (Map.Entry<Query.Kind, List<Integer>> entry : queries.entrySet()) {
+      if (entry.getValue().isEmpty()) {
+        throw new IllegalArgumentException(where + ": no query of kind " + entry.getKey());
       }
     }
   }

@@ -38,6 +38,9 @@ mvn clean package -DskipTests
 - -rowCountOverride [number of rows] _Specify number of rows to be upserted rather than using row count specified in schema_ </br>
 - -runDurationMs [ms], -threadCount [n], -targetRate [ops/s] _Overrides the execution duration,
   concurrency, and peak arrival rate of every query set at launch (see Launch overrides)._ <br />
+- -validate _Validates the scenario files offline without establishing a database connection and
+  exits with status 0 when no findings are reported or 65 when a validation rule fails (see
+  Validation)._ <br />
 - -connectionCache _Reuses connections through a cache holding at most pherf.default.threadpool
   idle connections. Each connection serves only operations with the same URL and connection
   properties (and therefore the same tenant and connection properties), allowing query sets and DDL
@@ -204,25 +207,27 @@ and the invalid value:
   which begins at 0 in each process. Separate processes generate disjoint keys only when their
   offsets are separated by at least the total number of rows written per process (including rows
   written by `writeParams` writers) and the primary key includes a column that yields distinct
-  values for every row index across the two ranges. Pherf does not enforce or validate this
-  requirement; for example, a SEQUENTIAL VARCHAR column wraps and repeats after 10 to the power of
-  its unprefixed length (its length without the prefix).
+  values for every row index across the two ranges. A standard execution does not verify this
+  requirement; `-validate` verifies that the offset ranges of co-generated scenarios targeting the
+  same table within a single run are disjoint, but it cannot inspect other processes or prove that
+  a subsequent key column produces unique values. For example, a SEQUENTIAL VARCHAR column wraps
+  and repeats after 10 to the power of its unprefixed length (its length without the prefix).
 * `blockSize` (default 1000, minimum 1): specifies the number of rows in a single writer block.
   Each block constitutes a single commit batch and never crosses an integer multiple of
   `blockSize`. The execution duration limit configured on `writeParams` is evaluated at block
   boundaries.
 * `clusterLimit` (omitted for no clustering, otherwise at least 1): caps the maximum number of
   distinct values generated for the leading primary key column within each block. Pherf determines
-  the leading column from the primary key metadata. Specifying a value smaller than `blockSize` on
-  a single-column primary key fails validation. In addition, the primary key must contain a
+  the leading column from the primary key metadata. Specifying a value below `blockSize` on a
+  single-column primary key fails validation. In addition, the primary key must contain a
   subsequent column that produces a unique value for each row index (such as a SEQUENTIAL column);
   otherwise, generated rows will collide.
 * `watermark`: controls when written rows become visible to readers. `COMMIT` (the default) exposes
   each block immediately after it is committed, whereas `LOAD` defers visibility until all writers
   in the data load phase have completed.
 * `walk`: selects the order in which readers traverse committed rows. `MULTIPLICATIVE` (the
-  default) visits committed rows in a hashed sequence using a stride coprime to the row count so
-  that each pass visits every row exactly once before repeating any row, whereas `SEQUENTIAL`
+  default) visits committed rows in a hashed sequence using a stride coprime to the number of rows
+  so that each pass reads every row once before reading any row again, whereas `SEQUENTIAL`
   traverses rows in ascending index order.
 
 Column rules retain their standard semantics, subject to the following differences from the
@@ -247,16 +252,17 @@ traditional rule-based generators:
 Read and write coordination behavior:
 
 * A data load (`-l`) writes rows starting at index 0. An execution invoked without a data load
-  (such as `-q` by itself) reads across the `rowCount` rows that a data load of the same scenario
-  would produce. Because this range is assumed rather than observed from live commits, the prior
-  load must have run to completion with identical settings and `rowCount`; otherwise, point lookups
-  return no matching rows without reporting an error, and the validator must be used to confirm the
-  results. Configuring `rowCount="0"` in such a run leaves no rows available to read, causing every
-  read to fail. Concurrent writers configured via `writeParams` append new rows at indexes above
-  that initial range.
-* All placeholders within a single statement are resolved from the same row index, ensuring that a
-  point query receives a complete, consistent primary key for one row. A statement draws a row
-  index only when it contains at least one placeholder associated with a column rule.
+  (such as `-q` alone) reads across the `rowCount` rows that a data load of the same scenario would
+  produce. Because this range is assumed rather than observed from live commits, the prior load
+  must have run to completion with identical settings and `rowCount`; otherwise, point lookups
+  return no matching rows without reporting an error. The `-validate` option checks read operations
+  against this assumed start state (see Validation), but because it operates without database
+  access, it cannot confirm that the prior load actually took place. Configuring `rowCount="0"` in
+  such a run leaves no rows available to read, causing every read to fail. Concurrent writers
+  configured via `writeParams` append new rows at indexes above that initial range.
+* All placeholders within a single statement are resolved from the same row, ensuring that a point
+  query receives the complete, consistent primary key for a single row. A statement draws a row
+  only when it contains at least one placeholder associated with a column rule.
 * Under closed-loop execution, thread i at concurrency level C reads exclusively from row indexes
   matching i mod C, so concurrent reader threads access disjoint sets of rows. Under open-loop
   execution, worker threads share a single traversal sequence across the query set: a complete pass
@@ -459,6 +465,128 @@ requires `-rowCountOverride 10000` or greater.
 These files are not packaged inside the JAR, and resource discovery does not scan
 `config/reference`, so `-listFiles`, regex patterns passed to `-scenarioFile`, and default schema
 application do not locate them.
+
+### Validation
+The `-validate` option validates the configured `-scenarioFile` files, their referenced workload
+profiles, and the DDL statements of the run offline, and then exits immediately. It establishes no
+database connection and performs no other execution phase—neither dropping tables, applying
+schemas, loading data, nor executing queries.
+
+`bin/pherf-standalone.py -validate -disableSchemaApply -scenarioFile phoenix-pherf/config/reference/relational_scenario.xml`
+
+* Recognized options: `-scenarioFile` (required), `-label` (specifying the report name),
+  `-schemaFile` (or the default schema files when omitted), `-disableSchemaApply` (disabling schema
+  file loading), and `-rowCountOverride`. All other execution options and launch overrides are
+  ignored.
+* Exit codes: returns 0 when all validation rules pass; returns 65 (EX_DATAERR) when any validation
+  rule fails; returns 1, consistent with all other Pherf errors, for an invalid invocation or when
+  no matching scenario or schema file is found.
+* Output: emits one line per finding formatted as `<rule> <file>[:<line>] <where>: <message>`,
+  followed by a summary line. It also writes the JSON report `VALIDATION_<label>.json` to the
+  directory configured by `pherf.default.results.dir`, containing the top-level fields `format`
+  ("pherf-validation"), `version` (1, incremented only for backward-incompatible schema changes
+  that an older reader cannot parse), `label`, `files` (listing the scenario and profile files),
+  `schemaFiles`, `errors`, and `findings`, where each finding entry contains `rule`, `file`, `line`
+  (populated for structural rules only), `where`, and `message`.
+* DDL resolution: table definitions are collected first from the schema files that the run would
+  apply—discovered and read as single statements by the standard schema reader—and subsequently
+  from the `preScenarioDdls` declared on the scenarios. Only CREATE TABLE statements define tables,
+  and when a table is defined multiple times, the first definition takes precedence.
+* Parser compatibility: runtime XML parsing behavior remains unchanged and continues to ignore
+  unknown elements and attributes so that existing working scenarios continue to execute without
+  modification; only the validator reports unrecognized XML constructs.
+
+All validation rules execute in a single pass, and each rule reports every configuration object
+that violates it. Whenever a validation check corresponds to a check also enforced during a live
+run, the validator produces the same diagnostic message as the runtime check. The rule identifiers
+are stable and do not change:
+
+| Rule | Applies to | Fails when |
+|---|---|---|
+| `xml.parse` | each file | The XML file is not well-formed, contains a DTD declaration, cannot be
+read, or declares an unexpected root element. |
+| `xml.unknown-element` | each file | An XML element is not recognized by the Pherf schema model at
+its current position; the nested content of the unknown element is not inspected further. |
+| `xml.unknown-attribute` | each file | An XML attribute is not defined in the Pherf model,
+although standard `xsi:` and `xml:` namespace attributes are permitted. |
+| `xml.value` | each file | A configured value cannot be parsed as its expected target type—whether
+an enumeration constant (which must match exactly), a boolean, or a numeric value—where the runtime
+parser otherwise treats an invalid enum value as absent, an invalid boolean as false, and an
+invalid element number as 0, while failing only on an invalid attribute number. This rule also
+fails when a required runtime value is missing (such as a scenario name, or the statement or table
+name on a `ddl` element), in which case subsequent rules are skipped for that object. |
+| `xml.profile` | each profile reference | The referenced workload profile conflicts with an inline
+openLoop or mix definition on the query set, or the profile itself omits an openLoop
+configuration. |
+| `query.kind` | each query | The query `kind` attribute is not one of SELECT, SCAN, or DELETE. |
+| `queryset.warmup` | each query set | The configured `warmupExecutions` count is negative. |
+| `openloop.rate` | each open loop | The open-loop concurrency, a stage definition, the target
+arrival rates, the total schedule duration, or the scheduling lag limit is invalid. |
+| `openloop.seed` | each open loop | A POISSON arrival distribution is configured without a seed. |
+| `openloop.mix` | each mix | The operation mix violates a runtime mix validation rule. |
+| `predicate.parse` | each statement | The SQL statement fails to parse after column placeholder
+substitution is performed. |
+| `predicate.casing` | each statement | A placeholder matches a column rule only under a different
+character case (which would cause the runtime to leave the raw placeholder unsubstituted in the
+statement), or a double-quoted column identifier matches a DDL column definition only under a
+different case. |
+| `key.coverage` | co-generation | A primary key column has no matching data generation rule; a
+point lookup binds primary key columns on both sides of an intermediate key column that is not
+bound to its own placeholder (via `K = [K]`, `K IN ([K])`, or `(K1, K2) = ([K1], [K2])`), causing
+the query to scan across all values of that omitted key column; or a column belonging to the
+scenario table is compared against the placeholder of a different column. Queries that filter on a
+non-key column, on a leading prefix of the primary key, or against another table remain valid
+because the decoder binds every placeholder from the single drawn row. |
+| `cogen.settings` | co-generation | An attribute on the `coGeneration` element is invalid. |
+| `cogen.walk` | co-generation | At the assumed start state, a point reader, scan, or delete
+operation receives an empty partition share of rows or blocks, or a multiplicative walk stride is
+not coprime to its window size. Because no user setting directly specifies the stride and the walk
+generator constructs each stride to be coprime, the coprimality check serves as an internal
+safeguard against a defect in the walk implementation. |
+| `cogen.writer-blocks` | co-generation | The configured `clusterLimit` is smaller than `blockSize`
+on a table with a single-column primary key, which causes rows generated within the same writer
+block to overwrite one another. |
+| `cogen.offsets` | co-generation | Two scenarios in the same run write overlapping row index
+ranges `[offset, offset + rowCount)` to the same target table (where scenarios configured with
+`writeParams` have an unbounded upper range), or a computed row index range overflows. |
+| `cogen.watermark` | co-generation | Two co-generated scenarios share the same scenario name,
+causing them to share a single row cursor so that the second data load resets the watermark of the
+first. |
+| `cogen.range` | co-generation | The range check of the SCAN and DELETE statement decoder fails. |
+| `predicate.in-list` | co-generation | An IN list contains two or more elements with placeholders
+(since a single statement binds values from only one row), a SCAN or DELETE statement contains an
+IN list with a placeholder, or an IN list element is not a constant expression. |
+| `predicate.row-value` | co-generation | A SCAN or DELETE statement contains a row value
+constructor with a placeholder, or an `=`, `!=`, or IN list predicate compares row value
+constructors of different arities, which causes Phoenix to compare each trailing extra element
+against NULL. An inequality comparison between row value constructors of different arities compares
+only their common prefix and is therefore valid. |
+| `predicate.range-bounds` | co-generation | The first occurrence of the range placeholder does not
+form an inclusive lower bound or the second occurrence does not form an inclusive upper bound,
+where each bound must appear as a top-level AND conjunct. These bounds always compare logical
+column values, even when the key column is declared with DESC sort order. |
+
+To ensure that a single underlying defect produces only one finding, any rule that depends on the
+output of a prerequisite rule is skipped whenever that prerequisite fails: a file that fails XML
+parsing undergoes no further rule evaluation, co-generation rules that depend on valid settings are
+skipped when `cogen.settings` fails, SQL parse-dependent rules are skipped when `predicate.parse`
+fails, and `cogen.range` executes only after all other statement-level rules pass. Similarly, rules
+that require the DDL metadata of a scenario table are skipped without reporting a finding when the
+run contains no CREATE TABLE statement for that table.
+
+For co-generated scenarios, the validator evaluates the initial steady-state condition of the run
+in which the commit watermark equals the configured row count—representing both the state
+immediately following a complete data load and the state assumed by a query-only run executed
+without a load. Against this start state, the validator verifies that every reader partition share
+and scan window share is non-empty, that range constraints hold across the configured row count,
+and that the offset ranges of scenarios within the run are mutually disjoint, applying
+`-rowCountOverride` in the same manner as a live execution. Because the validator operates offline
+without database access, it cannot verify that a prior data load ran to completion with the same
+seed, offset, row count, column rules, block size, and cluster limit, that no prior DELETE workload
+or external writer modified the rows, what rows were appended by `writeParams` writers in earlier
+runs, or whether the current invocation includes a data load. Likewise, it does not model dynamic
+row growth produced by concurrent `writeParams` writers during execution, nor can it prove that a
+subsequent primary key column governed by a RANDOM or LIST rule produces unique values.
 
 ## Results
 Results are written real time in _results_ directory. Open the result that is saved in .jpg format for real time
