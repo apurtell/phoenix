@@ -66,10 +66,11 @@ operation identifier follows the `<kind>:<scenario>:<name>` format:
 
 | Kind | Name | One sample |
 |---|---|---|
-| `query` | query id | Tracks one query set execution from connection to last row (service time). |
-| `response` | query id | Tracks open-loop `steady` response time from dispatch time to last row. |
-| `load` | table name | Tracks a single batch committed during the data load phase. |
-| `operation` | operation group id | Tracks one upsert, query, or pre-run DDL in a load profile. |
+| `query` | query id | One execution of a query of a query set, from the connection to the last row. On an open loop query set this is the service time. |
+| `scan`, `delete` | query id | One execution of a query of a query set with `kind="SCAN"` or `kind="DELETE"`, as for `query`. A DELETE ends at its commit. |
+| `response` | query id | Open loop query sets only, phase `steady` only: the response time of one execution, from its intended dispatch time to the last row. It is the lag (the wait from the intended time until a worker took the operation) plus the service time, so `response` minus `query` is the client queueing delay. |
+| `load` | table name | One committed batch of the data load. |
+| `operation` | operation group id | One upsert, query, SCAN, DELETE or pre-run DDL operation of a load profile. |
 
 Failed operations are omitted from recording and produce no sample. Similarly, idle intervals and
 user-defined operations in a load profile are excluded because they do not measure database work. A

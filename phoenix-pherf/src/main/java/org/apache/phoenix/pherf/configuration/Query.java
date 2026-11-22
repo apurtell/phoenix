@@ -35,6 +35,19 @@ public class Query {
   private boolean useGlobalConnection;
   private Pattern pattern;
   private long timeoutDuration = Long.MAX_VALUE;
+  private String kind;
+
+  /**
+   * Defines the operation type of a query. SELECT executes a point query, whereas SCAN reads and
+   * DELETE removes the rows falling between two bounds. For range operations, the SQL statement
+   * references its range column placeholder twice: first for the lower bound and second for the
+   * upper bound.
+   */
+  public enum Kind {
+    SELECT,
+    SCAN,
+    DELETE
+  }
 
   public Query() {
     pattern = Pattern.compile("\\[.*?\\]");
@@ -163,5 +176,46 @@ public class Query {
 
   public void setTimeoutDuration(long timeoutDuration) {
     this.timeoutDuration = timeoutDuration;
+  }
+
+  /**
+   * Returns the text of the optional kind attribute (SELECT, SCAN, or DELETE), where an omitted
+   * attribute defaults to SELECT.
+   */
+  @XmlAttribute
+  public String getKind() {
+    return kind;
+  }
+
+  public void setKind(String kind) {
+    this.kind = kind;
+  }
+
+  /**
+   * Resolves and returns the operation kind configured for this query.
+   * @throws IllegalArgumentException identifying the query if the attribute has an invalid value.
+   */
+  public Kind kind() {
+    if (kind == null) {
+      return Kind.SELECT;
+    }
+    try {
+      return Kind.valueOf(kind.trim());
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+        "kind of query " + getId() + " is not SELECT, SCAN or DELETE: '" + kind + "'", e);
+    }
+  }
+
+  /**
+   * Resolves and returns the operation kind configured for this query within the given scenario.
+   * @throws IllegalArgumentException naming the scenario and the query if the value is invalid.
+   */
+  public Kind kind(String scenarioName) {
+    try {
+      return kind();
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("scenario " + scenarioName + ": " + e.getMessage(), e);
+    }
   }
 }

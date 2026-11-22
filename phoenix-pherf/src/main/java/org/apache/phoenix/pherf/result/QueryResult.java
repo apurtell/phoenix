@@ -53,6 +53,7 @@ public class QueryResult extends Query {
     this.setQueryGroup(query.getQueryGroup());
     this.setId(query.getId());
     this.setTimeoutDuration(query.getTimeoutDuration());
+    this.setKind(query.getKind());
   }
 
   public Date getStartTime() {

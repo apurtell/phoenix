@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- Range SCAN and DELETE on a mini cluster: 300 rows in blocks of 100, and at most 7 values of the
+     leading key K1 in each block. K2 is unique for each row index. One SCAN and then one DELETE run
+     with the bounds of one block each. -->
+<datamodel name="range">
+    <datamapping>
+        <column>
+            <type>BIGINT</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000000</maxValue>
+            <name>K1</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000000</maxValue>
+            <name>K2</name>
+        </column>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <length>12</length>
+            <prefix>v</prefix>
+            <name>V</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.COGEN_RANGE" rowCount="300" name="range">
+            <coGeneration seed="5" blockSize="100" clusterLimit="7"/>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="1"
+                      executionDurationInMs="600000">
+                <query id="rangeScan" kind="SCAN"
+                       statement="SELECT K2 FROM PHERF.COGEN_RANGE WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+                <query id="rangeDelete" kind="DELETE"
+                       statement="DELETE FROM PHERF.COGEN_RANGE WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>

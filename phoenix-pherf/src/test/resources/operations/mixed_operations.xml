@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- One load profile that mixes the six operation types. The SEQUENTIAL generator with one handler
+     runs the operations in turn, so 12 operations run each type twice. This directory is outside
+     the scenario directory, so the checks of all scenario fixtures do not read this file. -->
+<datamodel name="mixed_operations">
+    <datamapping>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000</maxValue>
+            <name>K1</name>
+        </column>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <length>8</length>
+            <name>V</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.MIXED" name="mixed" generatorName="SEQUENTIAL">
+            <loadProfile>
+                <batchSize>1</batchSize>
+                <numOperations>12</numOperations>
+                <tenantDistribution id="tg1" numTenants="1"></tenantDistribution>
+                <opDistribution id="upsertOp"></opDistribution>
+                <opDistribution id="queryOp"></opDistribution>
+                <opDistribution id="scanOp"></opDistribution>
+                <opDistribution id="deleteOp"></opDistribution>
+                <opDistribution id="idleOp"></opDistribution>
+                <opDistribution id="udfOp"></opDistribution>
+            </loadProfile>
+            <upserts>
+                <upsert id="upsertOp">
+                    <column>
+                        <type>INTEGER</type>
+                        <name>K1</name>
+                    </column>
+                    <column>
+                        <type>VARCHAR</type>
+                        <name>V</name>
+                    </column>
+                </upsert>
+            </upserts>
+            <querySet>
+                <query id="queryOp" statement="SELECT V FROM PHERF.MIXED WHERE K1 = 1"/>
+                <query id="scanOp" kind="SCAN"
+                       statement="SELECT V FROM PHERF.MIXED WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+                <query id="deleteOp" kind="DELETE"
+                       statement="DELETE FROM PHERF.MIXED WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+            </querySet>
+            <idleTimes>
+                <idleTime id="idleOp" idleTime="1"></idleTime>
+            </idleTimes>
+            <udfs>
+                <udf id="udfOp">
+                    <clazzName>org.apache.phoenix.pherf.ConfigurationParserTest.TestUDF</clazzName>
+                </udf>
+            </udfs>
+        </scenario>
+    </scenarios>
+</datamodel>

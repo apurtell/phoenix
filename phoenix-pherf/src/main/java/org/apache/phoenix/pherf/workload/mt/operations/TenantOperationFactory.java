@@ -138,12 +138,23 @@ public class TenantOperationFactory {
         new UpsertOperationSupplier(phoenixUtil, model, scenario));
     }
 
-    // Case : Operation.OperationType.SELECT
+    // Case : Operation.OperationType.SELECT, SCAN, and DELETE, resolved according to each query's
+    // configured kind.
     List<Operation> queryOperations = getQueryOperationsForScenario(scenario);
-    if (queryOperations.size() > 0) {
-      operationList.addAll(queryOperations);
-      operationSuppliers.put(Operation.OperationType.SELECT,
-        new QueryOperationSupplier(phoenixUtil, model, scenario));
+    operationList.addAll(queryOperations);
+    // All SCAN and DELETE operations within the scenario share a single range operation supplier.
+    RangeOperationSupplier rangeSupplier =
+      queryOperations.stream().anyMatch(op -> op.getType() != Operation.OperationType.SELECT)
+        ? new RangeOperationSupplier(phoenixUtil, model, scenario)
+        : null;
+    for (Operation operation : queryOperations) {
+      Operation.OperationType type = operation.getType();
+      if (type == Operation.OperationType.SELECT) {
+        operationSuppliers.computeIfAbsent(type,
+          t -> new QueryOperationSupplier(phoenixUtil, model, scenario));
+      } else {
+        operationSuppliers.put(type, rangeSupplier);
+      }
     }
 
     // Case : Operation.OperationType.IDLE_TIME
@@ -191,6 +202,7 @@ public class TenantOperationFactory {
     List<Operation> opList = Lists.newArrayList();
     for (final QuerySet querySet : scenario.getQuerySet()) {
       for (final Query query : querySet.getQuery()) {
+        final Operation.OperationType type = operationType(scenario, query);
         Operation queryOp = new QueryOperation() {
           @Override
           public Query getQuery() {
@@ -204,13 +216,22 @@ public class TenantOperationFactory {
 
           @Override
           public OperationType getType() {
-            return OperationType.SELECT;
+            return type;
           }
         };
         opList.add(queryOp);
       }
     }
     return opList;
+  }
+
+  /**
+   * Resolves the operation type corresponding to the configured kind of a query.
+   * @throws IllegalArgumentException identifying the scenario and query when the query kind is
+   *                                  invalid
+   */
+  private static Operation.OperationType operationType(Scenario scenario, Query query) {
+    return Operation.OperationType.valueOf(query.kind(scenario.getName()).name());
   }
 
   private List<Operation> getIdleTimeOperationsForScenario(Scenario scenario) {

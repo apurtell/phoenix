@@ -156,6 +156,7 @@ public class QueryExecutor implements Workload {
   protected Callable<Void> executeAllScenarios(final DataModel dataModel) throws Exception {
     checkWarmupExecutions(dataModel);
     checkOpenLoop(dataModel);
+    checkKinds(dataModel);
     return new Callable<Void>() {
       @Override
       public Void call() throws Exception {
@@ -276,9 +277,10 @@ public class QueryExecutor implements Workload {
       querySetResult.getQueryResults().add(queryResult);
       runners.add((MultiThreadedRunner) executeRunner("1," + concurrency, dataModelResult,
         queryResult, querySetResult, scenario));
-      // Construct the operation keys before starting worker threads, because the first call to
-      // getId() may lazily initialize the query identifier.
-      services.add("query:" + scenario.getName() + ":" + queryResult.getId());
+      // Construct the operation keys before starting the worker threads, because the first call to
+      // getId() may lazily generate the query identifier.
+      services.add(MultiThreadedRunner.latencyOperation(queryResult.kind(), scenario.getName(),
+        queryResult.getId()));
       responses.add("response:" + scenario.getName() + ":" + queryResult.getId());
     }
     final int queries = runners.size();
@@ -438,6 +440,20 @@ public class QueryExecutor implements Workload {
         }
         if (openLoop.getLagPolicy() == OpenLoop.LagPolicy.DROP && openLoop.getMaxLagMs() == null) {
           throw new IllegalArgumentException(where + ": lagPolicy DROP requires maxLagMs");
+        }
+      }
+    }
+  }
+
+  /**
+   * Validates the kind of every query in the data model before any query set begins execution.
+   * @throws IllegalArgumentException identifying the scenario and query when validation fails
+   */
+  static void checkKinds(DataModel dataModel) {
+    for (Scenario scenario : dataModel.getScenarios()) {
+      for (QuerySet querySet : scenario.getQuerySet()) {
+        for (Query query : querySet.getQuery()) {
+          query.kind(scenario.getName());
         }
       }
     }

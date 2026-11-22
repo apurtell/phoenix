@@ -24,10 +24,12 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import org.apache.phoenix.pherf.configuration.CoGeneration;
 import org.apache.phoenix.pherf.configuration.CoGeneration.WalkStrategy;
 import org.apache.phoenix.pherf.configuration.CoGeneration.WatermarkPolicy;
 import org.apache.phoenix.pherf.configuration.DataModel;
+import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.rules.IndexHash;
@@ -59,6 +61,7 @@ public final class CoGenerator {
   private final RulesApplier rules;
   private final RowCursor cursor;
   private IndexDecoder decoder;
+  private String leadingKey;
 
   private CoGenerator(DataModel model, Scenario scenario, Settings settings) {
     this.scenario = scenario;
@@ -130,11 +133,14 @@ public final class CoGenerator {
   }
 
   /**
-   * Identifies the primary key column at KEY_SEQ 1 for the scenario table. Because a cluster limit
-   * smaller than the block size produces repeated leading column values within a block, the primary
-   * key must contain at least one subsequent column.
+   * Identifies and caches the primary key column at KEY_SEQ 1 for the scenario table on first read.
+   * Because a cluster limit smaller than the block size produces repeated leading column values
+   * within a block, the primary key must include at least one subsequent column.
    */
-  private String leadingKey(Connection connection) throws SQLException {
+  private synchronized String leadingKey(Connection connection) throws SQLException {
+    if (leadingKey != null) {
+      return leadingKey;
+    }
     String schema = scenario.getSchemaName();
     String table = scenario.getTableNameWithoutSchemaName();
     String leading = null;
@@ -153,11 +159,14 @@ public final class CoGenerator {
       throw new IllegalStateException(
         where + " needs a primary key, and table " + scenario.getTableName() + " has none");
     }
-    if (columns == 1 && settings.clusterLimit < settings.blockSize) {
+    if (
+      columns == 1 && settings.clusterLimit != null && settings.clusterLimit < settings.blockSize
+    ) {
       throw new IllegalArgumentException(where + " is less than blockSize, so rows of a block"
         + " overwrite each other: the primary key of table " + scenario.getTableName()
         + " has only column " + leading);
     }
+    leadingKey = leading;
     return leading;
   }
 
@@ -178,12 +187,13 @@ public final class CoGenerator {
   }
 
   /**
-   * Creates a reader for worker w of W total workers, backed by its own dedicated walk sequence.
+   * Creates a reader for worker w of W total workers, backed by dedicated walk sequences over both
+   * individual rows and block windows.
    */
   public Reader reader(int worker, int workers) {
-    return new Reader(this,
-      new Walk(IndexHash.columnSeed(settings.seed, "#walk"), settings.walk, worker, workers),
-      worker, workers);
+    long walkSeed = IndexHash.columnSeed(settings.seed, "#walk");
+    return new Reader(this, new Walk(walkSeed, settings.walk, worker, workers),
+      new Walk(walkSeed, settings.walk, worker, workers), worker, workers);
   }
 
   /** Encapsulates the co-generation settings for a scenario with all default values applied. */
@@ -248,36 +258,95 @@ public final class CoGenerator {
   }
 
   /**
-   * Coordinates the read operations for a single worker, where each statement draws a row index
-   * from that worker's share of committed rows.
+   * Coordinates read and range operations for a single worker, where each statement draws a target
+   * from the live row range [deleted, committed). Point reads draw an individual row from the
+   * worker's share using one walk sequence, while scans draw a complete window from the worker's
+   * share using a second walk sequence. Both walks skip entries below the delete watermark, so when
+   * no deletes occur, the drawn sequence matches the underlying walk directly. Delete operations
+   * claim the next committed window in order from a cursor shared across all workers.
+   * <p>
+   * A read or scan that completes its draw before a delete claims a window may still access rows in
+   * that window while the delete executes, whereas any draw performed after the claim is guaranteed
+   * never to return those rows.
    */
   public static final class Reader {
     private final CoGenerator generator;
     private final Walk walk;
+    private final Walk windows;
     private final int worker;
     private final int workers;
 
-    private Reader(CoGenerator generator, Walk walk, int worker, int workers) {
+    private Reader(CoGenerator generator, Walk walk, Walk windows, int worker, int workers) {
       this.generator = generator;
       this.walk = walk;
+      this.windows = windows;
       this.worker = worker;
       this.workers = workers;
     }
 
-    /**
-     * Binds the placeholders of a SQL statement using values derived from the next row index in the
-     * walk sequence.
-     * @throws IllegalStateException when the share of this worker contains no committed rows
-     */
+    /** Binds the placeholders of a point SELECT query statement. */
     public String statement(String sql, Connection connection) throws SQLException {
-      return generator.decoder(connection).statement(sql, () -> {
-        long index = walk.next(generator.cursor.watermark());
-        if (index < 0) {
-          throw new IllegalStateException("coGeneration of scenario " + generator.scenario.getName()
-            + ": worker " + worker + " of " + workers + " has no committed row to read");
+      return statement(Query.Kind.SELECT, sql, connection);
+    }
+
+    /**
+     * Binds the placeholders of a SQL statement of the specified kind using a single draw.
+     * @throws IllegalStateException when this worker's share contains no live row or window, or
+     *                               when no committed window remains available to delete
+     */
+    public String statement(Query.Kind kind, String sql, Connection connection)
+      throws SQLException {
+      IndexDecoder decoder = generator.decoder(connection);
+      final RowCursor cursor = generator.cursor;
+      final long rows = generator.scenario.getRowCount();
+      if (kind == Query.Kind.SELECT) {
+        return decoder.statement(sql,
+          () -> draw(walk, cursor::deleted, cursor::watermark, "no committed row to read"));
+      }
+      // Ensure that the range rule does not wrap across the combined row range produced by the
+      // initial data load and any concurrent writeParams writers.
+      String key = generator.leadingKey(connection);
+      long indexes = Math.max(rows, cursor.highWater());
+      if (kind == Query.Kind.SCAN) {
+        return decoder.range(sql, key, indexes, () -> cursor.window(draw(windows,
+          cursor::deletedWindows, () -> cursor.windows(rows), "no committed block to scan"), rows));
+      }
+      return decoder.range(sql, key, indexes, () -> {
+        RowCursor.Block block = cursor.claimDelete(rows);
+        if (block == null) {
+          throw new IllegalStateException(where() + ": no committed block is left to delete");
         }
-        return index;
+        return block;
       });
+    }
+
+    /**
+     * Draws the next value from a walk within the active interval [floor, count). The underlying
+     * walk generates candidate values below count, while this method skips any values that fall
+     * below floor. Both bounds are re-evaluated before each draw attempt. Before each draw, this
+     * method checks that the worker's share within the range is non-empty and throws an
+     * IllegalStateException when it is empty, so skipping terminates within a single pass of the
+     * walk.
+     */
+    private long draw(Walk walk, LongSupplier floor, LongSupplier count, String none) {
+      while (true) {
+        long low = floor.getAsLong();
+        long high = count.getAsLong();
+        // Compute the smallest value belonging to this worker's share that is at least low.
+        long first = low + Math.floorMod(worker - low, (long) workers);
+        if (first >= high) {
+          throw new IllegalStateException(
+            where() + ": worker " + worker + " of " + workers + " has " + none);
+        }
+        long value = walk.next(high);
+        if (value >= low) {
+          return value;
+        }
+      }
+    }
+
+    private String where() {
+      return "coGeneration of scenario " + generator.scenario.getName();
     }
   }
 }

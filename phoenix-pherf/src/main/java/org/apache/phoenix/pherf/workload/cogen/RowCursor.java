@@ -31,8 +31,13 @@ import org.apache.phoenix.pherf.configuration.CoGeneration.WatermarkPolicy;
  * Every claimed block is written, ensuring that no gaps remain below the high-water mark.
  * <p>
  * The watermark marks the end of the contiguous committed prefix. Any block that commits above an
- * uncommitted gap is buffered in a pending map until the intervening gap commits. As a result, the
+ * uncommitted gap is buffered in a pending map until the intervening gap commits. Consequently, the
  * watermark advances monotonically, and every local index below it is guaranteed to be committed.
+ * <p>
+ * The delete watermark marks the end of the contiguous deleted prefix. Delete operations claim
+ * aligned windows of the configured block size sequentially, and a window can be claimed only after
+ * all of its rows have been committed. Thus, the set of live rows always spans the interval
+ * [deleted, watermark), and readers draw exclusively from that range.
  */
 public final class RowCursor {
   /**
@@ -43,7 +48,7 @@ public final class RowCursor {
     public final long start;
     public final long end;
 
-    Block(long start, long end) {
+    public Block(long start, long end) {
       this.start = start;
       this.end = end;
     }
@@ -55,8 +60,9 @@ public final class RowCursor {
 
   private final int blockSize;
   private final AtomicLong next = new AtomicLong();
+  private final AtomicLong deleted = new AtomicLong();
   // Stores committed index ranges above the current watermark, keyed by start index. All accesses
-  // synchronize on this map instance.
+  // must synchronize on this map instance.
   private final Map<Long, Long> pending = new TreeMap<>();
   private volatile long watermark;
 
@@ -103,20 +109,70 @@ public final class RowCursor {
     return watermark;
   }
 
-  /** Returns the high-water mark, representing the total number of local indexes claimed so far. */
+  /**
+   * Returns the delete watermark, representing the number of deleted local indexes such that every
+   * index below this value has been deleted or claimed for deletion.
+   */
+  public long deleted() {
+    return deleted.get();
+  }
+
+  /**
+   * Claims the next aligned window of the block size for deletion, or the remaining rows for the
+   * final partial window. Claiming a window advances the delete watermark before the delete
+   * operation executes, ensuring that no subsequent read or scan draw returns a row from that
+   * window.
+   * @param rows the total number of rows configured for the scenario
+   * @return the claimed window, or null if the next window is not yet fully committed or no windows
+   *         remain
+   */
+  public Block claimDelete(long rows) {
+    while (true) {
+      long d = deleted.get();
+      long e = Math.min(d + blockSize, rows);
+      if (e <= d || e > watermark) {
+        return null;
+      }
+      if (deleted.compareAndSet(d, e)) {
+        return new Block(d, e);
+      }
+    }
+  }
+
+  /**
+   * Returns the number of complete block-sized windows below the committed watermark available for
+   * scan operations.
+   */
+  public long windows(long rows) {
+    long mark = watermark;
+    return mark >= rows ? (rows + blockSize - 1) / blockSize : mark / blockSize;
+  }
+
+  /** Returns the block of row indexes corresponding to window k for a scan operation. */
+  public Block window(long k, long rows) {
+    return new Block(k * blockSize, Math.min((k + 1) * blockSize, rows));
+  }
+
+  /** Returns the number of windows covered by the current delete watermark. */
+  public long deletedWindows() {
+    return (deleted.get() + blockSize - 1) / blockSize;
+  }
+
+  /** Returns the high-water mark, representing the total number of claimed local indexes. */
   public long highWater() {
     return next.get();
   }
 
   /**
-   * Resets both the high-water mark and the committed watermark to start, clearing any pending
-   * blocks prior to a data load.
+   * Resets both the high-water mark and the committed watermark to start, and resets the delete
+   * watermark to 0.
    */
   public void reset(long start) {
     synchronized (pending) {
       pending.clear();
       next.set(start);
       watermark = start;
+      deleted.set(0);
     }
   }
 

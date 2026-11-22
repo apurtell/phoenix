@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~   or more contributor license agreements.  See the NOTICE file
+  ~   distributed with this work for additional information
+  ~   regarding copyright ownership.  The ASF licenses this file
+  ~   to you under the Apache License, Version 2.0 (the
+  ~   "License"); you may not use this file except in compliance
+  ~   with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~   Unless required by applicable law or agreed to in writing, software
+  ~   distributed under the License is distributed on an "AS IS" BASIS,
+  ~   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~   See the License for the specific language governing permissions and
+  ~   limitations under the License.
+  -->
+
+<!-- Range SCAN and DELETE with co-generation: 20 rows in blocks of 5. The first query set scans 4
+     blocks, the second deletes 2 blocks, the third reads 10 rows. K1 is the range column. The other
+     columns are for the decoder tests, which change the rows and the block settings. -->
+<datamodel name="cogen_range">
+    <datamapping>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K1</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K2</name>
+        </column>
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <length>8</length>
+            <prefix>v</prefix>
+            <name>V</name>
+        </column>
+        <column>
+            <type>BIGINT</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000000000</maxValue>
+            <name>KB</name>
+        </column>
+        <column>
+            <type>DATE</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <name>D</name>
+        </column>
+        <!-- Rules that a range column must not have. -->
+        <column>
+            <type>VARCHAR</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <length>6</length>
+            <name>VS</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>49</maxValue>
+            <name>W</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <nullChance>10</nullChance>
+            <name>N</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>100</maxValue>
+            <name>R</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.COGEN_RANGE" rowCount="20" name="cogenRange">
+            <coGeneration seed="11" blockSize="5"/>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="4"
+                      executionDurationInMs="600000">
+                <query id="scan" kind="SCAN"
+                       statement="SELECT K2 FROM PHERF.COGEN_RANGE WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+            </querySet>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="2"
+                      executionDurationInMs="600000">
+                <query id="delete" kind="DELETE"
+                       statement="DELETE FROM PHERF.COGEN_RANGE WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+            </querySet>
+            <querySet concurrency="1" executionType="SERIAL" numberOfExecutions="10"
+                      executionDurationInMs="600000">
+                <query id="lookup"
+                       statement="SELECT V FROM PHERF.COGEN_RANGE WHERE K1 = [K1] AND K2 = [K2]"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>

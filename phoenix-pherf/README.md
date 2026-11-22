@@ -272,6 +272,57 @@ Read and write coordination behavior:
 * Every scenario configured with `coGeneration` must have a unique scenario name across all data
   models included in the run.
 
+### SCAN and DELETE operations
+Configuring a query with `kind="SCAN"` reads the rows falling between two bounds, while configuring
+`kind="DELETE"` removes the rows within those bounds. A query that omits this attribute or specifies
+`kind="SELECT"` continues to execute as a point query. Supplying any other value aborts the run
+before any query set starts, reporting the scenario, the query, and the invalid value in the error
+message. The query statement must reference its range column placeholder twice: the first occurrence
+specifies the lower bound and the second specifies the upper bound.
+
+```
+
+<querySet concurrency="1" executionType="SERIAL" numberOfExecutions="10">
+    <query id="scan" kind="SCAN" statement="SELECT V FROM PHERF.T WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+    <query id="delete" kind="DELETE" statement="DELETE FROM PHERF.T WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+</querySet>
+
+```
+
+* Under standard rule-based generation, both occurrences of the range placeholder receive the same
+  generated value from the rule, so a SCAN reads and a DELETE removes the rows matching a single
+  leading key value. Every other placeholder in the statement appears once.
+* With `coGeneration`, each statement draws a single block representing an aligned window of
+  `blockSize` row indexes, or the remaining rows in the final window. The lower bound is set to the
+  value of the block's first row and the upper bound to the value of its last row, ensuring that the
+  bounds enclose the exact rows of the block, including when `clusterLimit` is active. The range
+  column must be the sole placeholder backed by a rule: any additional rule-backed placeholder would
+  introduce a filter whose value varies within the block, causing the statement to fail before
+  drawing a block. Furthermore, the range column must be the leading primary key column so that the
+  bounds define a key-range scan; specifying any other column fails the statement with an error
+  message naming the scenario and both columns. The column rule must also generate values that
+  increase monotonically with the row index: either a SEQUENTIAL TINYINT, INTEGER, BIGINT, or
+  UNSIGNED_LONG rule that does not wrap across the written rows (the row count, or the highest index
+  claimed by `writeParams` writers when greater, plus the offset, must not exceed
+  `maxValue - minValue + 1`), or a SEQUENTIAL DATE or TIMESTAMP rule, with no `nullChance`. Any
+  other rule, such as SEQUENTIAL VARCHAR whose lexical text order diverges from the row index order,
+  causes the statement to fail before drawing a block.
+* A SCAN selects a complete committed block along its own traversal walk across the blocks. A DELETE
+  claims the next committed block in ascending index order; deleter threads share this sequence, and
+  a block is eligible for deletion only after all of its rows are committed. If no committed block
+  remains, the DELETE fails. Because deleted rows always form a prefix of the index space, point
+  reads and scans draw exclusively from rows above that prefix. A read that draws its target before
+  a DELETE claims the corresponding block can execute concurrently with that DELETE, whereas any
+  read that draws afterward never selects those rows. A failed DELETE leaves its rows in the table,
+  and those rows are not read again during the run. Because a run containing DELETE operations
+  removes rows from the underlying table, a subsequent run executed without a data load will find
+  those rows missing; reload the data (`-l`) before the next run.
+* A SCAN records its returned row count in the same manner as a standard query. A DELETE reports the
+  number of rows it removes as the row count in the legacy reports and commits the transaction.
+* The load profile execution path (`-mt`) runs SCAN and DELETE operations using rule-based
+  generation, while query operations that omit the attribute continue to execute their statement as
+  written.
+
 ## Results
 Results are written real time in _results_ directory. Open the result that is saved in .jpg format for real time
 visualization.

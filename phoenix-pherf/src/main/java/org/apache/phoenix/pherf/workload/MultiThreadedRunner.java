@@ -63,6 +63,7 @@ class MultiThreadedRunner implements Callable<Void> {
   private final XMLConfigParser parser;
   private final boolean writeRuntimeResults;
   private final Map<String, String> connectionProperties;
+  private final Query.Kind kind;
   private final String latencyOperation;
   private final long warmupExecutions;
   private final CoGenerator.Reader reader;
@@ -104,9 +105,23 @@ class MultiThreadedRunner implements Callable<Void> {
     this.parser = parser;
     this.writeRuntimeResults = writeRuntimeResults;
     this.connectionProperties = connectionProperties;
-    this.latencyOperation = "query:" + scenario.getName() + ":" + query.getId();
+    this.kind = query.kind();
+    this.latencyOperation = latencyOperation(kind, scenario.getName(), query.getId());
     this.warmupExecutions = warmupExecutions;
     this.reader = reader;
+  }
+
+  /**
+   * Formats the latency key for a query using "query" for a point query, or "scan" or "delete" for
+   * a range query, followed by the scenario name and the query ID. The metrics sink record uses the
+   * same leading operation label.
+   */
+  static String latencyOperation(Query.Kind kind, String scenario, String queryId) {
+    return label(kind) + ":" + scenario + ":" + queryId;
+  }
+
+  private static String label(Query.Kind kind) {
+    return kind == Query.Kind.SCAN ? "scan" : kind == Query.Kind.DELETE ? "delete" : "query";
   }
 
   /**
@@ -198,7 +213,7 @@ class MultiThreadedRunner implements Callable<Void> {
       conn.setAutoCommit(true);
       final String statementString = reader == null
         ? query.getDynamicStatement(ruleApplier, scenario)
-        : reader.statement(query.getStatement(), conn);
+        : reader.statement(kind, query.getStatement(), conn);
       statement = conn.prepareStatement(statementString);
       LOGGER.debug("Executing iteration: " + queryIteration + ": " + statementString);
 
@@ -209,8 +224,12 @@ class MultiThreadedRunner implements Callable<Void> {
         workloadExecutor.add(writes);
       }
 
-      boolean isQuery = statement.execute();
-      if (isQuery) {
+      if (kind == Query.Kind.DELETE) {
+        // Record the affected row count in reports for DELETE operations, while other DML
+        // statements retain a row count of 0.
+        resultRowCount = (long) statement.executeUpdate();
+        conn.commit();
+      } else if (statement.execute()) {
         rs = statement.getResultSet();
         Pair<Long, Long> r = getResults(rs, queryIteration, isSelectCountStatement, queryStartTime);
         resultRowCount = r.getFirst();
@@ -247,7 +266,7 @@ class MultiThreadedRunner implements Callable<Void> {
       if (!warmup && Extensions.hasMetricsSinks()) {
         String outcome =
           failed ? "error" : queryElapsedTime > query.getTimeoutDuration() ? "timeout" : "ok";
-        Extensions.record("query", Extensions.tags("scenario", scenario.getName(), "query",
+        Extensions.record(label(kind), Extensions.tags("scenario", scenario.getName(), "query",
           query.getId(), "tenant", query.getTenantId(), "outcome", outcome), queryElapsedTime,
           resultRowCount);
       }

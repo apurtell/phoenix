@@ -27,7 +27,9 @@ public interface Operation {
     UPSERT,
     SELECT,
     IDLE_TIME,
-    USER_DEFINED
+    USER_DEFINED,
+    SCAN,
+    DELETE
   }
 
   String getId();

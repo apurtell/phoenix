@@ -309,6 +309,27 @@ public final class IndexedRule implements IndexedDataGenerator {
     return Kind.LIST;
   }
 
+  /**
+   * Returns true when the generated value strictly increases with the global index over the range
+   * [0, last], which guarantees that the values within any index interval are bounded by the values
+   * at its two endpoints. SEQUENTIAL DATE and TIMESTAMP rules always increase monotonically,
+   * whereas a SEQUENTIAL integer rule increases until it wraps at maxValue - minValue + 1.
+   */
+  public boolean increasing(long last) {
+    if (kind == Kind.SEQUENTIAL_DATE) {
+      return true;
+    }
+    if (kind != Kind.SEQUENTIAL_INTEGER) {
+      return false;
+    }
+    try {
+      long values = Math.addExact(Math.subtractExact(max, min), 1);
+      return last < values;
+    } catch (ArithmeticException e) {
+      return false;
+    }
+  }
+
   @Override
   public DataValue valueAt(long index, long seed) {
     return new DataValue(type, text(index, IndexHash.rowSeed(seed, index)));

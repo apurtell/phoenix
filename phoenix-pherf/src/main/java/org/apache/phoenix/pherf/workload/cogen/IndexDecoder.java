@@ -19,11 +19,13 @@ package org.apache.phoenix.pherf.workload.cogen;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -169,8 +171,116 @@ public final class IndexDecoder {
   }
 
   /**
-   * Formats a generated value as a SQL literal that matches the writer parameter binding for the
-   * given data type.
+   * Binds a range SCAN or DELETE statement to the row bounds of a single drawn block. The statement
+   * may contain only one rule-backed placeholder column name, which must appear exactly twice: the
+   * first occurrence is bound to the value at the block's starting index, and the second occurrence
+   * is bound to the value at the block's ending index. Any additional rule-backed placeholder is
+   * rejected because it would introduce a filter predicate whose value varies across the block.
+   * <p>
+   * To ensure that the predicate defines a primary key range scan, the range column must be the
+   * table's leading primary key column. Its generation rule must have a zero null chance and must
+   * produce values that strictly increase with the row index across all indexes that writers can
+   * generate. Because each block is an aligned window of the configured block size, the clustered
+   * index c(i) is non-decreasing, and distinct windows map to disjoint ranges of c(i). As a result,
+   * the key range between the two bound values matches the exact set of rows in the block. Because
+   * the range predicate compares logical column values, these semantics hold equally for DESC and
+   * salted primary keys.
+   * <p>
+   * All statement and rule validations are performed prior to drawing a block, ensuring that an
+   * invalid statement never claims a block from the cursor.
+   * @param leadingKey the leading primary key column of the scenario table
+   * @param indexes    the total number of local indexes that writers can produce, which is at least
+   *                   the configured scenario row count
+   * @throws IllegalArgumentException identifying the scenario, as well as the offending column when
+   *                                  rule validation fails
+   */
+  public String range(String sql, String leadingKey, long indexes, Supplier<RowCursor.Block> draw) {
+    String where = "range statement of scenario " + scenario.getName();
+    Map<String, Source> named = new LinkedHashMap<>();
+    Map<String, Integer> counts = new LinkedHashMap<>();
+    Matcher m = PLACEHOLDER.matcher(sql);
+    while (m.find()) {
+      String name = m.group(0).replace("[", "").replace("]", "");
+      Column rule = rules.getRule(name, scenario);
+      if (rule != null && rule.getType() != null) {
+        named.computeIfAbsent(name, n -> source(column(n, rule.getType())));
+        counts.merge(name, 1, Integer::sum);
+      }
+    }
+    String range = null;
+    for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+      String name = entry.getKey();
+      if (entry.getValue() != 2) {
+        throw new IllegalArgumentException(
+          where + ": placeholder [" + name + "] occurs " + entry.getValue()
+            + " times. Only the range column has a placeholder with a rule, two times: " + sql);
+      }
+      if (range != null) {
+        throw new IllegalArgumentException(where + ": placeholders [" + range + "] and [" + name
+          + "] both occur two times, and only the range column can: " + sql);
+      }
+      range = name;
+    }
+    if (range == null) {
+      throw new IllegalArgumentException(where + ": no placeholder occurs two times, so the"
+        + " statement has no range column: " + sql);
+    }
+    if (!range.equals(leadingKey)) {
+      throw new IllegalArgumentException(where + ": range column " + range + " is not the leading"
+        + " primary key column " + leadingKey + ", so the bounds do not give a key range: " + sql);
+    }
+    Source source = named.get(range);
+    checkRange(where, range, source, indexes);
+
+    RowCursor.Block block = draw.get();
+    StringBuffer ret = new StringBuffer();
+    boolean lower = true;
+    m = PLACEHOLDER.matcher(sql);
+    while (m.find()) {
+      String text = m.group(0);
+      if (text.equals("[" + range + "]")) {
+        long index = lower ? block.start : block.end - 1;
+        lower = false;
+        text =
+          literal(source.rule.getType(), value(source, source.statements, range, index).getValue());
+      }
+      m.appendReplacement(ret, Matcher.quoteReplacement(text));
+    }
+    m.appendTail(ret);
+    return ret.toString();
+  }
+
+  /**
+   * Validates that the generation rule for the range column has no chance of producing nulls and
+   * generates strictly increasing values across the global indexes corresponding to the local index
+   * range [0, indexes).
+   */
+  private void checkRange(String where, String name, Source source, long indexes) {
+    if (source.rule.getNullChance() > 0) {
+      throw new IllegalArgumentException(
+        where + ": range column " + name + " has a nullChance, so a row can have no value");
+    }
+    long last = settings.offset + cluster(indexes - 1);
+    if (
+      !(source.indexed instanceof IndexedRule) || !((IndexedRule) source.indexed).increasing(last)
+    ) {
+      throw new IllegalArgumentException(where + ": range column " + name + " needs a SEQUENTIAL"
+        + " integer rule that does not wrap over the written rows, or a SEQUENTIAL DATE or"
+        + " TIMESTAMP rule. Its values must increase with the row index up to global index "
+        + last);
+    }
+  }
+
+  private static Column column(String name, DataTypeMapping type) {
+    Column column = new Column();
+    column.setName(name);
+    column.setType(type);
+    return column;
+  }
+
+  /**
+   * Formats a generated value as a SQL literal matching the parameter binding used by writers for
+   * the specified data type.
    */
   private static String literal(DataTypeMapping type, String value) {
     switch (type) {
