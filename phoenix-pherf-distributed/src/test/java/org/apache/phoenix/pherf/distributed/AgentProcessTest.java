@@ -48,6 +48,7 @@ public class AgentProcessTest {
       Map<String, String> agentEnv = new HashMap<>();
       agentEnv.put("PHERF_CONTROLLER", "http://127.0.0.1:" + port);
       agentEnv.put("PHERF_AGENT_ID", "smoke-1");
+      agentEnv.put("PHERF_ZOOKEEPER", "smoke-zk");
       try (ChildProcess agent = ChildProcess.start("agent", AgentMain.class, agentEnv)) {
         agent.awaitLine("agent smoke-1 started", TIMEOUT_MS);
         agent.awaitLine("agent smoke-1 registered", TIMEOUT_MS);
@@ -58,6 +59,21 @@ public class AgentProcessTest {
       }
       controller.terminate();
       assertEquals(controller.output(), 0, controller.waitFor(TIMEOUT_MS));
+    }
+  }
+
+  /**
+   * Verifies that when PHERF_ZOOKEEPER is omitted, the agent detects an invalid configuration and
+   * terminates with exit status 2.
+   */
+  @Test
+  public void agentWithoutZookeeperExitsTwo() throws Exception {
+    Map<String, String> agentEnv = new HashMap<>();
+    agentEnv.put("PHERF_CONTROLLER", "http://127.0.0.1:1");
+    agentEnv.put("PHERF_AGENT_ID", "smoke-2");
+    try (ChildProcess agent = ChildProcess.start("agent", AgentMain.class, agentEnv)) {
+      assertEquals(agent.output(), 2, agent.waitFor(TIMEOUT_MS));
+      agent.awaitLine("PHERF_ZOOKEEPER is not set", TIMEOUT_MS);
     }
   }
 }

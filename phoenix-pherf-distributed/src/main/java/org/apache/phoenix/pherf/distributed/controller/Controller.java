@@ -26,11 +26,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import org.apache.phoenix.pherf.distributed.clock.Clock;
-import org.apache.phoenix.pherf.distributed.identity.DataPlaneIdentity;
 import org.apache.phoenix.pherf.distributed.protocol.Ack;
 import org.apache.phoenix.pherf.distributed.protocol.AgentMessage;
 import org.apache.phoenix.pherf.distributed.protocol.Assign;
-import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Cancel;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
 import org.apache.phoenix.pherf.distributed.protocol.Heartbeat;
@@ -119,31 +117,11 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Validates the specification, initiates a new run across available free agents, and returns the
-   * assigned run identifier.
-   * @throws IllegalArgumentException When the run specification is invalid.
-   * @throws IllegalStateException    When fewer free agents are available than step 0 requires.
+   * Initiates a new run across available free agents and returns its assigned run identifier,
+   * assuming that {@link RunSpec#parse} has already validated the execution plan.
+   * @throws IllegalStateException when fewer free agents are available than step 0 requires.
    */
   public synchronized String submit(RunSpec spec) {
-    if (spec.getSteps().isEmpty()) {
-      throw new IllegalArgumentException("a run needs at least one step");
-    }
-    for (int i = 0; i < spec.getSteps().size(); i++) {
-      StepSpec step = spec.getSteps().get(i);
-      if (step.getAgents() < 1 || step.getAgents() > DataPlaneIdentity.MAX_SLOTS) {
-        throw new IllegalArgumentException("step " + i + " asks for " + step.getAgents()
-          + " agents; a step takes 1 to " + DataPlaneIdentity.MAX_SLOTS);
-      }
-      if (step.getStride() < 0) {
-        throw new IllegalArgumentException("step " + i + " has a negative stride");
-      }
-      try {
-        Math.multiplyExact((long) step.getAgents() - 1, step.getStride());
-      } catch (ArithmeticException e) {
-        throw new IllegalArgumentException(
-          "step " + i + " stride " + step.getStride() + " overflows the slot offset");
-      }
-    }
     String shortage = shortage(spec, 0);
     if (shortage != null) {
       throw new IllegalStateException(shortage);
@@ -288,6 +266,7 @@ public final class Controller implements AgentChannel {
     Status status = agent.reported;
     RunRecord.SlotRecord slot = agent.binding;
     if (slot == null) {
+      cancelledSlotFailed(agent, status);
       return;
     }
     if (!slot.matches(status.getRunId(), status.getStep())) {
@@ -321,8 +300,29 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Computes the next control command required to drive the agent toward its desired state, or
-   * returns null if no action is currently needed.
+   * Records a subsequent failure reported for a slot that was already cancelled due to the failure
+   * of its run, ensuring that the run view preserves the error details of every failed slot while
+   * the overall run failure reason retains the initial error.
+   */
+  private void cancelledSlotFailed(AgentRecord agent, Status status) {
+    RunRecord run = status.getRunId() == null ? null : runs.get(status.getRunId());
+    if (
+      status.getPhase() != Phase.FAILED || run == null || status.getStep() < 0
+        || status.getStep() >= run.steps.size()
+    ) {
+      return;
+    }
+    for (RunRecord.SlotRecord slot : run.steps.get(status.getStep()).slots) {
+      if (slot.agent.equals(agent.id) && slot.state == RunView.SlotState.CANCELLED) {
+        slot.state = RunView.SlotState.FAILED;
+        slot.error = "agent " + agent.id + ": " + status.getError();
+      }
+    }
+  }
+
+  /**
+   * Determines the control command for an agent, or returns null when the agent has no pending
+   * command.
    */
   private Message command(AgentRecord agent) {
     if (agent.leaving) {
@@ -495,10 +495,8 @@ public final class Controller implements AgentChannel {
         break;
       }
       if (agent.free()) {
-        Assignment assignment = new Assignment(run.runId, index,
-          DataPlaneIdentity.derive(run.spec.getSeed(), slot, spec.getStride()), spec.getDocuments(),
-          spec.getProperties());
-        agent.binding = new RunRecord.SlotRecord(step, agent.id, assignment);
+        agent.binding =
+          new RunRecord.SlotRecord(step, agent.id, run.spec.assignment(run.runId, index, slot));
         step.slots.add(agent.binding);
         slot++;
       }
@@ -514,6 +512,7 @@ public final class Controller implements AgentChannel {
       }
     }
     step.startAtMs = clock.millis();
+    step.run.started = true;
     for (RunRecord.SlotRecord slot : step.slots) {
       slot.state = RunView.SlotState.RUNNING;
     }
@@ -550,17 +549,25 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Transitions the run to the failed state and unbinds the agents assigned to its current step so
-   * that they receive a cancel or release command on their next poll.
+   * Terminates the run and unbinds the agents assigned to its current step so that they receive a
+   * cancel or release command. The run transitions to ABORTED if no step has started, or to FAILED
+   * otherwise, and every slot that is not already DONE or FAILED is marked CANCELLED. No slot is
+   * retried or bound again, and subsequent steps do not run.
    */
   private void failRun(RunRecord run, String reason) {
     if (run.state != RunView.State.RUNNING) {
       return;
     }
-    run.state = RunView.State.FAILED;
+    run.state = run.started ? RunView.State.FAILED : RunView.State.ABORTED;
     run.reason = reason;
-    unbind(run.steps.get(run.current));
-    LOG.warn("run {} failed: {}", run.runId, reason);
+    RunRecord.StepRecord step = run.steps.get(run.current);
+    for (RunRecord.SlotRecord slot : step.slots) {
+      if (slot.state != RunView.SlotState.DONE && slot.state != RunView.SlotState.FAILED) {
+        slot.state = RunView.SlotState.CANCELLED;
+      }
+    }
+    unbind(step);
+    LOG.warn("run {} {}: {}", run.runId, run.state, reason);
   }
 
   private void unbind(RunRecord.StepRecord step) {

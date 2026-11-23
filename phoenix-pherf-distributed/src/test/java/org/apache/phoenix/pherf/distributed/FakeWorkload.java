@@ -18,7 +18,6 @@
 package org.apache.phoenix.pherf.distributed;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import org.HdrHistogram.Histogram;
 import org.apache.phoenix.pherf.distributed.agent.Workload;
@@ -31,10 +30,12 @@ import org.apache.phoenix.pherf.latency.LatencyRecorders;
  * configured interval before completing. Any configuration property key suffixed with
  * {@code .<slot>} is scoped exclusively to that individual slot:
  * <ul>
- * <li>fake.intervals: configures the total number of intervals to run, defaulting to 3.</li>
+ * <li>fake.intervals: configures the total number of intervals to execute, defaulting to 3.</li>
  * <li>fake.intervalMs: configures the duration of each interval, defaulting to 1000 ms.</li>
- * <li>fake.fail: triggers a workload failure after this many intervals have been emitted.</li>
- * <li>fake.prepareError: causes the prepare phase to report the specified error string.</li>
+ * <li>fake.fail: causes the workload to fail after this many intervals have completed.</li>
+ * <li>fake.prepareError: causes the prepare phase to report this error. Any later slice validated
+ * during preparation reports its own configured value prefixed with "step &lt;step&gt; slot
+ * &lt;slot&gt;: ", matching PherfWorkload.</li>
  * <li>fake.prepareThrows: causes the prepare phase to throw an IllegalStateException with this
  * message.</li>
  * </ul>
@@ -74,9 +75,19 @@ public final class FakeWorkload implements Workload {
     if (thrown != null) {
       throw new IllegalStateException(thrown);
     }
+    List<String> errors = new ArrayList<>();
     String error = property(assignment, "fake.prepareError");
-    listener.prepared(
-      error == null ? Collections.<String> emptyList() : Collections.singletonList(error));
+    if (error != null) {
+      errors.add(error);
+    }
+    for (Assignment later : assignment.getValidations()) {
+      error = property(later, "fake.prepareError");
+      if (error != null) {
+        errors
+          .add("step " + later.getStep() + " slot " + later.getIdentity().getSlot() + ": " + error);
+      }
+    }
+    listener.prepared(errors);
   }
 
   @Override

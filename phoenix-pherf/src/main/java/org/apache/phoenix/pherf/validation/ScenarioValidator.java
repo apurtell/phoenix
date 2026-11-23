@@ -51,6 +51,7 @@ import org.apache.phoenix.pherf.configuration.DataTypeMapping;
 import org.apache.phoenix.pherf.configuration.Ddl;
 import org.apache.phoenix.pherf.configuration.Query;
 import org.apache.phoenix.pherf.configuration.QuerySet;
+import org.apache.phoenix.pherf.configuration.RunOverrides;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.exception.FileLoaderException;
@@ -140,7 +141,7 @@ public final class ScenarioValidator {
     throws Exception {
     // Instantiate the runtime schema reader without a database connection.
     SchemaReader schema = schemaPattern == null ? null : new SchemaReader(null, schemaPattern);
-    return validate(files, schema, new HashMap<>());
+    return validate(files, schema, new HashMap<>(), null);
   }
 
   /**
@@ -155,7 +156,30 @@ public final class ScenarioValidator {
    */
   public static ValidationReport validate(String scenarioPattern, SchemaReader schema,
     Map<Path, DataModel> models) throws Exception {
-    return validate(scenarioFiles(scenarioPattern), schema, models);
+    return validate(scenarioFiles(scenarioPattern), schema, models, null);
+  }
+
+  /**
+   * Validates all scenario files matching the given pattern in the manner of -validate. The
+   * validation rules first evaluate the data models as written, matching the pre-run gate. When
+   * launch overrides are supplied, the rules also evaluate the models after applying the overrides
+   * to reflect the effective values used by the run, appending each finding not already present in
+   * the gate report. Consequently, a passing -validate check guarantees that the pre-run gate will
+   * also pass. Any launch override rejected by the runtime is reported as a finding.
+   * @param models    receives the parsed data models as written, matching the pre-run gate
+   * @param overrides the launch overrides for the run, or null when no overrides are applied
+   * @throws FileLoaderException when no scenario file matches the pattern
+   */
+  public static ValidationReport validate(String scenarioPattern, SchemaReader schema,
+    Map<Path, DataModel> models, RunOverrides overrides) throws Exception {
+    Collection<Path> files = scenarioFiles(scenarioPattern);
+    ValidationReport report = validate(files, schema, models, null);
+    if (overrides != null && !overrides.isEmpty()) {
+      // Because applying launch overrides mutates the data models in place, re-parse the scenario
+      // files for the post-override validation pass.
+      report.addNew(validate(files, schema, new HashMap<>(), overrides));
+    }
+    return report;
   }
 
   /** Resolves the scenario files matching a pattern in the same manner as the runtime parser. */
@@ -170,7 +194,7 @@ public final class ScenarioValidator {
   }
 
   private static ValidationReport validate(Collection<Path> files, SchemaReader schema,
-    Map<Path, DataModel> models) throws Exception {
+    Map<Path, DataModel> models, RunOverrides overrides) throws Exception {
     ScenarioValidator validator = new ScenarioValidator();
     if (schema != null) {
       // Each schema file is applied by the runtime as a single DDL statement.
@@ -185,6 +209,9 @@ public final class ScenarioValidator {
       ValidationReport findings = new ValidationReport();
       perFile.add(findings);
       validator.structure(file, findings, profiles, models);
+    }
+    if (overrides != null && !validator.parsed.isEmpty()) {
+      validator.overrides(overrides);
     }
     for (Parsed file : validator.parsed) {
       for (Scenario scenario : file.scenarios) {
@@ -214,6 +241,33 @@ public final class ScenarioValidator {
       findings.add(Rule.XML_VALUE, file, null, where,
         "a value that the run needs is missing or not valid, so the run fails here: " + e);
       return false;
+    }
+  }
+
+  /**
+   * Applies the configured launch overrides to the parsed data models in the same manner as a
+   * standard run prior to executing any data load.
+   */
+  private void overrides(RunOverrides overrides) {
+    List<DataModel> models = new ArrayList<>();
+    for (Parsed file : parsed) {
+      models.add(file.model);
+    }
+    try {
+      overrides.apply(models);
+    } catch (IllegalArgumentException e) {
+      // An invalid openLoop configuration also prevents override scaling; when that occurs, defer
+      // to the openLoop validation rules so that the error is reported only once.
+      for (DataModel model : models) {
+        try {
+          QueryExecutor.checkOpenLoop(model);
+        } catch (IllegalArgumentException bad) {
+          return;
+        }
+      }
+      Parsed first = parsed.get(0);
+      first.findings.add(Rule.OPENLOOP_RATE, first.file, null, "the launch overrides",
+        e.getMessage());
     }
   }
 

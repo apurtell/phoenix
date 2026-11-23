@@ -31,6 +31,11 @@ final class RunRecord {
   String reason;
   /** Holds the index of the current step in the run sequence. */
   int current;
+  /**
+   * True once at least one step has started, indicating that the run may have sent database
+   * traffic.
+   */
+  boolean started;
 
   RunRecord(String runId, RunSpec spec) {
     this.runId = runId;
@@ -45,9 +50,8 @@ final class RunRecord {
     for (StepRecord step : steps) {
       List<RunView.SlotView> slotViews = new ArrayList<>();
       for (SlotRecord slot : step.slots) {
-        slotViews.add(new RunView.SlotView(slot.assignment.getIdentity().getSlot(), slot.agent,
-          slot.state, slot.error, slot.assignment.getIdentity().getPrefix(), slot.heldSeq,
-          slot.finalSeq, slot.frames.size()));
+        slotViews.add(new RunView.SlotView(slot.assignment.getIdentity(), slot.agent, slot.state,
+          slot.error, slot.assignment.getShare(), slot.heldSeq, slot.finalSeq, slot.frames.size()));
       }
       stepViews.add(new RunView.StepView(step.index, step.state, step.startAtMs, slotViews));
     }

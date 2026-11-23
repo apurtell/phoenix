@@ -19,6 +19,8 @@ package org.apache.phoenix.pherf.distributed.controller;
 
 import java.util.Collections;
 import java.util.List;
+import org.apache.phoenix.pherf.distributed.identity.DataPlaneIdentity;
+import org.apache.phoenix.pherf.distributed.protocol.Share;
 
 /** Represents an immutable status snapshot of a single run, its steps, and their slots. */
 public final class RunView {
@@ -26,6 +28,12 @@ public final class RunView {
   public enum State {
     RUNNING,
     COMPLETE,
+    /**
+     * Indicates that the run failed before any of its steps started, ensuring that it sent no
+     * database traffic.
+     */
+    ABORTED,
+    /** Indicates that the run failed after at least one step had already started. */
     FAILED
   }
 
@@ -43,7 +51,12 @@ public final class RunView {
     READY,
     RUNNING,
     DONE,
-    FAILED
+    FAILED,
+    /**
+     * Indicates that the run failed on another slot and this slot received a cancel or release
+     * command.
+     */
+    CANCELLED
   }
 
   private final String runId;
@@ -68,7 +81,9 @@ public final class RunView {
     return state;
   }
 
-  /** Returns the failure reason when the run is in the FAILED state, or null otherwise. */
+  /**
+   * Returns the failure reason when the run is in the ABORTED or FAILED state, or null otherwise.
+   */
   public String getReason() {
     return reason;
   }
@@ -121,29 +136,37 @@ public final class RunView {
 
   /** Represents an immutable status snapshot of a single slot within a step. */
   public static final class SlotView {
-    private final int slot;
+    private final DataPlaneIdentity identity;
     private final String agent;
     private final SlotState state;
     private final String error;
-    private final String prefix;
+    private final Share share;
     private final long heldSeq;
     private final long finalSeq;
     private final int frames;
 
-    SlotView(int slot, String agent, SlotState state, String error, String prefix, long heldSeq,
-      long finalSeq, int frames) {
-      this.slot = slot;
+    SlotView(DataPlaneIdentity identity, String agent, SlotState state, String error, Share share,
+      long heldSeq, long finalSeq, int frames) {
+      this.identity = identity;
       this.agent = agent;
       this.state = state;
       this.error = error;
-      this.prefix = prefix;
+      this.share = share;
       this.heldSeq = heldSeq;
       this.finalSeq = finalSeq;
       this.frames = frames;
     }
 
     public int getSlot() {
-      return slot;
+      return identity.getSlot();
+    }
+
+    /**
+     * Returns the data-plane identity assigned to the slot, comprising the slot index, its seed,
+     * its row offset, and its key prefix.
+     */
+    public DataPlaneIdentity getIdentity() {
+      return identity;
     }
 
     public String getAgent() {
@@ -158,8 +181,9 @@ public final class RunView {
       return error;
     }
 
-    public String getPrefix() {
-      return prefix;
+    /** Returns the portion of the step workload totals allocated for this slot to execute. */
+    public Share getShare() {
+      return share;
     }
 
     /** Returns the highest frame sequence number held by the controller with no gap below it. */

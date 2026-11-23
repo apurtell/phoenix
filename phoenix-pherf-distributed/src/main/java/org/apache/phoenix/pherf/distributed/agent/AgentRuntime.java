@@ -67,9 +67,14 @@ import org.slf4j.LoggerFactory;
  * Workload completion proceeds in two phases so that the agent reports DONE only after receiving an
  * acknowledgment that covers the final frame. Incoming commands are idempotent for each run and
  * step. Following a cancellation, the agent continues to report its active phase until the
- * underlying workload halts, guaranteeing that two runs never overlap within the same process. If
+ * underlying workload stops, guaranteeing that two runs never overlap within a single process. If
  * the workload throws a runtime exception, the current work transitions to a failed state while the
  * communication loops continue operating.
+ * <p>
+ * The agent automatically cancels its active work if no reply arrives on either stream for longer
+ * than {@link Protocol#DEADLINE_MS}, matching the controller's eviction threshold. This ensures
+ * that an agent evicted by the controller does not continue driving workload traffic against the
+ * database.
  */
 public final class AgentRuntime {
   private static final Logger LOG = LoggerFactory.getLogger(AgentRuntime.class);
@@ -107,6 +112,8 @@ public final class AgentRuntime {
   private Clock.Timer controlRetry;
   private boolean telemetryOut;
   private Clock.Timer telemetryRetry;
+  /** Timer that fires when no reply arrives from the controller within the deadline bound. */
+  private Clock.Timer silence;
   private long controlCount;
   private long telemetryCount;
   private int stopStatus;
@@ -237,6 +244,7 @@ public final class AgentRuntime {
     if (life == Life.STOPPED) {
       return;
     }
+    replied();
     if (request instanceof Goodbye) {
       finish(stopStatus);
       return;
@@ -267,6 +275,28 @@ public final class AgentRuntime {
         controlRetry = null;
         sendControl();
       }));
+    }
+  }
+
+  /** Resets the silence deadline timer whenever a reply arrives from the controller. */
+  private void replied() {
+    if (silence != null) {
+      silence.cancel();
+    }
+    silence = clock.schedule(Protocol.DEADLINE_MS + 1, () -> call(this::silent));
+  }
+
+  /**
+   * Cancels active work when no reply arrives within the deadline, since the controller may have
+   * evicted this agent.
+   */
+  private void silent() {
+    silence = null;
+    Work current = work;
+    if (life == Life.REGISTERED && current != null && current.phase.active()) {
+      LOG.warn("agent {} got no reply for more than {} ms; it cancels run {}", identity.getId(),
+        Protocol.DEADLINE_MS, current.assignment.getRunId());
+      cancelWork();
     }
   }
 
@@ -326,10 +356,7 @@ public final class AgentRuntime {
     }
     Assignment resolved;
     try {
-      resolved =
-        new Assignment(assignment.getRunId(), assignment.getStep(), assignment.getIdentity(),
-          SlotTokens.resolve(assignment.getDocuments(), assignment.getIdentity()),
-          SlotTokens.resolve(assignment.getProperties(), assignment.getIdentity()));
+      resolved = resolve(assignment);
     } catch (IllegalArgumentException e) {
       work = new Work(assignment);
       work.phase = Phase.FAILED;
@@ -343,6 +370,20 @@ public final class AgentRuntime {
     LOG.info("agent {} prepares run {} step {} as {}", identity.getId(), resolved.getRunId(),
       resolved.getStep(), resolved.getIdentity());
     safely(created, "prepare", () -> workload.prepare(resolved, created));
+  }
+
+  /**
+   * Resolves slot placeholder tokens across the assignment and every validation slice attached to
+   * it.
+   */
+  private static Assignment resolve(Assignment assignment) {
+    List<Assignment> validations = new ArrayList<>();
+    for (Assignment validation : assignment.getValidations()) {
+      validations.add(resolve(validation));
+    }
+    return assignment.resolved(
+      SlotTokens.resolve(assignment.getDocuments(), assignment.getIdentity()),
+      SlotTokens.resolve(assignment.getProperties(), assignment.getIdentity()), validations);
   }
 
   private void start(Start command) {
@@ -446,6 +487,7 @@ public final class AgentRuntime {
     if (life == Life.STOPPED) {
       return;
     }
+    replied();
     try {
       Work current = work;
       if (current != null && current.matches(ack.getRunId(), ack.getStep())) {
@@ -518,7 +560,8 @@ public final class AgentRuntime {
     }
     life = Life.STOPPED;
     exitStatus = status;
-    for (Clock.Timer timer : new Clock.Timer[] { stopGrace, controlRetry, telemetryRetry }) {
+    for (Clock.Timer timer : new Clock.Timer[] { stopGrace, controlRetry, telemetryRetry,
+      silence }) {
       if (timer != null) {
         timer.cancel();
       }

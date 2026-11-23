@@ -146,7 +146,7 @@ public class AgentLifecycleTest {
     String runId = simulation.controller.submit(Simulation.spec(7, properties, 1));
     simulation.runFor(5000);
     RunView run = simulation.run(runId);
-    assertEquals(RunView.State.FAILED, run.getState());
+    assertEquals(RunView.State.ABORTED, run.getState());
     assertEquals("agent a1: prepare failed: java.lang.IllegalStateException: broken scenario",
       run.getReason());
     assertEquals(RunView.SlotState.FAILED, run.getSteps().get(0).getSlots().get(0).getState());

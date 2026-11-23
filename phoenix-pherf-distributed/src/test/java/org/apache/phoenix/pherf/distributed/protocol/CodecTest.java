@@ -19,6 +19,7 @@ package org.apache.phoenix.pherf.distributed.protocol;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -74,8 +75,13 @@ public class CodecTest {
     documents.put("scenario.xml", "<datamodel name=\"d\" seed=\"${pherf.slot.seed}\"/>");
     Map<String, String> properties = new LinkedHashMap<>();
     properties.put("pherf.default.hdr.intervalMs", "1000");
-    Assignment assignment = new Assignment("20260101T000000000Z-1", 2,
-      DataPlaneIdentity.derive(42, 3, 1000), documents, properties);
+    Assignment later = new Assignment("20260101T000000000Z-1", 3,
+      DataPlaneIdentity.derive(42, 3, 750), "scenario.xml", documents, Arrays.asList("-q"),
+      new Share(60000L, 2L, 11L, 125L), properties);
+    Assignment assignment =
+      new Assignment("20260101T000000000Z-1", 2, DataPlaneIdentity.derive(42, 3, 1000),
+        "scenario.xml", documents, Arrays.asList("-q", "-disableSchemaApply"),
+        new Share(60000L, 4L, 33L, 250L), properties, Arrays.asList(later));
     Histogram histogram = sampleHistogram();
     IntervalFrame frame = new IntervalFrame(1, "query:s:q1", LatencyRecorders.STEADY, 1000, 2000,
       RecorderConfig.of(histogram), HistogramBlob.encode(histogram));
@@ -93,8 +99,16 @@ public class CodecTest {
       traced(new Ack("20260101T000000000Z-1", 2, 1), "a1/telemetry/1"));
   }
 
-  /** Fails the assertion when any field of the message or of a value it holds is null or empty. */
+  /**
+   * Fails the assertion if any field of the message or of a nested value it holds is null or empty.
+   * Because a subsequent slice contains no slices of its own, its nested validations are expected
+   * to be absent.
+   */
   private static void assertComplete(String path, Object value) throws IllegalAccessException {
+    if (path.endsWith(".validations[].validations")) {
+      assertNull(path, value);
+      return;
+    }
     assertNotNull(path + " is null", value);
     if (value instanceof Collection) {
       assertTrue(path + " is empty", !((Collection<?>) value).isEmpty());

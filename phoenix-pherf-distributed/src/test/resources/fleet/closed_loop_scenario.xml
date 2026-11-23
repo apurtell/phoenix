@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+
+<!-- A co-generated relational scenario with a closed loop query set of 2 workers. Each worker of
+     the walk reads its own share of the committed rows, so a slot with 1 row gives worker 1 no
+     row and no block, which Pherf's validator reports as cogen.walk. -->
+<datamodel name="fleet_closed_loop">
+    <datamapping>
+        <column>
+            <type>BIGINT</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000000000000</maxValue>
+            <name>K1</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>SEQUENTIAL</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>2000000000</maxValue>
+            <name>K2</name>
+        </column>
+        <column>
+            <type>INTEGER</type>
+            <userDefined>true</userDefined>
+            <dataSequence>RANDOM</dataSequence>
+            <minValue>0</minValue>
+            <maxValue>1000</maxValue>
+            <name>QTY</name>
+        </column>
+    </datamapping>
+    <scenarios>
+        <scenario tableName="PHERF.FLEET" rowCount="1000" name="fleetClosedLoop">
+            <preScenarioDdls>
+                <ddl tableName="PHERF.FLEET"
+                     statement="CREATE TABLE IF NOT EXISTS ? (K1 BIGINT NOT NULL, K2 INTEGER NOT NULL, QTY INTEGER CONSTRAINT PK PRIMARY KEY (K1, K2))"/>
+            </preScenarioDdls>
+            <coGeneration seed="1" offset="${pherf.slot.offset}" blockSize="50"/>
+            <querySet concurrency="2" executionType="SERIAL" numberOfExecutions="10"
+                      executionDurationInMs="10000">
+                <query id="lookup"
+                       statement="SELECT QTY FROM PHERF.FLEET WHERE K1 = [K1] AND K2 = [K2]"/>
+                <query id="rangeScan" kind="SCAN"
+                       statement="SELECT K2, QTY FROM PHERF.FLEET WHERE K1 &gt;= [K1] AND K1 &lt;= [K1]"/>
+            </querySet>
+        </scenario>
+    </scenarios>
+</datamodel>

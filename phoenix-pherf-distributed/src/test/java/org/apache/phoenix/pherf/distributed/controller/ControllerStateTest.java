@@ -29,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.HdrHistogram.Histogram;
+import org.apache.phoenix.pherf.distributed.Plans;
 import org.apache.phoenix.pherf.distributed.Simulation;
 import org.apache.phoenix.pherf.distributed.agent.AgentRuntime;
 import org.apache.phoenix.pherf.distributed.clock.VirtualClock;
@@ -202,7 +203,7 @@ public class ControllerStateTest {
     assertEquals("i-new", view.getIncarnation());
     assertEquals(registered + 500, view.getRegisteredMs());
     RunView run = controller.run(runId);
-    assertEquals(RunView.State.FAILED, run.getState());
+    assertEquals(RunView.State.ABORTED, run.getState());
     assertEquals("agent a1 restarted", run.getReason());
     // The previous agent process is rejected on its next poll.
     assertEquals(MessageType.REJECTED, type(heartbeat("a1", Phase.PREPARING, runId)));
@@ -234,18 +235,24 @@ public class ControllerStateTest {
     assertEquals("20260101T000001000Z-1", runId);
   }
 
+  /**
+   * Verifies that plan validation during submission rejects an invalid plan before any execution
+   * slot is bound.
+   */
   @Test
-  public void strideThatOverflowsTheOffsetIsRefused() {
+  public void refusedPlanBindsNothing() {
     register("a1");
     register("a2");
     register("a3");
-    List<StepSpec> steps = Arrays.asList(new StepSpec(3, Long.MAX_VALUE / 2 + 1,
-      new LinkedHashMap<String, String>(), new LinkedHashMap<String, String>()));
-    try {
-      controller.submit(new RunSpec(7, steps));
-      fail("submitted a stride that overflows");
-    } catch (IllegalArgumentException e) {
-      assertEquals("step 0 stride 4611686018427387904 overflows the slot offset", e.getMessage());
+    String offset = "<c offset=\"${pherf.slot.offset}\"/>";
+    for (Plans plan : new Plans[] { Plans.plan(7).step(Plans.step(3).scenario("s.xml", offset)),
+      Plans.plan(7).step(Plans.step(3).scenario("s.xml", "<s/>").rows(2)) }) {
+      try {
+        controller.submit(plan.spec());
+        fail("submitted " + plan.json());
+      } catch (IllegalArgumentException e) {
+        assertTrue(e.getMessage(), e.getMessage().startsWith("steps[0]"));
+      }
     }
     // Because no slots are bound, every agent remains free.
     assertNull(type(heartbeat("a3", Phase.IDLE, null)));
@@ -283,9 +290,9 @@ public class ControllerStateTest {
     String runId = simulation.controller.submit(Simulation.spec(7, properties, 2));
     simulation.runFor(5000);
     RunView run = simulation.run(runId);
-    assertEquals(RunView.State.FAILED, run.getState());
+    assertEquals(RunView.State.ABORTED, run.getState());
     assertEquals("agent a2: bad slice", run.getReason());
-    assertEquals(Arrays.asList(RunView.SlotState.READY, RunView.SlotState.FAILED),
+    assertEquals(Arrays.asList(RunView.SlotState.CANCELLED, RunView.SlotState.FAILED),
       Arrays.asList(run.getSteps().get(0).getSlots().get(0).getState(),
         run.getSteps().get(0).getSlots().get(1).getState()));
     assertEquals(0, simulation.count("reply", "start"));

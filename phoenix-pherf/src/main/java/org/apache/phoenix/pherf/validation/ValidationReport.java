@@ -28,8 +28,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Encapsulates the findings produced by a single validation run in a fixed order. Each finding
@@ -123,6 +126,10 @@ public final class ValidationReport {
       return message;
     }
 
+    private List<Object> key() {
+      return Arrays.asList(rule, file, line, where, message);
+    }
+
     @Override
     public String toString() {
       return rule.id() + " " + file + (line == null ? "" : ":" + line) + " " + where + ": "
@@ -140,6 +147,23 @@ public final class ValidationReport {
 
   void addAll(ValidationReport part) {
     findings.addAll(part.findings);
+  }
+
+  /**
+   * Appends every finding from the supplied partial report that is not already present in this
+   * report. Two findings are considered identical when they share the same rule, file, line,
+   * element path, and message.
+   */
+  void addNew(ValidationReport part) {
+    Set<List<Object>> have = new HashSet<>();
+    for (Finding finding : findings) {
+      have.add(finding.key());
+    }
+    for (Finding finding : part.findings) {
+      if (!have.contains(finding.key())) {
+        findings.add(finding);
+      }
+    }
   }
 
   void addFile(String file) {

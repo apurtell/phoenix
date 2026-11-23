@@ -322,16 +322,19 @@ public class Pherf {
    * Validates the configured scenario files and the DDL statements for the run without opening a
    * database connection. A standard run invokes this check before executing any phase that can
    * establish a connection. When -allowUnknownTags is specified, unrecognized XML elements and
-   * attributes are logged rather than reported as errors. Under -validate, the validation report is
-   * written to the results directory and printed to stdout; during a standard run, the report is
-   * emitted only when a validation rule fails.
+   * attributes are logged rather than reported as errors. Under -validate, the validation rules
+   * evaluate both the models as written and the models after applying launch overrides, and the
+   * report is written to the results directory and printed to stdout. A standard run validates the
+   * models as written, applies launch overrides after the pre-run gate, and writes the report only
+   * when a validation rule fails.
    * @param schema the schema reader for the run, or null when the run applies no schema
    * @return the parsed data model for each scenario file, to be reused by the runtime parser
-   * @throws ValidationException if any validation rule fails
+   * @throws ValidationException when any validation rule fails
    */
   private Map<Path, DataModel> validateScenarios(SchemaReader schema) throws Exception {
     Map<Path, DataModel> models = new LinkedHashMap<>();
-    ValidationReport report = ScenarioValidator.validate(scenarioFile, schema, models);
+    ValidationReport report =
+      ScenarioValidator.validate(scenarioFile, schema, models, validate ? overrides : null);
     if (allowUnknownTags) {
       for (Finding finding : report.waiveUnknownNames()) {
         LOGGER.warn("-allowUnknownTags lets this pass: " + finding);

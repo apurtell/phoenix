@@ -67,9 +67,12 @@ public final class ChildProcess implements AutoCloseable {
     throws IOException {
     String classPath =
       System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
-    ProcessBuilder builder = new ProcessBuilder(
-      Arrays.asList(new File(System.getProperty("java.home"), "bin/java").getPath(), "-cp",
-        classPath, main.getName())).redirectErrorStream(true);
+    ProcessBuilder builder = new ProcessBuilder(Arrays.asList(
+      new File(System.getProperty("java.home"), "bin/java").getPath(),
+      // Propagate the temporary directory so the agent creates its working directory inside the
+      // test build directory.
+      "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp", classPath, main.getName()))
+        .redirectErrorStream(true);
     builder.environment().keySet().removeIf(key -> key.startsWith("PHERF_"));
     builder.environment().putAll(env);
     return new ChildProcess(name, builder.start());

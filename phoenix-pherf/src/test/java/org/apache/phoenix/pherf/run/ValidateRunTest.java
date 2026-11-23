@@ -31,6 +31,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Properties;
 import org.apache.phoenix.pherf.spi.ConnectionProvider;
@@ -56,10 +57,13 @@ public class ValidateRunTest {
   private static ChildJvm defects;
   private static ChildJvm drop;
   private static ChildJvm unnamed;
+  private static ChildJvm range;
+  private static File rangeScenario;
   private static int cleanExit;
   private static int defectsExit;
   private static int dropExit;
   private static int unnamedExit;
+  private static int rangeExit;
 
   /** Records each connection attempt and then fails it so that no connection ever opens. */
   public static class ThrowingProvider implements ConnectionProvider {
@@ -97,6 +101,29 @@ public class ValidateRunTest {
     }
     unnamedExit = unnamed.runMain(ChildJvm.args("-validate", "-disableSchemaApply", "-label",
       "unnamed", "-scenarioFile", new File(dir, "clean_cogen.xml").getPath()));
+    // Configure the open loop query set with a concurrency range that is replaced by the
+    // -threadCount 2 override.
+    range = child("range");
+    rangeScenario =
+      copy("rangeScenario", "concurrency=\"1\" profile=", "concurrency=\"1-2\" profile=");
+    rangeExit = range.runMain(ChildJvm.args("-validate", "-q", "-threadCount", "2",
+      "-disableSchemaApply", "-label", "range", "-scenarioFile", rangeScenario.getPath()));
+  }
+
+  /**
+   * Copies the clean fixture and its profile with a single string replacement applied, returning
+   * the copied scenario file.
+   */
+  private static File copy(String folder, String from, String to) throws Exception {
+    File dir = FOLDER.newFolder(folder);
+    for (String name : new String[] { "clean_cogen.xml", "clean_cogen_profile.xml" }) {
+      String text =
+        new String(Files.readAllBytes(new File(fixture(name)).toPath()), StandardCharsets.UTF_8);
+      assertTrue(name.endsWith("profile.xml") || text.contains(from));
+      Files.write(new File(dir, name).toPath(),
+        text.replace(from, to).getBytes(StandardCharsets.UTF_8));
+    }
+    return new File(dir, "clean_cogen.xml");
   }
 
   private static ChildJvm child(String name) throws Exception {
@@ -194,6 +221,28 @@ public class ValidateRunTest {
     assertEquals(0, json.getAsJsonArray("findings").size());
     assertEquals(2, json.getAsJsonArray("files").size());
     assertTrue(json.toString(), json.getAsJsonArray("schemaFiles").size() > 0);
+  }
+
+  /**
+   * Verifies that running -validate with launch overrides still reports the findings that the
+   * pre-run gate detects in the files as written, ensuring that a passing -validate run guarantees
+   * a passing pre-run gate.
+   */
+  @Test
+  public void testOverridesKeepTheGateFindings() throws Exception {
+    assertEquals(ScenarioValidator.EXIT_CODE, rangeExit);
+    PhoenixUtil.setRowCountOverride(0);
+    ValidationReport gate =
+      ScenarioValidator.validate(rangeScenario.getPath(), null, new LinkedHashMap<>());
+    assertEquals(gate.getFindings().toString(), 1, gate.getErrors());
+    assertEquals("openloop.rate", gate.getFindings().get(0).getRule().id());
+    JsonArray findings =
+      read(new File(range.work(), "RESULTS/VALIDATION_range.json")).getAsJsonArray("findings");
+    assertEquals(findings.toString(), 1, findings.size());
+    JsonObject entry = findings.get(0).getAsJsonObject();
+    assertEquals("openloop.rate", entry.get("rule").getAsString());
+    assertEquals(gate.getFindings().get(0).getWhere(), entry.get("where").getAsString());
+    assertEquals(gate.getFindings().get(0).getMessage(), entry.get("message").getAsString());
   }
 
   private static JsonObject read(File file) throws Exception {

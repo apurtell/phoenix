@@ -482,8 +482,16 @@ schemas, loading data, nor executing queries.
 
 * Recognized options: `-scenarioFile` (required), `-label` (specifying the report name),
   `-schemaFile` (or the default schema files when omitted), `-disableSchemaApply` (disabling schema
-  file loading), `-rowCountOverride`, and `-allowUnknownTags`. All other execution options and
-  launch overrides are ignored.
+  file loading), `-rowCountOverride`, `-allowUnknownTags`, and the launch overrides
+  (`-runDurationMs`, `-threadCount`, and `-targetRate`, which require `-q`). All other execution
+  options are ignored.
+* Launch override evaluation: when launch overrides are supplied, the validation rules evaluate the
+  files in two passes—first as written, matching the pre-run gate, and then after applying the
+  overrides to reflect the effective runtime values. The report combines the findings from both
+  passes, recording any duplicate finding produced by both (with the same rule, file, line, where,
+  and message) only once. Consequently, any file that passes `-validate` is guaranteed to pass the
+  pre-run gate. A launch override that the runtime rejects is reported as a finding. When no launch
+  overrides are specified, the validation report matches the pre-run gate report directly.
 * Exit codes: returns 0 when all validation rules pass; returns 65 (EX_DATAERR) when any validation
   rule fails; returns 1, consistent with all other Pherf errors, for an invalid invocation or when
   no matching scenario or schema file is found.
@@ -495,9 +503,9 @@ schemas, loading data, nor executing queries.
   `schemaFiles`, `errors`, and `findings`, where each finding entry contains `rule`, `file`, `line`
   (populated for structural rules only), `where`, and `message`.
 * DDL resolution: table definitions are collected first from the schema files that the run would
-  apply—discovered and read as single statements by the standard schema reader—and subsequently
-  from the `preScenarioDdls` declared on the scenarios. Only CREATE TABLE statements define tables,
-  and when a table is defined multiple times, the first definition takes precedence.
+  apply—discovered and read as single statements by the runtime schema reader—and subsequently from
+  the `preScenarioDdls` declared on the scenarios. Only CREATE TABLE statements define tables, and
+  when a table is defined multiple times, the first definition takes precedence.
 
 Any execution invoked with `-scenarioFile` (whether `-l`, `-q`, `-mt`, or `-diff`, using either the
 thick or thin driver) runs the same validation first as a pre-run gate. The gate validates the

@@ -30,9 +30,7 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.phoenix.pherf.configuration.Column;
@@ -40,10 +38,10 @@ import org.apache.phoenix.pherf.configuration.DataModel;
 import org.apache.phoenix.pherf.configuration.Scenario;
 import org.apache.phoenix.pherf.configuration.XMLConfigParser;
 import org.apache.phoenix.pherf.distributed.CapturingAppender;
+import org.apache.phoenix.pherf.distributed.Plans;
 import org.apache.phoenix.pherf.distributed.Simulation;
 import org.apache.phoenix.pherf.distributed.controller.RunSpec;
 import org.apache.phoenix.pherf.distributed.controller.RunView;
-import org.apache.phoenix.pherf.distributed.controller.StepSpec;
 import org.apache.phoenix.pherf.distributed.protocol.AgentMessage;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
@@ -57,6 +55,7 @@ import org.junit.rules.TemporaryFolder;
 
 public class IdentityTest {
   private static final long PLAN_SEED = 20260101L;
+  /** Defines the starting row offset assigned to slot 1 across the identity test cases. */
   private static final long STRIDE = 1000;
   private static final int ROWS = 20;
   private static final String DOCUMENT = "scenario.xml";
@@ -97,12 +96,8 @@ public class IdentityTest {
   }
 
   private static RunSpec templateRun(String template) {
-    Map<String, String> documents = new LinkedHashMap<>();
-    documents.put(DOCUMENT, template);
-    Map<String, String> properties = new LinkedHashMap<>();
-    properties.put("pherf.prefix", "${pherf.slot.prefix}");
-    return new RunSpec(PLAN_SEED,
-      Collections.singletonList(new StepSpec(1, STRIDE, documents, properties)));
+    return Plans.plan(PLAN_SEED).step(Plans.step(1).scenario(DOCUMENT, template).rows(ROWS)
+      .property("pherf.prefix", "${pherf.slot.prefix}")).spec();
   }
 
   /** Executes the template on one agent and returns the assignment received by its workload. */
@@ -135,7 +130,7 @@ public class IdentityTest {
   @Test
   public void dataPlaneIdentityChangesSeedAndPrefix() throws Exception {
     String template = template();
-    DataPlaneIdentity slot0 = DataPlaneIdentity.derive(PLAN_SEED, 0, STRIDE);
+    DataPlaneIdentity slot0 = DataPlaneIdentity.derive(PLAN_SEED, 0, 0);
     DataPlaneIdentity slot1 = DataPlaneIdentity.derive(PLAN_SEED, 1, STRIDE);
     assertNotEquals(slot0.getSeed(), slot1.getSeed());
     assertEquals(0, slot0.getOffset());
@@ -176,7 +171,7 @@ public class IdentityTest {
       assertEquals(DataPlaneIdentity.derive(PLAN_SEED, slot, STRIDE),
         DataPlaneIdentity.derive(PLAN_SEED, slot, STRIDE));
     }
-    DataPlaneIdentity last = DataPlaneIdentity.derive(PLAN_SEED, 999, STRIDE);
+    DataPlaneIdentity last = DataPlaneIdentity.derive(PLAN_SEED, 999, 999 * STRIDE);
     assertEquals("p999", last.getPrefix());
     assertEquals(999 * STRIDE, last.getOffset());
     assertNotEquals(DataPlaneIdentity.derive(PLAN_SEED, 5, STRIDE).getSeed(),
@@ -194,11 +189,17 @@ public class IdentityTest {
         assertTrue(e.getMessage(), e.getMessage().contains("slot"));
       }
     }
+    try {
+      DataPlaneIdentity.derive(PLAN_SEED, 1, -1);
+      fail("negative offset");
+    } catch (IllegalArgumentException e) {
+      assertTrue(e.getMessage(), e.getMessage().contains("offset"));
+    }
   }
 
   @Test
   public void unknownSlotTokenIsAnError() {
-    DataPlaneIdentity slot0 = DataPlaneIdentity.derive(PLAN_SEED, 0, STRIDE);
+    DataPlaneIdentity slot0 = DataPlaneIdentity.derive(PLAN_SEED, 0, 0);
     for (String token : new String[] { "${pherf.slot.agent}", "${pherf.slot.id}",
       "${pherf.slot.}" }) {
       try {

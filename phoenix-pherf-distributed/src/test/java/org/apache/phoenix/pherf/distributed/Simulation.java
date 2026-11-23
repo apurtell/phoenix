@@ -24,12 +24,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.phoenix.pherf.distributed.agent.AgentRuntime;
+import org.apache.phoenix.pherf.distributed.agent.Workload;
 import org.apache.phoenix.pherf.distributed.clock.VirtualClock;
 import org.apache.phoenix.pherf.distributed.controller.AgentView;
 import org.apache.phoenix.pherf.distributed.controller.Controller;
 import org.apache.phoenix.pherf.distributed.controller.RunSpec;
 import org.apache.phoenix.pherf.distributed.controller.RunView;
-import org.apache.phoenix.pherf.distributed.controller.StepSpec;
 import org.apache.phoenix.pherf.distributed.identity.OperationalIdentity;
 import org.apache.phoenix.pherf.distributed.transport.InProcessNetwork;
 
@@ -47,7 +47,8 @@ public final class Simulation {
   public final VirtualClock clock = new VirtualClock(START_MS);
   public final InProcessNetwork network = new InProcessNetwork();
   public final Controller controller = new Controller(clock);
-  private final Map<String, FakeWorkload> workloads = new LinkedHashMap<>();
+  private final Map<String, Workload> workloads = new LinkedHashMap<>();
+  private final Map<String, AgentRuntime> runtimes = new LinkedHashMap<>();
   private int incarnations;
 
   public Simulation() {
@@ -60,18 +61,28 @@ public final class Simulation {
    * allowing a subsequent agent process to reuse the same logical agent id.
    */
   public AgentRuntime agent(String id) {
+    return agent(id, new FakeWorkload(clock));
+  }
+
+  /** Instantiates and starts a simulated agent process configured with its own workload. */
+  public AgentRuntime agent(String id, Workload workload) {
     String incarnation = UUID
       .nameUUIDFromBytes((id + "#" + ++incarnations).getBytes(StandardCharsets.UTF_8)).toString();
-    FakeWorkload workload = new FakeWorkload(clock);
     AgentRuntime runtime = new AgentRuntime(new OperationalIdentity(id, incarnation), clock,
       network.connect(id, ENDPOINT), workload);
     workloads.put(id, workload);
+    runtimes.put(id, runtime);
     runtime.start();
     return runtime;
   }
 
+  /** Returns the most recent agent process runtime started under the specified identifier. */
+  public AgentRuntime agentRuntime(String id) {
+    return runtimes.get(id);
+  }
+
   public FakeWorkload workload(String id) {
-    return workloads.get(id);
+    return (FakeWorkload) workloads.get(id);
   }
 
   /**
@@ -123,13 +134,12 @@ public final class Simulation {
    * configuring every step with the provided property map.
    */
   public static RunSpec spec(long seed, Map<String, String> properties, int... agents) {
-    List<StepSpec> steps = new ArrayList<>();
+    Plans plan = Plans.plan(seed);
     for (int count : agents) {
-      Map<String, String> documents = new LinkedHashMap<>();
-      documents.put("scenario.xml", "<datamodel name=\"fake\"/>");
-      steps.add(new StepSpec(count, 1000, documents, properties));
+      plan.step(Plans.step(count).scenario("scenario.xml", "<datamodel name=\"fake\"/>")
+        .properties(properties));
     }
-    return new RunSpec(seed, steps);
+    return plan.spec();
   }
 
   public static RunSpec spec(int... agents) {
