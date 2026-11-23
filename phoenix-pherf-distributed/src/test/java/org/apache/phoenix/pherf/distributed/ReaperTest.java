@@ -29,7 +29,9 @@ import java.util.Map;
 import org.apache.phoenix.pherf.distributed.agent.AgentRuntime;
 import org.apache.phoenix.pherf.distributed.controller.AgentView;
 import org.apache.phoenix.pherf.distributed.controller.RunView;
+import org.apache.phoenix.pherf.distributed.protocol.MessageType;
 import org.apache.phoenix.pherf.distributed.protocol.Protocol;
+import org.apache.phoenix.pherf.distributed.transport.InProcessNetwork;
 import org.junit.Test;
 
 /**
@@ -110,5 +112,35 @@ public class ReaperTest {
     assertEquals(Collections.singletonList(runId), simulation.workload("a1").cancelled);
     assertEquals(AgentRuntime.State.IDLE, a1.state());
     assertEquals(AgentView.State.IDLE, view.getState());
+  }
+
+  /**
+   * Verifies the control stream keepalive mechanism, in which the held poll acts as the keepalive
+   * signal for the control stream. If a single reply to a held poll is lost, the request times out
+   * after {@link Protocol#IO_TIMEOUT_MS} and the subsequent poll reaches the controller before the
+   * deadline on either side expires, ensuring that the idle agent remains registered.
+   */
+  @Test
+  public void lostHeldPollReplyDoesNotEvict() {
+    Simulation simulation = new Simulation();
+    simulation.agent("a1");
+    simulation.runFor(3000);
+    String incarnation = simulation.view("a1").getIncarnation();
+    boolean[] lost = new boolean[1];
+    simulation.network.policy((agent, stream, direction, message) -> {
+      if (
+        direction.equals(InProcessNetwork.REPLY) && message.type() == MessageType.WAIT && !lost[0]
+      ) {
+        lost[0] = true;
+        return InProcessNetwork.Policy.DROP;
+      }
+      return 0;
+    });
+    simulation.runFor(3 * Protocol.DEADLINE_MS);
+    assertEquals(1, simulation.count(InProcessNetwork.DROP, "wait"));
+    assertEquals(1, simulation.count(InProcessNetwork.FAIL, "heartbeat"));
+    assertEquals(incarnation, simulation.view("a1").getIncarnation());
+    assertEquals(1, simulation.count("request", "register"));
+    assertEquals(0, simulation.count("reply", "reregister"));
   }
 }

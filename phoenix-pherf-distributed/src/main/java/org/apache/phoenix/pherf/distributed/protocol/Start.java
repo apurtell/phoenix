@@ -18,8 +18,10 @@
 package org.apache.phoenix.pherf.distributed.protocol;
 
 /**
- * This control reply instructs the agent to start executing the prepared slot at the specified
- * epoch time in milliseconds (ms).
+ * Represents a control reply instructing the agent to open the start gate of its armed slot at
+ * startAtMs, which specifies an epoch timestamp in milliseconds (ms) on the wall clock of the
+ * agent. The controller derives this timestamp from a single shared epoch for the step and the
+ * clock offset of the agent.
  */
 public final class Start extends Message {
   private String runId;

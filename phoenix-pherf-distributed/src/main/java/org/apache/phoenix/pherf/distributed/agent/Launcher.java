@@ -32,6 +32,9 @@ public interface Launcher {
 
   /** Represents a running child process launched by the agent. */
   interface Handle {
+    /** Writes a single line to the standard input stream of the child process. */
+    void send(String line) throws IOException;
+
     /** Requests graceful termination of the child process via SIGTERM. */
     void destroy();
 
@@ -39,9 +42,17 @@ public interface Launcher {
     void destroyForcibly();
   }
 
-  /** Receives notification when a launched child process terminates. */
+  /** Receives lifecycle marker events and termination notifications from a child process. */
   interface ExitListener {
     /** Reports the final exit status and the trailing output lines captured from the child. */
     void exited(int status, List<String> lastLines);
+
+    /** Reports that the child process is holding at its start gate. */
+    default void armed() {
+    }
+
+    /** Reports that the child process opened its start gate at the given agent clock time. */
+    default void started(long startedMs) {
+    }
   }
 }

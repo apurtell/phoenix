@@ -91,6 +91,16 @@ public class PherfWorkloadTest {
     }
 
     @Override
+    public synchronized void armed() {
+      calls.add("armed");
+    }
+
+    @Override
+    public synchronized void started(long startedMs) {
+      calls.add("started " + startedMs);
+    }
+
+    @Override
     public synchronized void interval(String operation, String phase, long startMs, long endMs,
       Histogram histogram) {
       calls.add("interval " + operation + " " + phase + " " + startMs + " " + endMs + " "
@@ -179,19 +189,44 @@ public class PherfWorkloadTest {
     clock.advance(0);
     assertEquals(Collections.singletonList("prepared []"), events.calls);
 
-    // The run child process launches at the scheduled start time with the same options, except
-    // that -validate is omitted.
-    workload.start(assignment(), clock.millis() + 5000, events);
-    clock.advance(4999);
-    assertEquals(1, launcher.launches.size());
-    clock.advance(1);
+    // Launching the run child process starts it immediately with the same command-line options,
+    // omitting the -validate flag.
+    workload.launch(assignment(), events);
+    assertEquals(2, launcher.launches.size());
     FakeLauncher.Launch run = launcher.last();
     assertEquals(Arrays.asList("-q", "-disableSchemaApply", "-scenarioFile", scenario, "-label",
       "run", "-z", "zk1:2181", "-runDurationMs", "2000", "-threadCount", "3", "-targetRate", "34",
       "-rowCountOverride", "995"), run.args);
+    // Lifecycle markers from the child process are delivered to the listener on the clock thread,
+    // and starting the run writes the target start timestamp to the child's standard input stream.
+    run.arm();
+    assertEquals(Collections.singletonList("prepared []"), events.calls);
+    clock.advance(0);
+    long startAtMs = clock.millis() + 5000;
+    workload.start(RUN, startAtMs);
+    workload.start("other", startAtMs + 1);
+    assertEquals(Collections.singletonList(Long.toString(startAtMs)), run.sent);
+    run.started(startAtMs + 1);
+    clock.advance(0);
     run.exit(0);
     clock.advance(0);
-    assertEquals(Arrays.asList("prepared []", "finished"), events.calls);
+    assertEquals(Arrays.asList("prepared []", "armed", "started " + (startAtMs + 1), "finished"),
+      events.calls);
+  }
+
+  /**
+   * Verifies that a child process that exits without arming at a start gate, as a -l load execution
+   * does, still completes its run normally.
+   */
+  @Test
+  public void childThatNeverArmsFinishes() {
+    prepared(assignment());
+    workload.launch(assignment(), events);
+    FakeLauncher.Launch run = launcher.last();
+    workload.start(RUN, clock.millis());
+    run.exit(0);
+    clock.advance(0);
+    assertEquals(Collections.singletonList("finished"), events.calls);
   }
 
   @Test
@@ -371,8 +406,7 @@ public class PherfWorkloadTest {
   @Test
   public void runExitCodes() {
     prepared(assignment());
-    workload.start(assignment(), clock.millis(), events);
-    clock.advance(0);
+    workload.launch(assignment(), events);
     launcher.last().exit(3, "a", "b");
     clock.advance(0);
     assertEquals(Collections.singletonList("failed pherf exited with 3: a | b"), events.calls);
@@ -380,7 +414,7 @@ public class PherfWorkloadTest {
     events.calls.clear();
     prepared(assignment());
     launcher.failure = new IOException("no java");
-    workload.start(assignment(), clock.millis(), events);
+    workload.launch(assignment(), events);
     clock.advance(0);
     assertEquals(Collections.singletonList("failed cannot launch pherf: no java"), events.calls);
   }
@@ -406,23 +440,34 @@ public class PherfWorkloadTest {
     assertEquals(0, launcher.last().destroys);
   }
 
+  /**
+   * Verifies that cancelling a child process while it is holding at its start gate terminates the
+   * child and prevents any start time from being sent to it.
+   */
   @Test
-  public void cancelWhileWaitingForTheStart() {
+  public void cancelWhileArmed() {
     prepared(assignment());
-    workload.start(assignment(), clock.millis() + 5000, events);
-    workload.cancel(RUN);
+    workload.launch(assignment(), events);
+    FakeLauncher.Launch run = launcher.last();
+    run.arm();
     clock.advance(0);
-    assertEquals(Collections.singletonList("finished"), events.calls);
-    clock.advance(10000);
-    assertEquals(1, launcher.launches.size());
-    assertEquals(Collections.singletonList("finished"), events.calls);
+    workload.cancel(RUN);
+    assertEquals(1, run.destroys);
+    workload.start(RUN, clock.millis());
+    assertEquals(Collections.emptyList(), run.sent);
+    // Any lifecycle marker emitted after cancellation is suppressed and does not reach the
+    // listener.
+    run.started(clock.millis());
+    run.exit(143);
+    clock.advance(0);
+    assertEquals(Arrays.asList("armed", "finished"), events.calls);
+    assertEquals(2, launcher.launches.size());
   }
 
   @Test
   public void cancelWhileRunning() {
     prepared(assignment());
-    workload.start(assignment(), clock.millis(), events);
-    clock.advance(0);
+    workload.launch(assignment(), events);
     FakeLauncher.Launch run = launcher.last();
     assertFalse(run.validates());
     workload.cancel(RUN);
@@ -439,8 +484,7 @@ public class PherfWorkloadTest {
     // A child process that terminates within the stop grace period is not sent a SIGKILL signal.
     events.calls.clear();
     prepared(assignment());
-    workload.start(assignment(), clock.millis(), events);
-    clock.advance(0);
+    workload.launch(assignment(), events);
     FakeLauncher.Launch quick = launcher.last();
     workload.cancel(RUN);
     quick.exit(143);
@@ -468,8 +512,7 @@ public class PherfWorkloadTest {
 
     events.calls.clear();
     prepared(assignment());
-    workload.start(assignment(), clock.millis(), events);
-    clock.advance(0);
+    workload.launch(assignment(), events);
     workload.close();
     assertEquals(1, launcher.last().kills);
     // Closing the workload when no child process is alive performs no further kill action.
@@ -585,6 +628,13 @@ public class PherfWorkloadTest {
     simulation.runFor(2000);
     FakeLauncher.Launch run = launcher.last();
     assertFalse(run.validates());
+    // Once the child process arms, the scheduled start time is written to its standard input
+    // stream, and the start gate opens at that timestamp.
+    run.arm();
+    simulation.runFor(4000);
+    assertEquals(1, run.sent.size());
+    long startAtMs = Long.parseLong(run.sent.get(0));
+    run.started(startAtMs);
     long base = simulation.clock.millis() + 7;
     IntervalLog log =
       new IntervalLog(new File(work, "RESULTS_HDR/LATENCY_run_intervals.hlog"), base);
@@ -620,8 +670,13 @@ public class PherfWorkloadTest {
     assertEquals(expected, held(simulation));
     RunView done = simulation.run(runId);
     assertEquals(RunView.State.COMPLETE, done.getState());
-    assertEquals(4, done.getSteps().get(0).getSlots().get(0).getHeldSeq());
-    assertEquals(4, done.getSteps().get(0).getSlots().get(0).getFinalSeq());
+    RunView.SlotView slot = done.getSteps().get(0).getSlots().get(0);
+    assertEquals(4, slot.getHeldSeq());
+    assertEquals(4, slot.getFinalSeq());
+    assertEquals(2 + 5 + 1 + 3, slot.getSamples());
+    assertEquals(Long.valueOf(startAtMs), slot.getStartAtMs());
+    assertEquals(Long.valueOf(startAtMs), slot.getDispatchMs());
+    assertEquals(Long.valueOf(0), done.getSteps().get(0).getSkewMs());
   }
 
   @Test

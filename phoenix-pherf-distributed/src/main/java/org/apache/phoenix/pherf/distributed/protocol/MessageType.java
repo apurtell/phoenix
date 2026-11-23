@@ -28,6 +28,7 @@ public enum MessageType {
   REGISTERED("registered", Registered.class),
   WAIT("wait", Wait.class),
   ASSIGN("assign", Assign.class),
+  LAUNCH("launch", Launch.class),
   START("start", Start.class),
   CANCEL("cancel", Cancel.class),
   RELEASE("release", Release.class),

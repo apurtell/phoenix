@@ -32,7 +32,7 @@ final class RunRecord {
   /** Holds the index of the current step in the run sequence. */
   int current;
   /**
-   * True once at least one step has started, indicating that the run may have sent database
+   * True once at least one step has been launched, indicating that the run may have sent database
    * traffic.
    */
   boolean started;
@@ -51,9 +51,11 @@ final class RunRecord {
       List<RunView.SlotView> slotViews = new ArrayList<>();
       for (SlotRecord slot : step.slots) {
         slotViews.add(new RunView.SlotView(slot.assignment.getIdentity(), slot.agent, slot.state,
-          slot.error, slot.assignment.getShare(), slot.heldSeq, slot.finalSeq, slot.frames.size()));
+          slot.error, slot.assignment.getShare(), slot.heldSeq, slot.finalSeq, slot.frames.size(),
+          slot.samples, slot.offsetMs, slot.delayMs, slot.startAtMs, slot.dispatchMs));
       }
-      stepViews.add(new RunView.StepView(step.index, step.state, step.startAtMs, slotViews));
+      stepViews
+        .add(new RunView.StepView(step.index, step.state, step.startAtMs, step.skewMs, slotViews));
     }
     return new RunView(runId, state, reason, current, stepViews);
   }
@@ -64,7 +66,13 @@ final class RunRecord {
     final int index;
     final List<SlotRecord> slots = new ArrayList<>();
     RunView.StepState state = RunView.StepState.PENDING;
+    /** Holds the step start epoch on the controller clock, or 0 before the epoch is set. */
     long startAtMs;
+    /**
+     * Holds the upper bound on the start skew across started slots once every started slot has
+     * reported a dispatch timestamp.
+     */
+    Long skewMs;
 
     StepRecord(RunRecord run, int index) {
       this.run = run;
@@ -85,6 +93,19 @@ final class RunRecord {
     String error;
     long heldSeq;
     long finalSeq;
+    /** Holds the cumulative sample count across all currently held frames. */
+    long samples;
+    /**
+     * Holds the agent's clock offset and delay estimate captured when the start epoch was set,
+     * along with the resulting start time on the agent's clock.
+     */
+    Long offsetMs;
+    Long delayMs;
+    Long startAtMs;
+    /**
+     * Holds the timestamp when the agent's start gate opened, translated to the controller clock.
+     */
+    Long dispatchMs;
 
     SlotRecord(StepRecord step, String agent, Assignment assignment) {
       this.step = step;

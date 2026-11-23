@@ -18,29 +18,32 @@
 package org.apache.phoenix.pherf.distributed.protocol;
 
 /**
- * This class represents the complete operational state of an agent. The runId and step fields
- * identify the current assignment, while finalSeq records the last frame sequence for a DONE
- * assignment and error captures the failure reason for a FAILED assignment.
+ * Represents the complete operational state of an agent. The runId and step fields identify the
+ * current assignment, while finalSeq records the last frame sequence of a DONE assignment and error
+ * captures the failure reason of a FAILED one. The startedMs field records the agent wall-clock
+ * time when the start gate of the workload opened, or 0 before that point.
  */
 public final class Status {
-  /** This constant represents the status of an agent that currently has no assignment. */
-  public static final Status IDLE = new Status(Phase.IDLE, null, 0, 0, null);
+  /** Represents the status of an agent that currently has no assignment. */
+  public static final Status IDLE = new Status(Phase.IDLE, null, 0, 0, null, 0);
 
   private Phase phase;
   private String runId;
   private int step;
   private long finalSeq;
   private String error;
+  private long startedMs;
 
   private Status() {
   }
 
-  public Status(Phase phase, String runId, int step, long finalSeq, String error) {
+  public Status(Phase phase, String runId, int step, long finalSeq, String error, long startedMs) {
     this.phase = phase;
     this.runId = runId;
     this.step = step;
     this.finalSeq = finalSeq;
     this.error = error;
+    this.startedMs = startedMs;
   }
 
   public Phase getPhase() {
@@ -61,5 +64,9 @@ public final class Status {
 
   public String getError() {
     return error;
+  }
+
+  public long getStartedMs() {
+    return startedMs;
   }
 }

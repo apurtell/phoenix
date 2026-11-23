@@ -26,10 +26,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Decorates a process launcher so that each launch call returns only after the child process exit
- * listener has completed execution. This synchronous behavior allows virtual-clock tests to observe
- * each real child process execution as a single discrete step, using a bounded process wait rather
- * than a thread sleep.
+ * Decorates a process launcher so that each launch invocation returns only after the child process
+ * has either armed at its start gate or completed its exit listener callback. Sending a line to an
+ * armed child process likewise blocks until its exit listener has completed. This synchronous
+ * behavior allows virtual-clock tests to observe each real child process execution as one or two
+ * discrete steps, using bounded process waits rather than thread sleeps.
  */
 public final class SyncLauncher implements Launcher {
   private static final long TIMEOUT_MS = 120000;
@@ -45,24 +46,62 @@ public final class SyncLauncher implements Launcher {
     synchronized (commands) {
       commands.add(new ArrayList<>(args));
     }
+    CountDownLatch armedOrExited = new CountDownLatch(1);
     CountDownLatch exited = new CountDownLatch(1);
-    Handle handle = delegate.launch(args, workDir, (status, lines) -> {
-      try {
-        listener.exited(status, lines);
-      } finally {
-        exited.countDown();
+    Handle handle = delegate.launch(args, workDir, new ExitListener() {
+      @Override
+      public void armed() {
+        listener.armed();
+        armedOrExited.countDown();
+      }
+
+      @Override
+      public void started(long startedMs) {
+        listener.started(startedMs);
+      }
+
+      @Override
+      public void exited(int status, List<String> lines) {
+        try {
+          listener.exited(status, lines);
+        } finally {
+          exited.countDown();
+          armedOrExited.countDown();
+        }
       }
     });
-    try {
-      if (!exited.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+    await(armedOrExited, handle, args);
+    return new Handle() {
+      @Override
+      public void send(String line) throws IOException {
+        handle.send(line);
+        await(exited, handle, args);
+      }
+
+      @Override
+      public void destroy() {
+        handle.destroy();
+      }
+
+      @Override
+      public void destroyForcibly() {
         handle.destroyForcibly();
-        throw new IOException("the child did not exit in " + TIMEOUT_MS + " ms: " + args);
+      }
+    };
+  }
+
+  private static void await(CountDownLatch latch, Handle handle, List<String> args)
+    throws IOException {
+    try {
+      if (!latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        handle.destroyForcibly();
+        throw new IOException(
+          "the child did not reach its next step in " + TIMEOUT_MS + " ms: " + args);
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IOException(e);
     }
-    return handle;
   }
 
   /** Returns the command-line argument lists recorded for each launch in invocation order. */

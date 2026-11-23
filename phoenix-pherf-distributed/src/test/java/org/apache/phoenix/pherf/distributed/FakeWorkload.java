@@ -26,33 +26,52 @@ import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.latency.LatencyRecorders;
 
 /**
- * A synthetic test workload driven by the virtual clock. It emits one interval histogram per
- * configured interval before completing. Any configuration property key suffixed with
- * {@code .<slot>} is scoped exclusively to that individual slot:
+ * A synthetic test workload driven by the virtual clock or by the skewed clock of its host. After
+ * launch, it emits its warmup intervals, waits until it is ready, and arms. At the scheduled start
+ * time, it dispatches by emitting one steady interval histogram for each configured interval before
+ * finishing. Any configuration property key suffixed with {@code .<slot>} is scoped exclusively to
+ * that individual slot:
  * <ul>
- * <li>fake.intervals: configures the total number of intervals to execute, defaulting to 3.</li>
+ * <li>fake.intervals: configures the total number of steady intervals to execute, defaulting to
+ * 3.</li>
  * <li>fake.intervalMs: configures the duration of each interval, defaulting to 1000 ms.</li>
- * <li>fake.fail: causes the workload to fail after this many intervals have completed.</li>
+ * <li>fake.warmup: configures the total number of warmup intervals to execute, defaulting to
+ * 0.</li>
+ * <li>fake.readyMs: configures the delay from the last warmup interval until the workload arms,
+ * defaulting to 0.</li>
+ * <li>fake.gate: set to false for a workload without a start gate, such as a -l load; the workload
+ * never arms and instead dispatches immediately at launch.</li>
+ * <li>fake.fail: causes the workload to fail after this many steady intervals have completed.</li>
  * <li>fake.prepareError: causes the prepare phase to report this error. Any later slice validated
  * during preparation reports its own configured value prefixed with "step &lt;step&gt; slot
  * &lt;slot&gt;: ", matching PherfWorkload.</li>
  * <li>fake.prepareThrows: causes the prepare phase to throw an IllegalStateException with this
  * message.</li>
  * </ul>
- * Once cancel is requested, the workload stops at the end of its currently active interval.
+ * Once cancel is requested, the workload stops at the end of its currently active interval, or
+ * terminates immediately if it is currently armed.
  */
 public final class FakeWorkload implements Workload {
   public static final String OPERATION = "query:fake:q1";
 
   public final List<Assignment> prepared = new ArrayList<>();
-  public final List<Assignment> started = new ArrayList<>();
+  public final List<Assignment> launched = new ArrayList<>();
+  /** Records the local start timestamp received for each start command. */
+  public final List<Long> startAtMs = new ArrayList<>();
+  /** Records the local timestamp at which each initial steady interval is dispatched. */
+  public final List<Long> dispatchedMs = new ArrayList<>();
   public final List<String> cancelled = new ArrayList<>();
-  /** Stores the total count of each emitted interval histogram in emission order. */
+  /**
+   * Stores the total count of each emitted warmup and steady interval histogram in emission order.
+   */
   public final List<Long> emitted = new ArrayList<>();
 
   private final Clock clock;
   private Clock.Timer timer;
   private boolean cancelling;
+  private boolean armed;
+  private Assignment assignment;
+  private Listener listener;
 
   public FakeWorkload(Clock clock) {
     this.clock = clock;
@@ -91,39 +110,92 @@ public final class FakeWorkload implements Workload {
   }
 
   @Override
-  public void start(Assignment assignment, long startAtMs, Listener listener) {
-    started.add(assignment);
+  public void launch(Assignment assignment, Listener listener) {
+    launched.add(assignment);
+    this.assignment = assignment;
+    this.listener = listener;
     cancelling = false;
-    long intervals = number(assignment, "fake.intervals", 3);
-    long intervalMs = number(assignment, "fake.intervalMs", 1000);
-    long failAfter = number(assignment, "fake.fail", -1);
-    tick(assignment, listener, 1, intervals, intervalMs, failAfter);
+    armed = false;
+    if ("false".equals(property(assignment, "fake.gate"))) {
+      steady(1);
+    } else {
+      warmup(1);
+    }
   }
 
-  private void tick(Assignment assignment, Listener listener, long n, long intervals,
-    long intervalMs, long failAfter) {
+  private long intervalMs() {
+    return number(assignment, "fake.intervalMs", 1000);
+  }
+
+  private void warmup(long n) {
+    if (n > number(assignment, "fake.warmup", 0)) {
+      timer = clock.schedule(number(assignment, "fake.readyMs", 0), () -> {
+        timer = null;
+        if (cancelling) {
+          listener.finished();
+          return;
+        }
+        armed = true;
+        listener.armed();
+      });
+      return;
+    }
     long startMs = clock.millis();
-    timer = clock.schedule(intervalMs, () -> {
+    timer = clock.schedule(intervalMs(), () -> {
       timer = null;
       if (cancelling) {
         listener.finished();
         return;
       }
-      Histogram histogram = new Histogram(LatencyRecorders.LOWEST_US, LatencyRecorders.HIGHEST_US,
-        LatencyRecorders.DIGITS);
-      for (int i = 0; i < n; i++) {
-        histogram.recordValue(100 * n + 10 * assignment.getIdentity().getSlot() + i);
+      emit(LatencyRecorders.WARMUP, n, startMs);
+      warmup(n + 1);
+    });
+  }
+
+  @Override
+  public void start(String runId, long startAtMs) {
+    this.startAtMs.add(startAtMs);
+    armed = false;
+    timer = clock.schedule(startAtMs - clock.millis(), () -> {
+      timer = null;
+      if (cancelling) {
+        listener.finished();
+        return;
       }
-      emitted.add(histogram.getTotalCount());
-      listener.interval(OPERATION, LatencyRecorders.STEADY, startMs, clock.millis(), histogram);
+      dispatchedMs.add(clock.millis());
+      listener.started(clock.millis());
+      steady(1);
+    });
+  }
+
+  private void steady(long n) {
+    long failAfter = number(assignment, "fake.fail", -1);
+    long startMs = clock.millis();
+    timer = clock.schedule(intervalMs(), () -> {
+      timer = null;
+      if (cancelling) {
+        listener.finished();
+        return;
+      }
+      emit(LatencyRecorders.STEADY, n, startMs);
       if (n == failAfter) {
         listener.failed("fake failure after " + n + " intervals");
-      } else if (n == intervals) {
+      } else if (n == number(assignment, "fake.intervals", 3)) {
         listener.finished();
       } else {
-        tick(assignment, listener, n + 1, intervals, intervalMs, failAfter);
+        steady(n + 1);
       }
     });
+  }
+
+  private void emit(String phase, long n, long startMs) {
+    Histogram histogram = new Histogram(LatencyRecorders.LOWEST_US, LatencyRecorders.HIGHEST_US,
+      LatencyRecorders.DIGITS);
+    for (int i = 0; i < n; i++) {
+      histogram.recordValue(100 * n + 10 * assignment.getIdentity().getSlot() + i);
+    }
+    emitted.add(histogram.getTotalCount());
+    listener.interval(OPERATION, phase, startMs, clock.millis(), histogram);
   }
 
   @Override
@@ -131,11 +203,27 @@ public final class FakeWorkload implements Workload {
     cancelled.add(runId);
     if (timer != null) {
       cancelling = true;
+    } else if (armed) {
+      armed = false;
+      cancelling = true;
+      timer = clock.schedule(0, () -> {
+        timer = null;
+        listener.finished();
+      });
     }
   }
 
-  /** Returns true while an interval timer is currently armed and awaiting execution. */
+  /** Returns true while a workload timer is currently armed and awaiting execution. */
   public boolean active() {
     return timer != null;
+  }
+
+  /** Computes and returns the cumulative sum of all emitted interval histogram counts. */
+  public long emittedCount() {
+    long sum = 0;
+    for (long count : emitted) {
+      sum += count;
+    }
+    return sum;
   }
 }

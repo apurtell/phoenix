@@ -47,18 +47,21 @@ import org.slf4j.LoggerFactory;
 /**
  * Executes the Pherf workload for an agent. Pherf always runs in an isolated child JVM rather than
  * inside the agent JVM, spawning one child process for each validation during preparation and one
- * child process for each execution upon start. Process isolation prevents Pherf's static state from
- * leaking across runs, ensures an exit within Pherf cannot terminate the agent, allows cancellation
- * to stop active work, and prevents a heavy workload from starving the agent heartbeat.
+ * child process for each launch. Process isolation prevents Pherf's static state from leaking
+ * across runs, ensures an exit within Pherf cannot terminate the agent, allows cancellation to stop
+ * active work, and prevents a heavy workload from starving the agent heartbeat.
  * <p>
  * Preparation writes the assigned slice and the overlay pherf.properties into the work directory
  * and runs Pherf's built-in offline validation (-validate) against the slice using the run options.
  * It then sequentially validates each later-step slice included in the assignment, running one
  * child process at a time in its own subdirectory under {@link #LATER}, and reports the collected
- * errors across all slices. Starting the workload launches the run at the scheduled start time and
- * tails its interval log. Cancellation sends SIGTERM and escalates to SIGKILL after
- * {@link Protocol#STOP_GRACE_MS}. Each lifecycle stage notifies the listener only after its child
- * process has exited, ensuring the agent never transitions to idle while a child remains alive.
+ * errors across all slices. Launching the workload immediately starts the run child process and
+ * tails its interval log. The child process warms up and prints an armed marker when it holds at
+ * the Pherf start gate. Starting the workload writes the start time to the child process's standard
+ * input (stdin), which opens the gate at that time and prints a started marker with that timestamp.
+ * Cancellation sends SIGTERM and escalates to SIGKILL after {@link Protocol#STOP_GRACE_MS}. Each
+ * lifecycle stage notifies the listener only after its child process has exited, ensuring the agent
+ * never transitions to idle while a child remains alive.
  * <p>
  * Listener callbacks always execute on the clock thread without holding the workload lock, because
  * the agent runtime invokes the workload while holding its own lock; this serialization also
@@ -99,7 +102,6 @@ public final class PherfWorkload implements Workload, AutoCloseable {
   private enum Stage {
     VALIDATING,
     PREPARED,
-    WAITING,
     RUNNING,
     ENDED
   }
@@ -120,7 +122,7 @@ public final class PherfWorkload implements Workload, AutoCloseable {
     long launches;
     long exitedLaunch;
     Launcher.Handle child;
-    /** Holds the active timer used either to wait for the scheduled start or to poll intervals. */
+    /** Holds the active timer used to periodically poll the child process's interval log. */
     Clock.Timer timer;
     Clock.Timer kill;
     /** Reads the child's interval log; accessed exclusively on the clock thread. */
@@ -227,10 +229,12 @@ public final class PherfWorkload implements Workload, AutoCloseable {
     }
   }
 
+  /** Immediately launches the run child process and begins periodic polling of its interval log. */
   @Override
-  public void start(Assignment assignment, long startAtMs, Listener listener) {
+  public void launch(Assignment assignment, Listener listener) {
+    Job j;
     synchronized (this) {
-      Job j = job;
+      j = job;
       if (
         j == null || j.stage != Stage.PREPARED || j.cancelled
           || !j.assignment.getRunId().equals(assignment.getRunId())
@@ -241,8 +245,81 @@ public final class PherfWorkload implements Workload, AutoCloseable {
         return;
       }
       j.listener = listener;
-      j.stage = Stage.WAITING;
-      j.timer = clock.schedule(Math.max(0, startAtMs - clock.millis()), () -> run(j));
+      j.stage = Stage.RUNNING;
+      j.tail = new IntervalTail(
+        new File(workDir, RESULTS + "_HDR/LATENCY_" + RUN_LABEL + "_intervals.hlog"));
+    }
+    LOG.info("pherf launches run {} step {}", j.assignment.getRunId(), j.assignment.getStep());
+    launch(j, args(j.assignment, workDir, false), workDir, new Launcher.ExitListener() {
+      @Override
+      public void exited(int status, List<String> lastLines) {
+        ran(j, status, lastLines);
+      }
+
+      @Override
+      public void armed() {
+        marker(j, () -> j.listener.armed());
+      }
+
+      @Override
+      public void started(long startedMs) {
+        marker(j, () -> j.listener.started(startedMs));
+      }
+    }, error -> {
+      synchronized (this) {
+        j.stage = Stage.ENDED;
+      }
+      clock.schedule(0, () -> j.listener.failed("cannot launch pherf: " + error));
+    });
+    synchronized (this) {
+      if (j.stage == Stage.RUNNING && !j.exited()) {
+        j.timer = clock.schedule(INTERVAL_MS, () -> poll(j));
+      }
+    }
+  }
+
+  /**
+   * Dispatches a lifecycle marker emitted by the run child process to the listener on the clock
+   * thread.
+   */
+  private void marker(Job j, Runnable call) {
+    synchronized (this) {
+      if (job != j || j.stage != Stage.RUNNING || j.cancelled) {
+        return;
+      }
+    }
+    clock.schedule(0, call);
+  }
+
+  /**
+   * Sends the scheduled start time to the armed run child process. The write executes outside the
+   * workload lock because the child process can exit during the operation. A failed write
+   * terminates the child process and causes the run to fail once the child has exited.
+   */
+  @Override
+  public void start(String runId, long startAtMs) {
+    Job j;
+    Launcher.Handle child;
+    synchronized (this) {
+      j = job;
+      if (
+        j == null || j.stage != Stage.RUNNING || j.cancelled || j.child == null
+          || !j.assignment.getRunId().equals(runId)
+      ) {
+        return;
+      }
+      child = j.child;
+    }
+    try {
+      child.send(Long.toString(startAtMs));
+    } catch (IOException e) {
+      LOG.warn("cannot send the start time to the pherf child of run {}: {}", runId, e.toString());
+      synchronized (this) {
+        if (j.failure == null) {
+          j.failure = "cannot send the start time: " + e;
+          terminate(j);
+        }
+      }
     }
   }
 
@@ -257,14 +334,9 @@ public final class PherfWorkload implements Workload, AutoCloseable {
       switch (j.stage) {
         case VALIDATING:
         case RUNNING:
-          // The child process exit callback will report the completion of the active stage.
+          // The child process exit callback reports the completion of the active stage, including
+          // when the child is holding at its start gate.
           terminate(j);
-          break;
-        case WAITING:
-          j.timer.cancel();
-          j.stage = Stage.ENDED;
-          Listener listener = j.listener;
-          clock.schedule(0, listener::finished);
           break;
         default:
           // No child or timer is active, so the agent transitions to idle immediately.
@@ -329,11 +401,24 @@ public final class PherfWorkload implements Workload, AutoCloseable {
     }
     Launcher.Handle handle;
     try {
-      handle = launcher.launch(args, dir, (status, lines) -> {
-        synchronized (this) {
-          exited(j, launch);
+      handle = launcher.launch(args, dir, new Launcher.ExitListener() {
+        @Override
+        public void exited(int status, List<String> lastLines) {
+          synchronized (PherfWorkload.this) {
+            PherfWorkload.this.exited(j, launch);
+          }
+          exit.exited(status, lastLines);
         }
-        exit.exited(status, lines);
+
+        @Override
+        public void armed() {
+          exit.armed();
+        }
+
+        @Override
+        public void started(long startedMs) {
+          exit.started(startedMs);
+        }
       });
     } catch (IOException | RuntimeException e) {
       LOG.warn("cannot launch pherf for run {}", j.assignment.getRunId(), e);
@@ -422,36 +507,8 @@ public final class PherfWorkload implements Workload, AutoCloseable {
   }
 
   /**
-   * Executes on the clock thread when the start timer fires to launch the run child process and
-   * begin periodic polling of its interval log.
-   */
-  private void run(Job j) {
-    synchronized (this) {
-      if (job != j || j.stage != Stage.WAITING) {
-        return;
-      }
-      j.stage = Stage.RUNNING;
-      j.tail = new IntervalTail(
-        new File(workDir, RESULTS + "_HDR/LATENCY_" + RUN_LABEL + "_intervals.hlog"));
-    }
-    LOG.info("pherf starts run {} step {}", j.assignment.getRunId(), j.assignment.getStep());
-    launch(j, args(j.assignment, workDir, false), workDir, (status, lines) -> ran(j, status, lines),
-      error -> {
-        synchronized (this) {
-          j.stage = Stage.ENDED;
-        }
-        j.listener.failed("cannot launch pherf: " + error);
-      });
-    synchronized (this) {
-      if (j.stage == Stage.RUNNING && !j.exited()) {
-        j.timer = clock.schedule(INTERVAL_MS, () -> poll(j));
-      }
-    }
-  }
-
-  /**
-   * Executes on the clock thread when the poll timer fires to drain newly written intervals and
-   * schedule the next poll while the child process remains active.
+   * Executes the poll timer callback on the clock thread to drain newly written intervals and
+   * reschedule polling while the run remains active.
    */
   private void poll(Job j) {
     synchronized (this) {

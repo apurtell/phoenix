@@ -32,11 +32,14 @@ import org.apache.phoenix.pherf.distributed.protocol.Assign;
 import org.apache.phoenix.pherf.distributed.protocol.Cancel;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
 import org.apache.phoenix.pherf.distributed.protocol.Heartbeat;
+import org.apache.phoenix.pherf.distributed.protocol.HistogramBlob;
 import org.apache.phoenix.pherf.distributed.protocol.IntervalFrame;
 import org.apache.phoenix.pherf.distributed.protocol.Intervals;
+import org.apache.phoenix.pherf.distributed.protocol.Launch;
 import org.apache.phoenix.pherf.distributed.protocol.Message;
 import org.apache.phoenix.pherf.distributed.protocol.Phase;
 import org.apache.phoenix.pherf.distributed.protocol.Protocol;
+import org.apache.phoenix.pherf.distributed.protocol.ProtocolException;
 import org.apache.phoenix.pherf.distributed.protocol.Registered;
 import org.apache.phoenix.pherf.distributed.protocol.Rejected;
 import org.apache.phoenix.pherf.distributed.protocol.Release;
@@ -59,18 +62,41 @@ import org.slf4j.LoggerFactory;
  * the command from the desired state and the reported state, a repeated request produces no
  * additional side effects. When no command is pending, the controller holds the poll open for at
  * most {@link Protocol#HOLD_MS}, and any transition in the desired state re-evaluates and answers
- * the held polls. An identical command is dispatched at most once per hold cycle. Any heartbeat
- * that is not newer than the last one applied receives a wait reply, ensuring that a delayed
- * duplicate cannot revert a more recent status update.
+ * the held polls. An identical command is dispatched at most once per hold cycle. Because an agent
+ * keeps a single control request in flight, a newer heartbeat that still requires the previous
+ * command indicates that its reply was lost, and the controller immediately retransmits that
+ * command once. Cancel is the exception to this rule because the agent continues to report its
+ * active phase until the workload stops. Any heartbeat that is not newer than the last one applied
+ * receives a wait reply, ensuring that a delayed duplicate cannot revert a more recent status
+ * update.
  * <p>
  * A background reaper evicts any agent that remains silent for longer than
  * {@link Protocol#DEADLINE_MS} of monotonic time. When an agent is evicted or departs, its assigned
  * slot fails, causing the corresponding run to fail as well.
+ * <p>
+ * Every control reply carries the controller timestamps for when the request arrived and when the
+ * reply was sent, and every heartbeat echoes the timestamps from the previous exchange so that the
+ * controller can estimate the clock offset of each agent. A step initiates execution in two phases:
+ * once all slots reach READY, each agent receives a launch command so its run child process warms
+ * up and holds at its start gate (ARMED). Once no slot remains in LAUNCHED, the controller
+ * establishes a single future start epoch for the step and delivers it to each agent as a start
+ * command translated to that agent's clock. The step skew represents an upper bound on the actual
+ * spread of the dispatch times, calculated as the measured spread plus the two largest error bounds
+ * across the slots.
+ * <p>
+ * The controller retains each frame sequence of a slot exactly once without gaps, decoding each
+ * retained frame once to accumulate its sample count.
  */
 public final class Controller implements AgentChannel {
   private static final Logger LOG = LoggerFactory.getLogger(Controller.class);
   private static final DateTimeFormatter RUN_ID =
     DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'").withZone(ZoneOffset.UTC);
+
+  /**
+   * Defines the maximum single-slot clock error bound in milliseconds that still guarantees two
+   * slots remain within the 50 ms start-skew bound.
+   */
+  private static final long MAX_PROVEN_ERROR_MS = 25;
 
   private final Clock clock;
   private final TreeMap<String, AgentRecord> agents = new TreeMap<>();
@@ -152,16 +178,17 @@ public final class Controller implements AgentChannel {
 
   @Override
   public synchronized void control(AgentMessage request, Callback<Message> reply) {
+    long rxMs = clock.millis();
     Protocol.withAgent(request.getAgent(), () -> {
       switch (request.type()) {
         case REGISTER:
-          register(request, reply);
+          register(request, reply, rxMs);
           break;
         case HEARTBEAT:
-          heartbeat((Heartbeat) request, reply);
+          heartbeat((Heartbeat) request, reply, rxMs);
           break;
         case GOODBYE:
-          goodbye(request, reply);
+          goodbye(request, reply, rxMs);
           break;
         default:
           throw new IllegalStateException("not a control request: " + request.type().wire());
@@ -169,12 +196,12 @@ public final class Controller implements AgentChannel {
     });
   }
 
-  private void register(AgentMessage request, Callback<Message> reply) {
+  private void register(AgentMessage request, Callback<Message> reply, long rxMs) {
     AgentRecord agent = agents.get(request.getAgent());
     if (agent != null && agent.incarnation.equals(request.getIncarnation())) {
       agent.seen(clock);
       answerHeld(agent, new Wait());
-      send(reply, request.getTrace(), new Registered());
+      send(reply, request.getTrace(), new Registered(), rxMs);
       return;
     }
     if (agent != null) {
@@ -185,41 +212,44 @@ public final class Controller implements AgentChannel {
     agents.put(request.getAgent(),
       new AgentRecord(request.getAgent(), request.getIncarnation(), clock));
     LOG.info("agent {} registered", request.getAgent());
-    send(reply, request.getTrace(), new Registered());
+    send(reply, request.getTrace(), new Registered(), rxMs);
   }
 
-  private void heartbeat(Heartbeat request, Callback<Message> reply) {
+  private void heartbeat(Heartbeat request, Callback<Message> reply, long rxMs) {
     AgentRecord agent = agents.get(request.getAgent());
     if (agent == null) {
-      send(reply, request.getTrace(), new Reregister());
+      send(reply, request.getTrace(), new Reregister(), rxMs);
       return;
     }
     if (!agent.incarnation.equals(request.getIncarnation())) {
       send(reply, request.getTrace(),
-        new Rejected("incarnation " + request.getIncarnation() + " is stale"));
+        new Rejected("incarnation " + request.getIncarnation() + " is stale"), rxMs);
       return;
     }
     if (request.getSeq() <= agent.heartbeatSeq) {
       // Ignore delayed duplicates of older heartbeats so they cannot revert a newer agent status.
-      send(reply, request.getTrace(), new Wait());
+      send(reply, request.getTrace(), new Wait(), rxMs);
       return;
     }
     agent.heartbeatSeq = request.getSeq();
     agent.seen(clock);
+    if (request.getClock() != null) {
+      agent.clockFilter.add(request.getClock());
+    }
     answerHeld(agent, new Wait());
     agent.reported = request.getStatus();
     apply(agent);
     answerHeldPolls();
-    respond(agent, reply, request.getTrace());
+    respond(agent, reply, request.getTrace(), rxMs);
   }
 
-  private void goodbye(AgentMessage request, Callback<Message> reply) {
+  private void goodbye(AgentMessage request, Callback<Message> reply, long rxMs) {
     AgentRecord agent = agents.get(request.getAgent());
     if (agent != null && agent.incarnation.equals(request.getIncarnation())) {
       LOG.info("agent {} said goodbye", agent.id);
       remove(agent, "agent " + agent.id + " left the fleet", new Wait());
     }
-    send(reply, request.getTrace(), new Shutdown());
+    send(reply, request.getTrace(), new Shutdown(), rxMs);
   }
 
   @Override
@@ -242,7 +272,21 @@ public final class Controller implements AgentChannel {
     // duplicates, and stop processing as soon as a sequence gap is encountered.
     for (IntervalFrame frame : batch.getFrames()) {
       if (frame.getSeq() == slot.heldSeq + 1) {
+        long count;
+        try {
+          count = HistogramBlob.decode(frame.getHistogram()).getTotalCount();
+        } catch (ProtocolException e) {
+          String reason = "frame " + frame.getSeq() + " of run " + batch.getRunId() + " step "
+            + batch.getStep() + " has a bad histogram: " + e.getMessage();
+          LOG.warn("agent {}: {}", agent.id, reason);
+          // Keep the agent registered in the fleet; the acknowledgment stops advancing held frames
+          // and a subsequent cancel command terminates the active workload.
+          fail(slot, "agent " + agent.id + ": " + reason);
+          answerHeldPolls();
+          return ack(batch, slot.heldSeq);
+        }
         slot.frames.add(frame);
+        slot.samples += count;
         slot.heldSeq++;
       } else if (frame.getSeq() > slot.heldSeq + 1) {
         break;
@@ -275,18 +319,33 @@ public final class Controller implements AgentChannel {
       }
       return;
     }
+    if (status.getStartedMs() > 0 && slot.startAtMs != null && slot.dispatchMs == null) {
+      dispatched(slot, status.getStartedMs());
+    }
     switch (status.getPhase()) {
       case READY:
         if (slot.state == RunView.SlotState.ASSIGNED) {
           slot.state = RunView.SlotState.READY;
-          startIfReady(slot.step);
+          launchIfReady(slot.step);
+        }
+        break;
+      case ARMED:
+        if (slot.state == RunView.SlotState.LAUNCHED) {
+          slot.state = RunView.SlotState.ARMED;
+          startIfArmed(slot.step);
         }
         break;
       case DONE:
-        if (slot.state == RunView.SlotState.RUNNING) {
+        if (slot.state.launched()) {
           slot.finalSeq = status.getFinalSeq();
           if (slot.heldSeq >= slot.finalSeq) {
+            // A slot without a start gate transitions directly from LAUNCHED to DONE, unblocking
+            // the remaining armed slots to start.
+            boolean gated = slot.state != RunView.SlotState.LAUNCHED;
             slot.state = RunView.SlotState.DONE;
+            if (!gated) {
+              startIfArmed(slot.step);
+            }
             completeIfDone(slot.step);
           }
         }
@@ -344,8 +403,11 @@ public final class Controller implements AgentChannel {
     if (slot.state == RunView.SlotState.ASSIGNED && status.getPhase() == Phase.IDLE) {
       return new Assign(slot.assignment);
     }
-    if (slot.state == RunView.SlotState.RUNNING && status.getPhase() == Phase.READY) {
-      return new Start(slot.step.run.runId, slot.step.index, slot.step.startAtMs);
+    if (slot.state == RunView.SlotState.LAUNCHED && status.getPhase() == Phase.READY) {
+      return new Launch(slot.step.run.runId, slot.step.index);
+    }
+    if (slot.state == RunView.SlotState.RUNNING && status.getPhase() == Phase.ARMED) {
+      return new Start(slot.step.run.runId, slot.step.index, slot.startAtMs);
     }
     return null;
   }
@@ -364,21 +426,40 @@ public final class Controller implements AgentChannel {
       return null;
     }
     agent.lastCommand = encoded;
+    agent.resent = false;
     return command;
   }
 
   /**
-   * Dispatches a fresh command immediately if one is available, or holds the poll request open
-   * awaiting a future state change.
+   * Returns the previous control command for a single retransmission when a newer heartbeat still
+   * requires it, or null otherwise, ensuring that a lost reply incurs only one retry without
+   * holding the poll.
    */
-  private void respond(AgentRecord agent, Callback<Message> reply, String trace) {
+  private Message lost(AgentRecord agent) {
+    Message command = command(agent);
+    if (command == null || command instanceof Cancel || agent.resent) {
+      return null;
+    }
+    agent.resent = true;
+    return command;
+  }
+
+  /**
+   * Dispatches a fresh or retransmitted lost command immediately if one is available, or holds the
+   * poll request open awaiting a future state transition.
+   */
+  private void respond(AgentRecord agent, Callback<Message> reply, String trace, long rxMs) {
     Message command = fresh(agent);
+    if (command == null) {
+      command = lost(agent);
+    }
     if (command != null) {
-      send(reply, trace, command);
+      send(reply, trace, command, rxMs);
       return;
     }
     agent.held = reply;
     agent.heldTrace = trace;
+    agent.heldRxMs = rxMs;
     agent.holdTimer = clock.schedule(Protocol.HOLD_MS, () -> holdEnded(agent));
   }
 
@@ -416,11 +497,16 @@ public final class Controller implements AgentChannel {
     String trace = agent.heldTrace;
     agent.held = null;
     agent.holdTimer.cancel();
-    Protocol.withAgent(agent.id, () -> send(held, trace, message));
+    Protocol.withAgent(agent.id, () -> send(held, trace, message, agent.heldRxMs));
   }
 
-  private static void send(Callback<Message> reply, String trace, Message message) {
+  /**
+   * Completes a control reply stamped with the request arrival timestamp and the reply transmission
+   * timestamp.
+   */
+  private void send(Callback<Message> reply, String trace, Message message, long rxMs) {
     message.setTrace(trace);
+    message.setStamps(rxMs, clock.millis());
     reply.completed(message);
   }
 
@@ -504,19 +590,109 @@ public final class Controller implements AgentChannel {
     LOG.info("run {} step {} assigned to {} agents", run.runId, index, spec.getAgents());
   }
 
-  /** Transitions all slots of the step to the running state once every slot has reported READY. */
-  private void startIfReady(RunRecord.StepRecord step) {
+  /**
+   * Transitions all slots of the step to the LAUNCHED state once every slot has reported READY,
+   * allowing the run child processes to begin generating database traffic from this point onward.
+   */
+  private void launchIfReady(RunRecord.StepRecord step) {
     for (RunRecord.SlotRecord slot : step.slots) {
       if (slot.state != RunView.SlotState.READY) {
         return;
       }
     }
-    step.startAtMs = clock.millis();
     step.run.started = true;
     for (RunRecord.SlotRecord slot : step.slots) {
-      slot.state = RunView.SlotState.RUNNING;
+      slot.state = RunView.SlotState.LAUNCHED;
     }
-    LOG.info("run {} step {} started", step.run.runId, step.index);
+    LOG.info("run {} step {} launched", step.run.runId, step.index);
+  }
+
+  /**
+   * Establishes the step start epoch once no slot remains in LAUNCHED and at least one slot is
+   * ARMED, computing the epoch as the current time plus {@link Protocol#START_LEAD_MS} plus the
+   * maximum round-trip delay among the armed agents. Each armed slot records its agent's clock
+   * estimate and receives the start epoch translated to that agent's clock.
+   */
+  private void startIfArmed(RunRecord.StepRecord step) {
+    List<RunRecord.SlotRecord> armed = new ArrayList<>();
+    for (RunRecord.SlotRecord slot : step.slots) {
+      if (slot.state == RunView.SlotState.LAUNCHED) {
+        return;
+      }
+      if (slot.state == RunView.SlotState.ARMED) {
+        armed.add(slot);
+      }
+    }
+    if (armed.isEmpty()) {
+      return;
+    }
+    long maxDelayMs = 0;
+    for (RunRecord.SlotRecord slot : armed) {
+      long[] best = agents.get(slot.agent).clockFilter.best();
+      if (best != null) {
+        slot.offsetMs = best[0];
+        slot.delayMs = best[1];
+        maxDelayMs = Math.max(maxDelayMs, slot.delayMs);
+      } else {
+        slot.offsetMs = 0L;
+      }
+    }
+    step.startAtMs = clock.millis() + Protocol.START_LEAD_MS + maxDelayMs;
+    for (RunRecord.SlotRecord slot : armed) {
+      slot.startAtMs = step.startAtMs + slot.offsetMs;
+      slot.state = RunView.SlotState.RUNNING;
+      if (slot.delayMs == null || errorBoundMs(slot.delayMs) > MAX_PROVEN_ERROR_MS) {
+        LOG.warn(
+          "run {} step {}: the clock error of agent {} is not known to be within {} ms"
+            + " (round trip delay {} ms), so the 50 ms start bound is not proven for it",
+          step.run.runId, step.index, slot.agent, MAX_PROVEN_ERROR_MS, slot.delayMs);
+      }
+    }
+    LOG.info("run {} step {} starts at {} on the controller clock", step.run.runId, step.index,
+      step.startAtMs);
+  }
+
+  /**
+   * Computes the error bound of a dispatch timestamp on the controller clock as half the round-trip
+   * delay of the clock sample plus 2 ms to account for millisecond clock resolution.
+   */
+  private static long errorBoundMs(long delayMs) {
+    return delayMs / 2 + 2;
+  }
+
+  /**
+   * Records the timestamp when the agent's start gate opened, translated to the controller clock.
+   * Once every slot that received a start command has reported its dispatch timestamp, the step
+   * computes its start skew as the spread of those dispatch timestamps plus the two largest error
+   * bounds. Because translating the dispatch timestamp subtracts the same estimated offset that was
+   * added to the target start time, the measured spread does not reflect offset estimation error;
+   * only the error bounds account for it. If any slot lacks a clock sample, it has no error bound
+   * and the step records no skew.
+   */
+  private void dispatched(RunRecord.SlotRecord slot, long startedMs) {
+    slot.dispatchMs = startedMs - slot.offsetMs;
+    RunRecord.StepRecord step = slot.step;
+    long min = Long.MAX_VALUE;
+    long max = Long.MIN_VALUE;
+    long largest = 0;
+    long next = 0;
+    int started = 0;
+    for (RunRecord.SlotRecord other : step.slots) {
+      if (other.startAtMs == null) {
+        continue;
+      }
+      if (other.dispatchMs == null || other.delayMs == null) {
+        return;
+      }
+      min = Math.min(min, other.dispatchMs);
+      max = Math.max(max, other.dispatchMs);
+      long bound = errorBoundMs(other.delayMs);
+      next = Math.max(next, Math.min(largest, bound));
+      largest = Math.max(largest, bound);
+      started++;
+    }
+    step.skewMs = max - min + (started > 1 ? largest + next : 0);
+    LOG.info("run {} step {} start skew at most {} ms", step.run.runId, step.index, step.skewMs);
   }
 
   /**
@@ -550,9 +726,9 @@ public final class Controller implements AgentChannel {
 
   /**
    * Terminates the run and unbinds the agents assigned to its current step so that they receive a
-   * cancel or release command. The run transitions to ABORTED if no step has started, or to FAILED
-   * otherwise, and every slot that is not already DONE or FAILED is marked CANCELLED. No slot is
-   * retried or bound again, and subsequent steps do not run.
+   * cancel or release command. The run transitions to ABORTED if no step has been launched, or to
+   * FAILED otherwise, and every slot that is not already DONE or FAILED is marked CANCELLED. No
+   * slot is retried or bound again, and subsequent steps do not run.
    */
   private void failRun(RunRecord run, String reason) {
     if (run.state != RunView.State.RUNNING) {

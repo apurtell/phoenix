@@ -45,6 +45,8 @@ import org.apache.phoenix.pherf.distributed.protocol.Share;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Executes a real Pherf run inside a child JVM using the real clock, driven through the agent
@@ -53,6 +55,7 @@ import org.junit.rules.TemporaryFolder;
  * process waits rather than sleeps.
  */
 public class PherfProcessTest {
+  private static final Logger LOG = LoggerFactory.getLogger(PherfProcessTest.class);
   private static final long TIMEOUT_S = 120;
 
   @Rule
@@ -66,13 +69,25 @@ public class PherfProcessTest {
     final Map<String, Long> counts = new TreeMap<>();
     final List<String> ends = new ArrayList<>();
     final CountDownLatch prepared = new CountDownLatch(1);
+    final CountDownLatch armed = new CountDownLatch(1);
     final CountDownLatch ended = new CountDownLatch(1);
     volatile List<String> errors;
+    volatile long startedMs;
 
     @Override
     public void prepared(List<String> errors) {
       this.errors = errors;
       prepared.countDown();
+    }
+
+    @Override
+    public void armed() {
+      armed.countDown();
+    }
+
+    @Override
+    public void started(long startedMs) {
+      this.startedMs = startedMs;
     }
 
     @Override
@@ -114,9 +129,15 @@ public class PherfProcessTest {
       workload.prepare(assignment, recorder);
       assertTrue(recorder.prepared.await(TIMEOUT_S, TimeUnit.SECONDS));
       assertEquals(Collections.emptyList(), recorder.errors);
-      workload.start(assignment, clock.millis(), recorder);
+      // Launch the run child process so that it warms up and arms at the start gate, which then
+      // opens at the scheduled start epoch.
+      workload.launch(assignment, recorder);
+      assertTrue(recorder.armed.await(TIMEOUT_S, TimeUnit.SECONDS));
+      long epochMs = clock.millis() + 1500;
+      workload.start(assignment.getRunId(), epochMs);
       assertTrue(recorder.ended.await(TIMEOUT_S, TimeUnit.SECONDS));
       assertEquals(Collections.singletonList("finished"), recorder.ends);
+      assertTrue(recorder.startedMs + " < " + epochMs, recorder.startedMs >= epochMs);
 
       // Verify that the total count accumulated across forwarded intervals for each key matches
       // the corresponding aggregate count recorded in Pherf's own latency report.
@@ -139,6 +160,12 @@ public class PherfProcessTest {
       // each of which runs to completion.
       JsonArray schedules = report.getAsJsonArray("schedules");
       assertEquals(1, schedules.size());
+      // The schedule must start at or after the epoch; because the upper bound depends on the
+      // execution host, the test logs the observed offset.
+      long scheduleStartMs = schedules.get(0).getAsJsonObject().get("startMs").getAsLong();
+      assertTrue(scheduleStartMs + " < " + epochMs, scheduleStartMs >= epochMs);
+      LOG.info("start gate opened {} ms and the schedule started {} ms after the epoch",
+        recorder.startedMs - epochMs, scheduleStartMs - epochMs);
       assertEquals(50, schedules.get(0).getAsJsonObject().get("scheduled").getAsLong());
       assertEquals(50, schedules.get(0).getAsJsonObject().get("completed").getAsLong());
       List<String> jdbc =

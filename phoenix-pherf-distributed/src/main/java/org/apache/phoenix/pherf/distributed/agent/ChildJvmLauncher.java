@@ -21,6 +21,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
@@ -73,7 +74,7 @@ public final class ChildJvmLauncher implements Launcher {
     command.add(PherfChild.class.getName());
     command.addAll(args);
     // The child process terminates when its standard input stream closes, so the agent holds the
-    // pipe open without writing to it.
+    // pipe open and writes only the start epoch to it.
     Process process =
       new ProcessBuilder(command).directory(workDir).redirectErrorStream(true).start();
     Thread watcher = new Thread(() -> Protocol.withAgent(agent, () -> watch(process, listener)),
@@ -81,6 +82,13 @@ public final class ChildJvmLauncher implements Launcher {
     watcher.setDaemon(true);
     watcher.start();
     return new Handle() {
+      @Override
+      public void send(String line) throws IOException {
+        OutputStream in = process.getOutputStream();
+        in.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+        in.flush();
+      }
+
       @Override
       public void destroy() {
         process.destroy();
@@ -93,13 +101,20 @@ public final class ChildJvmLauncher implements Launcher {
     };
   }
 
-  /** Relays child output to the log until the stream ends, then reports the process exit. */
+  /**
+   * Relays child process output to the agent log until the stream ends and then reports process
+   * termination, intercepting child marker lines for the listener so they are excluded from the log
+   * and the trailing output buffer.
+   */
   private static void watch(Process process, ExitListener listener) {
     ArrayDeque<String> last = new ArrayDeque<>();
     try (BufferedReader out =
       new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
       String line;
       while ((line = out.readLine()) != null) {
+        if (marker(line, listener)) {
+          continue;
+        }
         LOG.info("pherf: {}", line);
         if (last.size() == TAIL_LINES) {
           last.removeFirst();
@@ -124,5 +139,26 @@ public final class ChildJvmLauncher implements Launcher {
     } catch (RuntimeException e) {
       LOG.error("the exit report of the pherf child failed", e);
     }
+  }
+
+  /**
+   * Dispatches a lifecycle marker line from the child process to the listener, or returns false if
+   * the line is ordinary output.
+   */
+  private static boolean marker(String line, ExitListener listener) {
+    try {
+      if (line.equals(PherfChild.ARMED)) {
+        listener.armed();
+        return true;
+      }
+      if (line.startsWith(PherfChild.STARTED + " ")) {
+        listener.started(Long.parseLong(line.substring(PherfChild.STARTED.length() + 1).trim()));
+        return true;
+      }
+    } catch (RuntimeException e) {
+      LOG.error("the marker report of the pherf child failed: {}", line, e);
+      return true;
+    }
+    return false;
   }
 }

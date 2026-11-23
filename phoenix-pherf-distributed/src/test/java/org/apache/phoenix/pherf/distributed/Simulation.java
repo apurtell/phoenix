@@ -25,6 +25,8 @@ import java.util.Map;
 import java.util.UUID;
 import org.apache.phoenix.pherf.distributed.agent.AgentRuntime;
 import org.apache.phoenix.pherf.distributed.agent.Workload;
+import org.apache.phoenix.pherf.distributed.clock.Clock;
+import org.apache.phoenix.pherf.distributed.clock.SkewedClock;
 import org.apache.phoenix.pherf.distributed.clock.VirtualClock;
 import org.apache.phoenix.pherf.distributed.controller.AgentView;
 import org.apache.phoenix.pherf.distributed.controller.Controller;
@@ -45,8 +47,12 @@ public final class Simulation {
   public static final long START_MS = 1767225600000L;
 
   public final VirtualClock clock = new VirtualClock(START_MS);
-  public final InProcessNetwork network = new InProcessNetwork();
-  public final Controller controller = new Controller(clock);
+  public final InProcessNetwork network = new InProcessNetwork(clock);
+  /**
+   * Holds the active simulated controller process instance, which is replaced when
+   * {@link #restartController()} is invoked.
+   */
+  public Controller controller = new Controller(clock);
   private final Map<String, Workload> workloads = new LinkedHashMap<>();
   private final Map<String, AgentRuntime> runtimes = new LinkedHashMap<>();
   private int incarnations;
@@ -66,14 +72,40 @@ public final class Simulation {
 
   /** Instantiates and starts a simulated agent process configured with its own workload. */
   public AgentRuntime agent(String id, Workload workload) {
+    return agent(id, clock, workload);
+  }
+
+  /**
+   * Instantiates and starts a simulated agent process on a host whose wall clock is skewMs ahead of
+   * the controller host, configured with a FakeWorkload driven by that skewed host clock. Each
+   * simulated host maintains its own independent monotonic clock origin.
+   */
+  public AgentRuntime skewedAgent(String id, long skewMs) {
+    SkewedClock host = new SkewedClock(clock, skewMs, 7919L * (runtimes.size() + 1));
+    return agent(id, host, new FakeWorkload(host));
+  }
+
+  /** Instantiates and starts a simulated agent process on a host with its own dedicated clock. */
+  public AgentRuntime agent(String id, Clock hostClock, Workload workload) {
     String incarnation = UUID
       .nameUUIDFromBytes((id + "#" + ++incarnations).getBytes(StandardCharsets.UTF_8)).toString();
-    AgentRuntime runtime = new AgentRuntime(new OperationalIdentity(id, incarnation), clock,
+    AgentRuntime runtime = new AgentRuntime(new OperationalIdentity(id, incarnation), hostClock,
       network.connect(id, ENDPOINT), workload);
     workloads.put(id, workload);
     runtimes.put(id, runtime);
     runtime.start();
     return runtime;
+  }
+
+  /**
+   * Stops the active controller process and starts a fresh, stateless controller instance bound to
+   * the same network endpoint.
+   */
+  public void restartController() {
+    controller.close();
+    controller = new Controller(clock);
+    network.listen(ENDPOINT, controller);
+    controller.start();
   }
 
   /** Returns the most recent agent process runtime started under the specified identifier. */

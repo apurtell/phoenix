@@ -87,7 +87,7 @@ public class ChannelHandlerTest {
     assertEquals(1, controller.agents().size());
     // An unrecognized agent that sends a request to the controller is instructed to register.
     exchange = exchange("POST", Protocol.CONTROL_PATH,
-      json(new Heartbeat(1, Status.IDLE), "b2", "b2/control/1"));
+      json(new Heartbeat(1, Status.IDLE, null), "b2", "b2/control/1"));
     assertEquals(200, exchange.getResponseCode());
     assertEquals(MessageType.REREGISTER, reply(exchange).type());
   }
@@ -121,7 +121,7 @@ public class ChannelHandlerTest {
         new Intervals("r1", 0, Collections.<IntervalFrame> emptyList()), "a1", "a1/control/1")),
       "not a control request");
     assertRejected(exchange("POST", Protocol.CONTROL_PATH,
-      json(new Heartbeat(0, Status.IDLE), "a1", "a1/control/1")), "heartbeat has no seq");
+      json(new Heartbeat(0, Status.IDLE, null), "a1", "a1/control/1")), "heartbeat has no seq");
     assertTrue(controller.agents().isEmpty());
   }
 

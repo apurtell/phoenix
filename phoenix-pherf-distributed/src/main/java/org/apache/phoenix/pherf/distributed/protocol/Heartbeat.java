@@ -19,22 +19,26 @@ package org.apache.phoenix.pherf.distributed.protocol;
 
 /**
  * Represents the long-poll control request sent by an agent. Because each message reports the full
- * status of the agent, the same request can be retransmitted with no other effect. The seq value
- * increases with each control request of an incarnation, and the controller ignores any heartbeat
- * that is not newer than the last one received so that a late copy has no effect.
+ * status of the agent, the same request can be retransmitted with no additional side effects. The
+ * seq value increases with each control request of an incarnation, and the controller ignores any
+ * heartbeat that is not newer than the last one received so that a delayed duplicate has no effect.
+ * The clock field carries the timestamps of the most recently completed control exchange, or is
+ * absent prior to the first completed exchange.
  */
 public final class Heartbeat extends AgentMessage {
   private long seq;
   private Status status;
+  private ClockSample clock;
 
   private Heartbeat() {
     super(MessageType.HEARTBEAT);
   }
 
-  public Heartbeat(long seq, Status status) {
+  public Heartbeat(long seq, Status status, ClockSample clock) {
     this();
     this.seq = seq;
     this.status = status;
+    this.clock = clock;
   }
 
   public long getSeq() {
@@ -43,5 +47,9 @@ public final class Heartbeat extends AgentMessage {
 
   public Status getStatus() {
     return status;
+  }
+
+  public ClockSample getClock() {
+    return clock;
   }
 }

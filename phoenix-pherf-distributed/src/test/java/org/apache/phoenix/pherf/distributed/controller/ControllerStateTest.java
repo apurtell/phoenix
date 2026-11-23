@@ -95,7 +95,7 @@ public class ControllerStateTest {
 
   private Reply heartbeat(String agent, Phase phase, String runId, int step, long finalSeq) {
     return control(from(agent, "i-" + agent,
-      new Heartbeat(traces + 1, new Status(phase, runId, step, finalSeq, null))));
+      new Heartbeat(traces + 1, new Status(phase, runId, step, finalSeq, null, 0), null)));
   }
 
   private Reply heartbeat(String agent, Phase phase, String runId) {
@@ -112,16 +112,38 @@ public class ControllerStateTest {
   }
 
   private Ack telemetry(String agent, String runId, long... seqs) {
-    Histogram histogram = new Histogram(LatencyRecorders.LOWEST_US, LatencyRecorders.HIGHEST_US,
-      LatencyRecorders.DIGITS);
-    histogram.recordValue(10);
+    return (Ack) telemetryReply(agent, runId, seqs);
+  }
+
+  /**
+   * Sends a telemetry batch containing one interval frame for each sequence number, where frame seq
+   * records seq latency samples.
+   */
+  private Message telemetryReply(String agent, String runId, long... seqs) {
     List<IntervalFrame> frames = new ArrayList<>();
     for (long seq : seqs) {
+      Histogram histogram = new Histogram(LatencyRecorders.LOWEST_US, LatencyRecorders.HIGHEST_US,
+        LatencyRecorders.DIGITS);
+      histogram.recordValueWithCount(10, seq);
       frames.add(new IntervalFrame(seq, "query:s:q", LatencyRecorders.STEADY, 0, 1,
         RecorderConfig.of(histogram), HistogramBlob.encode(histogram)));
     }
     Intervals batch = from(agent, "i-" + agent, new Intervals(runId, 0, frames));
-    return (Ack) controller.telemetry(batch);
+    return controller.telemetry(batch);
+  }
+
+  /**
+   * Registers agent a1 and advances a single-slot run through assignment, launch, and start into
+   * the RUNNING phase.
+   */
+  private String running() {
+    register("a1");
+    String runId = controller.submit(Simulation.spec(1));
+    assertEquals(MessageType.ASSIGN, type(heartbeat("a1", Phase.IDLE, null)));
+    assertEquals(MessageType.LAUNCH, type(heartbeat("a1", Phase.READY, runId)));
+    assertEquals(MessageType.START, type(heartbeat("a1", Phase.ARMED, runId)));
+    assertNull(type(heartbeat("a1", Phase.RUNNING, runId)));
+    return runId;
   }
 
   @Test
@@ -134,7 +156,9 @@ public class ControllerStateTest {
     assertEquals("a1/control/2", assign.value.getTrace());
     assertEquals("p000", ((Assign) assign.value).getAssignment().getIdentity().getPrefix());
     assertNull(type(heartbeat("a1", Phase.PREPARING, runId)));
-    assertEquals(MessageType.START, type(heartbeat("a1", Phase.READY, runId)));
+    assertEquals(MessageType.LAUNCH, type(heartbeat("a1", Phase.READY, runId)));
+    assertNull(type(heartbeat("a1", Phase.LAUNCHED, runId)));
+    assertEquals(MessageType.START, type(heartbeat("a1", Phase.ARMED, runId)));
     assertNull(type(heartbeat("a1", Phase.RUNNING, runId)));
     Reply done = heartbeat("a1", Phase.DONE, runId, 0, 2);
     assertNull(type(done));
@@ -161,8 +185,14 @@ public class ControllerStateTest {
     register("a1");
     Reply running = heartbeat("a1", Phase.RUNNING, "old");
     assertEquals(MessageType.CANCEL, type(running));
+    // The cancel command is not reissued immediately because the agent continues to report its
+    // active phase until its running work stops.
+    assertNull(type(heartbeat("a1", Phase.RUNNING, "old")));
     assertEquals(MessageType.RELEASE, type(heartbeat("a1", Phase.DONE, "old")));
-    // Issuing the same command twice consecutively waits for one hold interval before repeating.
+    // A newer heartbeat that still requests the previous command indicates that the earlier reply
+    // was lost, so the controller reissues the command immediately once; any subsequent repeat
+    // waits for one hold interval.
+    assertEquals(MessageType.RELEASE, type(heartbeat("a1", Phase.FAILED, "old")));
     Reply again = heartbeat("a1", Phase.FAILED, "old");
     assertNull(type(again));
     clock.advance(1000);
@@ -267,16 +297,17 @@ public class ControllerStateTest {
   public void staleHeartbeatIsIgnored() throws Exception {
     register("a1");
     String runId = controller.submit(Simulation.spec(1));
-    Heartbeat late = from("a1", "i-a1", new Heartbeat(100, Status.IDLE));
+    Heartbeat late = from("a1", "i-a1", new Heartbeat(100, Status.IDLE, null));
     Heartbeat ready =
-      from("a1", "i-a1", new Heartbeat(101, new Status(Phase.READY, runId, 0, 0, null)));
+      from("a1", "i-a1", new Heartbeat(101, new Status(Phase.READY, runId, 0, 0, null, 0), null));
     assertEquals(MessageType.ASSIGN, type(heartbeat("a1", Phase.IDLE, null)));
-    // Heartbeats traverse the wire format, so the seq field must be preserved by the codec.
-    assertEquals(MessageType.START, type(control(ChannelRequests.control(Codec.encode(ready)))));
+    // Heartbeats traverse the serialized wire format, requiring the codec to preserve the seq
+    // field across encoding and decoding.
+    assertEquals(MessageType.LAUNCH, type(control(ChannelRequests.control(Codec.encode(ready)))));
     assertEquals(MessageType.WAIT, type(control(ChannelRequests.control(Codec.encode(late)))));
     RunView run = controller.run(runId);
     assertEquals(RunView.State.RUNNING, run.getState());
-    assertEquals(RunView.SlotState.RUNNING, run.getSteps().get(0).getSlots().get(0).getState());
+    assertEquals(RunView.SlotState.LAUNCHED, run.getSteps().get(0).getSlots().get(0).getState());
   }
 
   @Test
@@ -295,13 +326,53 @@ public class ControllerStateTest {
     assertEquals(Arrays.asList(RunView.SlotState.CANCELLED, RunView.SlotState.FAILED),
       Arrays.asList(run.getSteps().get(0).getSlots().get(0).getState(),
         run.getSteps().get(0).getSlots().get(1).getState()));
-    assertEquals(0, simulation.count("reply", "start"));
-    assertTrue(simulation.workload("a1").started.isEmpty());
+    assertEquals(0, simulation.count("reply", "launch"));
+    assertTrue(simulation.workload("a1").launched.isEmpty());
     assertEquals(Arrays.asList(runId), simulation.workload("a1").cancelled);
     assertEquals(AgentRuntime.State.IDLE, a1.state());
     assertEquals(AgentRuntime.State.IDLE, a2.state());
     for (AgentView view : simulation.controller.agents()) {
       assertEquals(AgentView.State.IDLE, view.getState());
     }
+  }
+
+  /**
+   * Verifies RQ-233: the controller decodes each held interval frame exactly once upon ingestion
+   * and accumulates its sample count.
+   */
+  @Test
+  public void samplesAreCountedOnceAtIngest() {
+    String runId = running();
+    assertEquals(2, telemetry("a1", runId, 1, 2, 4).getHeldSeq());
+    assertEquals(4, telemetry("a1", runId, 1, 2, 3, 4).getHeldSeq());
+    assertEquals(4, telemetry("a1", runId, 3, 4).getHeldSeq());
+    RunView.SlotView slot = controller.run(runId).getSteps().get(0).getSlots().get(0);
+    assertEquals(4, slot.getFrames());
+    assertEquals(1 + 2 + 3 + 4, slot.getSamples());
+  }
+
+  /**
+   * Verifies that an interval frame whose histogram fails to decode transitions its slot to the
+   * failed state, returns an ack that holds no additional frames, and leaves the agent registered.
+   */
+  @Test
+  public void badHistogramFailsTheSlot() {
+    String runId = running();
+    assertEquals(1, telemetry("a1", runId, 1).getHeldSeq());
+    List<IntervalFrame> frames = new ArrayList<>();
+    frames.add(new IntervalFrame(2, "query:s:q", LatencyRecorders.STEADY, 0, 1,
+      RecorderConfig.PINNED, "not-a-histogram"));
+    Message reply = controller.telemetry(from("a1", "i-a1", new Intervals(runId, 0, frames)));
+    assertEquals(MessageType.ACK, reply.type());
+    assertEquals(1, ((Ack) reply).getHeldSeq());
+    RunView run = controller.run(runId);
+    assertEquals(RunView.State.FAILED, run.getState());
+    RunView.SlotView slot = run.getSteps().get(0).getSlots().get(0);
+    assertEquals(RunView.SlotState.FAILED, slot.getState());
+    assertTrue(slot.getError(), slot.getError()
+      .startsWith("agent a1: frame 2 of run " + runId + " step 0 has a bad histogram: "));
+    assertEquals(1, slot.getHeldSeq());
+    assertEquals(1, slot.getSamples());
+    assertEquals("a1", controller.agents().get(0).getId());
   }
 }

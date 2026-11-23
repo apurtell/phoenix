@@ -24,7 +24,7 @@ import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 /**
  * Defines the asynchronous execution contract for work assigned to an agent. Every method returns
  * immediately, delivering its results to the supplied listener on any thread, including
- * synchronously from within the call itself. Following a cancel request, a started workload must
+ * synchronously from within the call itself. Following a cancel request, a launched workload must
  * still invoke finished or failed once it stops, and a workload in prepare must still invoke
  * prepared. Any runtime exception thrown from a method call immediately fails the work of the
  * agent.
@@ -37,9 +37,17 @@ public interface Workload {
   void prepare(Assignment assignment, Listener listener);
 
   /**
-   * Executes the previously prepared assignment beginning at the scheduled startAtMs timestamp.
+   * Launches the previously prepared assignment immediately. The workload warms up and invokes
+   * armed when it holds at its start gate prior to its first steady dispatch; a workload without a
+   * start gate never invokes armed.
    */
-  void start(Assignment assignment, long startAtMs, Listener listener);
+  void launch(Assignment assignment, Listener listener);
+
+  /**
+   * Opens the start gate of the armed run at the specified startAtMs timestamp as measured by the
+   * agent clock.
+   */
+  void start(String runId, long startAtMs);
 
   /** Requests cancellation and halts all active work associated with the specified run. */
   void cancel(String runId);
@@ -51,6 +59,12 @@ public interface Workload {
      * assignment is valid and ready to run.
      */
     void prepared(List<String> errors);
+
+    /** Signals that the launched workload has reached and is holding at its start gate. */
+    void armed();
+
+    /** Signals that the start gate opened at the specified timestamp on the agent clock. */
+    void started(long startedMs);
 
     /** Delivers a single interval histogram recorded for a given operation and phase. */
     void interval(String operation, String phase, long startMs, long endMs, Histogram histogram);

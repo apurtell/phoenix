@@ -44,8 +44,8 @@ import org.junit.Test;
 public class ChannelTest {
   private static final Set<MessageType> CONTROL = new HashSet<>(Arrays.asList(MessageType.REGISTER,
     MessageType.HEARTBEAT, MessageType.GOODBYE, MessageType.REGISTERED, MessageType.WAIT,
-    MessageType.ASSIGN, MessageType.START, MessageType.CANCEL, MessageType.RELEASE,
-    MessageType.SHUTDOWN, MessageType.REREGISTER, MessageType.REJECTED));
+    MessageType.ASSIGN, MessageType.LAUNCH, MessageType.START, MessageType.CANCEL,
+    MessageType.RELEASE, MessageType.SHUTDOWN, MessageType.REREGISTER, MessageType.REJECTED));
   private static final Set<MessageType> TELEMETRY =
     new HashSet<>(Arrays.asList(MessageType.INTERVALS, MessageType.ACK));
 
@@ -76,8 +76,9 @@ public class ChannelTest {
     }
     for (String agent : Arrays.asList("a1", "a2")) {
       assertEquals(Arrays.asList(Protocol.CONTROL, Protocol.TELEMETRY), connections.get(agent));
-      assertTrue(types.get(agent + " control").containsAll(Arrays.asList(MessageType.REGISTER,
-        MessageType.REGISTERED, MessageType.HEARTBEAT, MessageType.ASSIGN, MessageType.START)));
+      assertTrue(types.get(agent + " control")
+        .containsAll(Arrays.asList(MessageType.REGISTER, MessageType.REGISTERED,
+          MessageType.HEARTBEAT, MessageType.ASSIGN, MessageType.LAUNCH, MessageType.START)));
       assertEquals(TELEMETRY, types.get(agent + " telemetry"));
     }
     assertEquals(2, connections.size());

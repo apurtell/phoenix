@@ -193,12 +193,13 @@ of the slot, so a step that reads the rows of another step needs the same agent 
 - Rule-based generators: divide the keys with `${pherf.slot.prefix}`.
 - Poisson arrivals: `${pherf.slot.seed}` on the profile gives each agent its own arrivals.
 - `writeParams` can write past the row share of a slot. Do not use it with a split.
-- Put a `-l` load in its own step, so that the measured `-q` step starts on every agent together.
+- Place any `-l` data load in a dedicated step so that the subsequent measured `-q` query step
+  starts simultaneously across every agent (see Start synchronization).
 
 ## Agent workload
 
 An agent runs Pherf in a child JVM, never in its own JVM: one `-validate` child in each prepare
-and one run child at each start. So the static state of Pherf does not go from run to run, a Pherf
+and one run child at each launch, so Pherf static state never carries over between runs, a Pherf
 error cannot stop the agent, a cancel can stop the work, and the workload cannot starve the
 heartbeat.
 
@@ -218,7 +219,7 @@ org.apache.phoenix.pherf.distributed.agent.PherfChild <args> -scenarioFile slice
 -label validate|run -z $PHERF_ZOOKEEPER [share options] [-validate]`
 in the work directory, with the environment of the agent. The exit status is the status of Pherf.
 A child stops at once when its stdin ends, so it never outlives its agent. Its output goes to the
-agent log.
+agent log, with the exception of the two start gate marker lines (see Start synchronization).
 
 - **Prepare** runs Pherf's own offline validation on the slice with the same options as the run.
   The share options change the scenario before the rules, as in the run, so the rules check the
@@ -229,13 +230,20 @@ agent log.
   `step <step> slot <slot>: `. The prepare reports the errors of all its slices, so a bad slice of
   any step aborts the run before the first `start`. Each later step validates its own slices again
   in its prepare.
-- **Start** launches the run at `startAtMs`. Every 1000 ms the agent reads the new complete lines
-  of `RESULTS_HDR/LATENCY_run_intervals.hlog` and sends each one as a frame, for every operation
-  and phase. The time bounds come from the decimal text of the line, so they are exact to the ms.
-  After the exit, a last read sends the rest. Exit 0 then completes the slot; another exit or a
-  bad line fails it.
-- **Cancel** sends SIGTERM to a live child, and SIGKILL after 5 seconds. Each stage reports its
-  end only after its child has exited.
+- **Launch** immediately spawns the run child process. The child connects to the cluster, applies
+  the schema, performs its warmup phase, and then pauses at its start gate, at which point the
+  agent reports `ARMED`. Every 1000 ms from launch onward, the agent reads newly completed lines
+  from `RESULTS_HDR/LATENCY_run_intervals.hlog` and transmits each line as a telemetry frame for
+  every operation and phase, allowing warmup frames to stream before the start gate opens. The
+  interval time bounds are parsed directly from the decimal text of each line so that they remain
+  exact to the millisecond. Once the child process exits, a final read drains any remaining lines;
+  an exit status of 0 completes the slot, whereas any other exit status or a malformed line causes
+  the slot to fail.
+- **Start** writes `startAtMs` to the standard input stream of the armed child process, which opens
+  its start gate at that timestamp.
+- **Cancel** sends SIGTERM to a live child process, including one holding at its start gate, and
+  escalates to SIGKILL after 5 seconds. Each stage reports its termination only after its child
+  process has exited.
 
 ## Run states
 
@@ -243,14 +251,16 @@ agent log.
 |---|---|
 | `RUNNING` | The run has a step that is not complete. |
 | `COMPLETE` | Every step is complete. |
-| `ABORTED` | The run failed before any step got `start`, so it sent no database traffic. |
-| `FAILED` | The run failed after a step got `start`. |
+| `ABORTED` | The run failed before any step received `launch`, so it sent no database traffic. |
+| `FAILED` | The run failed after a step received `launch`. |
 
 | Slot state | Meaning |
 |---|---|
 | `ASSIGNED` | The agent has the slot and prepares it. |
 | `READY` | The prepare passed. The slot waits for the other slots of the step. |
-| `RUNNING` | The step got `start`. |
+| `LAUNCHED` | The step received `launch` and the run child process is warming up. |
+| `ARMED` | The run child process is holding at its start gate. |
+| `RUNNING` | The slot has received its scheduled start time. |
 | `DONE` | The controller holds every frame of the slot. |
 | `FAILED` | The slot failed. Its error is `agent <id>: <error>`. |
 | `CANCELLED` | Another slot failed the run, and this slot got `cancel` or `release`. |
@@ -272,11 +282,12 @@ JSON payload.
 | `/v1/channel/control` | Carries registration requests, long-polled heartbeats, and commands. |
 | `/v1/channel/telemetry` | Carries interval latency histograms and their acknowledgments. |
 
-The server responds with HTTP status 200 containing the reply body on success, 400 with a
-`rejected` message when the payload is not a valid request, 405 for any other HTTP method, 413 when
-a request body exceeds 16 MiB, and 404 for any unrecognized path. On the client side, an agent
-retries failed requests after a 1 second backoff for all transient failures, but immediately exits
-with status 2 if it receives a 400 status, a 404 status, or a reply payload that it cannot decode.
+The server responds with HTTP status 200 containing the reply payload on success, 400 with a
+`rejected` message when the body is not a valid request, 405 for any other HTTP method, 413 when a
+request body exceeds 16 MiB, and 404 for any unrecognized path. Each agent request uses a 5 second
+connect and read timeout. On the client side, an agent retries failed requests after a 1 second
+backoff for every failure except HTTP 400, HTTP 404, or a reply that it cannot decode, any of which
+causes the agent to terminate with status 2.
 
 Every protocol message carries a common envelope consisting of `v` (currently 1), `type`, and
 `trace`. Messages originating from an agent additionally carry `agent` (the operational id) and
@@ -286,18 +297,26 @@ response header.
 
 ### Control stream
 
-Control communication follows a level-triggered state reconciliation model in which each request
-reports the complete current state of the agent and each reply carries a single command. Because
-the controller derives each command by comparing its desired state against the state reported by
-the agent, repeating the same request is idempotent and has no additional effect. When no command
-is ready, the controller holds the long-poll request for at most 1 second and then replies with
-`wait`.
+Control communication follows a state reconciliation model in which each request reports the full
+state of the agent and each reply carries a single command. Because the controller computes the
+command from its desired state and the state reported by the agent, repeating the same request has
+no additional effect. When no command is pending, the controller holds the poll for at most 1
+second and then replies with `wait`, emitting the same command at most once per hold. Because only
+one control request from a given agent is in flight at a time, a newer heartbeat that still
+requires the previous command indicates that the earlier reply was lost, causing the controller to
+retransmit that command immediately one time. The sole exception is `cancel`, because the agent
+continues to report its active phase until its workload stops. Each reply also carries `rxMs`, the
+controller wall-clock time when the request arrived, and `txMs`, the time when the reply was sent.
 
 | Request | Fields | Meaning |
 |---|---|---|
-| `register` | | Requests admission of the agent into the controller's active fleet. |
-| `heartbeat` | `seq, status{phase, runId, step, finalSeq, error}` | Issues a long-polled status
-report in which `phase` is `IDLE`, `PREPARING`, `READY`, `RUNNING`, `DONE`, or `FAILED`. |
+| `register` | | Requests admission of the agent into the active fleet. |
+| `heartbeat` |
+`seq, status{phase, runId, step, finalSeq, error, startedMs}, clock{sentMs, rxMs, txMs, receivedMs}`
+| Issues a long-polled status report where `phase` is `IDLE`, `PREPARING`, `READY`, `LAUNCHED`,
+`ARMED`, `RUNNING`, `DONE`, or `FAILED`, `startedMs` records the agent clock time when the start
+gate opened (or 0 otherwise), and `clock` reports the timestamps of the last completed control
+exchange (omitted before the first completed exchange). |
 | `goodbye` | | Notifies the controller that the agent is leaving the fleet immediately. |
 
 | Reply | Fields | Meaning |
@@ -305,7 +324,8 @@ report in which `phase` is `IDLE`, `PREPARING`, `READY`, `RUNNING`, `DONE`, or `
 | `registered` | | The agent is in the fleet |
 | `wait` | | The hold ended with no command |
 | `assign` | `assignment{runId, step, identity{slot, seed, offset, prefix}, scenario, documents, args, share{durationMs, threads, rate, rows}, properties, validations}` | Prepare this slot. An absent share field means no override. `validations` holds the later slices that the prepare validates, each an `assignment` with no `validations`; it is absent when empty |
-| `start` | `runId, step, startAtMs` | Start the prepared slot at this time |
+| `launch` | `runId, step` | Immediately launches the run child process for the prepared slot. |
+| `start` | `runId, step, startAtMs` | Opens the armed slot start gate at this agent clock time. |
 | `cancel` | `runId` | Stop the work of this run |
 | `release` | `runId` | Forget this finished or failed run and go idle |
 | `shutdown` | | Stop with status 0 |
@@ -326,6 +346,63 @@ To guarantee lossless telemetry delivery before completion, an agent reports the
 after its final telemetry frame has been acknowledged, and the controller marks a slot complete
 only after it holds every frame up to `finalSeq`.
 
+### Start synchronization
+
+Step execution begins in two phases because the initialization time required for a run child
+process to become ready (spanning JVM startup, JDBC driver initialization, ZooKeeper and metadata
+discovery, the validation gate, schema application, and warmup) has no fixed upper bound.
+
+1. Once every slot in the step reaches `READY`, the controller issues a `launch` command to each
+   participating agent. The run child process executes its warmup phase and pauses at the Pherf
+   start gate, after which the agent reports `ARMED`.
+2. Once no slot in the step remains in `LAUNCHED` and at least one slot is `ARMED`, the controller
+   computes the target start epoch on its own clock as now + 2000 ms + the largest round-trip
+   delay among the armed agents. Each armed agent receives a `start` command carrying this epoch
+   adjusted by the agent's estimated clock offset, ensuring that every agent targets the same
+   physical instant on its local clock. The 2000 ms lead time accommodates delivery jitter as well
+   as a single reset request followed by its 1 second retry backoff.
+3. The child process waits until its local wall clock reaches `startAtMs`, opens the start gate to
+   begin steady-state workload dispatch, and reports the actual opening timestamp in `startedMs`.
+
+The controller estimates each agent's clock offset from its control exchanges using an NTP-style
+calculation with the controller serving as the reference clock. For a single control exchange, let
+t1 and t4 denote the agent timestamps when the request was sent and the reply was received, and
+let t2 and t3 denote the controller timestamps (`rxMs` and `txMs`). The clock offset (defined as
+agent minus controller) is ((t1 - t2) + (t4 - t3)) / 2, and the round-trip network delay is
+(t4 - t1) - (t3 - t2), which excludes the controller's long-poll hold duration. A sample is valid
+whenever the computed delay is non-negative and t3 is not earlier than t2. The controller retains
+the last 8 valid samples for each agent and selects the sample with the smallest delay, breaking
+ties in favor of the most recent sample. The estimation error of the offset is bounded by at most
+half of that minimum delay plus 1 ms. Both controller and agent use wall clocks, and the child
+process shares the wall clock of its agent host.
+
+The run view exposes the step epoch along with each slot's agent clock offset and delay at the
+epoch, its scheduled `startAtMs`, and its controller-normalized dispatch time (`startedMs` minus
+the offset). The error bound on a slot's dispatch time is half the round-trip delay plus 2 ms to
+account for millisecond clock resolution. Because the estimated offset cancels out when computing
+the spread between a slot's scheduled and actual dispatch times, the offset estimation error
+appears only in the error bounds. Once every slot that received a `start` command has reported its
+dispatch time, the controller computes and logs the step skew, which represents a rigorous upper
+bound on the true start skew across the fleet: the latest dispatch time minus the earliest
+dispatch time, plus the two largest individual error bounds. Any slot whose error bound exceeds
+25 ms (corresponding to a round-trip delay above approximately 46 ms) triggers a warning indicating
+that a 50 ms synchronization bound cannot be proven for that slot. If any slot in a step lacks a
+valid clock sample, no skew value is computed for the step.
+
+- If a `start` command arrives after its target epoch or a sleeping thread wakes up late, the
+  child opens its start gate immediately. The slot dispatches late and the resulting skew reflects
+  the delay, without aborting or retrying the run. In particular, a `start` reply lost to the 5
+  second read timeout arrives approximately 4 seconds after its scheduled epoch.
+- Open-loop workloads gate the dispatch schedule after all worker threads have completed warmup,
+  whereas closed-loop workloads gate each runner thread individually after its own warmup so that
+  the first thread on every agent starts in sync.
+- Data loads (`-l`) and multi-tenant (`-mt`) workloads do not use a start gate; their slots
+  transition directly from `LAUNCHED` to `DONE` without a `start` command, and the step reports no
+  skew.
+- The synchronization error bound assumes that no host wall clock steps during startup. A step
+  containing two slots whose round-trip delays each exceed approximately 46 ms cannot prove a
+  50 ms skew bound.
+
 ### Telemetry stream
 
 | Message | Fields |
@@ -333,18 +410,67 @@ only after it holds every frame up to `finalSeq`.
 | `intervals` | `runId, step, frames[{seq, operation, phase, startMs, endMs, recorder{lowestUs, highestUs, significantDigits}, histogram}]` |
 | `ack` | `runId, step, heldSeq` |
 
-- `seq` numbers frames sequentially starting at 1 for each run and step, and a single batch may
-  contain at most 256 frames.
+- `seq` numbers frames sequentially starting at 1 for each run and step. Each request batch carries
+  at most 256 frames starting from the lowest unacknowledged sequence number, with at most one
+  batch in flight at a time.
 - `recorder` captures the actual precision and range parameters of the underlying histogram; Pherf
   recorders use 1 us, 600,000,000 us, and 3 significant digits.
-- `histogram` carries the recorded latency distribution encoded in the compressed base64 format of
+- `histogram` carries the recorded latency distribution in the compressed base64 representation of
   an HdrHistogram log line.
 - `heldSeq` reports the highest contiguous sequence number that the controller currently holds with
   no missing frames below it, and the agent retransmits every frame whose sequence number is above
-  `heldSeq`. When a batch pertains to a run that the controller does not recognize, `heldSeq` is
-  set to the highest sequence number in the batch so that the agent discards those stale frames.
-- The controller may reply with `rejected` in place of `ack`, upon which the agent terminates with
-  status 2.
+  `heldSeq`. When a batch pertains to an unrecognized run, an unbound slot, or a superseded agent
+  incarnation, the controller sets `heldSeq` to the highest sequence number in the batch without
+  retaining any of its frames so that the agent discards them.
+- The controller accepts a frame only when its sequence number equals `heldSeq + 1`, skipping any
+  sequence number it already holds and stopping at the first gap. Each newly accepted frame is
+  decoded once and its sample count is added to the slot total. If a frame cannot be decoded, the
+  slot fails, the acknowledgment accepts no further frames, and the agent receives a `cancel`
+  command while remaining in the active fleet.
+- If the listener cannot decode a telemetry batch payload at all, it responds with HTTP 400
+  `rejected`, causing the agent to terminate with status 2.
+- If telemetry requests fail continuously for more than 10 seconds measured from the first failure
+  following an acknowledgment while unacknowledged frames remain pending, the agent terminates its
+  run child process and reports `FAILED` with the error
+  `telemetry stream failed for more than 10000 ms`. Consequently, an agent buffers unacknowledged
+  frames for at most approximately 15 seconds.
+- Receiving an acknowledgment whose `heldSeq` is below the previously acknowledged sequence number
+  indicates that the controller lost frames that the agent has already discarded; the agent fails
+  its active work in the same manner.
+
+### Keepalives
+
+The long-polled control request serves as a bidirectional keepalive for the control stream: the
+agent receives a reply within 1 second, immediately issues the next poll, and obtains a fresh clock
+sample from every completed exchange. The telemetry stream transmits approximately one batch per
+second while frames are pending and remains silent when the agent is idle, as an idle telemetry
+stream holds no state. Because the 5 second socket read timeout is longer than the 1 second poll
+hold duration and shorter than the 10 second liveness deadline, a single lost reply is retried
+after 6 seconds and recovers before either side evicts or cancels the other.
+
+| Side | Rule |
+|---|---|
+| Controller | Evicts any agent with no request on either stream for more than 10 seconds. |
+| Agent | Cancels active work after no reply arrives on either stream for more than 10 seconds. |
+| Agent | Fails active work if telemetry fails for more than 10 seconds with frames pending. |
+| Agent | Fails active work if an acknowledgment is below the previously acknowledged sequence. |
+
+### Guarantees
+
+- Across transient disconnects, duplicate transmissions, or late copies of a request, the
+  controller accepts each frame sequence of a slot exactly once, ensuring that the aggregated
+  sample count of the slot equals the exact count recorded by the agent. Any fault that causes
+  frame loss fails the run, guaranteeing that a run with missing frames never reaches `COMPLETE`.
+- Restarting an agent during an active run is not supported: the run child process terminates
+  alongside its parent agent. When the new incarnation registers, it replaces the previous agent
+  record, marks the assigned slot as failed, and transitions the run to `FAILED`. Any stale frames
+  from the old incarnation are acknowledged without being retained, ensuring that no samples are
+  counted twice.
+- Restarting the controller loses all active runs. Connected agents receive `reregister`, cancel
+  their active workloads, and discard their buffered frames, while the restarted controller
+  acknowledges any stale frames without retaining them. Consequently, no samples are counted twice
+  and no interrupted run is ever reported as complete.
+
 
 ### Version rule
 

@@ -29,11 +29,11 @@ public final class RunView {
     RUNNING,
     COMPLETE,
     /**
-     * Indicates that the run failed before any of its steps started, ensuring that it sent no
+     * Indicates that the run failed before any of its steps were launched, ensuring that it sent no
      * database traffic.
      */
     ABORTED,
-    /** Indicates that the run failed after at least one step had already started. */
+    /** Indicates that the run failed after at least one step had already been launched. */
     FAILED
   }
 
@@ -49,6 +49,11 @@ public final class RunView {
   public enum SlotState {
     ASSIGNED,
     READY,
+    /** Indicates that the step was launched and the run child process is warming up. */
+    LAUNCHED,
+    /** Indicates that the run child process is holding at its start gate. */
+    ARMED,
+    /** Indicates that the slot has received its target start time. */
     RUNNING,
     DONE,
     FAILED,
@@ -56,7 +61,15 @@ public final class RunView {
      * Indicates that the run failed on another slot and this slot received a cancel or release
      * command.
      */
-    CANCELLED
+    CANCELLED;
+
+    /**
+     * Returns true while the slot's run child process may be active, specifically in the LAUNCHED,
+     * ARMED, or RUNNING states.
+     */
+    public boolean launched() {
+      return this == LAUNCHED || this == ARMED || this == RUNNING;
+    }
   }
 
   private final String runId;
@@ -107,12 +120,14 @@ public final class RunView {
     private final int index;
     private final StepState state;
     private final long startAtMs;
+    private final Long skewMs;
     private final List<SlotView> slots;
 
-    StepView(int index, StepState state, long startAtMs, List<SlotView> slots) {
+    StepView(int index, StepState state, long startAtMs, Long skewMs, List<SlotView> slots) {
       this.index = index;
       this.state = state;
       this.startAtMs = startAtMs;
+      this.skewMs = skewMs;
       this.slots = Collections.unmodifiableList(slots);
     }
 
@@ -124,9 +139,23 @@ public final class RunView {
       return state;
     }
 
-    /** Returns the start epoch timestamp of the step in milliseconds, or 0 before it starts. */
+    /**
+     * Returns the start epoch timestamp of the step on the controller clock in milliseconds, or 0
+     * before the epoch is established.
+     */
     public long getStartAtMs() {
       return startAtMs;
+    }
+
+    /**
+     * Returns an upper bound on the start skew across the slots that received a start command once
+     * every such slot has reported a dispatch timestamp, computed as the latest minus the earliest
+     * dispatch timestamp plus the two largest error bounds (each equal to half the round-trip delay
+     * plus 2 ms). Returns null when any slot lacks a clock sample or when the step has no start
+     * gate.
+     */
+    public Long getSkewMs() {
+      return skewMs;
     }
 
     public List<SlotView> getSlots() {
@@ -144,9 +173,15 @@ public final class RunView {
     private final long heldSeq;
     private final long finalSeq;
     private final int frames;
+    private final long samples;
+    private final Long offsetMs;
+    private final Long delayMs;
+    private final Long startAtMs;
+    private final Long dispatchMs;
 
     SlotView(DataPlaneIdentity identity, String agent, SlotState state, String error, Share share,
-      long heldSeq, long finalSeq, int frames) {
+      long heldSeq, long finalSeq, int frames, long samples, Long offsetMs, Long delayMs,
+      Long startAtMs, Long dispatchMs) {
       this.identity = identity;
       this.agent = agent;
       this.state = state;
@@ -155,6 +190,11 @@ public final class RunView {
       this.heldSeq = heldSeq;
       this.finalSeq = finalSeq;
       this.frames = frames;
+      this.samples = samples;
+      this.offsetMs = offsetMs;
+      this.delayMs = delayMs;
+      this.startAtMs = startAtMs;
+      this.dispatchMs = dispatchMs;
     }
 
     public int getSlot() {
@@ -199,6 +239,43 @@ public final class RunView {
     /** Returns the total number of interval frames currently held for this slot. */
     public int getFrames() {
       return frames;
+    }
+
+    /** Returns the cumulative sample count across all currently held frames for this slot. */
+    public long getSamples() {
+      return samples;
+    }
+
+    /**
+     * Returns the estimated clock offset of the agent when the step start epoch was established, or
+     * null if not set.
+     */
+    public Long getOffsetMs() {
+      return offsetMs;
+    }
+
+    /**
+     * Returns the round-trip delay associated with the agent's clock offset estimate, or null if
+     * unavailable; the dispatch timestamp has an error bound of at most delay / 2 + 2 ms.
+     */
+    public Long getDelayMs() {
+      return delayMs;
+    }
+
+    /**
+     * Returns the target start timestamp delivered to the agent on its own clock, or null if not
+     * set.
+     */
+    public Long getStartAtMs() {
+      return startAtMs;
+    }
+
+    /**
+     * Returns the timestamp when the agent's start gate opened on the controller clock, or null if
+     * not yet reported.
+     */
+    public Long getDispatchMs() {
+      return dispatchMs;
     }
   }
 }

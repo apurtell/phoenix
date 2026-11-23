@@ -29,6 +29,7 @@ import org.HdrHistogram.Histogram;
 import org.apache.phoenix.pherf.configuration.OpenLoop;
 import org.apache.phoenix.pherf.latency.LatencyRecorders;
 import org.apache.phoenix.pherf.latency.Micros;
+import org.apache.phoenix.pherf.workload.StartGate;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -439,7 +440,21 @@ public final class OpenLoopScheduler {
       if (halted) {
         return;
       }
-      // The timed arrival schedule begins only after all worker warmup operations have completed.
+      StartGate.Gate gate = StartGate.get();
+      if (gate != null) {
+        // The start gate holds the arrival schedule after warmup completes; because a stop request
+        // may arrive while waiting at the gate, the scheduler lock is released during the hold.
+        lock.unlock();
+        try {
+          gate.await();
+        } finally {
+          lock.lock();
+        }
+        if (halted) {
+          return;
+        }
+      }
+      // The timed arrival schedule begins only after all warmup operations have completed.
       t0 = clock.nowMicros();
       startMs = EnvironmentEdgeManager.currentTimeMillis();
       phase = OpenLoopState.STEADY;

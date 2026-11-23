@@ -62,7 +62,7 @@ public class AgentLifecycleTest {
     assertEquals(1, simulation.count(REQUEST, "register"));
     assertEquals(before.getRegisteredMs(), after.getRegisteredMs());
     assertEquals(before.getIncarnation(), after.getIncarnation());
-    assertEquals(2, simulation.workload("a1").started.size());
+    assertEquals(2, simulation.workload("a1").launched.size());
     assertEquals(AgentView.State.IDLE, after.getState());
     assertEquals(AgentRuntime.State.IDLE, agent.state());
   }
@@ -83,8 +83,8 @@ public class AgentLifecycleTest {
     assertEquals(1, simulation.count(REQUEST, "register"));
     assertEquals(2, simulation.count(REPLY, "release"));
     assertEquals(Arrays.asList(0, 1),
-      Arrays.asList(simulation.workload("a1").started.get(0).getStep(),
-        simulation.workload("a1").started.get(1).getStep()));
+      Arrays.asList(simulation.workload("a1").launched.get(0).getStep(),
+        simulation.workload("a1").launched.get(1).getStep()));
   }
 
   @Test

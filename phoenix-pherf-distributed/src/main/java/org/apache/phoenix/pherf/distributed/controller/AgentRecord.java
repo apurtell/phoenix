@@ -53,12 +53,20 @@ final class AgentRecord {
    */
   String lastCommand;
   /**
+   * Indicates whether the most recent command was immediately retransmitted following a lost reply.
+   */
+  boolean resent;
+  /**
    * Holds the pending long-poll callback along with its associated trace identifier and hold
    * expiration timer.
    */
   Callback<Message> held;
   String heldTrace;
+  /** Records the controller timestamp at which the currently held long-poll request arrived. */
+  long heldRxMs;
   Clock.Timer holdTimer;
+  /** Maintains the clock offset estimator for this agent. */
+  final ClockFilter clockFilter = new ClockFilter();
 
   AgentRecord(String id, String incarnation, Clock clock) {
     this.id = id;
@@ -95,6 +103,12 @@ final class AgentRecord {
         case READY:
           state = AgentView.State.READY;
           break;
+        case LAUNCHED:
+          state = AgentView.State.LAUNCHED;
+          break;
+        case ARMED:
+          state = AgentView.State.ARMED;
+          break;
         case RUNNING:
           state = AgentView.State.RUNNING;
           break;
@@ -102,7 +116,9 @@ final class AgentRecord {
           state = AgentView.State.IDLE;
       }
     }
+    long[] clock = clockFilter.best();
     return new AgentView(id, incarnation, state, reported.getPhase(), reported.getRunId(),
-      reported.getStep(), registeredMs, lastSeenMs);
+      reported.getStep(), registeredMs, lastSeenMs, clock == null ? null : clock[0],
+      clock == null ? null : clock[1]);
   }
 }

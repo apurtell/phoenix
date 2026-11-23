@@ -26,8 +26,9 @@ import java.util.List;
 
 /**
  * An in-memory test launcher implementation that records launch requests without spawning actual
- * operating system processes. Tests explicitly drive the completion of each simulated child by
- * invoking {@link Launch#exit}.
+ * operating system processes. Tests explicitly drive the lifecycle markers of each simulated child
+ * process by invoking {@link Launch#arm} and {@link Launch#started}, and terminate it by invoking
+ * {@link Launch#exit}.
  */
 public final class FakeLauncher implements Launcher {
   public final List<Launch> launches = new ArrayList<>();
@@ -56,6 +57,8 @@ public final class FakeLauncher implements Launcher {
     public final List<String> args;
     public final File workDir;
     private final ExitListener listener;
+    /** Records the lines written by the workload to the standard input stream of the child. */
+    public final List<String> sent = new ArrayList<>();
     public int destroys;
     public int kills;
     private boolean exited;
@@ -87,6 +90,21 @@ public final class FakeLauncher implements Launcher {
     @Override
     public void destroyForcibly() {
       kills++;
+    }
+
+    @Override
+    public void send(String line) {
+      sent.add(line);
+    }
+
+    /** Simulates the child process reaching and holding at its start gate. */
+    public void arm() {
+      listener.armed();
+    }
+
+    /** Simulates the start gate of the child process opening at the specified timestamp. */
+    public void started(long startedMs) {
+      listener.started(startedMs);
     }
 
     /**

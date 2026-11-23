@@ -26,6 +26,8 @@ public final class AgentView {
     IDLE,
     ASSIGNED,
     READY,
+    LAUNCHED,
+    ARMED,
     RUNNING,
     DONE,
     LEAVING
@@ -39,9 +41,11 @@ public final class AgentView {
   private final int step;
   private final long registeredMs;
   private final long lastSeenMs;
+  private final Long offsetMs;
+  private final Long delayMs;
 
   AgentView(String id, String incarnation, State state, Phase phase, String runId, int step,
-    long registeredMs, long lastSeenMs) {
+    long registeredMs, long lastSeenMs, Long offsetMs, Long delayMs) {
     this.id = id;
     this.incarnation = incarnation;
     this.state = state;
@@ -50,6 +54,8 @@ public final class AgentView {
     this.step = step;
     this.registeredMs = registeredMs;
     this.lastSeenMs = lastSeenMs;
+    this.offsetMs = offsetMs;
+    this.delayMs = delayMs;
   }
 
   public String getId() {
@@ -83,6 +89,22 @@ public final class AgentView {
 
   public long getLastSeenMs() {
     return lastSeenMs;
+  }
+
+  /**
+   * Returns the estimated clock offset in milliseconds, defined as the agent wall clock minus the
+   * controller wall clock, or null if no estimate is available.
+   */
+  public Long getOffsetMs() {
+    return offsetMs;
+  }
+
+  /**
+   * Returns the round-trip delay of the clock offset estimate in milliseconds; the offset
+   * estimation error is at most half of this delay.
+   */
+  public Long getDelayMs() {
+    return delayMs;
   }
 
   @Override

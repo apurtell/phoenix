@@ -32,11 +32,13 @@ import org.apache.phoenix.pherf.distributed.protocol.AgentMessage;
 import org.apache.phoenix.pherf.distributed.protocol.Assign;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Cancel;
+import org.apache.phoenix.pherf.distributed.protocol.ClockSample;
 import org.apache.phoenix.pherf.distributed.protocol.Goodbye;
 import org.apache.phoenix.pherf.distributed.protocol.Heartbeat;
 import org.apache.phoenix.pherf.distributed.protocol.HistogramBlob;
 import org.apache.phoenix.pherf.distributed.protocol.IntervalFrame;
 import org.apache.phoenix.pherf.distributed.protocol.Intervals;
+import org.apache.phoenix.pherf.distributed.protocol.Launch;
 import org.apache.phoenix.pherf.distributed.protocol.Message;
 import org.apache.phoenix.pherf.distributed.protocol.Phase;
 import org.apache.phoenix.pherf.distributed.protocol.Protocol;
@@ -64,17 +66,30 @@ import org.slf4j.LoggerFactory;
  * {@link Protocol#MAX_FRAMES} per request. Any failed request is retried after
  * {@link Protocol#RETRY_MS}.
  * <p>
- * Workload completion proceeds in two phases so that the agent reports DONE only after receiving an
- * acknowledgment that covers the final frame. Incoming commands are idempotent for each run and
- * step. Following a cancellation, the agent continues to report its active phase until the
- * underlying workload stops, guaranteeing that two runs never overlap within a single process. If
- * the workload throws a runtime exception, the current work transitions to a failed state while the
- * communication loops continue operating.
+ * Each heartbeat echoes the agent and controller timestamps from the last completed control
+ * exchange so that the controller can estimate the clock offset of the agent.
  * <p>
- * The agent automatically cancels its active work if no reply arrives on either stream for longer
+ * Workload startup proceeds in two phases: a launch command starts the workload process, which
+ * warms up and arms at its start gate, and a subsequent start command specifies the target agent
+ * clock time at which the gate opens. The workload may emit telemetry frames starting immediately
+ * from the launch phase.
+ * <p>
+ * Workload completion also proceeds in two phases so that the agent reports DONE only after
+ * receiving an acknowledgment that covers the final frame. Incoming commands are idempotent for
+ * each run and step. Following a cancellation, the agent continues to report its active phase until
+ * the underlying workload stops, guaranteeing that two runs never overlap within a single process.
+ * If the workload throws a runtime exception, the current work transitions to a failed state while
+ * the communication loops continue operating.
+ * <p>
+ * The agent automatically cancels its active work when no reply arrives on either stream for longer
  * than {@link Protocol#DEADLINE_MS}, matching the controller's eviction threshold. This ensures
  * that an agent evicted by the controller does not continue driving workload traffic against the
- * database.
+ * database. Furthermore, the agent transitions its active work to a failed state in two situations:
+ * if the telemetry stream fails continuously for longer than the deadline while frames are awaiting
+ * acknowledgment, or if a telemetry acknowledgment reports a sequence number below the previously
+ * acknowledged sequence, indicating that the controller lost frames that the agent has already
+ * discarded. In both cases, the agent stops the running workload before reporting the failure so
+ * that the run cannot complete with missing data.
  */
 public final class AgentRuntime {
   private static final Logger LOG = LoggerFactory.getLogger(AgentRuntime.class);
@@ -85,6 +100,8 @@ public final class AgentRuntime {
     IDLE,
     PREPARING,
     READY,
+    LAUNCHED,
+    ARMED,
     RUNNING,
     DONE,
     FAILED,
@@ -112,6 +129,10 @@ public final class AgentRuntime {
   private Clock.Timer controlRetry;
   private boolean telemetryOut;
   private Clock.Timer telemetryRetry;
+  /** Agent clock timestamp recorded when the currently in-flight control request was sent. */
+  private long controlSentMs;
+  /** Timestamps from the most recently completed control exchange, echoed on the next heartbeat. */
+  private ClockSample lastClock;
   /** Timer that fires when no reply arrives from the controller within the deadline bound. */
   private Clock.Timer silence;
   private long controlCount;
@@ -188,7 +209,7 @@ public final class AgentRuntime {
     }
     Assignment assignment = work.assignment;
     return new Status(work.phase, assignment.getRunId(), assignment.getStep(),
-      work.phase == Phase.DONE ? work.finalSeq : 0, work.error);
+      work.phase == Phase.DONE ? work.finalSeq : 0, work.error, work.startedMs);
   }
 
   /**
@@ -222,10 +243,11 @@ public final class AgentRuntime {
     } else if (life == Life.UNREGISTERED) {
       request = new Register();
     } else {
-      request = new Heartbeat(n, status());
+      request = new Heartbeat(n, status(), lastClock);
     }
     stamp(request, Protocol.CONTROL, n);
     controlOut = true;
+    controlSentMs = clock.millis();
     transport.control(request, new Callback<Message>() {
       @Override
       public void completed(Message reply) {
@@ -243,6 +265,9 @@ public final class AgentRuntime {
     controlOut = false;
     if (life == Life.STOPPED) {
       return;
+    }
+    if (reply.getRxMs() != null && reply.getTxMs() != null) {
+      lastClock = new ClockSample(controlSentMs, reply.getRxMs(), reply.getTxMs(), clock.millis());
     }
     replied();
     if (request instanceof Goodbye) {
@@ -311,6 +336,11 @@ public final class AgentRuntime {
       case ASSIGN:
         if (life == Life.REGISTERED) {
           assign(((Assign) reply).getAssignment());
+        }
+        break;
+      case LAUNCH:
+        if (life == Life.REGISTERED) {
+          launch((Launch) reply);
         }
         break;
       case START:
@@ -386,7 +416,7 @@ public final class AgentRuntime {
       SlotTokens.resolve(assignment.getProperties(), assignment.getIdentity()), validations);
   }
 
-  private void start(Start command) {
+  private void launch(Launch command) {
     Work current = work;
     if (
       current == null || current.phase != Phase.READY || current.cancelling
@@ -394,11 +424,25 @@ public final class AgentRuntime {
     ) {
       return;
     }
-    current.phase = Phase.RUNNING;
-    LOG.info("agent {} starts run {} step {}", identity.getId(), command.getRunId(),
+    current.phase = Phase.LAUNCHED;
+    LOG.info("agent {} launches run {} step {}", identity.getId(), command.getRunId(),
       command.getStep());
+    safely(current, "launch", () -> workload.launch(current.assignment, current));
+  }
+
+  private void start(Start command) {
+    Work current = work;
+    if (
+      current == null || current.phase != Phase.ARMED || current.cancelling
+        || !current.matches(command.getRunId(), command.getStep())
+    ) {
+      return;
+    }
+    current.phase = Phase.RUNNING;
+    LOG.info("agent {} starts run {} step {} at {}", identity.getId(), command.getRunId(),
+      command.getStep(), command.getStartAtMs());
     safely(current, "start",
-      () -> workload.start(current.assignment, command.getStartAtMs(), current));
+      () -> workload.start(current.assignment.getRunId(), command.getStartAtMs()));
   }
 
   /**
@@ -428,7 +472,7 @@ public final class AgentRuntime {
       return;
     }
     current.unacked.clear();
-    if (current.phase == Phase.PREPARING || current.phase == Phase.RUNNING && !current.finishing) {
+    if (current.live()) {
       if (!current.cancelling) {
         current.cancelling = true;
         LOG.info("agent {} cancels run {}", identity.getId(), current.assignment.getRunId());
@@ -440,6 +484,28 @@ public final class AgentRuntime {
       safely(current, "cancel", () -> workload.cancel(current.assignment.getRunId()));
     }
     idle();
+  }
+
+  /**
+   * Transitions the current assignment to a failed state and discards any unacknowledged telemetry
+   * frames. If the underlying workload is still live, it is stopped first and the agent reports
+   * FAILED only after termination completes, ensuring the agent never reports failure while a
+   * workload remains running.
+   */
+  private void failWork(Work current, String reason) {
+    LOG.warn("agent {} fails run {} step {}: {}", identity.getId(), current.assignment.getRunId(),
+      current.assignment.getStep(), reason);
+    current.unacked.clear();
+    if (current.live()) {
+      current.failing = reason;
+      if (!current.cancelling) {
+        current.cancelling = true;
+        safely(current, "cancel", () -> workload.cancel(current.assignment.getRunId()));
+      }
+      return;
+    }
+    current.phase = Phase.FAILED;
+    current.error = reason;
   }
 
   private void idle() {
@@ -490,8 +556,17 @@ public final class AgentRuntime {
     replied();
     try {
       Work current = work;
+      if (current != null && current.telemetryDeadline != null) {
+        current.telemetryDeadline.cancel();
+        current.telemetryDeadline = null;
+      }
       if (current != null && current.matches(ack.getRunId(), ack.getStep())) {
-        current.ackedSeq = Math.max(current.ackedSeq, ack.getHeldSeq());
+        if (ack.getHeldSeq() < current.ackedSeq) {
+          failWork(current, "telemetry ack " + ack.getHeldSeq() + " is below the acked sequence "
+            + current.ackedSeq);
+          return;
+        }
+        current.ackedSeq = ack.getHeldSeq();
         while (!current.unacked.isEmpty() && current.unacked.peek().getSeq() <= current.ackedSeq) {
           current.unacked.poll();
         }
@@ -513,10 +588,27 @@ public final class AgentRuntime {
     }
     LOG.warn("agent {} telemetry request {} failed: {}; again in {} ms", identity.getId(),
       batch.getTrace(), e.toString(), Protocol.RETRY_MS);
+    Work current = work;
+    if (current != null && current.telemetryDeadline == null) {
+      current.telemetryDeadline =
+        clock.schedule(Protocol.DEADLINE_MS, () -> call(() -> telemetryDead(current)));
+    }
     telemetryRetry = clock.schedule(Protocol.RETRY_MS, () -> call(() -> {
       telemetryRetry = null;
       pumpTelemetry();
     }));
+  }
+
+  /**
+   * Fails the active assignment when no telemetry acknowledgment arrives within the deadline after
+   * the first transmission failure, indicating that pending frames cannot reach the controller. If
+   * the assignment has already been replaced, the expired timer has no effect.
+   */
+  private void telemetryDead(Work current) {
+    current.telemetryDeadline = null;
+    if (life != Life.STOPPED && current == work && !current.unacked.isEmpty()) {
+      failWork(current, "telemetry stream failed for more than " + Protocol.DEADLINE_MS + " ms");
+    }
   }
 
   private void beginStop(int status) {
@@ -560,8 +652,8 @@ public final class AgentRuntime {
     }
     life = Life.STOPPED;
     exitStatus = status;
-    for (Clock.Timer timer : new Clock.Timer[] { stopGrace, controlRetry, telemetryRetry,
-      silence }) {
+    for (Clock.Timer timer : new Clock.Timer[] { stopGrace, controlRetry, telemetryRetry, silence,
+      work == null ? null : work.telemetryDeadline }) {
       if (timer != null) {
         timer.cancel();
       }
@@ -578,10 +670,19 @@ public final class AgentRuntime {
     Phase phase = Phase.PREPARING;
     String error;
     boolean cancelling;
+    /** Failure reason recorded while waiting for a live workload to stop, or null if none. */
+    String failing;
     boolean finishing;
     long nextSeq = 1;
     long ackedSeq;
     long finalSeq;
+    /** Agent clock timestamp when the workload start gate opened, or 0 if not yet opened. */
+    long startedMs;
+    /**
+     * Timer that fires when telemetry delivery fails continuously for longer than the deadline, and
+     * is cleared upon receiving an acknowledgment.
+     */
+    Clock.Timer telemetryDeadline;
 
     Work(Assignment assignment) {
       this.assignment = assignment;
@@ -592,11 +693,32 @@ public final class AgentRuntime {
     }
 
     /**
+     * Returns true while the underlying workload process may still be executing, either during
+     * preparation or after launch before execution has finished.
+     */
+    boolean live() {
+      return phase == Phase.PREPARING || phase.launched() && !finishing;
+    }
+
+    /**
+     * Completes termination of a cancelled workload by transitioning to FAILED if a deferred
+     * failure reason is present, or returning to the idle state otherwise.
+     */
+    void stopped() {
+      if (failing != null) {
+        phase = Phase.FAILED;
+        error = failing;
+      } else {
+        idle();
+      }
+    }
+
+    /**
      * Transitions the assignment to DONE once workload execution has finished and the controller
      * acknowledgment covers the final telemetry frame.
      */
     void checkDone() {
-      if (finishing && phase == Phase.RUNNING && ackedSeq >= finalSeq) {
+      if (finishing && phase.launched() && ackedSeq >= finalSeq) {
         phase = Phase.DONE;
         LOG.info("agent {} finished run {} step {} with {} frames", identity.getId(),
           assignment.getRunId(), assignment.getStep(), finalSeq);
@@ -618,7 +740,7 @@ public final class AgentRuntime {
           return;
         }
         if (cancelling) {
-          idle();
+          stopped();
         } else if (errors.isEmpty()) {
           phase = Phase.READY;
         } else {
@@ -631,12 +753,34 @@ public final class AgentRuntime {
     }
 
     @Override
+    public void armed() {
+      call(() -> {
+        if (current() && phase == Phase.LAUNCHED && !cancelling) {
+          phase = Phase.ARMED;
+          LOG.info("agent {} is armed for run {} step {}", identity.getId(), assignment.getRunId(),
+            assignment.getStep());
+        }
+      });
+    }
+
+    @Override
+    public void started(long atMs) {
+      call(() -> {
+        if (current() && phase.launched()) {
+          startedMs = atMs;
+        }
+      });
+    }
+
+    @Override
     public void interval(String operation, String measurePhase, long startMs, long endMs,
       Histogram histogram) {
       String blob = HistogramBlob.encode(histogram);
       RecorderConfig recorder = RecorderConfig.of(histogram);
       call(() -> {
-        if (!current() || phase != Phase.RUNNING || cancelling || finishing) {
+        // Warmup frames arrive before the start gate opens, so any launched workload is permitted
+        // to enqueue telemetry frames.
+        if (!current() || !phase.launched() || cancelling || finishing) {
           return;
         }
         unacked.add(
@@ -652,8 +796,8 @@ public final class AgentRuntime {
           return;
         }
         if (cancelling) {
-          idle();
-        } else if (phase == Phase.RUNNING && !finishing) {
+          stopped();
+        } else if (phase.launched() && !finishing) {
           finishing = true;
           finalSeq = nextSeq - 1;
           checkDone();
@@ -668,7 +812,7 @@ public final class AgentRuntime {
           return;
         }
         if (cancelling) {
-          idle();
+          stopped();
         } else if (phase.active()) {
           phase = Phase.FAILED;
           error = reason;

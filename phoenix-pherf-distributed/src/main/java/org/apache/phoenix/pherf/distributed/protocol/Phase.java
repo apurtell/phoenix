@@ -17,11 +17,18 @@
  */
 package org.apache.phoenix.pherf.distributed.protocol;
 
-/** Defines the execution phase that an agent reports as part of its operational status. */
+/**
+ * Defines the execution phase that an agent reports in its status. In the LAUNCHED phase, the run
+ * child process has started and is performing its warmup. In the ARMED phase, the run child process
+ * is holding at its start gate. In the RUNNING phase, the agent has received its scheduled start
+ * time.
+ */
 public enum Phase {
   IDLE,
   PREPARING,
   READY,
+  LAUNCHED,
+  ARMED,
   RUNNING,
   DONE,
   FAILED;
@@ -31,6 +38,15 @@ public enum Phase {
    * LAUNCHED, ARMED or RUNNING.
    */
   public boolean active() {
-    return this == PREPARING || this == READY || this == RUNNING;
+    return this == PREPARING || this == READY || this == LAUNCHED || this == ARMED
+      || this == RUNNING;
+  }
+
+  /**
+   * Returns true while the run child process of the agent can be live, which includes the LAUNCHED,
+   * ARMED, and RUNNING phases.
+   */
+  public boolean launched() {
+    return this == LAUNCHED || this == ARMED || this == RUNNING;
   }
 }

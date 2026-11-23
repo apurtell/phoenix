@@ -62,15 +62,29 @@ public final class Protocol {
    */
   public static final long RETRY_MS = 1000;
   /**
-   * Specifies the connection and read timeout, in milliseconds, applied to an outgoing agent
-   * request.
+   * Specifies the connection and read timeout, in milliseconds, for an agent request. This value is
+   * greater than the poll hold duration and less than the liveness deadline so that a single lost
+   * reply is retransmitted before either side evicts the other.
    */
-  public static final int IO_TIMEOUT_MS = 10000;
+  public static final int IO_TIMEOUT_MS = 5000;
   /**
-   * Defines the maximum grace period, in milliseconds, allotted for an agent to complete an orderly
+   * Defines the maximum duration, in milliseconds, allowed for an agent to complete an orderly
    * stop.
    */
   public static final long STOP_GRACE_MS = 5000;
+  /**
+   * Defines the lead time, in milliseconds, of a start epoch ahead of the moment the controller
+   * establishes it, in addition to the largest round-trip delay among the agents assigned to the
+   * step. This margin accommodates start delivery jitter as well as one reset request and its retry
+   * after {@link #RETRY_MS}. A lost reply that waits for {@link #IO_TIMEOUT_MS} arrives late, and
+   * the resulting delay is reflected in the skew of the step.
+   */
+  public static final long START_LEAD_MS = 2000;
+  /**
+   * Specifies the number of most recent valid clock samples used to estimate the clock offset of an
+   * agent.
+   */
+  public static final int CLOCK_SAMPLES = 8;
   /** Defines the maximum number of interval frames permitted in a single telemetry batch. */
   public static final int MAX_FRAMES = 256;
   /** Defines the maximum permitted payload size, in bytes, for any request or reply body. */

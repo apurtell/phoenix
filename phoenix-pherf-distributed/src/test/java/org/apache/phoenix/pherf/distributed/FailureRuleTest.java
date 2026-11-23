@@ -38,9 +38,9 @@ import org.junit.Test;
 
 /**
  * Verifies the run failure propagation rules: a single failing slot causes the entire run to fail.
- * If the failure occurs before any slot starts, the run transitions to the ABORTED state;
- * otherwise, it transitions to the FAILED state. All remaining participating agents receive either
- * a cancel or a release command, ensuring that every agent returns to an idle and free state.
+ * If the failure occurs before any launch, the run transitions to the ABORTED state; otherwise, it
+ * transitions to the FAILED state. All other participating agents receive either a cancel or a
+ * release command, ensuring that every agent returns to an idle and free state.
  */
 public class FailureRuleTest {
   private static final String[] AGENTS = { "a1", "a2", "a3" };
@@ -103,10 +103,11 @@ public class FailureRuleTest {
     assertEquals(Arrays.asList(RunView.SlotState.CANCELLED, RunView.SlotState.CANCELLED,
       RunView.SlotState.FAILED), states(run));
     assertEquals(RunView.StepState.PENDING, run.getSteps().get(1).getState());
+    assertEquals(0, simulation.count(InProcessNetwork.REPLY, "launch"));
     assertEquals(0, simulation.count(InProcessNetwork.REPLY, "start"));
     for (String id : AGENTS) {
       assertEquals(AgentRuntime.State.IDLE, simulation.agentRuntime(id).state());
-      assertTrue(simulation.workload(id).started.isEmpty());
+      assertTrue(simulation.workload(id).launched.isEmpty());
     }
     assertEquals(Arrays.asList(runId, runId), Arrays.asList(
       simulation.workload("a1").cancelled.get(0), simulation.workload("a2").cancelled.get(0)));
@@ -135,6 +136,7 @@ public class FailureRuleTest {
       run.getReason());
     assertEquals(Arrays.asList(RunView.SlotState.FAILED, RunView.SlotState.CANCELLED), states(run));
     assertEquals(RunView.StepState.PENDING, run.getSteps().get(1).getState());
+    assertEquals(0, simulation.count(InProcessNetwork.REPLY, "launch"));
     assertEquals(0, simulation.count(InProcessNetwork.REPLY, "start"));
     assertEquals(Arrays.asList("1.0", "1.2"),
       validated(simulation.workload("a1").prepared.get(0).getValidations()));
@@ -143,7 +145,7 @@ public class FailureRuleTest {
     assertTrue(simulation.workload("a3").prepared.isEmpty());
     for (String id : AGENTS) {
       assertEquals(AgentRuntime.State.IDLE, simulation.agentRuntime(id).state());
-      assertTrue(simulation.workload(id).started.isEmpty());
+      assertTrue(simulation.workload(id).launched.isEmpty());
     }
     allIdleAndFree(simulation, AGENTS);
   }
@@ -194,7 +196,9 @@ public class FailureRuleTest {
     properties.put("fake.fail.1", "4");
     properties.put("fake.intervals.2", "100");
     String runId = simulation.controller.submit(Simulation.spec(7, properties, 3));
-    simulation.runFor(2500);
+    // The arm notification reaches the controller after one hold, and the start epoch is scheduled
+    // 2 s later.
+    simulation.runFor(6000);
     RunView running = simulation.run(runId);
     assertEquals(
       Arrays.asList(RunView.SlotState.DONE, RunView.SlotState.RUNNING, RunView.SlotState.RUNNING),
@@ -206,11 +210,11 @@ public class FailureRuleTest {
     assertEquals(
       Arrays.asList(RunView.SlotState.DONE, RunView.SlotState.FAILED, RunView.SlotState.CANCELLED),
       states(run));
-    assertEquals(Arrays.asList("registered", "assign", "start", "release"),
+    assertEquals(Arrays.asList("registered", "assign", "launch", "start", "release"),
       replies(simulation, "a1"));
-    assertEquals(Arrays.asList("registered", "assign", "start", "release"),
+    assertEquals(Arrays.asList("registered", "assign", "launch", "start", "release"),
       replies(simulation, "a2"));
-    assertEquals(Arrays.asList("registered", "assign", "start", "cancel"),
+    assertEquals(Arrays.asList("registered", "assign", "launch", "start", "cancel"),
       replies(simulation, "a3"));
     assertEquals(Collections.singletonList(runId), simulation.workload("a3").cancelled);
     for (String id : AGENTS) {
@@ -236,9 +240,10 @@ public class FailureRuleTest {
     RunView run = simulation.run(runId);
     assertEquals(RunView.State.ABORTED, run.getState());
     assertEquals("agent a2 missed its heartbeat deadline", run.getReason());
+    assertEquals(0, simulation.count(InProcessNetwork.REPLY, "launch"));
     assertEquals(0, simulation.count(InProcessNetwork.REPLY, "start"));
     assertEquals(Collections.singletonList(runId), simulation.workload("a1").cancelled);
-    assertTrue(simulation.workload("a1").started.isEmpty());
+    assertTrue(simulation.workload("a1").launched.isEmpty());
     assertEquals(AgentView.State.IDLE, simulation.view("a1").getState());
   }
 

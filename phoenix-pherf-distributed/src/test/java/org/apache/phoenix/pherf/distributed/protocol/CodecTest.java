@@ -86,10 +86,14 @@ public class CodecTest {
     IntervalFrame frame = new IntervalFrame(1, "query:s:q1", LatencyRecorders.STEADY, 1000, 2000,
       RecorderConfig.of(histogram), HistogramBlob.encode(histogram));
     return Arrays.asList(traced(new Register(), "a1/control/1"),
-      traced(new Heartbeat(2, new Status(Phase.DONE, "20260101T000000000Z-1", 2, 9, "none")),
+      traced(
+        new Heartbeat(2,
+          new Status(Phase.DONE, "20260101T000000000Z-1", 2, 9, "none", 1767225601003L),
+          new ClockSample(1767225601000L, 1767225601001L, 1767225601002L, 1767225601004L)),
         "a1/control/2"),
       traced(new Goodbye(), "a1/control/3"), traced(new Registered(), "a1/control/1"),
       traced(new Wait(), "a1/control/2"), traced(new Assign(assignment), "a1/control/4"),
+      traced(new Launch("20260101T000000000Z-1", 2), "a1/control/5"),
       traced(new Start("20260101T000000000Z-1", 2, 1767225601000L), "a1/control/5"),
       traced(new Cancel("20260101T000000000Z-1"), "a1/control/6"),
       traced(new Release("20260101T000000000Z-1"), "a1/control/7"),
@@ -105,6 +109,11 @@ public class CodecTest {
    * to be absent.
    */
   private static void assertComplete(String path, Object value) throws IllegalAccessException {
+    if (path.endsWith(".rxMs") || path.endsWith(".txMs")) {
+      // Only the controller populates timestamps on a control reply; this behavior is verified by
+      // stampsRoundTripAndAreAbsentElsewhere.
+      return;
+    }
     if (path.endsWith(".validations[].validations")) {
       assertNull(path, value);
       return;
@@ -149,7 +158,28 @@ public class CodecTest {
       covered.add(decoded.type());
     }
     assertEquals(EnumSet.allOf(MessageType.class), covered);
-    assertEquals(14, MessageType.values().length);
+    assertEquals(15, MessageType.values().length);
+  }
+
+  /**
+   * Verifies that controller receive and transmit timestamps on a control reply survive round-trip
+   * serialization and are omitted from messages that do not carry them.
+   */
+  @Test
+  public void stampsRoundTripAndAreAbsentElsewhere() throws Exception {
+    Message reply = traced(new Wait(), "a1/control/2");
+    reply.setStamps(1767225601001L, 1767225601999L);
+    String json = Codec.encode(reply);
+    assertEquals("{\"v\":1,\"type\":\"wait\",\"trace\":\"a1/control/2\","
+      + "\"rxMs\":1767225601001,\"txMs\":1767225601999}", json);
+    Message decoded = Codec.decode(json);
+    assertEquals(Long.valueOf(1767225601001L), decoded.getRxMs());
+    assertEquals(Long.valueOf(1767225601999L), decoded.getTxMs());
+    String ack = Codec.encode(traced(new Ack("r", 0, 1), "a1/telemetry/1"));
+    assertTrue(ack, !ack.contains("rxMs") && !ack.contains("txMs"));
+    Message plain = Codec.decode(ack);
+    assertNull(plain.getRxMs());
+    assertNull(plain.getTxMs());
   }
 
   private static void assertSameHistogram(Histogram expected, Histogram actual) {

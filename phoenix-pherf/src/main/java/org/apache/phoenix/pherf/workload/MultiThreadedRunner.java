@@ -138,6 +138,7 @@ public class MultiThreadedRunner implements Callable<Void> {
         timedQuery(i + 1, true);
       }
     }
+    StartGate.await();
     long threadStartTime = EnvironmentEdgeManager.currentTimeMillis();
     for (long i = 0; i < numberOfExecutions; i++) {
       long threadElapsedTime = EnvironmentEdgeManager.currentTimeMillis() - threadStartTime;

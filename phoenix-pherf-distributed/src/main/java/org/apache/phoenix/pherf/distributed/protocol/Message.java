@@ -18,14 +18,19 @@
 package org.apache.phoenix.pherf.distributed.protocol;
 
 /**
- * This class represents a message exchanged over the agent channel. Every message carries the
- * catalogue version, its message type, and a trace identifier. The trace of a request is formatted
- * as {@code <agent>/<stream>/<n>}, and the corresponding reply echoes the same trace.
+ * Represents a message exchanged over the agent channel. Every message carries the catalogue
+ * version, its message type, and a trace identifier. The trace of a request is formatted as
+ * {@code <agent>/<stream>/<n>}, and the corresponding reply echoes the same trace. A control reply
+ * additionally carries rxMs, which records the controller wall-clock time when the request arrived,
+ * and txMs, which records the time when the reply was sent. These fields are omitted on all other
+ * messages.
  */
 public abstract class Message {
   private int v = Protocol.VERSION;
   private String type;
   private String trace;
+  private Long rxMs;
+  private Long txMs;
 
   protected Message(MessageType type) {
     this.type = type.wire();
@@ -45,5 +50,22 @@ public abstract class Message {
 
   public void setTrace(String trace) {
     this.trace = trace;
+  }
+
+  public Long getRxMs() {
+    return rxMs;
+  }
+
+  public Long getTxMs() {
+    return txMs;
+  }
+
+  /**
+   * Stamps a control reply with the controller timestamps recording when its corresponding request
+   * was received and when the reply itself was transmitted.
+   */
+  public void setStamps(long rxMs, long txMs) {
+    this.rxMs = rxMs;
+    this.txMs = txMs;
   }
 }
