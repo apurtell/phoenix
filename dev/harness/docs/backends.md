@@ -508,6 +508,18 @@ Where the high-level design document refers to abstract substrate verbs in prose
 `sb_restart_drain`, `oom_detect` maps to `sb_oom_killed`, `inspect` maps to `sb_list`, and all
 remaining verbs map directly to their matching `sb_*` function names.
 
+**Signals.** `sb_signal scope_id role index name` delivers `KILL` and `TERM` directly to the
+instance so that they terminate it just as a kill or stop operation does. Every other signal is
+sent to the daemon JVM—the oldest `java` process in the instance—because the initial process of the
+image is `tini`: `tini` forwards catchable signals to its child process, whereas `STOP` would halt
+only `tini` itself. After sending `STOP` or `TSTP`, the function polls the JVM process state for up
+to 5 s and returns exit code 1 unless the JVM is stopped; after sending `CONT`, it returns 1 unless
+the JVM is running. Consequently, a pause that does not take effect is reported as a failure rather
+than a success, and the error message distinguishes a signal that could not be delivered from a
+process state that did not appear within 5 s. Targeting an instance with no JVM returns exit code
+6. Because a paused JVM cannot respond, the instance's health probe—which queries its management
+server with a bounded wait—also reflects the paused state.
+
 **Scaling.** `sb_scale scope_id role count [timeout_s]` reads the target role's instance definitions
 from `services.tsv` in the recorded deployment directory, after `px-cluster scale` first re-renders
 the deployment with the updated replica count. The operation creates and starts only the newly added

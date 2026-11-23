@@ -255,24 +255,23 @@ a standalone Pherf guide in `phoenix-pherf/docs/howto`.
 
 ## Known defects
 
-Live verification of these guides surfaced three unresolved defects in the current implementation.
-The affected guides incorporate workarounds and document each issue where it arises. A fourth
-defect involving excessive memory retention in the Pherf detail report was resolved in 63c9dd0ec2;
-builds prior to that commit exhausted a 1 GiB heap once a single query set exceeded approximately
-10,000 operations.
-* **Spurious HBase `ERROR` log entry.** During table drop operations, the HBase master
-  occasionally logs `RemoteProcedureDispatcher:
-  DelayQueue for RemoteProcedureDispatcher is not empty when timed waiting elapsed`. When
-  `log.errors.max=0` is active, this entry causes the `cluster.log` check to report `FAIL` and the
-  run exits with code 1. This transient condition occurred in 2 of 59 verification runs; inspect
-  the `cluster.log` detail to confirm the signature and repeat the run (H03 step 4).
-* **Missing region count prior to a disruption.** Immediately after a region rebalance, a
-  RegionServer JMX query can return a payload that omits `regionCount`. The harness then declines
-  to inject the next scheduled `--disrupt` event, records its state as `fail`, and exits with code
-  1 (H09 step 13).
-* **`signal STOP` does not suspend the JVM.** Container signal delivery targets `tini`, the
-  initial process of the container, rather than the Java process; consequently, the RegionServer
-  continues processing requests while the harness records a pause interval (H09 step 13).
+Live verification of these HOWTOs surfaced four defects. All four have been resolved, though
+builds prior to the fixes still exhibit the earlier behavior.
+* **Memory retention in the Pherf detail report**, resolved in 63c9dd0ec2: builds prior to that
+  commit exhausted a 1 GiB heap once a single query set exceeded approximately 10,000 operations.
+* **Spurious HBase `ERROR` log line.** The HBase Master can log `RemoteProcedureDispatcher:
+  DelayQueue for RemoteProcedureDispatcher is not empty when timed waiting elapsed` while a table
+  is being dropped, which caused `cluster.log` to report `FAIL` in 2 of 59 runs. The harness allow
+  list now includes this signature so that it is not counted as an error, and the `cluster.log`
+  detail reports `1 allowed: hbase-dispatcher-delayqueue` (H03 step 4).
+* **Missing region count prior to a disruption.** Immediately after a rebalance, a RegionServer
+  can respond to JMX queries without publishing `regionCount`, which previously prevented the next
+  `--disrupt` entry from being injected. `px-run` now retries reading the region count within the
+  readiness timeout bound (H09 step 13).
+* **`signal STOP` did not pause the JVM.** Container signals were previously delivered to `tini`,
+  the initial process of the container. Every signal other than `KILL` and `TERM` is now delivered
+  directly to the JVM process, and any `STOP` signal that fails to place the JVM into a stopped
+  state is reported as a failure (H09 step 13).
 
 ## Out of scope
 

@@ -127,12 +127,13 @@ Four operational rules follow directly from this design:
   as a usage error with exit code 2.
 - Arguments placed after `--` are forwarded to Pherf. The `-runDurationMs`, `-threadCount`, and
   `-targetRate` options are passed exclusively to the `run` verb because Pherf rejects them when
-  `-q` is absent. All remaining options, including `-allowUnknownTags`, are passed to both
-  `prepare` and `run` because the Pherf pre-run validation gate executes during both phases.
-- The driver stages only the scenario file and the schema files. A query set configured with
-  `profile="..."` references an external sibling file next to the scenario that the driver does
-  not stage, causing the scenario to fail when run through the harness. Express open-loop
-  workloads using inline `<openLoop>` and `<mix>` elements instead. The standalone Pherf guide
+  `-q` is absent. Every other option, including `-allowUnknownTags`, is forwarded to both execution
+  verbs because the Pherf pre-run validation gate executes during both phases.
+- The driver stages the scenario file, the schema files, and every profile referenced by the
+  scenario. A query set configured with `profile="..."` references a file located next to the
+  scenario, and the driver stages it at that same relative path. Specifying a profile with an
+  absolute path or a `..` path segment is rejected as a usage error with exit code 2. The
+  standalone Pherf HOWTO guide
   [How to drive an open-loop workload with profiles and operation mixes](../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md)
   covers profiles in detail.
 - Specify every input file as an absolute path on the command line, because the driver resolves

@@ -138,6 +138,7 @@ T_SHIM_DIR=""
 T_SHIM_LOG=""
 T_SHIM_STATE=""
 T_SWEEP_STATE=""
+T_SWEEP_JVM=""
 T_SWEEP_OUT=""
 T_DEPLOY=""
 T_A2=""
@@ -300,6 +301,29 @@ t_flag() {
 ## @description  Reports whether a filesystem path exists as a yes or no flag.
 ## @return       Writes yes or no to stdout. Exit 0.
 t_exists() { if [ -e "$1" ]; then printf yes; else printf no; fi; }
+
+## @description  Reports the state of a process (pid) as T when stopped by a signal, gone when it
+##               does not exist, or run otherwise.
+## @return       Writes the state word to stdout. Exit 0.
+t_proc_state() {
+  case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in
+  T*) printf T ;;
+  '') printf gone ;;
+  *) printf run ;;
+  esac
+}
+
+## @description  Causes the post-kill STOP state check inside an exec to fail (state directory), or
+##               restores normal operation (state directory, off).
+## @return       Exit 0.
+t_ps_stop_fails() {
+  if [ "${2:-}" = off ]; then
+    rm -f "$T_SHIM_DIR/ps" "$1/ps-stop-fails"
+  else
+    cp -p "$T_WORK/ps-shim" "$T_SHIM_DIR/ps"
+    : >"$1/ps-stop-fails"
+  fi
+}
 
 ## @description  Executes a command in a target directory (directory, command...) with empty stdin.
 ## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
@@ -1167,6 +1191,20 @@ compose)
       esac
       printf '%s\t%s\n' "$fake_ms" "$fake_value" >>"$fake_state/region-count.log" 2>/dev/null
       [ ! -e "$fake_state/region-count-fails" ] || exit 1
+      # A RegionServer whose daemon JVM a STOP paused does not answer.
+      case "$(ps -o stat= -p "$(cat "$fake_state/jvm-pid" 2>/dev/null)" 2>/dev/null |
+        tr -d ' ')" in
+      T*)
+        printf 'px-region-count: regionserver 0 does not answer\n' >&2
+        exit 1
+        ;;
+      esac
+      # The line none is a RegionServer that answers without regionCount, as
+      # one does right after a restart or a rebalance.
+      if [ "$fake_value" = none ]; then
+        printf 'px-region-count: regionserver 0 publishes no regionCount\n' >&2
+        exit 1
+      fi
       printf '%s\n' "$fake_value"
       exit 0
     fi
@@ -1217,6 +1255,42 @@ esac
 exit 0
 SHIM_EOF
   chmod +x "$T_SHIM_DIR/docker"
+  # Shim for pgrep inside an instance, executed on the host by a fake runtime exec call; it reads
+  # the daemon JVM PID from the jvm-pid file in the state directory.
+  cat >"$T_SHIM_DIR/pgrep" <<'SHIM_EOF'
+#!/usr/bin/env bash
+[ "$*" = '-o -x java' ] || exit 2
+cat "${PX_FAKE_STATE_DIR:-/nonexistent}/jvm-pid" 2>/dev/null || exit 1
+SHIM_EOF
+  chmod +x "$T_SHIM_DIR/pgrep"
+  # Shim for the host ps command, which a fake runtime exec also invokes. When ps-stop-fails exists
+  # in the state directory, a process query inside an exec that observes a stopped process fails,
+  # causing the post-kill STOP state check to fail. The t_ps_stop_fails helper installs it into the
+  # shim directory only for the individual test cases that require it.
+  cat >"$T_WORK/ps-shim" <<'SHIM_EOF'
+#!/usr/bin/env bash
+shim_self=${0%/*}
+shim_real=""
+IFS=: read -r -a shim_path <<EOF
+$PATH
+EOF
+for shim_dir in "${shim_path[@]}"; do
+  if [ -n "$shim_dir" ] && [ "$shim_dir" != "$shim_self" ] && [ -x "$shim_dir/ps" ]; then
+    shim_real=$shim_dir/ps
+    break
+  fi
+done
+[ -n "$shim_real" ] || exit 127
+shim_out="$("$shim_real" "$@")" || exit
+if [ -n "${PX_FAKE_SERVICE:-}" ] && [ -e "${PX_FAKE_STATE_DIR:-/nonexistent}/ps-stop-fails" ]
+then
+  case "$(printf '%s' "$shim_out" | tr -d ' ')" in
+  T*) exit 1 ;;
+  esac
+fi
+printf '%s\n' "$shim_out"
+SHIM_EOF
+  chmod +x "$T_WORK/ps-shim"
   for name in ${T_K8S_NAMES//|/ }; do
     cat >"$T_SHIM_DIR/$name" <<'SHIM_EOF'
 #!/usr/bin/env bash
@@ -1239,6 +1313,21 @@ t_fixtures_sweep() {
   T_SWEEP_OUT="$T_WORK/sweep-out"
   T_DEPLOY="$T_WORK/deploy"
   mkdir -p "$T_SWEEP_STATE" "$T_SWEEP_OUT" "$T_DEPLOY" "$T_WORK/no-deploy"
+  # Spawn a real background process to stand in for the instance daemon JVM. It ignores every
+  # catchable signal exercised by the test cases so its kernel process state reflects STOP and CONT
+  # transitions; it self-terminates after an hour if the exit hook has not killed it first.
+  cat >"$T_WORK/fake-jvm.sh" <<'SWEEP_EOF'
+trap '' HUP INT QUIT USR1 USR2 TERM
+n=0
+while [ "$n" -lt 3600 ]; do
+  sleep 1
+  n=$((n + 1))
+done
+SWEEP_EOF
+  "$T_BASH" "$T_WORK/fake-jvm.sh" </dev/null >/dev/null 2>&1 &
+  T_SWEEP_JVM=$!
+  px_on_exit "kill -s KILL $T_SWEEP_JVM 2>/dev/null"
+  printf '%s\n' "$T_SWEEP_JVM" >"$T_SWEEP_STATE/jvm-pid"
   printf 'sweep\n' >"$T_SWEEP_STATE/cluster"
   printf 'px-sweep_default\n' >"$T_SWEEP_STATE/networks.txt"
   printf 'px-sweep_data\n' >"$T_SWEEP_STATE/volumes.txt"
@@ -3805,13 +3894,50 @@ t_group_sweep_evidence() {
 1 sb_oom_killed px-sweep master 0
 1 sb_image_ref px-sweep master 0"
   rm -f "$T_SWEEP_STATE/inspect-fails"
+  # Verify D-4: any signal other than KILL or TERM targets the daemon JVM (the oldest java process
+  # in the instance) rather than the instance init process (tini), because tini cannot forward a
+  # STOP signal. Because the fake JVM is a real process, its process state directly reflects whether
+  # STOP paused it.
+  t_shim_log_reset
+  t_sb sb_signal px-sweep master 0 STOP
+  t_equals sweep_signal_stop_pauses_the_daemon_jvm "0 T no" "$T_STATUS\
+ $(t_proc_state "$T_SWEEP_JVM") $(t_flag 'kill -s STOP' "$(cat "$T_SHIM_LOG")")"
+  t_sb sb_signal px-sweep master 0 CONT
+  t_equals sweep_signal_cont_resumes_the_daemon_jvm "0 run" \
+    "$T_STATUS $(t_proc_state "$T_SWEEP_JVM")"
+  kill -s CONT "$T_SWEEP_JVM" 2>/dev/null
+  # Verify that when a target process does not enter the stopped state within 5 s, the call fails
+  # with a dedicated timeout diagnostic rather than reporting a failed signal delivery.
+  t_ps_stop_fails "$T_SWEEP_STATE"
+  t_sb sb_signal px-sweep master 0 STOP
+  t_equals sweep_signal_state_not_shown_is_failure "1 T yes no" "$T_STATUS\
+ $(t_proc_state "$T_SWEEP_JVM") $(t_flag 'did not reach the STOP state within 5 s' "$T_STDERR")\
+ $(t_flag 'was not delivered' "$T_STDERR")"
+  t_ps_stop_fails "$T_SWEEP_STATE" off
+  kill -s CONT "$T_SWEEP_JVM" 2>/dev/null
   t_shim_log_reset
   t_sb sb_signal px-sweep master 0 QUIT
+  t_equals sweep_signal_quit_goes_to_the_daemon_jvm "0 yes no" "$T_STATUS $(t_flag \
+    'exec -T --index=1 master' "$(cat "$T_SHIM_LOG")") $(t_flag 'kill -s QUIT' \
+    "$(cat "$T_SHIM_LOG")")"
+  # Confirm that KILL and TERM are still delivered directly to the container instance as before,
+  # terminating it just as a container kill or stop operation does.
+  t_shim_log_reset
+  t_sb sb_signal px-sweep master 0 TERM
   t_outcome sweep_sb_signal 0 ""
-  t_called sweep_signal_names_the_instance 'kill -s QUIT ms01'
+  t_called sweep_signal_term_names_the_instance 'kill -s TERM ms01'
   t_sb_codes sweep_signal_refusals "
 2 sb_signal px-sweep master 0 BOGUS
 6 sb_signal px-sweep master 9 TERM"
+  # Verify that an instance with no daemon JVM is reported as a missing target object, whereas a
+  # daemon JVM that has already exited is reported as a failed signal delivery.
+  mv -f "$T_SWEEP_STATE/jvm-pid" "$T_SWEEP_STATE/jvm-pid.kept"
+  t_sb sb_signal px-sweep master 0 QUIT
+  t_equals sweep_signal_without_a_jvm_is_no_object 6 "$T_STATUS"
+  printf '999999\n' >"$T_SWEEP_STATE/jvm-pid"
+  t_sb sb_signal px-sweep master 0 STOP
+  t_equals sweep_signal_to_a_gone_jvm_is_failure 1 "$T_STATUS"
+  mv -f "$T_SWEEP_STATE/jvm-pid.kept" "$T_SWEEP_STATE/jvm-pid"
   # Delivering a signal during a runtime outage fails and succeeds again once the runtime responds.
   : >"$T_SWEEP_STATE/unreachable"
   t_sb sb_signal px-sweep master 0 QUIT
@@ -6936,9 +7062,24 @@ pb_stage begin steady@script
 sleep 0.5
 pb_stage end steady@script
 DRIVER_EOF
-  chmod +x "$T_WORK/drivers/phase-kill.sh" "$T_WORK/drivers/brief.sh"
-  # Create an external plug-in outside the default plug-in directory containing one failing check,
-  # one broken check that exits with code 3, and a custom threshold hook.
+  # Materialize a stub driver whose run verb records the process state of the fake JVM from jvm-pid
+  # into jvm-states twice per second for the duration in seconds given by its first argument.
+  cat >"$T_WORK/drivers/jvm-probe.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+probe_pid="$(cat "$PX_FAKE_STATE_DIR/jvm-pid")"
+probe_n=0
+while [ "$probe_n" -lt $((${1:-3} * 2)) ]; do
+  ps -o stat= -p "$probe_pid" | tr -d ' ' >>"$PX_FAKE_STATE_DIR/jvm-states"
+  sleep 0.5
+  probe_n=$((probe_n + 1))
+done
+DRIVER_EOF
+  chmod +x "$T_WORK/drivers/phase-kill.sh" "$T_WORK/drivers/brief.sh" \
+    "$T_WORK/drivers/jvm-probe.sh"
+  # Create an external plug-in outside the default directory containing one failing check, one
+  # check that cannot run, and a custom threshold definition of its own.
   mkdir -p "$T_A5/plugins/extra/checks" "$T_A5/plugins/extra/hooks"
   printf '%s\n' PX_PLUGIN_ID=extra PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=thresholds \
     >"$T_A5/plugins/extra/plugin.env"
@@ -7959,8 +8100,57 @@ t_group_a5_checks() {
   t_cluster_checks "$dir"
   t_equals cluster_log_warnings_are_advisory ADVISORY "$(t_severity_of "$dir" cluster.log)"
   rm -f "$T_A5_STATE/logs-c0ffee00a502.txt"
+  # Verify D-2: a log line matching an entry in suites/log-allow.txt is excluded from the error
+  # count and the verdict detail names the matched entry. The same message under a different logger,
+  # an unrecognized ERROR line, or the allowed line under an HBase version outside the entry's
+  # release range are still counted. The fixture topology runs HBase 2.6.7.
+  line='2026-11-20 17:00:00,000 ERROR [ProcedureDispatcherTimeoutThread]'
+  line="$line procedure2.RemoteProcedureDispatcher: DelayQueue for RemoteProcedureDispatcher"
+  line="$line is not empty when timed waiting elapsed. If this is repeated consistently, it"
+  line="$line means no element is getting expired from the queue and it might freeze the"
+  line="$line system. Queue: []"
+  got=""
+  for copy in allowed other-logger unknown other-version repeated; do
+    dir="$(t_check_bundle "allow-$copy")"
+    case "$copy" in
+    allowed) printf '%s\n' "$line" ;;
+    repeated) printf '%s\n' "$line" "${line/17:00:00/17:00:30}" ;;
+    other-logger) printf '%s\n' "${line/procedure2.RemoteProcedureDispatcher:/master.Other:}" ;;
+    unknown) printf '%s\n' "$line" '2026-11-20 17:00:01,000 ERROR [main] Server: boom' ;;
+    other-version)
+      printf '%s\n' "$line"
+      sed 's/^PX_DIST_HBASE_VERSION=.*/PX_DIST_HBASE_VERSION=2.6.8/' \
+        "$T_WORK/deploy-selftest/topology.env" >"$dir/cluster/topology.env"
+      ;;
+    esac >"$T_A5_STATE/logs-c0ffee00a502.txt"
+    t_cluster_checks "$dir"
+    want="$(t_detail_of "$dir" cluster.log)"
+    got="$got|$copy ${want%% ERROR or FATAL*}"
+    got="$got $(t_flag '1 allowed: hbase-dispatcher-delayqueue' "$want")"
+    got="$got $(t_flag 'allow list, counted: hbase-dispatcher-delayqueue' "$want")"
+  done
+  # Verify that every entry in the log allowlist has a unique id and all required keys, including a
+  # recognized log level, a max count of at least 1, and a release range for a known component.
+  t_empty log_allow_entries_are_well_formed "$(awk '
+    function close_entry() {
+      if (id != "" && (seen[id]++ || id !~ /^[a-z0-9][a-z0-9-]*$/ ||
+        k["level"] !~ /^(ERROR|FATAL|WARN)$/ || k["logger"] == "" || k["message"] == "" ||
+        k["max"] !~ /^[1-9][0-9]*$/ ||
+        k["release"] !~ /^(hbase|hadoop) [0-9]+(\.[0-9]+)* [0-9]+(\.[0-9]+)*$/ ||
+        k["reason"] == "")) print "entry " id
+      split("", k)
+    }
+    /^#/ || !index($0, "=") { next }
+    { key = substr($0, 1, index($0, "=") - 1); val = substr($0, index($0, "=") + 1) }
+    key == "id" { close_entry(); id = val; n++; next }
+    key ~ /^(level|logger|max|message|release|reason)$/ { k[key] = k[key] val; next }
+    { print "unknown key " key }
+    END { close_entry(); if (!n) print "no entry" }' "$PX_HOME/suites/log-allow.txt" 2>&1)"
+  t_equals cluster_log_allow_list_excuses_only_its_lines "|allowed PASS 0 yes no|other-logger\
+ FAIL 1 no no|unknown FAIL 1 yes no|other-version FAIL 1 no no|repeated FAIL 1 yes yes" "$got"
+  rm -f "$T_A5_STATE/logs-c0ffee00a502.txt"
   # Verify A7: a hard kill of a RegionServer causes DataNodes to log errors while the cluster
-  # recovers. Any log line within the recovery window (now - 50 s to now - 9 s) is ignored under
+  # recovers. Any log line within the recovery window (now - 50 s to now - 9 s) is excluded under
   # either timestamp layout, whereas lines after recovery or before injection (now - 60 s) are
   # counted. A recover row with no recovery timestamp indicates a failed recovery and defines no
   # window.
@@ -8470,14 +8660,89 @@ A5_EOF
   run="$(t_bundle)"
   t_equals lost_regions_fail_the_recovery "fail FAIL" "$(awk -F '\t' '$1 == "recover" {
     print $5 }' "$run/run-record.tsv") $(t_severity_of "$run" cluster.recovery)"
+  # Verify that a region-count read that continues to fail until the readiness bound expires aborts
+  # the disruption without injecting anything.
   t_a5_state_reset
   t_shim_log_reset
   : >"$T_A5_STATE/region-count-fails"
-  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,0'
+  t_a5_run phase-kill -e PX_TIMEOUT_READY=2 --disrupt 'phase:phase@kill,kill,regionserver,0'
   t_equals unread_regions_inject_nothing "fail no" "$(t_manifest "$(t_bundle)" \
     /disruptions/0/state) $(t_flag 'KILL' "$(cat "$T_SHIM_LOG")")"
-  # Confirm that px-region-count sums regionCount across all RegionServers and fails if any server
-  # fails to respond.
+  # Verify D-3: immediately after a restart or rebalance, a RegionServer may answer JMX queries
+  # without publishing regionCount. The pre-injection read treats the server as not yet ready,
+  # retries within the readiness bound, and fires the disruption entry once the count is published.
+  t_a5_state_reset
+  t_shim_log_reset
+  printf '%s\n' none none 12 >"$T_A5_STATE/region-count"
+  t_a5_run phase-kill --disrupt 'phase:phase@kill,kill,regionserver,0'
+  run="$(t_bundle)"
+  t_equals missing_region_count_is_read_again_before_the_injection "0 ok yes none none 12" \
+    "$T_STATUS $(t_manifest "$run" /disruptions/0/state) $(t_flag 'KILL' \
+    "$(cat "$T_SHIM_LOG")") $(cut -f 2 "$T_A5_STATE/region-count.log" | sed -n 1,3p |
+      tr '\n' ' ' | sed 's/ $//')"
+  # Verify D-4: a STOP disruption pauses the RegionServer daemon JVM, and its recovery waits for
+  # the scheduled CONT. The CONT reuses the baseline captured for the STOP because a paused server
+  # cannot respond, while the driver records the state of the fake JVM throughout its execution.
+  t_a5_state_reset
+  printf '%s\n' "$T_SWEEP_JVM" >"$T_A5_STATE/jvm-pid"
+  t_a5_run jvm-probe --disrupt '+1,signal,regionserver,0,STOP' \
+    --disrupt '+3,signal,regionserver,0,CONT' -- 5
+  run="$(t_bundle)"
+  t_equals stop_recovers_at_its_cont "0 ok ok yes run 2 yes" "$T_STATUS $(t_manifest "$run" \
+    /disruptions/0/state) $(t_manifest "$run" /disruptions/1/state) $(t_flag T \
+    "$(cat "$T_A5_STATE/jvm-states" 2>/dev/null)") $(t_proc_state "$T_SWEEP_JVM") $(awk \
+    -F '\t' '$1 == "action" && $6 == "CONT" { c = $2 }
+    $1 == "recover" && $5 == "ok" { n++; r[$2] = $4 }
+    END { print n + 0, (c > 0 && r[1] >= c) ? "yes" : "no" }' "$run/run-record.tsv")"
+  kill -s CONT "$T_SWEEP_JVM" 2>/dev/null
+  # Verify that a STOP disruption left unresumed by the schedule receives an automatic CONT from
+  # px-run at the end of the run verb, recorded as a distinct action in the run record.
+  t_a5_state_reset
+  printf '%s\n' "$T_SWEEP_JVM" >"$T_A5_STATE/jvm-pid"
+  t_a5_run jvm-probe --disrupt '+1,signal,regionserver,0,STOP' -- 3
+  run="$(t_bundle)"
+  t_equals unresumed_stop_is_resumed_at_the_end "0 yes run yes 1 1" "$T_STATUS $(t_flag T \
+    "$(cat "$T_A5_STATE/jvm-states" 2>/dev/null)") $(t_proc_state "$T_SWEEP_JVM") $(t_flag \
+    'px-run resumes it' "$T_STDERR") $(awk -F '\t' '$1 == "action" && $6 == "CONT" &&
+    $7 == "ok" { c++ } $1 == "recover" && $2 == 1 && $5 == "ok" { r++ }
+    END { print c + 0, r + 0 }' "$run/run-record.tsv")"
+  kill -s CONT "$T_SWEEP_JVM" 2>/dev/null
+  # Verify that the pause window between a STOP and its CONT rejects any intervening disruption:
+  # because a paused RegionServer cannot respond, a region read or recovery gate for another entry
+  # would otherwise wait up to PX_TIMEOUT_READY (left at its default here) and delay the CONT. The
+  # intervening entry injects nothing, and the CONT is delivered on schedule.
+  t_a5_state_reset
+  t_shim_log_reset
+  printf '%s\n' "$T_SWEEP_JVM" >"$T_A5_STATE/jvm-pid"
+  t_a5_run jvm-probe --disrupt '+1,signal,regionserver,0,STOP' \
+    --disrupt '+2,signal,client,0,QUIT' --disrupt '+3,signal,regionserver,0,CONT' -- 5
+  run="$(t_bundle)"
+  t_equals pause_window_allows_only_its_cont "ok fail ok run yes 0 yes" "$(t_manifest "$run" \
+    /disruptions/0/state) $(t_manifest "$run" /disruptions/1/state) $(t_manifest "$run" \
+    /disruptions/2/state) $(t_proc_state "$T_SWEEP_JVM") $(t_flag \
+    'regionserver/0 is paused until its CONT' "$T_STDERR") $(awk -F '\t' '
+    $1 == "action" && $6 == "STOP" { s = $2 } $1 == "action" && $6 == "QUIT" { q++ }
+    $1 == "action" && $6 == "CONT" { c = $2 }
+    END { print q + 0, (s > 0 && c > s && c - s < 10000) ? "yes" : "no" }' \
+    "$run/run-record.tsv")"
+  kill -s CONT "$T_SWEEP_JVM" 2>/dev/null
+  # Verify that when a STOP state check fails after the kill signal is sent, the JVM may still be
+  # paused; the disruption fails without running a recovery gate, and px-run still sends CONT at
+  # the end of the run verb.
+  t_a5_state_reset
+  printf '%s\n' "$T_SWEEP_JVM" >"$T_A5_STATE/jvm-pid"
+  t_ps_stop_fails "$T_A5_STATE"
+  t_a5_run jvm-probe --disrupt '+1,signal,regionserver,0,STOP' -- 3
+  run="$(t_bundle)"
+  t_equals failed_stop_is_resumed_at_the_end "fail yes run yes 1 0" "$(t_manifest "$run" \
+    /disruptions/0/state) $(t_flag T "$(cat "$T_A5_STATE/jvm-states" 2>/dev/null)")\
+ $(t_proc_state "$T_SWEEP_JVM") $(t_flag 'px-run resumes it' "$T_STDERR") $(awk -F '\t' '
+    $1 == "action" && $6 == "CONT" && $7 == "ok" { c++ } $1 == "recover" && $2 == 1 { r++ }
+    END { print c + 0, r + 0 }' "$run/run-record.tsv")"
+  t_ps_stop_fails "$T_A5_STATE" off
+  kill -s CONT "$T_SWEEP_JVM" 2>/dev/null
+  # Confirm that px-region-count in the container image sums regionCount across all RegionServers
+  # and fails if any server does not respond.
   t_curl_body "http://regionserver-0:16030$rs" '{"beans":[{"regionCount" : 5}]}'
   t_curl_body "http://regionserver-1:16030$rs" '{"beans":[{"regionCount" : 7}]}'
   t_image PX_ROLE=client PX_RS_COUNT=2 PX_PORT_REGIONSERVER_HTTP=16030 -- "$T_BASH" \
@@ -10435,7 +10700,7 @@ t_group_h2_report() {
 ##               the pherf driver against the A5 fake fixtures (RQ-207).
 ## @return       Records test assertions. Exit 0.
 t_group_h2_verbs() {
-  local run props="$T_WORK/h2.properties" staged scenario schema option
+  local run props="$T_WORK/h2.properties" staged scenario schema option got
   printf '# H2: the pherf driver verbs on the new Pherf\n'
   scenario="$PX_HOME/suites/pherf/px_functional_scenario.xml"
   schema="$PX_HOME/suites/pherf/px_functional_schema.sql"
@@ -10474,8 +10739,43 @@ http://regionserver-0:16030,http://regionserver-1:16031,http://regionserver-2:16
     t_equals "pherf_label_option_is_refused${option//[-=]/_}" "2 1" "$T_STATUS\
  $(printf '%s\n' "$T_STDERR" | grep -c 'the driver sets the Pherf -label')"
   done
-  # Verify P11: when the pre-run gate rejects a scenario during the prepare verb, execution halts
-  # before the run verb is invoked.
+  # Verify GAP: the driver stages every workload profile referenced by a querySet in the scenario
+  # at its relative path alongside the staged scenario so Pherf can resolve it in the staging
+  # directory, while ignoring any profile attribute inside an XML comment.
+  mkdir -p "$T_WORK/p9/mix"
+  cat >"$T_WORK/p9/p9.xml" <<'P9_EOF'
+<datamodel name="p9"><datamapping/><scenarios>
+  <!-- <querySet concurrency="1" profile="ghost.xml"> -->
+  <scenario tableName="T1" name="p9" rowCount="1">
+    <querySet concurrency="1"
+        profile="open.xml"><query statement="SELECT 1"/></querySet>
+    <querySet profile = 'mix/b.xml' concurrency="1"></querySet>
+    <querySet concurrency="1" profile="open.xml"></querySet>
+  </scenario>
+</scenarios></datamodel>
+P9_EOF
+  printf '<workloadProfile></workloadProfile>\n' >"$T_WORK/p9/open.xml"
+  printf '<workloadProfile></workloadProfile>\n' >"$T_WORK/p9/mix/b.xml"
+  run="$(t_a5_bundle)"
+  t_a5_verb pherf prepare "$run" --scenario "$T_WORK/p9/p9.xml"
+  t_equals pherf_stages_the_profiles_of_the_scenario "0 yes yes no" "$T_STATUS\
+ $(t_exists "$run/drivers/pherf/stage/scenario/open.xml")\
+ $(t_exists "$run/drivers/pherf/stage/scenario/mix/b.xml")\
+ $(t_exists "$run/drivers/pherf/stage/scenario/ghost.xml")"
+  # Verify that a missing profile file is rejected as a validation failure, whereas an absolute
+  # path or a relative path that escapes the scenario directory is rejected as a usage error.
+  got=""
+  for option in absent.xml /etc/p9.xml ../p9.xml mix/../../p9.xml; do
+    sed "s|open.xml|$option|g" "$T_WORK/p9/p9.xml" >"$T_WORK/p9/bad.xml"
+    run="$(t_a5_bundle)"
+    t_a5_verb pherf validate "$run" --scenario "$T_WORK/p9/bad.xml"
+    got="$got $option:$T_STATUS:$(awk -F '\t' '$1 == "pherf.profile" { print $2 }' \
+      "$run/verdicts.tsv")"
+  done
+  t_equals pherf_refuses_an_absent_or_escaping_profile " absent.xml:1:FAIL /etc/p9.xml:2:\
+ ../p9.xml:2: mix/../../p9.xml:2:" "$got"
+  # Verify P11: when the pre-run gate rejects the scenario during prepare, the run verb never
+  # executes.
   t_a5_state_reset
   : >"$T_A5_STATE/pherf-gate-fails"
   t_a5 "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$T_BIN/px-run" \

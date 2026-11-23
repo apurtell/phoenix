@@ -79,98 +79,73 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 px_trap_enable
 
-## @description  Prints the command-line usage, disruption specification grammar, and exit codes.
-## @return       Writes the usage text to stdout and exits 0.
-usage() {
-  cat <<'EOF'
-Usage: px-run [option...] [-- driver argument...]
-
-Runs one test. px-run owns one bundle, calls the six verbs of one driver,
-snapshots the cluster before and after the workload, injects the declared
-disruptions, runs the cluster checks, merges the verdicts and writes the
-manifest of the bundle.
-
-Options:
-  -d, --driver NAME|PATH  the driver: a path, or a name that resolves to
-                          <drivers>/NAME/driver.sh, else to the driver of the
-                          enabled plug-in NAME. A real run needs one.
-  -s, --scope ID          the scope id of a provisioned cluster, default
-                          PX_SCOPE_ID, else the scope px-cluster recorded for
-                          PX_CLUSTER_ID. Without one px-run takes no snapshot
-                          and refuses a disruption.
-  -b, --backend NAME      the substrate backend to bind
-  -c, --class NAME        the run class, validation or measurement. A real
-                          run needs one.
-  -D, --disrupt SPEC      one disruption, repeatable. Several specifications
-                          in one value are separated by a semicolon.
-  --collect NAME          start one collector around the run verb,
-                          repeatable; it replaces PX_COLLECTORS. A value can
-                          hold several names separated by a comma.
-  -t, --timeout SECONDS   the bound that prepare and run share, default
-                          PX_TIMEOUT_DEFAULT. Each other verb has the bound
-                          PX_TIMEOUT_VERB.
-  -e, --set NAME=VALUE    one configuration value, repeatable
-  -f, --config FILE       one configuration file, repeatable
-  -n, --dry-run           run describe, print the plan, call no backend and
-                          make no bundle
-  -k, --keep              keep the cluster and temporary files, and give the
-                          switch to the driver
-  -v, --verbose           report progress in detail
-  -h, --help              print this text
-
-A disruption specification is WHEN,ACTION,ROLE,INDEX[,ARGUMENT].
-  WHEN      +SECONDS after the run verb starts, or phase:NAME
-  ACTION    kill, signal or restart; a kill names a regionserver
-  ARGUMENT  the kill mode (hard, the default), the signal name, or empty for
-            restart
-A phase name is a point that px-run announces: setup, snapshot_pre,
-driver_start (the run verb starts), driver_exit (the run verb ends) and
-snapshot_post. It can also be a stage anchor <kind>@<name>, such as
-steady@script or verb@prepare: the disruption fires when a verb writes the
-begin row of that anchor. A specification that never fires is recorded as
-skipped, and one whose anchor opened and closed before px-run saw it as
-missed. A substrate function that the backend cannot serve exits 5, and the
-disruption is then recorded as a skip instead of a failure. After each
-injection px-run waits for recovery: a killed RegionServer starts again
-through the drain-aware restart, then the whole scope must be ready and the
-online regions back to their count before the disruption, within
-PX_TIMEOUT_READY and within the bound of the verb that is running. The time
-to recovery is the mttr_seconds of the disruption in the manifest.
-
-Exit codes: 0 ok, 1 failure, 2 usage or a refused describe document, 3
-cluster anomaly, 4 timeout, 5 unsupported, 6 no such object. The code is the
-first non-zero code of a verb; a code outside 0 to 3 counts as 1. A verb
-that passed its bound gives 4. An unplanned restart, an unplanned exit of a
-running instance, or an instance that vanished replaces 0 or 1 with 3. A
-planned action of this run, or of px-cluster during this run, explains a
-change. Such a change found while prepare or run works aborts the run at
-once with 3. When every verb gave 0, the code is that of the merged verdict
-of px-report: 0 PASS, SKIP or ADVISORY, 1 FAIL or INCONCLUSIVE, 3 ERROR. A
-bundle that px-bundle validate refuses turns 0 into 1. 4 also means that the
-host stayed busy and the run requires a quiet host.
-
-Time verdicts are ADVISORY unless the run is of the measurement class on a
-quiet host with the measurement sizing: a host that is busy or not checked,
-and a sizing that is not the measurement table, tag the run contaminated.
-
-The collectors are profile (px-profile), jfr (px-jfr), hiccup, host and
-container (px-collect) and trace (px-trace-count). PX_COLLECTORS is none or
-a comma list of them; the measurement class starts all six and the
-validation class none, and the HDR histograms of a driver stay on in both.
-px-run starts them after the pre-workload hook and right before the run
-verb, and stops them right after it, also at a failure or an interrupt.
-Each start and stop has the bound PX_TIMEOUT_VERB, and each remote session
-ends by itself one verb bound after the deadline of the run verb. Their
-files go into the bundle; a collector that fails gives ADVISORY.
-
-The run holds the host awake. When it ends, also by a failure or an
-interrupt, it tears the cluster down with px-cluster down, unless --keep,
-PX_KEEP=1 or PX_TEARDOWN=0 keeps the cluster.
-
-Output: a real run writes the bundle directory to stdout. A dry run writes
-the plan to stdout.
+px_cli_spec <<'EOF'
+about Runs one test: one driver against the cluster, one result bundle.
+about px-run calls the six verbs of the driver, snapshots the cluster before and after
++ the workload, injects the declared disruptions, runs the cluster checks, merges
++ the verdicts and writes the manifest of the bundle. DRIVER is a path, or a name
++ that resolves to <drivers>/NAME/driver.sh, else to the driver of the enabled
++ plug-in NAME. A real run needs the class validation or measurement, by default
++ the class of the cluster record.
+about A disruption specification is WHEN,ACTION,ROLE,INDEX[,ARGUMENT]. WHEN is
++ +SECONDS after the run verb starts, or phase:NAME. ACTION is kill, signal or
++ restart; a kill names a regionserver. ARGUMENT is the kill mode (hard, the
++ default), the signal name, or empty for restart. A phase name is a point that
++ px-run announces: setup, snapshot_pre, driver_start (the run verb starts),
++ driver_exit (the run verb ends) and snapshot_post. It can also be a stage anchor
++ <kind>@<name>, such as steady@script or verb@prepare: the disruption fires when
++ a verb writes the begin row of that anchor. A specification that never fires is
++ recorded as skipped, and one whose anchor opened and closed before px-run saw it
++ as missed. A substrate function that the backend cannot serve exits 5, and the
++ disruption is then recorded as a skip instead of a failure. After each injection
++ px-run waits for recovery: a killed RegionServer starts again through the
++ drain-aware restart, then the whole scope must be ready and the online regions
++ back to their count before the disruption, within PX_TIMEOUT_READY and within
++ the bound of the verb that is running. The time to recovery is the mttr_seconds
++ of the disruption in the manifest. A signal STOP or TSTP pauses the daemon JVM,
++ and its recovery waits for the next signal CONT to that instance. When the run
++ verb ends with the instance still paused, px-run sends the CONT itself.
+about Time verdicts are ADVISORY unless the run is of the measurement class on a quiet
++ host with the measurement sizing: a host that is busy or not checked, and a
++ sizing that is not the measurement table, tag the run contaminated.
+about The collectors are profile, jfr, hiccup, host, container and trace, and
++ px-collect starts and stops them. PX_COLLECTORS is none or a comma list of them;
++ the measurement class starts all six and the validation class none, and the HDR
++ histograms of a driver stay on in both. px-run calls px-collect start after the
++ pre-workload hook and right before the run verb, and px-collect stop right after
++ it, also at a failure or an interrupt. Each call has one PX_TIMEOUT_VERB for
++ each step, and each collector ends by itself one verb bound after the deadline
++ of the run verb. Their files go into the bundle; a collector that fails gives
++ ADVISORY.
+about The run holds the host awake while it runs and leaves the cluster up;
++ px-cluster down removes it.
+shared --cluster --class --backend
+operands DRIVER
+rest [-- DRIVER-ARGUMENT...]
+opt --disrupt SPEC PX_DISRUPT_SPEC+; | one disruption (repeatable); several specifications
++ in one value are separated by a semicolon
+opt --collect LIST PX_COLLECTORS | the collectors to start around the run verb,
++ comma separated; it replaces PX_COLLECTORS
+opt --targets LIST PX_COLLECT_TARGETS | the roles that the collectors target, comma
++ separated, default all: every service role except
++ setup and the pherf group
+opt --timeout SECONDS PX_TIMEOUT_RUN | the bound that prepare and run share, default
++ PX_TIMEOUT_RUN (3600); each other verb has the
++ bound PX_TIMEOUT_VERB
+output a real run writes the bundle directory, printed when the bundle is
++ created; a dry run writes the plan.
+exits The code is the first non-zero code of a verb; a code outside 0 to 3 counts as
++ 1. A verb that passed its bound gives 4. An unplanned restart, an unplanned
++ exit of a running instance, or an instance that vanished replaces 0 or 1 with
++ 3. A planned action of this run, or of px-cluster during this run, explains a
++ change. Such a change found while prepare or run works aborts the run at once
++ with 3. A bundle that px-bundle validate refuses turns 0 into 1. 4 also means
++ that the host stayed busy and the run requires a quiet host. 2 also means a
++ refused describe document.
+verdicts When every verb gave 0, the merged verdict of px-report decides:
+example px-run psql --class validation -- --prepare schema.sql query.sql
+example px-run pherf --disrupt '+40,restart,regionserver,0' -- --scenario walk.xml
 EOF
-}
 
 # ---------------------------------------------------------------------------
 # Global runtime state
@@ -224,6 +199,9 @@ DISRUPT_ARG=()
 DISRUPT_STATE=()
 DISRUPT_INJECTED=()
 DISRUPT_REGIONS=()
+DISRUPT_PAUSED=()
+GATE_STATE=""
+GATE_RECOVERED=""
 DRIVER_ARGS=()
 COLLECTORS=""
 COLLECT_LIVE=0
@@ -939,6 +917,7 @@ EOF
   DISRUPT_STATE[DISRUPT_COUNT]=pending
   DISRUPT_INJECTED[DISRUPT_COUNT]=""
   DISRUPT_REGIONS[DISRUPT_COUNT]=""
+  DISRUPT_PAUSED[DISRUPT_COUNT]=""
   DISRUPT_COUNT=$((DISRUPT_COUNT + 1))
 }
 
@@ -981,12 +960,13 @@ disrupt_rows() {
 }
 
 # When the active backend does not support an optional substrate operation (exit code 5), the
-# disruption is recorded as a skip rather than a failure.
+# disruption is recorded as a skip rather than a failure. While an instance is paused, only its
+# resuming CONT signal is allowed to fire.
 ## @description  Injects a scheduled disruption through the substrate contract, records the action,
 ##               and waits for cluster recovery.
 ## @return       Exit 0.
 disrupt_fire() {
-  local index=$1 action role instance argument out="" status=0 state
+  local index=$1 action role instance argument out="" status=0 state paused="" held sent=""
   action=${DISRUPT_ACTION[$index]}
   role=${DISRUPT_ROLE[$index]}
   instance=${DISRUPT_INDEX[$index]}
@@ -994,9 +974,25 @@ disrupt_fire() {
   # Mark the entry as no longer pending immediately so that a failed attempt cannot be re-fired.
   DISRUPT_STATE[index]=fail
   px_info "disruption $((index + 1)): $action $role/$instance ${argument:-(no argument)}"
-  # The post-injection recovery gate waits for the online region count to return to this baseline,
-  # so abort the injection if the baseline count cannot be read.
-  DISRUPT_REGIONS[index]="$(region_count || exit "$?")" || status=$?
+  # The recovery gate waits for the online region count to return to this baseline, so abort the
+  # injection if the count cannot be read. Because a paused server cannot respond, its resume
+  # reuses the baseline count captured before the pause. While an instance is paused, only its CONT
+  # signal is allowed to fire; the baseline read and recovery gate of any other entry would wait on
+  # the paused server and delay the CONT signal for too long.
+  held="$(disrupt_paused)"
+  if [ -n "$held" ] && [ "$action:${argument#SIG}" = signal:CONT ]; then
+    paused="$(disrupt_paused "$role" "$instance")"
+  fi
+  if [ -n "$held" ] && [ -z "$paused" ]; then
+    px_error "disruption $((index + 1)) not injected:" \
+      "${DISRUPT_ROLE[$held]}/${DISRUPT_INDEX[$held]} is paused until its CONT"
+    return 0
+  fi
+  if [ -n "$paused" ]; then
+    DISRUPT_REGIONS[index]=${DISRUPT_REGIONS[$paused]}
+  else
+    DISRUPT_REGIONS[index]="$(region_count_wait || exit "$?")" || status=$?
+  fi
   if [ "$status" != 0 ]; then
     px_error "disruption $((index + 1)) not injected: the online regions cannot be" \
       "read before it, exit $status"
@@ -1016,6 +1012,7 @@ disrupt_fire() {
           status=$?
         ;;
       signal)
+        sent=1
         out="$(sb_signal "$SCOPE" "$role" "$instance" "$argument" || exit "$?")" ||
           status=$?
         ;;
@@ -1038,7 +1035,95 @@ disrupt_fire() {
   record_row action "$(px_epoch_ms)" "$action" "$role" "$instance" "$argument" \
     "$state" "$status"
   record_rows "phase$PX_TAB$role$PX_TAB$instance$PX_TAB" "$out"
-  [ "$state" != ok ] || recover_gate "$index"
+  # A pause whose post-signal state check failed after the kill call may still leave the JVM
+  # stopped. It runs no recovery gate, but it is still owed a CONT signal, and delivering CONT to a
+  # running JVM has no effect.
+  case "$sent:$action:${argument#SIG}:$status" in
+  1:signal:STOP:[0256] | 1:signal:TSTP:[0256]) ;;
+  1:signal:STOP:* | 1:signal:TSTP:*) DISRUPT_PAUSED[index]=fail ;;
+  esac
+  [ "$state" = ok ] || return 0
+  # A paused JVM can recover only after it resumes running, so its recovery gate is deferred until
+  # the resume. Running the gate now would block the scheduled CONT signal.
+  case "$action:${argument#SIG}" in
+  signal:STOP | signal:TSTP)
+    DISRUPT_PAUSED[index]=1
+    px_info "disruption $((index + 1)): $role/$instance is paused; its recovery waits" \
+      "for a CONT"
+    ;;
+  *)
+    recover_gate "$index"
+    [ "$action:${argument#SIG}" != signal:CONT ] || disrupt_resumed "$role" "$instance"
+    ;;
+  esac
+}
+
+## @description  Finds the first paused disruption awaiting resume for an instance (role, index),
+##               or across all instances when no role is given.
+## @return       Writes the entry index to stdout (or nothing if none is waiting) and exits 0.
+disrupt_paused() {
+  local index=0
+  while [ "$index" -lt "$DISRUPT_COUNT" ]; do
+    if [ -n "${DISRUPT_PAUSED[$index]}" ] && { [ -z "${1:-}" ] || {
+      [ "${DISRUPT_ROLE[$index]}" = "$1" ] && [ "${DISRUPT_INDEX[$index]}" = "$2" ]; }; }; then
+      printf '%s\n' "$index"
+      return 0
+    fi
+    index=$((index + 1))
+  done
+}
+
+# Failed pause entries are cleared without emitting a recover row.
+## @description  Records the last recovery gate result as a recover row for each pause of the
+##               resumed instance (role, index) from its own injection timestamp.
+## @return       Exits 0.
+disrupt_resumed() {
+  local index
+  while index="$(disrupt_paused "$1" "$2")" && [ -n "$index" ]; do
+    [ "${DISRUPT_PAUSED[$index]}" = fail ] ||
+      record_row recover "$((index + 1))" "${DISRUPT_INJECTED[$index]}" "$GATE_RECOVERED" \
+        "$GATE_STATE"
+    DISRUPT_PAUSED[index]=""
+  done
+}
+
+# Sends a planned CONT signal and runs the recovery gate unless the pause failed. When quiet is set
+# during exit cleanup, it resumes the instance without running the recovery gate or writing rows.
+## @description  Resumes every instance left paused by the disruption schedule (quiet).
+## @return       Exits 0.
+disrupt_resume() {
+  local quiet=${1:-} index role instance status state
+  while index="$(disrupt_paused)" && [ -n "$index" ]; do
+    role=${DISRUPT_ROLE[$index]}
+    instance=${DISRUPT_INDEX[$index]}
+    px_warn "disruption $((index + 1)): $role/$instance is still paused, px-run resumes it" \
+      "with CONT"
+    sb_planned_record "$SCOPE" signal "$role" "$instance" "run $RUN_ID CONT" ||
+      px_warn "the resume of $role/$instance cannot be recorded as a planned action"
+    status=0
+    sb_signal "$SCOPE" "$role" "$instance" CONT || status=$?
+    GATE_STATE=fail
+    GATE_RECOVERED=""
+    if [ -n "$quiet" ]; then
+      while index="$(disrupt_paused "$role" "$instance")" && [ -n "$index" ]; do
+        DISRUPT_PAUSED[index]=""
+      done
+      continue
+    fi
+    state=ok
+    [ "$status" = 0 ] || state=fail
+    record_row action "$(px_epoch_ms)" signal "$role" "$instance" CONT "$state" "$status"
+    if [ "$status" = 0 ] && [ "${DISRUPT_PAUSED[$index]}" = fail ]; then
+      DISRUPT_PAUSED[index]=""
+    elif [ "$status" = 0 ]; then
+      DISRUPT_PAUSED[index]=""
+      recover_gate "$index"
+    else
+      px_error "disruption $((index + 1)): the CONT of $role/$instance failed, exit $status"
+    fi
+    # Propagate the recovery gate outcome to any other entries that paused the same instance.
+    disrupt_resumed "$role" "$instance"
+  done
 }
 
 ## @description  Queries the total number of online regions across the cluster by running
@@ -1050,6 +1135,27 @@ region_count() {
   out="$(printf '%s\n' "$out" | sed -n '$p')"
   [[ $out =~ $PX_RE_INT ]] || return "$PX_EXIT_FAIL"
   printf '%s\n' "$out"
+}
+
+## @description  Reads the online region count before an injection, retrying while unready within
+##               the readiness bound and any active verb deadline.
+## @return       Writes the count to stdout and exits 0, or returns the status of the final read.
+region_count_wait() {
+  local ready deadline status shared=0
+  ready="$(px_int_setting PX_TIMEOUT_READY 600 1 || exit "$?")" || return
+  [ -z "$VERB_PID" ] || shared=$VERB_DEADLINE
+  deadline=$(($(px_epoch_s) + $(gate_bound "$ready" "$shared")))
+  while [ "$(px_epoch_s)" -lt "$deadline" ]; do
+    status=0
+    region_count 2>/dev/null || status=$?
+    # Immediately after a restart or a rebalance, a RegionServer may respond before publishing
+    # regionCount, causing px-region-count to exit with 1 while not yet ready. Any other non-zero
+    # code indicates an execution fault that retrying cannot resolve.
+    [ "$status" = "$PX_EXIT_FAIL" ] || return "$status"
+    sleep "${PX_POLL_INTERVAL_S:-1}"
+  done
+  # Perform a final unguarded read so its diagnostic reason is emitted on stderr.
+  region_count
 }
 
 ## @description  Clamps a recovery gate timeout (seconds, shared deadline in epoch seconds or 0) to
@@ -1129,6 +1235,8 @@ recover_gate() {
   esac
   [ "$state" = ok ] || px_error "disruption $((index + 1)): no recovery, $state, exit $status"
   record_row recover "$((index + 1))" "${DISRUPT_INJECTED[$index]}" "$recovered" "$state"
+  GATE_STATE=$state
+  GATE_RECOVERED=$recovered
   # If the verb's shared deadline cuts recovery short, mark the verb as timed out and terminate it
   # just as the verb watcher would, even if the driver process itself has already exited.
   if [ "$state" != ok ] && [ "$shared" -gt 0 ] && [ "$(px_epoch_s)" -ge "$shared" ]; then
@@ -1210,11 +1318,12 @@ disrupt_missed() {
   DISRUPT_STATE[index]=missed
 }
 
-## @description  Finalizes the disruption schedule by marking unfired entries whose anchor began as
-##               missed and all other remaining pending entries as skipped.
+## @description  Finalizes the disruption schedule by resuming any paused instance, marking unfired
+##               entries whose anchor began as missed, and marking all other pending entries skip.
 ## @return       Exit 0.
 disrupt_sweep() {
   local index=0 reason
+  disrupt_resume
   disrupt_anchors sweep
   while [ "$index" -lt "$DISRUPT_COUNT" ]; do
     if [ "${DISRUPT_STATE[$index]}" = pending ]; then
@@ -1681,6 +1790,8 @@ px_inhibit_start "run-$RUN_ID" "$$"
 px_on_exit px_guard_release inhibit "run-$RUN_ID"
 px_on_exit collectors_stop
 px_on_exit verb_terminate
+# Resume any paused instance on exit so that no daemon JVM remains paused after px-run terminates.
+px_on_exit disrupt_resume quiet
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -1754,6 +1865,9 @@ if [ -z "$BLOCKED" ]; then
   if [ -z "$BLOCKED" ]; then
     collectors_start
     verb_run run "$SHARED_DEADLINE"
+    # Stopping a collector requires communicating with the target JVM, so resume any paused JVM
+    # before stopping collectors.
+    disrupt_resume
     collectors_stop
     hook_run post-workload || true
   fi

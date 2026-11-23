@@ -268,7 +268,9 @@ EOF
   signal) cat <<'EOF'
 Usage: px-cluster signal ROLE INDEX SIGNAL
   SIGNAL is a name, for example QUIT for a thread dump, STOP and CONT for a
-  pause, TERM for a graceful shutdown. The action is recorded as planned.
+  pause, TERM for a graceful shutdown. KILL and TERM go to the instance; each
+  other signal goes to its daemon JVM, and a STOP that does not stop the JVM
+  is a failure. The action is recorded as planned.
 EOF
     ;;
   restart) cat <<'EOF'
@@ -1286,8 +1288,8 @@ pc_kill() {
 }
 
 ## @description  Delivers a named signal to a single instance, such as QUIT for a JVM thread dump.
-## @return       Exits 0, 1 if delivery failed, 2 on usage, 5 if the backend does not support signal
-##               delivery, or 6 if no such instance exists.
+## @return       Exits 0, 1 if delivery failed or had no effect, 2 on usage, 5 if the backend does
+##               not support signal delivery, or 6 if no such instance exists or it has no JVM.
 pc_signal() {
   local role=$1 index=$2 signal=$3 scope status=0
   pc_require_instance "$role" "$index"

@@ -259,13 +259,14 @@ analysis reports.
    The `px-run` utility prints the newly created bundle path to stdout immediately upon creation and
    streams operational logs to stderr. The cluster remains active until step 16 tears it down.
 
-   In 1 out of 5 executions of this step during live verification, `px-run` exited with code 1
-   because the HBase master logged a single `ERROR` line while `restore` was dropping the table:
+   The HBase master may log a single `ERROR` line while `restore` is dropping the table:
    `RemoteProcedureDispatcher: DelayQueue for RemoteProcedureDispatcher is not empty when timed
-   waiting elapsed`. That line made `cluster.log` `FAIL`, because `log.errors.max`
-   defaults to 0. It is an internal HBase timing message, and the region closed normally 240 ms
-   later. Inspect the `detail` column of `cluster.log` first to identify the instance and the first
-   matching log line, and then rerun the step.
+   waiting elapsed`. This is an internal HBase timing message, and the region closes within a
+   second. Because the allowlist `suites/log-allow.txt` includes this message, `cluster.log`
+   excludes it from the error count and appends `1 allowed: hbase-dispatcher-delayqueue` to its
+   `detail` column. Any other `ERROR` line causes `cluster.log` to emit `FAIL` because
+   `log.errors.max` defaults to 0, with the `detail` column identifying the instance and the first
+   matching line.
 
 4. Examine the primary lifecycle event rows in the run execution record:
 

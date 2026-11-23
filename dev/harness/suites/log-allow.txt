@@ -1,0 +1,51 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The allow list of the cluster log check: server log lines that are known
+# to be benign. suites/checks/cluster.sh does not count a line that an entry
+# matches toward log.errors.max or log.warnings.max, and the detail of
+# cluster.log names each entry that matched. docs/bundle-format.md, section
+# "The cluster checks", is the specification.
+#
+# An entry is a block of key=value lines. An id line starts it, and each
+# other key is required:
+#   id       a unique name: lower-case words joined by hyphens
+#   level    ERROR, FATAL or WARN, the level of the line
+#   logger   the logger as the image layout writes it, the last two parts of
+#            the class name, for example procedure2.RemoteProcedureDispatcher
+#   message  an extended regular expression of awk that the message must
+#            match, the text after "<logger>: "
+#   max      the most lines that the entry allows in the log of one instance,
+#            an integer of at least 1. Each line after them counts, because
+#            a benign line that repeats can be the sign of a real fault.
+#   release  the component, hbase or hadoop, then the lowest and the highest
+#            release that the entry applies to, both included. The release
+#            of the run is PX_DIST_HBASE_VERSION or PX_DIST_HADOOP_VERSION of
+#            cluster/topology.env in the bundle.
+#   reason   why the line is benign, with a reference; more reason lines
+#            continue it
+# A line from a release outside the range counts again until a review
+# extends the range.
+
+id=hbase-dispatcher-delayqueue
+level=ERROR
+logger=procedure2.RemoteProcedureDispatcher
+message=^DelayQueue for RemoteProcedureDispatcher is not empty when timed waiting elapsed\.
+max=1
+release=hbase 2.5.3 2.6.7
+reason=A timing message of the timeout thread of RemoteProcedureDispatcher (hbase-procedure,
+reason=text present from 2.5.3 to 2.6.7), logged while a table is disabled or dropped; the
+reason=region closes within a second. PHOENIX-8070 W1 defect D-2: 2 of 59 runs on HBase 2.6.7,
+reason=one line in each. The message itself says that a line that repeats can freeze the system.

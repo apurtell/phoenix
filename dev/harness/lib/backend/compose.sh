@@ -1928,14 +1928,46 @@ sb_kill() {
   return 0
 }
 
-## @description  Deliver a named signal to a single instance, such as QUIT to trigger a thread dump.
+# Remote script that delivers a signal to the daemon JVM, identified as the oldest java process in
+# the container instance. Because the initial process of the instance is tini, which cannot forward
+# a STOP signal, the script signals the JVM process directly and then polls its process state for
+# up to five seconds: STOP or TSTP must place the JVM into a stopped state, and CONT must return it
+# to a running state, ensuring that any pause that fails to take effect is treated as a failure.
+# The script exits with 6 when no JVM exists, 1 when the kill command fails, and 3 when the target
+# state does not appear within five seconds (treating an unreadable state as not yet observed). The
+# script is assigned via read because bash 3.2 misparses a case statement inside $(...).
+PX_COMPOSE_SIGNAL_SCRIPT=""
+read -r -d '' PX_COMPOSE_SIGNAL_SCRIPT <<'SCRIPT_EOF' || true
+pid="$(pgrep -o -x java)" || exit 6
+kill -s "$1" "$pid" || exit 1
+case "$1" in
+STOP | TSTP) want=T ;;
+CONT) want=R ;;
+*) exit 0 ;;
+esac
+n=0
+while :; do
+  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+  case "$want:$state" in
+  T:T* | R:[!T]*) exit 0 ;;
+  esac
+  [ "$n" -lt 50 ] || exit 3
+  n=$((n + 1))
+  sleep 0.1
+done
+SCRIPT_EOF
+
+# Deliver a named signal to a single instance, such as QUIT to trigger a thread dump. KILL and TERM
+# are sent to the container instance and terminate it, whereas every other signal is delivered to
+# its daemon JVM process, where STOP or TSTP must stop the JVM and CONT must resume it.
+## @description  Deliver a named signal to an instance (KILL, TERM) or its daemon JVM.
 ## @param        scope_id: the scope ID returned by sb_scope_create
 ## @param        role: the target role name
 ## @param        index: the zero-based instance index
 ## @param        signal_name: HUP, INT, QUIT, ABRT, KILL, ALRM, TERM, USR1, USR2, STOP, CONT, or
 ##               TSTP (case-insensitive, with or without a leading SIG prefix)
-## @return       Exit 0 on delivery, exit 1 if delivery fails or the runtime does not respond,
-##               exit 2 on invalid usage or an unknown signal, or exit 6 if no instance exists.
+## @return       Exit 0, 1 if delivery fails, STOP, TSTP, or CONT fails, or no runtime answer, 2 on
+##               invalid usage or unknown signal, or 6 if the instance or its JVM is absent.
 sb_signal() {
   local scope=${1:-} role=${2:-} index=${3:-} signal=${4:-} name timeout status=0
   name="$(printf '%s' "${signal#SIG}" | tr '[:lower:]' '[:upper:]')"
@@ -1951,7 +1983,25 @@ sb_signal() {
     return 0
   fi
   timeout="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
-  px_compose_engine "$timeout" kill -s "$name" "$PX_PS_ID" >/dev/null || status=$?
+  case "$name" in
+  KILL | TERM)
+    px_compose_engine "$timeout" kill -s "$name" "$PX_PS_ID" >/dev/null || status=$?
+    ;;
+  *)
+    sb_exec "$scope" "$role" "$index" "$timeout" -- bash -c "$PX_COMPOSE_SIGNAL_SCRIPT" \
+      px-signal "$name" </dev/null >/dev/null || status=$?
+    case "$status" in
+    "$SB_EXIT_NO_OBJECT")
+      px_error "$role/$index runs no JVM, so the signal $name has no target"
+      return "$SB_EXIT_NO_OBJECT"
+      ;;
+    3)
+      px_error "the JVM of $role/$index did not reach the $name state within 5 s"
+      return "$SB_EXIT_FAIL"
+      ;;
+    esac
+    ;;
+  esac
   if [ "$status" != 0 ]; then
     px_error "the signal $name to $role/$index was not delivered"
     return "$SB_EXIT_FAIL"

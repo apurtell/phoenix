@@ -187,9 +187,9 @@ conditions are outside the scope of this mechanism.
    EOF
    ```
 
-   Because the harness stages only the scenario and schema files into the client container, the
-   open-loop schedule is defined inline; an external `profile="..."` file would not be copied to
-   the cluster.
+   The open-loop schedule is declared inline so that the scenario remains a single self-contained
+   file, although the harness also stages any external `profile="..."` file placed next to the
+   scenario.
 
 ### Measure the baseline
 
@@ -383,22 +383,28 @@ conditions are outside the scope of this mechanism.
     exactly. Because region draining moves regions off the server before it stops, clients see only
     brief region handoffs rather than a sudden outage and WAL split, confirming hypothesis 4.
 
-    In 1 of 2 live validation runs of this step, the third entry did not trigger: `px-run` logged
-    `px-region-count[client/0]: regionserver 1 publishes no regionCount` and `disruption 3 not
-    injected: the online regions cannot be read before it`, the entry state was `fail`, and the
-    execution exited with code 1. That region-count query occurred 2 s after the second entry
-    finished rebalancing. If you encounter this timing window, re-run the step.
+    Immediately after a rebalance, a RegionServer can respond to JMX queries before publishing
+    `regionCount`. When the pre-disruption region count is not yet available, `px-run` retries the
+    read within the readiness timeout bound so that the third disruption entry triggers on
+    schedule. Builds prior to this fix logged `regionserver 1
+    publishes no regionCount` and `disruption 3 not injected` in 1 of 2 runs.
 
-    **`STOP` and `CONT` do not pause the JVM.** Live validation tested the specification
-    `-D 'phase:steady@pherf,signal,regionserver,1,STOP' -D '+30,signal,regionserver,1,CONT'`.
-    Both entries triggered on schedule with state `ok`, reported an mttr of roughly 0.5 s, and
-    completed with exit code 0. However, RegionServer 1 continued serving throughout the 29 s
-    interval between the two signals, responding to JMX queries and writing log entries while the
-    client observed a peak lag of only 19 ms. Container signals are delivered to PID 1 (`tini`),
-    which forwards catchable signals such as `QUIT` to the child JVM process. Because `STOP`
-    cannot be caught or forwarded by a user-space init process, it suspends only `tini` while
-    leaving the JVM running. Until container signal targets are changed, use `kill` and `restart`
-    for resilience testing and reserve `signal` for catchable signals handled directly by the JVM.
+    **`STOP` and `CONT` pause the JVM.** Any signal other than `KILL` and `TERM` is delivered
+    directly to the JVM rather than to `tini`, the initial process of the container. Under
+    `--disrupt 'phase:steady@pherf,signal,regionserver,1,STOP'` paired with
+    `--disrupt '+20,signal,regionserver,1,CONT'`, the `STOP` entry reports state `ok` only once the
+    JVM has halted, and its recovery phase waits for the `CONT` signal so that `mttr_seconds`
+    spans both the roughly 19 s pause and the ensuing recovery. Any `STOP` action not resumed by
+    the schedule automatically receives a `CONT` signal from `px-run` when the run verb completes.
+    Earlier builds sent the signal to `tini`, leaving the RegionServer running while recording a
+    0.5 s pause.
+
+    Keep any pause shorter than 25 s. Because the container image runs ZooKeeper with
+    `tickTime=2000`, a session lasts at most 40 s, and the paused server may have sent its last
+    heartbeat ping up to one-third of that interval before receiving the `STOP` signal. A longer
+    pause causes the session to expire: the Master processes the server as dead, the server aborts
+    upon resuming execution, and recovery from the pause fails. A 30 s pause triggered this
+    failure in 1 of 1 runs (run `20261123T064007Z-ro1h`).
 
 ### Prove that the gate fails
 

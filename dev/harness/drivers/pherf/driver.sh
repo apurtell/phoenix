@@ -28,7 +28,9 @@
 # matching a regular expression pattern against the class path. The driver therefore stages those
 # files into a directory placed first on the class path under scenario/<name> and datamodel/<name>,
 # which serve as the resource roots of Pherf. The generated patterns match only the staged
-# directory so that files packaged inside a Pherf jar are never matched.
+# directory so that files packaged inside a Pherf jar are never matched. Because Pherf resolves the
+# profile="PATH" attribute of a querySet relative to the scenario file, the driver stages every
+# profile referenced by the scenario at that relative path under scenario/.
 #
 # Because the Pherf result directory defaults to the relative path RESULTS, the staged directory
 # also includes a pherf.properties file that Pherf loads from the class path, configured to place
@@ -57,6 +59,7 @@ PHERF_NAME=pherf
 PHERF_CLASS=org.apache.phoenix.pherf.Pherf
 PHERF_SCENARIO=""
 PHERF_SCHEMAS=()
+PHERF_PROFILES=()
 PHERF_PROPERTIES=""
 PHERF_SCENARIO_NAME=""
 PHERF_READ_SKEW=0
@@ -107,15 +110,16 @@ SCRIPT_EOF
 PHERF_COLUMNS="START_TIME QUERY_GROUP AVG_MAX_TIME_MS AVG_TIME_MS AVG_MIN_TIME_MS"
 PHERF_COLUMNS="$PHERF_COLUMNS RUN_COUNT RESULT_ROW_COUNT"
 
-# Parses the test arguments into the PHERF_* variables, resolving file paths to absolute paths, and
-# rejects any Pherf -label option because the driver owns the label for each verb.
-## @description  Parses the test arguments into the PHERF_* variables as absolute paths.
-## @return       Returns 0, or exits 2 on an unknown option, a missing value, no scenario, or a
-##               Pherf -label option.
+# Parses the test arguments and scenario profile paths into the PHERF_* variables, rejecting any
+# Pherf -label option (which the driver owns) and any profile outside the scenario directory.
+## @description  Parses the test arguments and scenario profiles into the PHERF_* variables.
+## @return       Returns 0, or exits 2 on an unknown option, a missing value, no scenario, a Pherf
+##               -label option, or a profile outside the scenario directory.
 pherf_args() {
-  local option
+  local option profile
   PHERF_SCENARIO=""
   PHERF_SCHEMAS=()
+  PHERF_PROFILES=()
   PHERF_PROPERTIES=""
   PHERF_SCENARIO_NAME=""
   PHERF_READ_SKEW=0
@@ -155,6 +159,52 @@ pherf_args() {
   if [ -z "$PHERF_PROPERTIES" ] && [ -n "$PX_TREE_ROOT" ]; then
     PHERF_PROPERTIES="$PX_TREE_ROOT/phoenix-pherf/config/pherf.properties"
   fi
+  [ -f "$PHERF_SCENARIO" ] && [ -r "$PHERF_SCENARIO" ] || return 0
+  # Because the staging layout contains only the scenario directory, every profile path must be a
+  # relative path beneath that directory.
+  while IFS= read -r profile; do
+    case "/$profile/" in
+    //) continue ;;
+    //*) px_die "$PX_EXIT_USAGE" "the querySet profile '$profile' of ${PHERF_SCENARIO##*/} is" \
+      "an absolute path: name it relative to the scenario file" ;;
+    */../*) px_die "$PX_EXIT_USAGE" "the querySet profile '$profile' of" \
+      "${PHERF_SCENARIO##*/} leaves the directory of the scenario file" ;;
+    esac
+    PHERF_PROFILES+=("$profile")
+  done <<EOF
+$(pherf_profile_names "$PHERF_SCENARIO")
+EOF
+}
+
+# Extracts the profile attribute from each querySet element in a scenario file (file), emitting
+# each unique name once with whitespace trimmed in the same manner as Pherf while ignoring any
+# querySet inside an XML comment.
+## @description  Extracts each unique, trimmed querySet profile name from a scenario file (file).
+## @return       Writes one profile name per line to stdout and exits 0.
+pherf_profile_names() {
+  awk -v q="'" '
+    { text = text $0 " " }
+    END {
+      while ((i = index(text, "<!--")) > 0) {
+        rest = substr(text, i + 4)
+        j = index(rest, "-->")
+        text = substr(text, 1, i - 1) (j ? substr(rest, j + 3) : "")
+      }
+      attr = "[[:space:]]profile[[:space:]]*=[[:space:]]*(\"[^\"]*\"|" q "[^" q "]*" q ")"
+      while (match(text, /<querySet[[:space:]][^>]*>/)) {
+        tag = substr(text, RSTART, RLENGTH)
+        text = substr(text, RSTART + RLENGTH)
+        if (!match(tag, attr)) continue
+        v = substr(tag, RSTART, RLENGTH)
+        sub(/^[^=]*=[[:space:]]*/, "", v)
+        v = substr(v, 2, length(v) - 2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        if (!(v in seen)) {
+          seen[v] = 1
+          print v
+        }
+      }
+    }' "$1"
 }
 
 # Constructs a Java regular expression anchored to the staged directory so that Pherf matches
@@ -213,6 +263,10 @@ pherf_stage() {
   cp "$PHERF_SCENARIO" "$stage/scenario/" || return "$PX_EXIT_FAIL"
   for file in ${PHERF_SCHEMAS[@]+"${PHERF_SCHEMAS[@]}"}; do
     cp "$file" "$stage/datamodel/" || return "$PX_EXIT_FAIL"
+  done
+  for file in ${PHERF_PROFILES[@]+"${PHERF_PROFILES[@]}"}; do
+    mkdir -p "$(dirname "$stage/scenario/$file")" || return "$PX_EXIT_FAIL"
+    cp "${PHERF_SCENARIO%/*}/$file" "$stage/scenario/$file" || return "$PX_EXIT_FAIL"
   done
   # Because the last definition of a property key determines its effective value, the keys managed
   # by the driver are appended last. An empty serverJmx value preserves the Pherf default of having
@@ -560,15 +614,20 @@ $hdr/LATENCY_${PHERF_LABEL_RUN}_intervals.hlog
 $hdr/VERDICT_$PHERF_LABEL_RUN.tsv"
 }
 
-# Verifies that the scenario file, every schema file, and the properties file specified by the
-# test arguments exist and are readable, and ensures that no two staged file names collide.
-## @description  Validates the workload files and arguments for the test definition.
+# Verifies that the workload files specified by the test arguments (argument...) and all profiles
+# referenced by the scenario exist and are readable, and ensures that no two staged schema file
+# names collide.
+## @description  Validates that all test files (argument...) and scenario profiles are readable and
+##               that no two staged schema names collide.
 ## @return       Returns 0 when the definition is valid, 1 otherwise, or exits 2 on bad arguments.
 verb_validate() {
-  local file kind problem failed=0 names=" "
+  local file kind problem failed=0 names=" " profiles=()
   pherf_args "$@"
+  for file in ${PHERF_PROFILES[@]+"${PHERF_PROFILES[@]}"}; do
+    profiles+=("profile:${PHERF_SCENARIO%/*}/$file")
+  done
   for file in "scenario:$PHERF_SCENARIO" "properties:$PHERF_PROPERTIES" \
-    ${PHERF_SCHEMAS[@]+"${PHERF_SCHEMAS[@]/#/schema:}"}; do
+    ${PHERF_SCHEMAS[@]+"${PHERF_SCHEMAS[@]/#/schema:}"} ${profiles[@]+"${profiles[@]}"}; do
     kind=${file%%:*}
     file=${file#*:}
     problem=""
@@ -602,7 +661,7 @@ verb_validate() {
     return "$PX_EXIT_FAIL"
   fi
   sx_verdict driver.workload_valid PASS "scenario ${PHERF_SCENARIO##*/}," \
-    "${#PHERF_SCHEMAS[@]} schema files"
+    "${#PHERF_SCHEMAS[@]} schema files, ${#PHERF_PROFILES[@]} profile files"
 }
 
 ## @description  Stages the workload files, applies the schema and loads data within setup@load,

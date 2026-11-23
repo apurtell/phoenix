@@ -470,6 +470,14 @@ the remote working directory rather than relying on Pherf's relative default pat
 steady anchor is `steady@pherf`, and the schemas of the Pherf output files consumed by the driver
 are defined in `phoenix-pherf/LATENCY.md` and `phoenix-pherf/VERDICT.md`.
 
+**The profiles.** Pherf resolves the `profile="PATH"` attribute of a `querySet` relative to the
+scenario file. The driver extracts each referenced profile path from the scenario, ignoring any
+`querySet` inside an XML comment, and stages the file alongside the scenario at the same relative
+path so that the test definition does not need to declare profile files separately. Because a
+profile with an absolute path or a `..` segment would escape the staging directory, every verb
+rejects it with exit 2. The `validate` verb emits a `FAIL` verdict row under `pherf.profile` for
+any referenced profile that is not a readable file.
+
 **The command line.** The `prepare` verb invokes Pherf with `-l` and `-label load`, whereas `run`
 invokes it with `-q` and `-label run`. Assigning distinct labels keeps the artifacts of the two
 verbs separate: because Pherf's pre-run gate executes before Pherf purges existing files for a

@@ -210,14 +210,14 @@ verdicts remain authoritative on any host and across every run class.
    EOF
    ```
 
-   The operation mix is declared inline alongside the inline `<openLoop>` element because the
-   pherf driver stages only the scenario and schema files, meaning an external `profile="..."`
-   file would not reach client 0. Both the SCAN and DELETE statements reference the `[K1]` range
-   placeholder twice, binding the first occurrence to the lower bound and the second occurrence
-   to the upper bound. Setting `watermark="COMMIT"` ensures that a reader observes a block only
-   after its commit completes, and `walk="MULTIPLICATIVE"` traverses the committed rows in a
-   hashed order that visits each row once per pass. To validate this scenario file offline
-   before running it, follow
+   The operation mix is declared inline alongside the inline `<openLoop>` element to keep the
+   scenario in a single file; an external `profile="..."` file placed next to the scenario also
+   works because the pherf driver stages it. Both the SCAN and DELETE statements reference the
+   `[K1]` range placeholder twice, binding the first occurrence to the lower bound and the second
+   occurrence to the upper bound. Setting `watermark="COMMIT"` ensures that a reader observes a
+   block only after its commit completes, and `walk="MULTIPLICATIVE"` traverses the committed rows
+   in a hashed order that reads each row once per pass. To validate this scenario file before a
+   run, follow
    [How to author a scenario and validate it offline](../../../../phoenix-pherf/docs/howto/02-scenario-authoring-and-validation.md);
    the pre-run validation gate of Pherf enforces the same rules automatically during `prepare`.
 

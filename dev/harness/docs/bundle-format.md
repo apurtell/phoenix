@@ -512,29 +512,56 @@ own observation window. The sixth steady-state metric is recorded under
 recovery gate did not pass. The timestamp `injected_ms` captures the moment immediately preceding
 the substrate disruption call. Before invoking that call, `px-run` determines the baseline online
 region count of the cluster by summing `regionCount` across the RegionServers queried by
-`px-region-count` inside `client` 0; if this read fails, no disruption is injected and the
-disruption state is recorded as `fail`. The timestamp `recovered_ms` marks the time at which the
-recovery gate of `px-run` succeeds across three checks in sequence: any killed RegionServer has
-been started again through the drain-aware restart procedure, every configured instance reports
-ready, and the summed online region count has returned to the count measured before the disruption.
-Because the region-count wait uses the remainder of the post-restart `PX_TIMEOUT_READY` bound, a
-single disruption consumes at most one `PX_TIMEOUT_DRAIN` interval and two `PX_TIMEOUT_READY`
-intervals. If a restart or readiness wait expires, the recovery state is recorded as `timeout`,
-whereas if the online region count has not returned to the baseline by the end of the bound, the
-state is recorded as `fail` with both counts included in the diagnostic message. A disruption that
-fires while a verb is running waits within the time bound of that verb—the shared deadline governing
-prepare and run—so each recovery step receives at most the time remaining in the verb budget. Any
-drain, readiness, or region wait truncated by that verb bound enters the state `timeout` and
-terminates the verb at its deadline, assigning exit code 4 to the verb and causing `px-run` to exit
-with code 4. Consequently, `mttr_seconds` measures the full interval until the server is live and
-every region is back online. The recovery gate never inspects `ritCount` (the regions-in-transition
-count, which can lag by up to a minute), and region rebalancing is excluded from recovery because a
-rejoined server does not need to be balanced to serve traffic. A kill action must target a
-RegionServer—the service role whose drain label is `regionmover`—using the mode `hard`, because
-only the drain-aware restart procedure starts a killed instance again and a deleted instance cannot
-be started again; `px-run` rejects any other kill configuration with exit code 2 before any verb
-runs. Finally, the cluster check `cluster.recovery` compares the measured value against the
-threshold `recovery.seconds.max`.
+`px-region-count` inside `client` 0. Immediately after a restart or a rebalance, a RegionServer can
+respond before publishing `regionCount`, so a failed read indicates that the server is not yet
+ready; `px-run` retries the read within the `PX_TIMEOUT_READY` bound and the active verb time
+bound. If the read still fails at the end of that bound, no disruption is injected and the
+disruption state is recorded as `fail`. A resume operation skips this read because a paused server
+cannot respond, reusing instead the baseline count captured before the pause. The timestamp
+`recovered_ms` marks the time at which the recovery gate of `px-run` succeeds across three checks in
+sequence: any killed RegionServer has been started again through the drain-aware restart procedure,
+every configured instance reports ready, and the summed online region count has returned to the
+count measured before the disruption. Because the region-count wait uses the remainder of the
+post-restart `PX_TIMEOUT_READY` bound, a single disruption consumes at most one `PX_TIMEOUT_DRAIN`
+interval and two `PX_TIMEOUT_READY` intervals. If a restart or readiness wait expires, the recovery
+state is recorded as `timeout`, whereas if the online region count has not returned to the baseline
+by the end of the bound, the state is recorded as `fail` with both counts included in the
+diagnostic message. A disruption that fires while a verb is running waits within the time bound of
+that verb—the shared deadline governing prepare and run—so each recovery step receives at most the
+time remaining in the verb budget. Any drain, readiness, or region wait truncated by that verb
+bound enters the state `timeout` and terminates the verb at its deadline, assigning exit code 4 to
+the verb and causing `px-run` to exit with code 4. Consequently, `mttr_seconds` measures the full
+interval until the server is live and every region is back online. The recovery gate never inspects
+`ritCount` (the regions-in-transition count, which can lag by up to a minute), and region
+rebalancing is excluded from recovery because a rejoined server does not need to be balanced to
+serve traffic. A kill action must target a RegionServer—the service role whose drain label is
+`regionmover`—using the mode `hard`, because only the drain-aware restart procedure starts a killed
+instance again and a deleted instance cannot be started again; `px-run` rejects any other kill
+configuration with exit code 2 before any verb runs. Finally, the cluster check `cluster.recovery`
+compares the measured value against the threshold `recovery.seconds.max`.
+
+**A pause.** A `signal` disruption delivering `STOP` or `TSTP` pauses the daemon JVM of the target
+instance (`sb_signal` in [backends.md](backends.md)), and the JVM cannot recover while it remains
+paused. Its recovery gate is therefore deferred until the instance is resumed by the next scheduled
+`signal` `CONT` targeting the same instance. The recovery gate executes after that `CONT` and emits
+a `recover` row for the `CONT` as well as for each pause entry that it concludes, measured from
+each entry's own injection timestamp; consequently, the `mttr_seconds` of a pause spans the full
+interval from the initial `STOP` until the server is live and every region is back online following
+the `CONT`. If the run verb finishes while an instance is still paused, `px-run` delivers the
+`CONT` itself as a planned action, records a corresponding `action` row, and executes the recovery
+gate for the pause. On an abnormal exit, it delivers the `CONT` without running the gate or writing
+a record row so that no instance is left paused after `px-run` terminates. A `STOP` or `TSTP` whose
+post-signal state check failed after the signal was sent may still leave the JVM stopped and is
+tracked as a pause as well: its disruption state is recorded as `fail` and it receives neither a
+recovery gate nor a `recover` row, yet the subsequent `CONT` from the schedule or from `px-run` is
+still delivered to it. No other disruption may execute during the window between a pause and its
+resuming `CONT`, because the baseline region read and recovery gate of another entry would block on
+the paused server and delay the `CONT`; any other entry that triggers during this window injects
+nothing and is recorded with state `fail`. Pausing a server for longer than its ZooKeeper session
+timeout causes the master to expire the server as dead, forcing the daemon to abort upon resuming
+and causing the recovery gate to fail. Because the container image bounds the ZooKeeper session
+timeout to at most 40 s, a schedule that pauses a server must deliver its `CONT` less than 25 s
+after the `STOP`.
 
 ## Validation
 
@@ -716,9 +743,24 @@ timestamp of the `recover` row, with 2 s of slack at each end—because an inten
 expectedly causes peer instances to log errors, such as a DataNode whose write pipeline from a
 killed RegionServer breaks. Each line's timestamp is taken from its leading UTC date and time. Lines
 logged after the recovery window are counted as usual, and `cluster.post_recovery` verifies any
-faults that remain. For each instance, the restart subject reports its state change, its restart
-counts, its termination reason and exit code, and its out-of-memory flag, matching the fields of the
-`anomaly` member of the manifest.
+faults that remain. Furthermore, the log subject excludes known benign server log lines matching an
+entry in the allowlist `suites/log-allow.txt`, and the verdict detail reports each matched entry,
+such as `1 allowed: hbase-dispatcher-delayqueue`. Each allowlist entry specifies a unique `id`, the
+log `level`, the exact `logger` name as formatted by the container image layout (the final two
+components of the class name immediately following the thread name), an awk regular expression
+`message` matched against the text following `<logger>: `, a per-instance `max` count of at least
+1, an inclusive `release` version range for `hbase` or `hadoop`, and a `reason` with a supporting
+reference. An entry permits at most `max` matching lines within the log of a single instance; any
+subsequent matching lines are counted as ordinary log lines and noted in the detail as
+`over the max of the allow list, counted: <id>`, because a benign message that repeats excessively
+can indicate a genuine fault. An entry applies only when the active release recorded in
+`cluster/topology.env` (`PX_DIST_HBASE_VERSION` or `PX_DIST_HADOOP_VERSION`) falls within its
+declared version range, ensuring that the message is counted again on newer releases until a review
+extends the range. The same message text logged under a different logger or severity level is still
+counted. The allowlist is owned exclusively by the harness and cannot be extended by a plug-in. For
+each instance, the restart subject reports its state change, its restart counts, its termination
+reason and exit code, and its out-of-memory flag, matching the fields of the `anomaly` member of
+the manifest.
 
 The oom subject evaluates peak memory utilization for each role against its limit across two sample
 sources combined: the `pre` and `post` snapshots, and the continuous instance samples collected by
