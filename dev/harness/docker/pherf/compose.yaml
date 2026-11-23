@@ -15,8 +15,9 @@
 
 # The standalone deployment of Distributed Pherf: one controller and a fleet
 # of agents (three by default) that drive any cluster by its ZooKeeper quorum.
-# The harness generates its own deployment of the same image (px-pherf), which
-# joins the network of a harness cluster. This file is not a harness cluster.
+# The harness renders the same image as the on-demand role group pherf of its
+# own deployment (docker/compose.gen.sh with PX_PHERF=1, started by px-pherf),
+# on the network of the harness cluster. This file is not a harness cluster.
 #
 # Set two variables for every command, also for down:
 #   PX_PHERF_IMAGE_TAG  the local image that stage-artifacts.sh --image pherf

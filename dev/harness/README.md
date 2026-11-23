@@ -73,10 +73,25 @@ px-cluster down                            # idempotent: exits 0 when nothing is
 
 The Distributed Pherf controller and agents execute in a second local container image defined in
 `docker/pherf`, built on the `PX_IMAGE_BASE_JRE17` JRE base image and pinned by digest under the
-same policy (`PX_IMAGE_BASE_JRE17_SHA256_<ARCH>`). Running `build-phoenix.sh --distributed` followed
-by `stage-artifacts.sh --image pherf` builds this image as `PX_PHERF_IMAGE_TAG`. The
-`docker/pherf/compose.yaml` manifest runs the image standalone against any cluster, and the module
-README of `phoenix-pherf-distributed` describes the image in detail.
+same policy (`PX_IMAGE_BASE_JRE17_SHA256_<ARCH>`). Enabling `PX_PHERF=1` serves as the single switch
+for the tier: running `px-cluster -e PX_PHERF=1 build` also compiles `phoenix-pherf-distributed`
+and builds the `PX_PHERF_IMAGE_TAG` image, while rendering with that setting adds the tier to the
+deployment as the on-demand `pherf` role group. The `px-pherf` command starts the tier and executes
+a suite against it, and the `pherf-distributed` driver runs a workload plan on it:
+
+```sh
+px-cluster -e PX_PHERF=1 build             # also phoenix-pherf-distributed and the pherf image
+px-pherf --class validation run fleet.suite -- --only r1   # up, start, the suite, then down
+px-cluster --class validation -e PX_PHERF=1 up && px-pherf --class validation start
+px-pherf status                            # the group and the agents; px-pherf stop stops them
+```
+
+By default, the tier targets the harness cluster. Setting `PX_PHERF_TARGET=external` with
+`PX_PHERF_ZOOKEEPER` pointed at the quorum of an external cluster renders a deployment containing
+the tier alone, and `px-pherf
+start` brings it up. `docker/pherf/compose.yaml` provides a standalone deployment of the same image
+outside the harness, while the module README of `phoenix-pherf-distributed` documents the image in
+detail.
 
 When invoked without a directory argument, `px-cluster up` first renders the deployment for the
 active run class into `$PX_OUT/deploy/<cluster>`. Calling it without a directory,
@@ -85,24 +100,29 @@ creating any resources, the command executes the host preflight check, `scripts/
 against the deployment directory to verify the container engine, its credentials, and the required
 loopback ports, and then compares the sum of the container memory limits against total engine memory
 less 4 GiB. Any deployment that exceeds this budget is refused with exit code 3 and a diagnostic
-message showing the arithmetic.
+message showing the arithmetic. Running `px-cluster up -n` performs a read-only preflight check: it
+renders the deployment into a scratch directory, prints the execution plan rows alongside
+individual check rows for the cluster record, host environment, container image, engine memory, and
+ports, and returns the exit status that an actual bring-up would produce.
 
-`px-cluster scale ROLE COUNT` adjusts the instance count of a DataNode, NodeManager, or
-RegionServer role in a running cluster. It re-renders the deployment with the updated count, runs
-the memory check against it, and starts or stops only the instances added or removed by the count
-change. Pass the `--class`, `--config`, and `-e` values used during bring-up; the command refuses
-any render that alters another instance.
+`px-cluster scale ROLE COUNT` adjusts the instance count of a DataNode, NodeManager, RegionServer,
+or Distributed Pherf agent role in a running cluster. It re-renders the deployment from the stored
+cluster record using the updated replica count, validates the new topology against the memory
+budget, starts or stops only the instances added or removed by the count change, and persists the
+updated count in the cluster record. If any command-line setting differs from the cluster record in
+a way that would alter another instance, the command rejects the render.
 
-Upon completion, `px-cluster up` records the cluster scope so that subsequent commands in any shell
-session can discover it automatically; see "Scope resolution" below. All generated output is placed
-under `$PX_OUT`, which defaults to `$HOME/phoenix-harness`. Operators should inspect the run
-directory printed by the command, as nothing useful is left inside the repository tree.
+Once provisioning completes, `px-cluster up` persists the cluster record so that subsequent
+commands across any shell session can automatically discover the active cluster and its
+configuration; see "Scope resolution" below. All generated artifacts are written beneath `$PX_OUT`,
+which defaults to `$HOME/phoenix-harness`. Operators should inspect the run directory path emitted
+by the command, because no runtime output is ever written inside the repository tree.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `px-cluster` | Runs cluster lifecycle: image build, provision, scale, faults, teardown, matrix. |
+| `px-cluster` | Manages the cluster lifecycle: build, up, scale, faults, down, matrix, and push. |
 | `px-suite` | Executes a declarative suite file: dependencies, boundaries, filters, and dry run. |
 | `px-run` | Executes one test: one run directory, one driver, snapshots, disruptions, exit code. |
 | `px-tool` | Enforces host safeguards: the health monitor and the quiet-host check. |
@@ -112,7 +132,7 @@ directory printed by the command, as nothing useful is left inside the repositor
 | `px-trace-count` | Reads Phoenix trace counters of every RegionServer, before and after the run. |
 | `px-bundle` | Writes and validates the result bundle produced by a run. |
 | `px-report` | Merges verdict streams into a single run verdict and a single exit code. |
-| `px-pherf` | Manages the Pherf controller and its agents on either backend; implemented in H3. |
+| `px-pherf` | Manages the Distributed Pherf tier: start, stop, status, and run of a suite on it. |
 | `px-k3d` | Manages the local k3d cluster for the Kubernetes backend proofs; implemented in K2. |
 
 Every command responds to `--help` with exit code 0 and rejects any unrecognized flag with exit
@@ -594,12 +614,20 @@ to 300 seconds and requires a quiet host.
 ## The host memory check
 
 Starting an additional role group commits its container resource limits against the container
-engine; accordingly, both `px-cluster group start` and the `requires` directive handling in
-`px-suite` execute `scripts/preflight.sh --phase memory` prior to starting each group via
-`px_memory_recheck` in `lib/common.sh`, which defines the invocation contract and its exit codes.
-Any exit status other than 0 blocks the group from starting. This check evaluates only the
+engine; accordingly, `px-cluster group start`, `px-pherf start`, and the `requires` directive
+handling in `px-suite` execute `scripts/preflight.sh --phase memory` prior to starting each group
+via `px_memory_recheck` in `lib/common.sh`, which defines the invocation contract and its exit
+codes. Any exit status other than 0 refuses the group start. This check evaluates only the
 `engine_memory` and `engine_cpus` rows reported by the backend preflight, since the full preflight's
 host port checks would fail against a cluster that is already running.
+
+The preflight check accounts for every rendered service, including on-demand role groups. In the
+measurement class, the Distributed Pherf tier requires 1024 + 3 x 1536 = 5632 MiB. On a 48 GiB
+container engine (which provides a 45056 MiB budget), the full sizing table with both YARN and the
+tier totals 47616 MiB and is refused; setting `PX_YARN=0` reduces the total to 37376 MiB, while
+running 2 RegionServers with YARN totals 43008 MiB. On a 24 GiB engine configured with
+`docker/env/override-24gib.env`, only `PX_YARN=0` with 1 RegionServer fits within the budget, using
+17920 of 19905 MiB.
 
 ## Verdict severity
 

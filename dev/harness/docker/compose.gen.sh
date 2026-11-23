@@ -38,6 +38,13 @@
 # The rendered directory contains compose.yaml, ports.generated.env, topology.env, and
 # services.tsv. Each service sets its swap limit equal to its memory limit so that out-of-memory
 # kills remain immediately visible rather than being masked by swap activity.
+#
+# Setting PX_PHERF=1 adds the Distributed Pherf tier as the on-demand role group pherf, comprising
+# one controller and PX_PHERF_AGENT_COUNT agents running on the PX_PHERF_IMAGE_TAG image. When
+# PX_PHERF_TARGET=harness, the tier joins the harness deployment and shares its network and its
+# ZooKeeper service. When PX_PHERF_TARGET=external, the rendered deployment contains the tier
+# alone, and the agents read the target ZooKeeper quorum exclusively from PX_PHERF_ZOOKEEPER; no
+# other source supplies a quorum.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
@@ -73,14 +80,17 @@ hbase-master MASTER rpc:16000:0 http:16010:0 debug:15001:0
 regionserver RS rpc:16020:10 http:16025:10 debug:15011:1
 client CLIENT debug:15007:0
 tooling TOOLING debug:15008:0
-setup SETUP debug:15009:0"
+setup SETUP debug:15009:0
+pherf-controller PHERF_CONTROLLER rest:8780:0
+pherf-agent PHERF_AGENT"
 PXG_ROLES="$(printf '%s\n' "$PXG_TABLE" | cut -d' ' -f1)"
 
-# Horizontally scalable roles. Scaling is capped at nine instances per role because each scaled
-# role allocates debug ports within a single decade from its base (15011-15019, 15021-15029, and
+# Horizontally scalable roles. Scaling is capped at nine instances per role because the debug ports
+# of each scaled role fill a single decade from its base (15011-15019, 15021-15029, and
 # 15031-15039); a tenth instance would occupy the decade guard port, and an eleventh would collide
-# with the base port of the subsequent role.
-PXG_SCALED="datanode nodemanager regionserver"
+# with the base port of the next role. Although a Distributed Pherf tier agent publishes no ports,
+# it retains the same nine-instance ceiling.
+PXG_SCALED="datanode nodemanager regionserver pherf-agent"
 
 # Constants shared between the container image and the deployment generator. Every service attaches
 # to the harness bridge network with <role>-<index> as both its hostname and service name. Daemons
@@ -99,6 +109,20 @@ PXG_STATE_MOUNT=/var/lib/px/state
 # path.
 PXG_OVERLAY_MOUNT=/opt/px/conf-overlay
 
+# Constants for the Distributed Pherf tier defined by the docker/pherf image, covering the health
+# probe script, the controller run directory, and the agent communication channel port. Because
+# agents reach the channel exclusively over the internal bridge network, the port map omits it just
+# as it omits internal MapReduce task ports. Each JVM claims a fixed percentage of its container
+# memory limit: the controller takes half (50 percent), and each agent takes 35 percent because the
+# agent daemon and one Pherf child process share the container memory limit.
+PXG_PHERF_HEALTHCHECK=/opt/pherf/healthcheck.sh
+PXG_PHERF_RUN_DIR=/var/lib/pherf/run
+PXG_PHERF_AGENT_PORT=8790
+PXG_PHERF_CONTROLLER_PCT=50
+PXG_PHERF_AGENT_PCT=35
+# Maximum number of Distributed Pherf agents permitted in the validation run class.
+PXG_PHERF_VALIDATION_AGENTS=2
+
 # Header marker written as the first line of topology.env. A target directory whose topology.env
 # begins with this marker is recognized as a rendered deployment that the generator may safely
 # replace.
@@ -113,12 +137,14 @@ PXG_FRACTION_RE='^0\.[0-9][0-9]?$'
 PXG_VERSION_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 PXG_LABEL_RE='^[a-z0-9][a-z0-9.-]*$'
 PXG_PATH_RE='^/[A-Za-z0-9 ._/+@-]*$'
+PXG_QUORUM_RE='^[A-Za-z0-9._:,/-]+$'
 
 # Memory totals recorded in topology.env, aggregated from the limits of the rendered services:
-# PX_TOPOLOGY_MEM_MIB covers all services, PX_TOPOLOGY_MEM_EAGER_MIB covers the services started by
-# sb_provision, and PX_GROUP_YARN_MEM_MIB covers the on-demand YARN tier. These figures are
-# reconciled with the design budget in docker/env/class-measurement.env. The setup service is
-# counted in full because it can remain resident while the remaining roles start.
+# PX_TOPOLOGY_MEM_MIB covers every service, PX_TOPOLOGY_MEM_EAGER_MIB covers the services started
+# by sb_provision, and PX_GROUP_<GROUP>_MEM_MIB covers each on-demand group (YARN and the
+# Distributed Pherf tier). These figures are reconciled with the design budget in
+# docker/env/class-measurement.env. The setup service is counted in full because it can remain
+# resident while the other roles start.
 
 # Per-render output and accounting accumulators.
 PXG_YAML=""
@@ -128,6 +154,8 @@ PXG_PUBLISHED=""
 PXG_TSV=""
 PXG_RENDERED=""
 PXG_YARN_ROLES=""
+PXG_PHERF_ROLES=""
+PXG_QUORUM=""
 PXG_STATE_HOST=""
 PXG_HEARTBEAT=""
 PXG_HOOK_OPTS=""
@@ -137,51 +165,26 @@ PXG_SERVICES=0
 PXG_MEM_TOTAL=0
 PXG_MEM_EAGER=0
 PXG_MEM_YARN=0
+PXG_MEM_PHERF=0
 PXG_REPLICATION=0
 PXG_ZOOKEEPER=""
 PXG_HBASE_HADOOP=""
 
-## @description  Prints command-line usage instructions and exit code documentation.
-## @return       Writes the usage text to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: compose.gen.sh [option...]
-
-Renders the Compose deployment directory of one cluster under $PX_OUT. It
-writes files only and never calls a container runtime. It writes the path of
-the directory to stdout.
-
-Options.
-  -h, --help             print this text and exit 0
-  -v, --verbose          report debug detail on stderr
-  -n, --dry-run          validate and report, but write no file
-      --strict           refuse a name that lib/varnames.txt does not declare
-      --class NAME       run class: validation or measurement
-      --cluster ID       cluster name, default PX_CLUSTER_ID or default
-      --out DIR          deployment directory under $PX_OUT,
-                         default $PX_OUT/deploy/<cluster>
-      --config FILE      extra configuration file, strongest file stage,
-                         repeatable
-  -e, --set NAME=VALUE   set one configuration value, repeatable, for example
-                         PX_RS_COUNT=5 or PX_CLIENT_JDK=21
-      --scale ROLE=COUNT set the count of one scaled role: datanode,
-                         nodemanager or regionserver. px-cluster scale uses it
-      --check            validate and write the service table to stdout, but
-                         write no file
-
-The run class is required: --class, PX_RUN_CLASS in the environment, or
-PX_RUN_CLASS in env/local.env beside this command. env/override-24gib.env
-beside this command fits a measurement-shaped run into a 24 GiB engine:
-  compose.gen.sh --class measurement --config <its path>
-
-The service table has one row for each service, tab separated:
-  service role index group start mem_limit_mib heap_mib direct_mib jdk
-
-Exit codes: 0 rendered; 1 the directory cannot be written; 2 usage, an unset
-or invalid value, an unknown run class, or a target directory that is not a
-rendered deployment; 6 a --config file is absent.
+px_cli_spec <<'EOF'
+about Renders the Compose deployment directory of one cluster under $PX_OUT, by
++ default $PX_OUT/deploy/<cluster>.
+about It writes files only and never calls a container runtime.
+about The run class is required: --class, PX_RUN_CLASS in the environment, or
++ PX_RUN_CLASS in env/local.env beside this command. PX_PHERF=1 adds the
++ Distributed Pherf tier; PX_PHERF_TARGET=external renders the tier alone, for the
++ ZooKeeper quorum of PX_PHERF_ZOOKEEPER. env/override-24gib.env beside this
++ command fits a measurement-shaped run into a 24 GiB engine. The scaled roles are
++ datanode, nodemanager, regionserver and pherf-agent.
+exits 1 also means that the directory cannot be written, 2 an unset or invalid value
++ or a target directory that is not a rendered deployment, 6 a --config file is
++ absent.
+example compose.gen.sh --class measurement --config env/override-24gib.env
 EOF
-}
 
 ## @description  Looks up a role in the catalog and prints either its sizing variable key (key) or
 ##               its port family definitions (ports).
@@ -222,19 +225,34 @@ pxg_scale_set() {
   printf 'PX_%s_COUNT=%s\n' "$(pxg_role "$role" key)" "${1#*=}"
 }
 
-# Only the YARN tier forms a role group because it is the only tier that starts and stops on demand
-# while a cluster is running.
+# A role group starts and stops on demand while a cluster is running, covering the YARN tier and
+# the Distributed Pherf tier.
 ## @description  Reports the role group associated with a given role.
 ## @return       Writes the group name to stdout (or nothing if ungrouped) and exits 0.
 pxg_role_group() {
   case "${1:-}" in
   resourcemanager | nodemanager | jobhistory) printf 'yarn\n' ;;
+  pherf-controller | pherf-agent) printf 'pherf\n' ;;
   esac
 }
 
+## @description  Computes the port for an instance family (role, family, index) from the role
+##               catalog.
+## @return       Writes the port to stdout and exits 0, or exits 1 if the role has no such family.
+pxg_port() {
+  local family
+  for family in $(pxg_role "$1" ports); do
+    [ "${family%%:*}" = "$2" ] || continue
+    family=${family#*:}
+    printf '%s\n' "$((${family%%:*} + ${family#*:} * $3))"
+    return 0
+  done
+  return 1
+}
+
 # The setup role mounts the NameNode data volume so that it can format the HDFS metadata.
-## @description  Resolves the persistent volume name mounted at the data directory for a given role
-##               and instance index.
+## @description  Resolves the persistent volume name that a service instance (role, index) mounts
+##               at the data directory.
 ## @return       Writes the volume name to stdout (or nothing for stateless roles) and exits 0.
 pxg_volume_of() {
   case "${1:-}" in
@@ -278,26 +296,26 @@ pxg_check_switch() {
   esac
 }
 
-# The image staging record, when present, must match the configured HBase profile and component
-# releases for the active version set.
-## @description  Populates PXG_ZOOKEEPER and PXG_HBASE_HADOOP from the image staging record.
-## @return       Exits 0 if the record matches or is absent, or exits 2 if the record belongs to
-##               another version set or lacks a required release version.
+# When an image staging record is present, its recorded values must match each requested key:name
+# configuration variable pair.
+## @description  Populates PXG_ZOOKEEPER and PXG_HBASE_HADOOP from the staging record of an image
+##               (tag variable name, record key:name...).
+## @return       Exits 0 if the record matches or is absent, or exits 2 on a version set mismatch.
 pxg_staged() {
-  local root record text key name value
+  local var=$1 tag=${!1} root record text key name value
+  shift
   PXG_ZOOKEEPER=unstaged
   PXG_HBASE_HADOOP=unstaged
   root="$(px_out_root 2>/dev/null)" || return 0
-  record="$root/images/$(px_image_stage_name "$PX_IMAGE_TAG").staged.tsv"
+  record="$root/images/$(px_image_stage_name "$tag").staged.tsv"
   [ -f "$record" ] || return 0
   text="$(cat "$record")"
-  for key in hbase_profile:PX_PHOENIX_HBASE_PROFILE hbase_version:PX_DIST_HBASE_VERSION \
-    hadoop_version:PX_DIST_HADOOP_VERSION; do
+  for key in "$@"; do
     name=${key#*:}
     value="$(px_tsv_get "${key%%:*}" "$text")" || value=""
     if [ "$value" != "${!name}" ]; then
-      px_die "$PX_EXIT_USAGE" "the image $PX_IMAGE_TAG was staged with ${key%%:*} '$value'," \
-        "and $name is '${!name}': stage the image again, or select another PX_IMAGE_TAG"
+      px_die "$PX_EXIT_USAGE" "the image $tag was staged with ${key%%:*} '$value'," \
+        "and $name is '${!name}': stage the image again, or select another $var"
     fi
   done
   PXG_ZOOKEEPER="$(px_tsv_get zookeeper_version "$text")" || PXG_ZOOKEEPER=""
@@ -414,6 +432,12 @@ pxg_plugins() {
     key=${line%% *}
     opts=${line#"$key"}
     px_trim_var opts
+    case "$key" in
+    PHERF_*)
+      px_die "$PX_EXIT_USAGE" "the jvm-opts hook of plug-in $id names $key, a key of the" \
+        "Distributed Pherf tier, which takes no JVM option of a plug-in: $line"
+      ;;
+    esac
     case "$keys" in
     *" $key "*) ;;
     *) px_die "$PX_EXIT_USAGE" "the jvm-opts hook of plug-in $id names no role key: $line" ;;
@@ -466,8 +490,7 @@ pxg_hundredths() {
 ## @return       Exits 0 when valid, 2 on any rejected value, or 1 when the state directory cannot
 ##               be resolved.
 pxg_configure() {
-  local role key cache store name
-  local required=()
+  local name
   case "${PX_RUN_CLASS:-}" in
   validation | measurement) ;;
   '')
@@ -486,26 +509,56 @@ pxg_configure() {
     px_die "$PX_EXIT_USAGE" "invalid cluster name '$PX_CLUSTER_ID': lower case" \
       "letters, digits, underscore and hyphen, starting with a letter or a digit"
   fi
+  pxg_require PX_PHERF PX_PHERF_TARGET PX_JVM_DEBUG PX_PHOENIX_HBASE_PROFILE \
+    PX_DIST_HBASE_VERSION PX_LABEL_PREFIX
+  pxg_check_switch PX_PHERF
+  pxg_check_switch PX_JVM_DEBUG
+  PXG_RENDERED=""
+  case "$PX_PHERF_TARGET" in
+  harness) pxg_configure_harness ;;
+  external)
+    [ "$PX_PHERF" = 1 ] || px_die "$PX_EXIT_USAGE" "PX_PHERF_TARGET=external renders the" \
+      "Distributed Pherf tier alone, so it needs PX_PHERF=1"
+    ;;
+  *) px_die "$PX_EXIT_USAGE" "PX_PHERF_TARGET='$PX_PHERF_TARGET' must be harness or external" ;;
+  esac
+  for name in PX_PHOENIX_HBASE_PROFILE PX_DIST_HBASE_VERSION; do
+    if ! [[ ${!name} =~ $PXG_VERSION_RE ]]; then
+      px_die "$PX_EXIT_USAGE" "$name='${!name}' must be a version: letters, digits, . _ -"
+    fi
+  done
+  if ! [[ $PX_LABEL_PREFIX =~ $PXG_LABEL_RE ]]; then
+    px_die "$PX_EXIT_USAGE" "PX_LABEL_PREFIX='$PX_LABEL_PREFIX' must hold lower case" \
+      "letters, digits, dots and hyphens"
+  fi
+  if [ "$PX_PHERF" = 1 ]; then
+    pxg_configure_tier
+  fi
+}
 
-  pxg_require PX_YARN PX_SNN PX_JVM_DEBUG PX_DN_COUNT PX_NM_COUNT PX_RS_COUNT \
+## @description  Validates the harness role configuration and appends each role to PXG_RENDERED.
+## @return       Exits 0 when valid, 2 on any rejected value, or 1 when the state directory cannot
+##               be resolved.
+pxg_configure_harness() {
+  local role key cache store name
+  local required=()
+  pxg_require PX_YARN PX_SNN PX_DN_COUNT PX_NM_COUNT PX_RS_COUNT \
     PX_HDFS_REPLICATION PX_HBASE_BLOCKCACHE_SIZE PX_HBASE_MEMSTORE_SIZE \
-    PX_IMAGE_TAG PX_PHOENIX_HBASE_PROFILE PX_DIST_HBASE_VERSION PX_DIST_HADOOP_VERSION \
-    PX_LABEL_PREFIX
+    PX_IMAGE_TAG PX_DIST_HADOOP_VERSION
   pxg_check_switch PX_YARN
   pxg_check_switch PX_SNN
-  pxg_check_switch PX_JVM_DEBUG
   for role in $PXG_SCALED; do
-    pxg_check_count "$role"
+    [ "$role" = pherf-agent ] || pxg_check_count "$role"
   done
 
-  # Every role is included in the deployment unless disabled by its feature switch. Enabling the
-  # YARN switch includes the YARN tier in the rendered deployment definition without starting it
-  # automatically at provision time.
-  PXG_RENDERED=""
+  # Every role is rendered into the deployment unless disabled by its feature switch. Enabling the
+  # YARN switch includes the YARN tier in the deployment definition without starting it
+  # automatically.
   for role in $PXG_ROLES; do
     case "$role" in
     secondarynamenode) [ "$PX_SNN" = 1 ] || continue ;;
     resourcemanager | nodemanager | jobhistory) [ "$PX_YARN" = 1 ] || continue ;;
+    pherf-*) continue ;;
     esac
     PXG_RENDERED="$PXG_RENDERED $role"
     key="$(pxg_role "$role" key)"
@@ -561,16 +614,12 @@ pxg_configure() {
     px_die "$PX_EXIT_USAGE" "PX_IMAGE_TAG='$PX_IMAGE_TAG' must be a local image" \
       "reference repository:tag, with no registry host and no digest"
   fi
-  for name in PX_PHOENIX_HBASE_PROFILE PX_DIST_HBASE_VERSION PX_DIST_HADOOP_VERSION; do
-    if ! [[ ${!name} =~ $PXG_VERSION_RE ]]; then
-      px_die "$PX_EXIT_USAGE" "$name='${!name}' must be a version: letters, digits, . _ -"
-    fi
-  done
-  pxg_staged
-  if ! [[ $PX_LABEL_PREFIX =~ $PXG_LABEL_RE ]]; then
-    px_die "$PX_EXIT_USAGE" "PX_LABEL_PREFIX='$PX_LABEL_PREFIX' must hold lower case" \
-      "letters, digits, dots and hyphens"
+  if ! [[ $PX_DIST_HADOOP_VERSION =~ $PXG_VERSION_RE ]]; then
+    px_die "$PX_EXIT_USAGE" "PX_DIST_HADOOP_VERSION='$PX_DIST_HADOOP_VERSION' must be a" \
+      "version: letters, digits, . _ -"
   fi
+  pxg_staged PX_IMAGE_TAG hbase_profile:PX_PHOENIX_HBASE_PROFILE \
+    hbase_version:PX_DIST_HBASE_VERSION hadoop_version:PX_DIST_HADOOP_VERSION
 
   # The bootstrap probe verifies the health monitor heartbeat. Because the monitor refreshes its
   # heartbeat after every sampling pass, a live heartbeat is at most one interval plus the duration
@@ -584,6 +633,52 @@ pxg_configure() {
   fi
   name="$(px_guard_name monitor "$PX_PROJECT_PREFIX-$PX_CLUSTER_ID")"
   PXG_HEARTBEAT="$PXG_STATE_MOUNT/$name.heartbeat"
+}
+
+## @description  Validates the Distributed Pherf tier configuration, sets PXG_QUORUM, and appends
+##               the two tier roles to PXG_RENDERED.
+## @return       Exits 0 when valid, or exits 2 on any rejected value.
+pxg_configure_tier() {
+  local name ver_zk=$PXG_ZOOKEEPER ver_hadoop=$PXG_HBASE_HADOOP
+  pxg_require PX_PHERF_AGENT_COUNT PX_PHERF_CONTROLLER_MEM_MIB PX_PHERF_AGENT_MEM_MIB \
+    PX_PHERF_IMAGE_TAG
+  pxg_check_count pherf-agent
+  if [ "$PX_RUN_CLASS" = validation ] &&
+    [ "$PX_PHERF_AGENT_COUNT" -gt "$PXG_PHERF_VALIDATION_AGENTS" ]; then
+    px_die "$PX_EXIT_USAGE" "PX_PHERF_AGENT_COUNT=$PX_PHERF_AGENT_COUNT: the validation class" \
+      "runs 1 to $PXG_PHERF_VALIDATION_AGENTS agents"
+  fi
+  for name in PX_PHERF_CONTROLLER_MEM_MIB PX_PHERF_AGENT_MEM_MIB; do
+    pxg_check_mib "$name"
+  done
+  if ! sb_image_tag_local "$PX_PHERF_IMAGE_TAG"; then
+    px_die "$PX_EXIT_USAGE" "PX_PHERF_IMAGE_TAG='$PX_PHERF_IMAGE_TAG' must be a local image" \
+      "reference repository:tag, with no registry host and no digest"
+  fi
+  # The ZooKeeper quorum for an external target cluster must be supplied explicitly by the
+  # operator, whereas the harness target resolves the deployment's own ZooKeeper instance and
+  # client port.
+  if [ "$PX_PHERF_TARGET" = external ]; then
+    [ -n "${PX_PHERF_ZOOKEEPER:-}" ] || px_die "$PX_EXIT_USAGE" "the external target needs" \
+      "PX_PHERF_ZOOKEEPER, the ZooKeeper quorum of the target cluster: host:port,..."
+    [[ $PX_PHERF_ZOOKEEPER =~ $PXG_QUORUM_RE ]] || px_die "$PX_EXIT_USAGE" \
+      "PX_PHERF_ZOOKEEPER='$PX_PHERF_ZOOKEEPER' must hold letters, digits and . _ : , / - only"
+    PXG_QUORUM=$PX_PHERF_ZOOKEEPER
+  else
+    [ -z "${PX_PHERF_ZOOKEEPER:-}" ] || px_die "$PX_EXIT_USAGE" "PX_PHERF_ZOOKEEPER is for" \
+      "PX_PHERF_TARGET=external. The harness target reads the ZooKeeper of the deployment"
+    PXG_QUORUM="zookeeper-0:$(pxg_port zookeeper client 0)"
+  fi
+  # The staging record of the Pherf image supplies the ZooKeeper version for an external
+  # deployment, whereas the staging record of the harness image supplies it for a harness
+  # deployment.
+  pxg_staged PX_PHERF_IMAGE_TAG hbase_profile:PX_PHOENIX_HBASE_PROFILE \
+    hbase_version:PX_DIST_HBASE_VERSION
+  if [ "$PX_PHERF_TARGET" = harness ]; then
+    PXG_ZOOKEEPER=$ver_zk
+    PXG_HBASE_HADOOP=$ver_hadoop
+  fi
+  PXG_RENDERED="$PXG_RENDERED pherf-controller pherf-agent"
 }
 
 ## @description  Appends a single line to the accumulated Compose YAML buffer.
@@ -733,36 +828,155 @@ pxg_render_service() {
   fi
 }
 
+# The Distributed Pherf container image consumes PHERF_* environment variables exclusively.
+## @description  Renders the Compose definition for one Distributed Pherf tier instance (role,
+##               index), appends its service table row, and records its memory allocation.
+## @return       Exits 0.
+pxg_render_tier_service() {
+  local role=$1 index=$2 service="$1-$2" prefix=$PX_LABEL_PREFIX var mem pct verb port
+  var="PX_$(pxg_role "$role" key)_MEM_MIB" && mem=${!var}
+  if [ "$role" = pherf-controller ]; then
+    verb=controller pct=$PXG_PHERF_CONTROLLER_PCT
+  else
+    verb=agent pct=$PXG_PHERF_AGENT_PCT
+  fi
+  pxg_y "  $service:"
+  pxg_y "    image: \"$PX_PHERF_IMAGE_TAG\""
+  pxg_y "    pull_policy: never"
+  pxg_y "    hostname: \"$service\""
+  pxg_y "    networks:"
+  pxg_y "      - default"
+  pxg_y "    restart: \"no\""
+  pxg_y "    mem_limit: ${mem}m"
+  pxg_y "    memswap_limit: ${mem}m"
+  pxg_y "    labels:"
+  pxg_y "      $prefix.cluster: \"$PX_CLUSTER_ID\""
+  pxg_y "      $prefix.group: \"pherf\""
+  pxg_y "      $prefix.index: \"$index\""
+  pxg_y "      $prefix.role: \"$role\""
+  pxg_y "      $prefix.start: \"on-demand\""
+  pxg_y "    command: [\"$verb\", \"start\"]"
+  pxg_y "    environment:"
+  pxg_render_ports "$role" "$index"
+  if [ "$verb" = controller ]; then
+    pxg_y "      PHERF_JAVA_OPTS: \"-XX:MaxRAMPercentage=$pct\""
+    pxg_y "      PHERF_REST_PORT: \"${PXG_PUBLISHED# }\""
+  else
+    pxg_y "      PHERF_CONTROLLER: \"http://pherf-controller-0:$PXG_PHERF_AGENT_PORT\""
+    pxg_y "      PHERF_JAVA_OPTS: \"-XX:MaxRAMPercentage=$pct\""
+    pxg_y "      PHERF_ZOOKEEPER: \"$PXG_QUORUM\""
+  fi
+  # Use the same healthcheck probe command and timing thresholds defined in
+  # docker/pherf/compose.yaml.
+  pxg_y "    healthcheck:"
+  pxg_y "      test: [\"CMD\", \"$PXG_PHERF_HEALTHCHECK\", \"$verb\"]"
+  pxg_y "      interval: 5s"
+  pxg_y "      timeout: 6s"
+  pxg_y "      retries: 3"
+  pxg_y "      start_period: 60s"
+  if [ -n "$PXG_PUBLISHED" ]; then
+    pxg_y "    ports:"
+    for port in $PXG_PUBLISHED; do
+      pxg_y "      - \"$PXG_PUBLISH_HOST:$port:$port\""
+    done
+  fi
+  # The controller persists its test definitions and run bundles on a dedicated volume.
+  if [ "$verb" = controller ]; then
+    pxg_y "    volumes:"
+    pxg_y "      - $service-data:$PXG_PHERF_RUN_DIR"
+    PXG_VOLUMES="$PXG_VOLUMES  $service-data:$PX_NL"
+    PXG_VOLUMES="$PXG_VOLUMES    labels:$PX_NL"
+    PXG_VOLUMES="$PXG_VOLUMES      $prefix.cluster: \"$PX_CLUSTER_ID\"$PX_NL"
+  fi
+  PXG_TSV="$PXG_TSV$(px_tsv_row "$service" "$role" "$index" pherf on-demand "$mem" \
+    "$((mem * pct / 100))" 0 17)$PX_NL"
+  PXG_SERVICES=$((PXG_SERVICES + 1))
+  PXG_MEM_TOTAL=$((PXG_MEM_TOTAL + mem))
+  PXG_MEM_PHERF=$((PXG_MEM_PHERF + mem))
+}
+
 # The self-test verifies that the maximum port map (nine instances of every scalable role) produces
 # no port collisions.
 ## @description  Iterates over all active roles and renders every configured service instance.
 ## @return       Populates the render accumulators and exits 0.
 pxg_build() {
-  local role count index var
-  PXG_YAML="" PXG_VOLUMES="" PXG_PORTS="" PXG_TSV="" PXG_YARN_ROLES=""
-  PXG_SERVICES=0 PXG_MEM_TOTAL=0 PXG_MEM_EAGER=0 PXG_MEM_YARN=0
+  local role count index var group
+  PXG_YAML="" PXG_VOLUMES="" PXG_PORTS="" PXG_TSV="" PXG_YARN_ROLES="" PXG_PHERF_ROLES=""
+  PXG_SERVICES=0 PXG_MEM_TOTAL=0 PXG_MEM_EAGER=0 PXG_MEM_YARN=0 PXG_MEM_PHERF=0
   for role in $PXG_RENDERED; do
     count=1
     if pxg_is_scaled "$role"; then
       var="PX_$(pxg_role "$role" key)_COUNT"
       count=${!var}
     fi
-    if [ -n "$(pxg_role_group "$role")" ]; then
-      PXG_YARN_ROLES="${PXG_YARN_ROLES:+$PXG_YARN_ROLES }$role"
-    fi
+    group="$(pxg_role_group "$role")"
+    case "$group" in
+    yarn) PXG_YARN_ROLES="${PXG_YARN_ROLES:+$PXG_YARN_ROLES }$role" ;;
+    pherf) PXG_PHERF_ROLES="${PXG_PHERF_ROLES:+$PXG_PHERF_ROLES }$role" ;;
+    esac
     index=0
     while [ "$index" -lt "$count" ]; do
-      pxg_render_service "$role" "$index"
+      if [ "$group" = pherf ]; then
+        pxg_render_tier_service "$role" "$index"
+      else
+        pxg_render_service "$role" "$index"
+      fi
       index=$((index + 1))
     done
   done
+}
+
+## @description  Emits the Distributed Pherf tier entries for the topology record, or nothing when
+##               PX_PHERF is 0.
+## @return       Writes the tier lines to stdout and exits 0.
+pxg_tier_lines() {
+  [ "$PX_PHERF" = 1 ] || return 0
+  cat <<EOF
+PX_PHERF=1
+PX_PHERF_TARGET=$PX_PHERF_TARGET
+PX_PHERF_AGENT_COUNT=$PX_PHERF_AGENT_COUNT
+PX_PHERF_IMAGE_TAG=$PX_PHERF_IMAGE_TAG
+PX_GROUP_PHERF=$PXG_PHERF_ROLES
+PX_GROUP_PHERF_MEM_MIB=$PXG_MEM_PHERF
+EOF
+}
+
+## @description  Formats the topology record for a standalone Distributed Pherf tier deployment,
+##               recording the run metadata, the Pherf image version set, and the tier parameters.
+## @return       Writes the rendered topology file text to stdout and exits 0.
+pxg_topology_external_text() {
+  cat <<EOF
+$PXG_MARKER
+# The topology record of a deployment that holds the Distributed Pherf tier
+# alone, for an external cluster. Memory figures are MiB. The version set is
+# that of the pherf image: the Phoenix HBase profile, the HBase release and
+# the ZooKeeper client that the staging record of the image names. The
+# ZooKeeper quorum of the cluster is not recorded here: only the agents read
+# it, from PX_PHERF_ZOOKEEPER of the operator.
+PX_CLUSTER_ID=$PX_CLUSTER_ID
+PX_RUN_CLASS=$PX_RUN_CLASS
+PX_SIZING_OVERRIDES=$(px_sizing_overrides)
+PX_PHOENIX_HBASE_PROFILE=$PX_PHOENIX_HBASE_PROFILE
+PX_DIST_HBASE_VERSION=$PX_DIST_HBASE_VERSION
+PX_ZOOKEEPER_VERSION=$PXG_ZOOKEEPER
+PX_HBASE_HADOOP_VERSION=$PXG_HBASE_HADOOP
+$(pxg_tier_lines)
+PX_GROUPS=pherf
+PX_TOPOLOGY_SERVICE_COUNT=$PXG_SERVICES
+PX_TOPOLOGY_MEM_MIB=$PXG_MEM_TOTAL
+PX_TOPOLOGY_MEM_EAGER_MIB=$PXG_MEM_EAGER
+EOF
 }
 
 ## @description  Formats the topology.env content consumed as an environment file by every service
 ##               and archived in the results bundle.
 ## @return       Writes the rendered topology file text to stdout and exits 0.
 pxg_topology_text() {
-  local groups="" yarn_lines=""
+  local groups="" yarn_lines="" tier_lines
+  if [ "$PX_PHERF_TARGET" = external ]; then
+    pxg_topology_external_text
+    return 0
+  fi
   if [ "$PX_YARN" = 1 ]; then
     groups=yarn
     yarn_lines="PX_NM_RESOURCE_MIB=$PX_NM_RESOURCE_MIB
@@ -774,6 +988,13 @@ PX_MR_TASK_MIB=$PX_MR_TASK_MIB
 PX_GROUP_YARN=$PXG_YARN_ROLES
 PX_GROUP_YARN_MEM_MIB=$PXG_MEM_YARN
 "
+  fi
+  # Omitting the Distributed Pherf tier preserves byte-for-byte output compatibility with
+  # deployments rendered without the tier.
+  tier_lines="$(pxg_tier_lines)"
+  if [ -n "$tier_lines" ]; then
+    tier_lines="$tier_lines$PX_NL"
+    groups="${groups:+$groups }pherf"
   fi
   cat <<EOF
 $PXG_MARKER
@@ -814,7 +1035,7 @@ PX_HDFS_REPLICATION=$PXG_REPLICATION
 PX_HDFS_REPLICATION_REQUESTED=$PX_HDFS_REPLICATION
 PX_HBASE_BLOCKCACHE_SIZE=$PX_HBASE_BLOCKCACHE_SIZE
 PX_HBASE_MEMSTORE_SIZE=$PX_HBASE_MEMSTORE_SIZE
-${yarn_lines}PX_GROUPS=$groups
+${yarn_lines}${tier_lines}PX_GROUPS=$groups
 PX_TOPOLOGY_SERVICE_COUNT=$PXG_SERVICES
 PX_TOPOLOGY_MEM_MIB=$PXG_MEM_TOTAL
 PX_TOPOLOGY_MEM_EAGER_MIB=$PXG_MEM_EAGER
@@ -965,8 +1186,8 @@ pxg_main() {
   pxg_build
   pxg_write "$target"
   px_info "rendered $PXG_SERVICES services for cluster $PX_CLUSTER_ID, class" \
-    "$PX_RUN_CLASS: $PXG_MEM_TOTAL MiB of container limits, $PXG_MEM_YARN MiB" \
-    "of them on demand, into $target"
+    "$PX_RUN_CLASS: $PXG_MEM_TOTAL MiB of container limits, $((PXG_MEM_YARN + PXG_MEM_PHERF))" \
+    "MiB of them on demand, into $target"
   printf '%s\n' "$target"
 }
 

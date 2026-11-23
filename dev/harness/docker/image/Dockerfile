@@ -61,7 +61,6 @@ ARG PX_STAGED_PHOENIX_SERVER
 ARG PX_STAGED_PHOENIX_CLIENT
 ARG PX_STAGED_PHOENIX_PHERF
 ARG PX_STAGED_PHOENIX_BSON
-ARG PX_STAGED_PHOENIX_DISTRIBUTED=
 # Declare the expected component versions for the active version set, covering the standalone
 # Hadoop and HBase distributions as well as the ZooKeeper and Hadoop client JARs bundled under
 # lib/ inside the HBase distribution archive, which the staging step inspects directly from the
@@ -94,8 +93,6 @@ RUN set -eu; \
     cp "/stage/$PX_STAGED_PHOENIX_SERVER" /out/phoenix/server/; \
     cp "/stage/$PX_STAGED_PHOENIX_CLIENT" "/stage/$PX_STAGED_PHOENIX_PHERF" \
       "/stage/$PX_STAGED_PHOENIX_BSON" /out/phoenix/client/; \
-    if [ -n "$PX_STAGED_PHOENIX_DISTRIBUTED" ]; then \
-      cp "/stage/$PX_STAGED_PHOENIX_DISTRIBUTED" /out/phoenix/client/; fi; \
     if [ -n "$PX_STAGED_ASYNC_PROFILER" ]; then \
       mkdir -p /out/px-tools/async-profiler; \
       tar -xzf "/stage/$PX_STAGED_ASYNC_PROFILER" -C /out/px-tools/async-profiler \

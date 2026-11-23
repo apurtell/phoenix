@@ -123,27 +123,21 @@ daemon log (which causes the `cluster.log` check to fail).
    assertion failed, with the trailing output lines identifying the failure. The self-test required
    24 min on the reference host.
 
-4. Verify that every CLI command responds to `--help` with exit 0:
+3. Confirm that every harness command responds to `--help` with exit status 0:
 
    ```sh
-   for c in px-cluster px-suite px-run px-report px-bundle px-tool px-collect px-profile \
-     px-jfr px-trace-count; do "$c" --help >/dev/null; echo "$c $?"; done
+   for c in dev/harness/bin/px-*; do "$c" --help >/dev/null || echo "${c##*/} $?"; done
    ```
 
-   ```text
-   px-cluster 0
-   px-suite 0
-   ...
-   px-trace-count 0
-   ```
+   The loop produces no output when every command succeeds.
 
-   Running `px-cluster <subcommand> --help` displays the options for an individual subcommand. Every
-   command rejects an unrecognized flag with exit 2. The `px-pherf` and `px-k3d` commands belong to
-   later development phases and currently return exit 5.
+   Invoking `px-cluster SUBCOMMAND --help` prints the flags accepted by a specific subcommand.
+   Every tool rejects an unrecognized option by logging `unknown option X` and terminating with
+   `(exit 2, usage)`.
 
 ### Build the image
 
-5. Compile the Phoenix JARs from your working tree and build the harness container image:
+4. Compile the Phoenix JARs from your local working tree and assemble the harness container image:
 
    ```sh
    px-cluster build

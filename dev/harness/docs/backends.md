@@ -434,7 +434,9 @@ ephemeral ports: the client RPC port of `MRClientService`, the task umbilical po
 setting to pin these ports. Because they bind across all interfaces of the NodeManager container,
 they remain isolated to the private harness network, and none of them are published on the host.
 The MapReduce shuffle handler likewise binds all container interfaces on the `shuffle` port defined
-in the port map.
+in the port map. Similarly, the controller of the Distributed Pherf tier binds its agent channel on
+port 8790 across all interfaces of `pherf-controller-0`; because only the agents access this
+endpoint at `http://pherf-controller-0:8790`, it is not published on the host.
 
 No HTTPS endpoints are bound because no configuration template sets an HTTPS policy, leaving all
 policies at `HTTP_ONLY`. The self-test suite verifies that every published port conforms to
@@ -447,6 +449,47 @@ rejected by the loader terminates the process with exit code 2. A missing port-m
 error: in its absence, `sb_endpoint` returns exit code 6 and `sb_preflight` reports a warning.
 Additionally, `sb_restart_drain` looks up the instance's `rpc` port via `PX_PORT_<ROLE>_RPC_<INDEX>`
 whenever the region-mover command template uses `{port}`.
+
+### The Distributed Pherf tier
+
+Setting `PX_PHERF=1` renders the Distributed Pherf tier—comprising 1 controller and
+`PX_PHERF_AGENT_COUNT` agents (1 to 9 in general, and 1 to 2 in the validation class)—as the
+on-demand role group `pherf` of the deployment, defining the roles `pherf-controller` and
+`pherf-agent` with the group label `pherf` and the start label `on-demand`. Because `pherf-agent` is
+a scaled role, running `px-cluster scale pherf-agent N` changes the agent count. Both services run
+the `PX_PHERF_IMAGE_TAG` image built from `docker/pherf`, read no harness environment file, and
+receive the `PHERF_*` variables in `phoenix-pherf-distributed/README.md`: `command` set to
+`["controller", "start"]` or `["agent",
+"start"]`, `PHERF_JAVA_OPTS` with `-XX:MaxRAMPercentage` set to 50 for the controller and 35 for an
+agent, the health probe `/opt/pherf/healthcheck.sh <role>`, and the memory limits
+`PX_PHERF_CONTROLLER_MEM_MIB` and `PX_PHERF_AGENT_MEM_MIB` with swap limits set equal to memory
+limits. The controller declares the `rest` port family, `PX_PORT_PHERF_CONTROLLER_REST` (8780),
+passed as `PHERF_REST_PORT` and published on `127.0.0.1` of the host for operator access, and mounts
+the volume `pherf-controller-0-data` at `/var/lib/pherf/run`. Each agent connects to the controller
+at `http://pherf-controller-0:8790` and connects to the cluster through `PHERF_ZOOKEEPER`. Harness
+code accesses the REST API exclusively via `sb_exec` inside `pherf-controller` instance 0
+(`lib/fleet.sh`) and never through a host-published port. The preflight memory check accounts for
+this group alongside the other on-demand groups, and `px-cluster group start pherf` re-runs the
+memory check before starting the group.
+
+The `PX_PHERF_TARGET` setting determines which cluster the agents target.
+
+* `harness`, the default: the tier joins the main cluster deployment and its network, setting
+  `PHERF_ZOOKEEPER` to `zookeeper-0:<PX_PORT_ZOOKEEPER_CLIENT>`. Setting `PX_PHERF_ZOOKEEPER` in
+  this mode fails with exit code 2.
+* `external`: the deployment provisions the tier by itself, within its own scope and network, to
+  target a cluster external to the harness. `PHERF_ZOOKEEPER` is populated from
+  `PX_PHERF_ZOOKEEPER`, which must be set explicitly by the operator: it is required, and any
+  character outside `[A-Za-z0-9._:,/-]` fails with exit code 2. No file in the repository working
+  tree stores a hardcoded ZooKeeper quorum. In this mode, the topology record captures the run
+  parameters, the tier settings, and the version set from the pherf image staging record, while
+  omitting all harness cluster roles.
+
+Because the tier acts as the load generator rather than a cluster daemon, the log subject of the
+cluster checks preserves the logs of the `pherf` group without counting any of their lines, and the
+`all` collector target omits the group—just as it omits the setup role—across all collectors. Even
+so, the restart, OOM, and container checks, together with the continuous anomaly monitor in
+`px-run`, continue to monitor the tier.
 
 ### The topology record
 
@@ -466,6 +509,12 @@ Section "Versions and the HBase profile" in the README defines this version set.
 sizing variable—`PX_<KEY>_MEM_MIB`, `PX_<KEY>_HEAP_MIB`, or `PX_<KEY>_DIRECT_MIB`—that differs from
 that class's configuration file. `px-run` reads both fields from the bundle copy and marks any
 measurement run executed on a cluster of a different class or with sizing overrides as contaminated.
+The two memory limits of the Distributed Pherf tier, `PX_PHERF_CONTROLLER_MEM_MIB` and
+`PX_PHERF_AGENT_MEM_MIB`, are tracked as sizing variables as well. When `PX_PHERF=1` is enabled, the
+topology record also includes `PX_PHERF`, `PX_PHERF_TARGET`, `PX_PHERF_AGENT_COUNT`,
+`PX_PHERF_IMAGE_TAG`, `PX_GROUP_PHERF`, and `PX_GROUP_PHERF_MEM_MIB`, and appends `pherf` to
+`PX_GROUPS`, whereas `PX_TOPOLOGY_MEM_EAGER_MIB` excludes the on-demand tier. Rendering a deployment
+without the tier produces an output identical to deployments prior to the introduction of the tier.
 
 ## The functions
 

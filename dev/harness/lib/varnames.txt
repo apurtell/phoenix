@@ -229,4 +229,11 @@ PX_ZOOKEEPER_VERSION     # build argument and topology: the ZooKeeper that HBase
 PX_HBASE_HADOOP_VERSION  # build argument and topology: the Hadoop client that HBase ships
 PX_BUILD_JDK             # the JDK major version of the Maven build, 11, 17 or 21
 PX_BUILD_JAVA_HOME       # the JDK home of the Maven build, of that version
-PX_BUILD_DISTRIBUTED     # 1 also builds phoenix-pherf-distributed
+
+# --- Distributed Pherf ------------------------------------------------------
+PX_PHERF                 # 1 renders, builds and stages the Distributed Pherf tier
+PX_PHERF_TARGET          # harness: the tier joins the harness deployment; external: tier only
+PX_PHERF_ZOOKEEPER       # the ZooKeeper quorum of an external target, only from the operator
+PX_PHERF_AGENT_COUNT     # the agents of the tier, 1 to 9; 1 to 2 in the validation class
+PX_PHERF_CONTROLLER_MEM_MIB # the container limit of the controller
+PX_PHERF_AGENT_MEM_MIB   # the container limit of each agent

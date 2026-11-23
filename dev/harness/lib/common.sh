@@ -1796,9 +1796,11 @@ EOF
 # PX_<KEY>_MEM_MIB, PX_<KEY>_HEAP_MIB, or PX_<KEY>_DIRECT_MIB.
 PX_SIZING_KEYS="ZK NN SNN DN RM NM JHS MASTER RS CLIENT TOOLING SETUP"
 
-## @description  Reports each sizing variable whose loaded value differs from the run-class file for
-##               PX_RUN_CLASS, identifying overrides of the sizing defined by the class.
-## @return       Writes the space-separated variable names in table order to stdout and exits 0.
+# Compares loaded sizing variables, including tier limits, against the run-class file for
+# PX_RUN_CLASS to identify any overrides of the class-defined sizing.
+## @description  Reports each sizing variable name, including tier limits, whose loaded value
+##               differs from the PX_RUN_CLASS run-class file.
+## @return       Writes the space-separated names in table order to stdout and exits 0.
 px_sizing_overrides() {
   local file table key part name value out=""
   file="${PX_CLASS_ENV:-${PX_ENV_DIR:-$PX_HOME/$PX_DEPLOY_SUBDIR/env}/class-${PX_RUN_CLASS:-}.env}"
@@ -1808,10 +1810,11 @@ px_sizing_overrides() {
   fi
   # Because the run-class file is plain text, a single pass extracts every sizing assignment in it.
   table="$(awk '{ sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
-    /^PX_[A-Z]+_(MEM|HEAP|DIRECT)_MIB[ \t]*=/ {
+    /^PX_[A-Z_]+_(MEM|HEAP|DIRECT)_MIB[ \t]*=/ {
       k = $0; sub(/[ \t]*=.*/, "", k); v = $0; sub(/^[^=]*=[ \t]*/, "", v)
       gsub(/^["\047]|["\047]$/, "", v); print k "\t" v }' "$file")"
-  for key in $PX_SIZING_KEYS; do
+  # Each Pherf tier defines only a memory limit; its heap is derived as a share of that limit.
+  for key in $PX_SIZING_KEYS PHERF_CONTROLLER PHERF_AGENT; do
     for part in MEM HEAP DIRECT; do
       name="PX_${key}_${part}_MIB"
       value="$(px_tsv_get "$name" "$table" || true)"

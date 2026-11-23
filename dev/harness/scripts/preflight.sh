@@ -40,11 +40,12 @@
 # host. That disk check covers only the bundles and logs stored under PX_OUT rather than the
 # internal disk of the engine, and the run class sets both minimum requirements.
 #
-# The memory sum includes every service in the deployment, including on-demand groups, because a
-# group started later still adds its container limits to the same engine. A deployment that cannot
-# accommodate its on-demand group is therefore refused upfront before its first container starts.
-# Because engine conditions can change between initial startup and a later group activation,
-# px-cluster runs the memory phase again before each group start through px_memory_recheck.
+# The memory sum includes every service in the deployment, including on-demand groups such as the
+# YARN tier and the Distributed Pherf tier, because a group started later still adds its container
+# limits to the same engine. A deployment that cannot accommodate its on-demand groups is therefore
+# refused upfront before its first container starts. Because engine conditions can change between
+# initial startup and a later group activation, px-cluster runs the memory phase again before each
+# group start through px_memory_recheck.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh

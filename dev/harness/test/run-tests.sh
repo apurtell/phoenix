@@ -153,6 +153,8 @@ T_IMG=""
 T_ENVD=""
 T_ZK_PORT=""
 T_ZK_PID=""
+T_H3=""
+T_H3_BIN=""
 
 # Default CLI options for executing against the fake selftest cluster recorded by t_seed_deployment:
 # a full validation run configuration, and the cluster identifier option alone.
@@ -1024,6 +1026,16 @@ start)
     fake_rewrite id "$1" exited 'Exited (1) 1 second ago'
   elif [ -e "$fake_state/start-unready" ]; then
     fake_rewrite id "$1" running 'Up 1 second (health: starting)'
+  elif [ -e "$fake_state/start-then-exit-0" ]; then
+    # The instance starts and is healthy, and it exits 0 after the next listing.
+    fake_rewrite id "$1" running 'Up 1 second (healthy)'
+    awk -F '|' -v OFS='|' -v id="$1" '$1 == id { $4 = "exited"; $5 = "Exited (0) 1 second ago" }
+      { print }' "$fake_inv" >"$fake_state/next.txt"
+  elif [ -e "$fake_state/start-then-absent" ]; then
+    # The instance starts and is healthy, and it is removed after the next
+    # listing.
+    fake_rewrite id "$1" running 'Up 1 second (healthy)'
+    awk -F '|' -v id="$1" '$1 != id' "$fake_inv" >"$fake_state/next.txt"
   else
     fake_rewrite id "$1" running 'Up 1 second (healthy)'
   fi
@@ -1053,7 +1065,9 @@ build)
 image)
   if [ "${1:-}" = inspect ]; then
     printf 'sha256:f00dfeed0001\n'
-  elif [ "${1:-}" = ls ] && [ ! -e "$fake_state/no-image" ]; then
+  elif [ "${1:-}" = ls ] && [ ! -e "$fake_state/no-image" ] &&
+    ! grep -qxF -- "${!#}" "$fake_state/missing-images" 2>/dev/null; then
+    # missing-images lists each reference that the host does not hold.
     printf 'sha256:f00dfeed0001\n'
   fi
   ;;
@@ -2246,6 +2260,7 @@ t_setup() {
   t_fixtures_a3
   t_fixtures_a5
   t_fixtures_a6
+  t_h3_fixtures
 }
 
 # ---------------------------------------------------------------------------
@@ -2638,12 +2653,13 @@ t_group_commands() {
       own="$own $name"
     fi
   done
-  # Entry points deferred to a later round must respond to --help and reject any other invocation
-  # with the unsupported exit code, whereas collector tools reject an unrecognized subcommand.
-  for name in px-pherf px-k3d; do
-    t_run "$T_BASH" "$T_BIN/$name" run
-    [ "$T_STATUS" = 5 ] || stub="$stub $name=$T_STATUS"
-  done
+  # A command implemented in a later round responds to --help and rejects every other invocation
+  # with the unsupported exit code, whereas a collector tool rejects an unknown subcommand.
+  t_run "$T_BASH" "$T_BIN/px-k3d" run
+  [ "$T_STATUS" = 5 ] || stub="$stub px-k3d=$T_STATUS"
+  # The px-pherf run subcommand requires a suite.
+  t_run "$T_BASH" "$T_BIN/px-pherf" run
+  [ "$T_STATUS" = 2 ] || stub="$stub px-pherf=$T_STATUS"
   for name in px-profile px-jfr px-trace-count; do
     t_run "$T_BASH" "$T_BIN/$name" run
     [ "$T_STATUS" = 2 ] || stub="$stub $name=$T_STATUS"
@@ -5223,7 +5239,7 @@ t_group_a2_dist() {
   text="$(grep -rn 'http://' "$PX_HOME/scripts" "$PX_HOME/$PX_DEPLOY_SUBDIR" 2>/dev/null)"
   t_contains fetch_http_scan_reads_the_tree "pherf/compose.yaml:" "$text"
   bad="$(printf '%s\n' "$text" | grep -v ':[[:space:]]*#' | grep -v 'www.apache.org/licenses' |
-    grep -vE "http://(127\\.0\\.0\\.1|\\\$host|controller:)")"
+    grep -vE "http://(127\\.0\\.0\\.1|\\\$host|controller:|pherf-controller-0:)")"
   t_empty fetch_no_http_download_target "$bad"
   t_curl_body 'https://www.apache.org/dyn/closer.lua?path=x/bar-1.tar.gz&asjson=1' \
     '{"preferred": "https://dlcdn.apache.org/"}'
@@ -7217,20 +7233,25 @@ printf 'probe %s\n' "$*" >>"$PX_FAKE_STATE_DIR/probe.log"
 [ ! -e "$PX_FAKE_STATE_DIR/probe-fails" ] || exit 1
 printf 'done every subject is verified\n'
 A5_EOF
-  # Materialize the fake JDK for client 0, which logs its command line and emulates the requested
-  # Java main class. PhoenixRuntime returns SYSTEM.CATALOG rows with UPDATE_CACHE_FREQUENCY set to
-  # 60000 for each table named in a catalog query, or otherwise emits the output of a two-statement
-  # script. Pherf loads pherf.properties from the first classpath entry (matching how the real
-  # Pherf reads it from the classpath) and, during its -q query phase, writes one aggregate CSV
-  # with the Header.java column header to the result directory configured in that file or to
-  # RESULTS in its working directory. When the hdr directory exists in the fake state, -q also
-  # copies its files into the sibling <results>_HDR directory, mirroring how Pherf writes its
-  # latency report and verdict. When the pherf-gate-fails flag file is present, Pherf exits with
-  # code 65, mirroring how its pre-run gate rejects a refused scenario. Any other main class prints
-  # two ad hoc metrics.
+  # Materialize the fake JDK for client 0, which records its command line and emulates the main
+  # class that it runs. PhoenixRuntime returns SYSTEM.CATALOG rows for a catalog query, with
+  # UPDATE_CACHE_FREQUENCY set to 60000 for each table named by the query, or otherwise emits the
+  # output of a two-statement script. Pherf reads pherf.properties from the first classpath entry
+  # (matching how the real Pherf reads it from the classpath), and its -q query phase writes one
+  # aggregate CSV with the Header.java column header into the result directory configured in that
+  # file, or otherwise into RESULTS in its working directory. When the hdr directory exists in the
+  # fake state, -q also copies its files into the sibling <results>_HDR directory, mirroring how
+  # Pherf writes its latency report and verdict. The pherf-gate-fails flag file causes Pherf to
+  # exit with code 65, mirroring how its pre-run gate handles a refused scenario, and the
+  # catalog-sleeps flag file delays the catalog query for 30 s. The java-naps flag file adds a 2 s
+  # delay to every invocation except the catalog query, while any other class emits two ad hoc
+  # metrics.
   cat >"$T_A5/jdk/fake/bin/java" <<'A5_EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$PX_FAKE_STATE_DIR/java.log"
+if [ -e "$PX_FAKE_STATE_DIR/java-naps" ] && ! grep -q 'SYSTEM.CATALOG' "${!#}" 2>/dev/null; then
+  sleep 2
+fi
 java_cp=""
 java_prev=""
 for java_arg in "$@"; do
@@ -7240,6 +7261,7 @@ for java_arg in "$@"; do
   org.apache.phoenix.util.PhoenixRuntime)
     java_sql=${!#}
     if grep -q 'SYSTEM.CATALOG' "$java_sql" 2>/dev/null; then
+      [ ! -e "$PX_FAKE_STATE_DIR/catalog-sleeps" ] || exec sleep 30
       printf 'TABLE_SCHEM TABLE_NAME UPDATE_CACHE_FREQUENCY \n----- ----- ----- \n'
       sed -n "s/.*TABLE_NAME IN (\(.*\));.*/\1/p" "$java_sql" | tr ',' '\n' | tr -d "'" |
         awk 'NF { print "<null> " $1 " 60000" }'
@@ -9128,7 +9150,8 @@ A5_EOF
 ## @return       Writes matching occurrences to stdout, or nothing for a compliant tree. Exit 0.
 t_driver_sb_calls() {
   local file
-  for file in "$1"/drivers/*/driver.sh "$1"/plugins/*/driver.sh; do
+  for file in "$1"/drivers/*/driver.sh "$1"/drivers/lib/*.sh "$1"/lib/fleet.sh \
+    "$1"/plugins/*/driver.sh; do
     [ -f "$file" ] || continue
     grep -noE 'sb_[a-z_]+' "$file" | awk -F: -v f="$file" \
       '$2 !~ /^sb_(exec|copy_in|copy_out|load)$/ { print f ":" $1 ":" $2 }'
@@ -10921,8 +10944,29 @@ t_group_h2_report() {
     END { print n + 0 }' "$run/verdicts.tsv")"
   t_contains pherf_verdict_of_another_source_names_the_line 'line 3: source "px-run"' \
     "$(t_detail_of "$run" pherf.verdict)"
-  # Verify that when an open-loop -mt execution writes no aggregate CSV, the latency report alone
-  # supplies the steady-state metrics.
+  # Verify that a near miss of the check expression is rejected because each dot in the expression
+  # matches only a literal dot, and that a repeated check is also rejected.
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/VERDICT_run.tsv"
+  awk -F '\t' -v OFS='\t' 'NR == 2 { gsub(/[.]/, "X", $1) } { print }' "$fixture" >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_verdict_refuses_a_near_miss_check "0 FAIL 0 yes" "$T_STATUS\
+ $(t_severity_of "$run" pherf.verdict) $(awk -F '\t' '$4 == "pherf" { n++ } END { print n + 0 }' \
+    "$run/verdicts.tsv") $(t_flag 'line 2: check "pherfXhealthX' \
+    "$(t_detail_of "$run" pherf.verdict)")"
+  run="$(t_a5_bundle)"
+  t_h2_report_bundle "$run" hdr
+  fixture="$run/drivers/pherf/results_HDR/VERDICT_run.tsv"
+  awk -F '\t' -v OFS='\t' 'NR == 2 { k = $1 } NR == 3 { $1 = k } { print }' "$fixture" \
+    >"$fixture.new"
+  mv "$fixture.new" "$fixture"
+  t_h2_report "$run"
+  t_equals pherf_verdict_refuses_a_repeated_check "0 FAIL yes" "$T_STATUS\
+ $(t_severity_of "$run" pherf.verdict) $(t_flag 'line 3: check' \
+    "$(t_detail_of "$run" pherf.verdict)")"
+  # Verify that when a -mt run writes no aggregate CSV, the report alone supplies the metrics.
   run="$(t_a5_bundle)"
   t_h2_report_bundle "$run" hdr
   rm -rf "$run/drivers/pherf/results"
@@ -11102,6 +11146,1602 @@ t_h2_hdr_run() {
 }
 
 # ---------------------------------------------------------------------------
+# H3: Distributed load-generation tier integration in the harness
+# ---------------------------------------------------------------------------
+# The distributed tier is modeled as the on-demand pherf role group within the harness deployment,
+# and every test case executes against the deployment layer fakes. The stub controller is
+# implemented as a fake curl binary placed first on PATH: because the fake runtime executes
+# commands targeted at pherf-controller 0 directly on the host, curl invocations inside that exec
+# resolve to the stub, which serves responses from the pherf/ subdirectory of the fake runtime
+# state directory.
+
+## @description  Materializes the stub controller and agent list fixtures for the px-pherf test
+##               cases.
+## @return       Exit 0.
+t_h3_fixtures() {
+  T_H3="$T_WORK/h3"
+  T_H3_BIN="$T_H3/bin"
+  mkdir -p "$T_H3_BIN" "$T_H3/agents"
+  cat >"$T_H3_BIN/curl" <<'H3_EOF'
+#!/usr/bin/env bash
+# The stub controller. It reads the command line of the REST client of the
+# harness, logs "METHOD PATH" to calls.log, keeps the body of each call as
+# body-<n>.json and answers from the reply files of its directory. A reply
+# file holds an HTTP status on its first line and the body after it. A
+# status of 400 or more exits 22, as curl --fail-with-body does. A flag file
+# selects a fault.
+st="${PX_FAKE_STATE_DIR:-/nonexistent}/pherf"
+mkdir -p "$st"
+method=GET url="" body=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -X) method=$2 && shift ;;
+  -H | --max-time | --noproxy) shift ;;
+  --data-binary) body=1 && shift ;;
+  -*) ;;
+  *) url=$1 ;;
+  esac
+  shift
+done
+path="/${url#http://*/}"
+printf '%s %s\n' "$method" "$path" >>"$st/calls.log"
+n="$(wc -l <"$st/calls.log" | tr -d ' ')"
+[ "$body" = 0 ] || cat >"$st/body-$n.json"
+if [ -e "$st/unreachable" ]; then
+  printf 'curl: (7) Failed to connect to 127.0.0.1 port 8780\n' >&2
+  exit 7
+fi
+## @description  Writes one reply file (name, sed expression) and exits with the code of its status.
+## @return       Exits 0, or 22 for a status of 400 or more.
+reply() {
+  local file="$st/$1" status
+  [ -f "$file" ] || file="$st/not-found"
+  status="$(sed -n 1p "$file" 2>/dev/null)"
+  sed -e 1d -e "${2:-}" "$file" 2>/dev/null
+  [ "${status:-404}" -lt 400 ] || exit 22
+  exit 0
+}
+## @description  Reports how many calls of the log match one expression (expression).
+## @return       Writes the count to stdout. Exit 0.
+count() { grep -c "^$1\$" "$st/calls.log"; }
+case "$method $path" in
+"GET /v1/agents")
+  k="$(count 'GET /v1/agents')"
+  [ ! -f "$st/agents-$k" ] || reply "agents-$k"
+  reply agents
+  ;;
+# Each test and each run gets the number of its call in its id.
+"POST /v1/tests")
+  reply test "s/\(\"id\":\"t-[0-9TZ]*-\)[0-9]*\"/\1$(count 'POST /v1/tests')\"/"
+  ;;
+"POST /v1/tests/"*/runs)
+  reply run "s/\(\"runId\":\"[0-9TZ]*-\)[0-9]*\"/\1$(count 'POST /v1/tests/.*/runs')\"/"
+  ;;
+"GET /v1/tests/"*/status)
+  # Each run is RUNNING for the count of the file running, then ends.
+  k="$(grep -cxF "$method $path" "$st/calls.log")"
+  [ "$k" -gt "$(cat "$st/running" 2>/dev/null || echo 0)" ] || reply status-running
+  reply status
+  ;;
+"GET /v1/tests/"*/report) reply report ;;
+"GET /v1/tests/"*/bundle) reply bundle ;;
+"GET /v1/tests/"*/bundle/*) reply "files/${path#*/bundle/}" ;;
+"POST /v1/tests/"*/cancel) reply cancel ;;
+"POST /v1/tests/"*/end) reply end ;;
+esac
+reply not-found
+H3_EOF
+  chmod +x "$T_H3_BIN/curl"
+  t_fleet_fixture "$T_H3/fx"
+  # Probe script that resolves bundle collector targets for all roles and then for the controller
+  # explicitly by name.
+  cat >"$T_H3/targets.sh" <<'H3_EOF'
+. "$PX_HOME/lib/common.sh"
+. "$PX_HOME/lib/collect.sh"
+ck_targets all
+ck_targets pherf-controller
+H3_EOF
+}
+
+## @description  Writes a stub GET /v1/agents response (file name, agent id:state...) containing
+##               the controller AgentView fields and a fault description for any FAULTED agent.
+## @return       Exit 0.
+t_h3_agents() {
+  local file="$T_A2_STATE/pherf/$1" entry sep=""
+  shift
+  mkdir -p "$T_A2_STATE/pherf"
+  {
+    printf '200\n{"agents": ['
+    for entry in "$@"; do
+      printf '%s{"id": "%s", "incarnation": "i-%s", "state": "%s", "phase": "IDLE",' "$sep" \
+        "${entry%%:*}" "${entry%%:*}" "${entry#*:}"
+      [ "${entry#*:}" != FAULTED ] || printf ' "fault": "the fixture fault",'
+      printf ' "registeredMs": 1795376000000, "lastSeenMs": 1795376001000}'
+      sep=", "
+    done
+    printf ']}\n'
+  } >"$file"
+}
+
+## @description  Resets the stub controller state directory for the deployment fakes.
+## @return       Exit 0.
+t_h3_reset() {
+  rm -rf "$T_A2_STATE/pherf"
+  mkdir -p "$T_A2_STATE/pherf"
+  printf '404\n{"error": "not_found", "message": "no such path"}\n' \
+    >"$T_A2_STATE/pherf/not-found"
+}
+
+## @description  Executes a command with the deployment fakes and the stub controller on PATH.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_h3() { t_a2 "PATH=$T_H3_BIN:$T_A2_BIN:$T_SHIM_DIR:$PATH" "$@"; }
+
+## @description  Executes px-pherf against the deployment fakes and the stub controller.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_h3_pherf() { t_h3 "$T_BASH" "$T_BIN/px-pherf" "$@"; }
+
+## @description  Extracts the rows belonging to group pherf from a rendered service table
+##               (directory).
+## @return       Writes the matching rows to stdout. Exit 0.
+t_h3_tier() { awk -F '\t' '$4 == "pherf"' "$1/services.tsv" 2>/dev/null; }
+
+## @description  Extracts a single service definition block (directory, service) from a rendered
+##               Compose file.
+## @return       Writes the service block lines to stdout. Exit 0.
+t_h3_block() {
+  awk -v s="  $2:" '$0 == s { f = 1; print; next } f && /^ ? ?[^ ]/ { f = 0 } f' \
+    "$1/compose.yaml" 2>/dev/null
+}
+
+## @description  Finds every ZooKeeper client port quorum reference under the given paths (path...),
+##               excluding hostnames in the reserved .invalid domain, formatted as file:line:match.
+## @return       Writes the matching lines to stdout. Exit 0.
+t_h3_quorums() {
+  grep -rnoE '[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+:2181|PHERF_ZOOKEEPER[=:][ "]*[A-Za-z0-9][^ "]*' \
+    "$@" 2>/dev/null | grep -vE '(\.invalid:2181|127\.0\.0\.1:2181|[" ]zookeeper-0:2181)$' || true
+}
+
+## @description  Verifies tier rendering across its enablement switch, targets, fail-closed checks,
+##               and service definitions (RQ-249, RQ-251 to RQ-254).
+## @return       Records test assertions. Exit 0.
+t_group_h3_render() {
+  local dir="$T_A2_OUT/deploy/h3m" ext="$T_A2_OUT/deploy/h3x" rows text bad="" line got
+  local quorum='zk1.h3.invalid:2181,zk2.h3.invalid:2181/hbase' tag=px-pherf:hbase-2.6.7-profile-2.6
+  local record
+  printf '# H3: the tier in the render\n'
+  t_gen --class measurement --cluster h3d
+  text="$(cat "$T_A2_OUT/deploy/h3d/compose.yaml" "$T_A2_OUT/deploy/h3d/topology.env" \
+    "$T_A2_OUT/deploy/h3d/services.tsv" 2>/dev/null)"
+  t_equals pherf_default_render_holds_no_tier "0 no no" "$T_STATUS $(t_flag pherf "$text")\
+ $(t_flag PX_PHERF "$text")"
+  # Verify RQ-251 and RQ-254: the measurement class renders one controller and three agents.
+  t_gen --class measurement --cluster h3m -e PX_PHERF=1
+  rows="$(t_h3_tier "$dir")"
+  t_equals pherf_measurement_renders_one_controller_three_agents \
+    "0 pherf-controller-0 pherf-agent-0 pherf-agent-1 pherf-agent-2" \
+    "$T_STATUS $(printf '%s\n' "$rows" | cut -f 1 | paste -sd ' ' -)"
+  t_equals pherf_measurement_renders_three_agents 3 \
+    "$(printf '%s\n' "$rows" | awk -F '\t' '$2 == "pherf-agent"' | grep -c .)"
+  # Verify RQ-249: the tier memory limits sum to 1024 + 3 x 1536 = 5632 MiB, which is included in
+  # the total topology memory footprint but excluded from the eager startup footprint.
+  t_equals pherf_tier_limits_sum_to_5632_mib "5632 5632 47616 31744" "$(t_mem_sum "$rows")\
+ $(t_env_value "$dir/topology.env" PX_GROUP_PHERF_MEM_MIB PX_TOPOLOGY_MEM_MIB \
+      PX_TOPOLOGY_MEM_EAGER_MIB)"
+  t_equals pherf_service_rows "$(t_rows 9 pherf-controller-0 pherf-controller 0 pherf on-demand \
+    1024 512 0 17 pherf-agent-2 pherf-agent 2 pherf on-demand 1536 537 0 17)" \
+    "$(printf '%s\n' "$rows" | sed -n '1p;$p')"
+  t_equals pherf_topology_names_the_tier \
+    "1 harness 3 $tag pherf-controller pherf-agent yarn pherf" \
+    "$(t_env_value "$dir/topology.env" PX_PHERF PX_PHERF_TARGET PX_PHERF_AGENT_COUNT \
+      PX_PHERF_IMAGE_TAG PX_GROUP_PHERF PX_GROUPS)"
+  t_equals pherf_port_map_holds_the_rest_port 8780 \
+    "$(t_env_value "$dir/ports.generated.env" PX_PORT_PHERF_CONTROLLER_REST)"
+  t_equals pherf_controller_service "  pherf-controller-0:
+    image: \"$tag\"
+    pull_policy: never
+    hostname: \"pherf-controller-0\"
+    networks:
+      - default
+    restart: \"no\"
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    labels:
+      px.harness.cluster: \"h3m\"
+      px.harness.group: \"pherf\"
+      px.harness.index: \"0\"
+      px.harness.role: \"pherf-controller\"
+      px.harness.start: \"on-demand\"
+    command: [\"controller\", \"start\"]
+    environment:
+      PHERF_JAVA_OPTS: \"-XX:MaxRAMPercentage=50\"
+      PHERF_REST_PORT: \"8780\"
+    healthcheck:
+      test: [\"CMD\", \"/opt/pherf/healthcheck.sh\", \"controller\"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
+    ports:
+      - \"127.0.0.1:8780:8780\"
+    volumes:
+      - pherf-controller-0-data:/var/lib/pherf/run" "$(t_h3_block "$dir" pherf-controller-0)"
+  t_equals pherf_agent_service "  pherf-agent-1:
+    image: \"$tag\"
+    pull_policy: never
+    hostname: \"pherf-agent-1\"
+    networks:
+      - default
+    restart: \"no\"
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    labels:
+      px.harness.cluster: \"h3m\"
+      px.harness.group: \"pherf\"
+      px.harness.index: \"1\"
+      px.harness.role: \"pherf-agent\"
+      px.harness.start: \"on-demand\"
+    command: [\"agent\", \"start\"]
+    environment:
+      PHERF_CONTROLLER: \"http://pherf-controller-0:8790\"
+      PHERF_JAVA_OPTS: \"-XX:MaxRAMPercentage=35\"
+      PHERF_ZOOKEEPER: \"zookeeper-0:2181\"
+    healthcheck:
+      test: [\"CMD\", \"/opt/pherf/healthcheck.sh\", \"agent\"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 60s" "$(t_h3_block "$dir" pherf-agent-1)"
+  t_equals pherf_controller_volume_carries_the_cluster_label "1" "$(grep -c \
+    '^  pherf-controller-0-data:$' "$dir/compose.yaml" 2>/dev/null)"
+  # Verify RQ-252: the tier services join the harness network and resolve the harness ZooKeeper
+  # endpoint from the generated port map.
+  t_equals pherf_tier_joins_the_harness_network "4 1" "$(for line in pherf-controller-0 \
+    pherf-agent-0 pherf-agent-1 pherf-agent-2; do t_h3_block "$dir" "$line"; done |
+    grep -c '^      - default$') $(awk '/^networks:/ { n = 1; next } /^[a-z]/ { n = 0 }
+    n && /^  [a-z]/ { c++ } END { print c + 0 }' "$dir/compose.yaml")"
+  t_equals pherf_agents_resolve_the_harness_zookeeper "3 zookeeper-0:$(t_env_value \
+    "$dir/ports.generated.env" PX_PORT_ZOOKEEPER_CLIENT)" "$(grep -c \
+    '^      PHERF_ZOOKEEPER: "zookeeper-0:2181"$' "$dir/compose.yaml") $(sed -n \
+    's/^      PHERF_ZOOKEEPER: "\(.*\)"$/\1/p' "$dir/compose.yaml" | sort -u)"
+  t_equals pherf_tier_reads_no_harness_environment_file 0 "$(for line in pherf-controller-0 \
+    pherf-agent-0; do t_h3_block "$dir" "$line"; done | grep -c 'env_file')"
+  # Verify external target rendering: only the distributed tier services are rendered, and the
+  # ZooKeeper quorum is taken exclusively from the operator-supplied environment variable.
+  t_gen --class measurement --cluster h3x -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+    -e "PX_PHERF_ZOOKEEPER=$quorum"
+  t_equals pherf_external_renders_the_tier_only \
+    "0 pherf-controller pherf-agent pherf-agent pherf-agent" \
+    "$T_STATUS $(grep -v '^#' "$ext/services.tsv" 2>/dev/null | cut -f 2 | paste -sd ' ' -)"
+  t_equals pherf_external_quorum_comes_only_from_the_variable "3 3" "$(grep -rn 'h3.invalid' \
+    "$ext" | grep -c .) $(grep -cxF "      PHERF_ZOOKEEPER: \"$quorum\"" "$ext/compose.yaml")"
+  t_equals pherf_external_topology_holds_the_tier_and_the_version_set \
+    "external 2.6 2.6.7 3.8.6 pherf  " "$(t_env_value "$ext/topology.env" PX_PHERF_TARGET \
+      PX_PHOENIX_HBASE_PROFILE PX_DIST_HBASE_VERSION PX_ZOOKEEPER_VERSION PX_GROUPS \
+      PX_DN_COUNT PX_GROUP_YARN)"
+  t_gen --class measurement --cluster h3y -e PX_PHERF=1 -e PX_PHERF_TARGET=external
+  t_equals pherf_external_target_needs_a_quorum "2 yes no" "$T_STATUS $(t_flag \
+    PX_PHERF_ZOOKEEPER "$T_STDERR") $(t_exists "$T_A2_OUT/deploy/h3y")"
+  t_gen --class measurement --cluster h3y -e PX_PHERF_TARGET=external \
+    -e "PX_PHERF_ZOOKEEPER=$quorum"
+  t_equals pherf_external_target_needs_the_tier "2 yes" \
+    "$T_STATUS $(t_flag 'PX_PHERF=1' "$T_STDERR")"
+  t_gen --class measurement --cluster h3y -e PX_PHERF=1 -e "PX_PHERF_ZOOKEEPER=$quorum"
+  t_equals pherf_harness_target_refuses_an_external_quorum "2 yes no" "$T_STATUS $(t_flag \
+    PX_PHERF_ZOOKEEPER "$T_STDERR") $(t_exists "$T_A2_OUT/deploy/h3y")"
+  bad=""
+  for line in "zk\$x:2181" 'zk":2181' "zk':2181" 'zk\x:2181' 'zk#1:2181' 'zk 1:2181' "\`zk\`"; do
+    t_gen --class measurement --check -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+      -e "PX_PHERF_ZOOKEEPER=$line"
+    [ "$T_STATUS" = 2 ] || bad="$bad [$line] gave $T_STATUS"
+  done
+  t_empty pherf_quorum_grammar_refuses_a_dollar_or_quote "$bad"
+  bad=""
+  for line in PX_PHERF=yes PX_PHERF_TARGET=cloud PX_PHERF_AGENT_COUNT=0 \
+    PX_PHERF_AGENT_COUNT=10 PX_PHERF_AGENT_MEM_MIB=1.5g PX_PHERF_CONTROLLER_MEM_MIB= \
+    PX_PHERF_IMAGE_TAG=reg.io/px-pherf:t; do
+    got=PX_PHERF=1
+    [ "${line%%=*}" != PX_PHERF ] || got=$line
+    t_gen --class measurement --check -e "$got" -e "$line"
+    case "$T_STATUS:$T_STDERR" in
+    2:*"${line%%=*}"*) ;;
+    *) bad="$bad [$line] gave $T_STATUS" ;;
+    esac
+  done
+  t_empty pherf_render_fails_closed_on_each_tier_value "$bad"
+  t_gen --class measurement --check -e PX_PHERF=1 -e PX_PHERF_AGENT_COUNT=9
+  t_equals pherf_agent_count_ceiling_is_nine "0 9" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' '$2 == "pherf-agent"' | grep -c .)"
+  # Verify that an image tag whose staging record specifies a mismatched version set is rejected.
+  record="$T_A2_OUT/images/$(px_image_stage_name px-pherf:h3-other).staged.tsv"
+  t_rows 2 image_tag px-pherf:h3-other hbase_profile 2.5 hbase_version 2.5.15 \
+    zookeeper_version 3.8.4 hbase_hadoop_version 3.3.6 >"$record"
+  t_gen --class measurement --check -e PX_PHERF=1 -e PX_PHERF_IMAGE_TAG=px-pherf:h3-other
+  t_equals pherf_image_record_of_another_version_set_is_refused "2 yes" "$T_STATUS $(t_flag \
+    'px-pherf:h3-other was staged with hbase_profile' "$T_STDERR")"
+  rm -f "$record"
+  # Verify RQ-253: the validation class permits one or two agents and defaults to two agents with a
+  # combined tier memory footprint of 1024 + 2 x 1536 MiB.
+  t_gen --class validation --check -e PX_PHERF=1
+  rows="$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$4 == "pherf"')"
+  t_equals pherf_validation_renders_two_agents "0 pherf-controller-0 pherf-agent-0 pherf-agent-1\
+ 4096" "$T_STATUS $(printf '%s\n' "$rows" | cut -f 1 | paste -sd ' ' -) $(t_mem_sum "$rows")"
+  t_gen --class validation --check -e PX_PHERF=1 -e PX_PHERF_AGENT_COUNT=1
+  t_equals pherf_validation_admits_one_agent "0 1" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' '$2 == "pherf-agent"' | grep -c .)"
+  t_gen --class validation --check -e PX_PHERF=1 -e PX_PHERF_AGENT_COUNT=3
+  t_equals pherf_validation_refuses_three_agents "2 yes" "$T_STATUS $(t_flag \
+    'PX_PHERF_AGENT_COUNT' "$T_STDERR")"
+  # Verify that px-cluster surfaces the generator's error diagnostic and closes the error stream
+  # with only its own exit summary line.
+  t_a2 "$T_BASH" "$T_BIN/px-cluster" --class validation -e PX_PHERF=1 \
+    -e PX_PHERF_AGENT_COUNT=3 --dry-run render
+  t_equals render_refusal_has_one_exit_line "2 yes yes 1" "$T_STATUS $(t_flag \
+    'the validation class runs 1 to 2 agents' "$T_STDERR") $(t_flag \
+    'px-cluster: render ends (exit 2, usage)' "$(t_last_line "$T_STDERR")") $(printf '%s\n' \
+    "$T_STDERR" | grep -c '(exit ')"
+  # Verify that pherf-agent is registered as a scalable role whose instance count can be set via
+  # the --scale option.
+  t_gen --class measurement --check -e PX_PHERF=1 --scale pherf-agent=4
+  t_equals pherf_agent_is_a_scaled_role "0 4" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' '$2 == "pherf-agent"' | grep -c .)"
+  # Verify that a tier memory limit that diverges from the class default is recorded as a sizing
+  # override.
+  t_gen --class measurement --cluster h3o -e PX_PHERF=1 -e PX_PHERF_AGENT_MEM_MIB=2048
+  t_equals pherf_tier_limit_override_is_named "PX_PHERF_AGENT_MEM_MIB" \
+    "$(t_env_value "$T_A2_OUT/deploy/h3o/topology.env" PX_SIZING_OVERRIDES)"
+  t_equals pherf_tier_defaults_name_no_override "" \
+    "$(t_env_value "$dir/topology.env" PX_SIZING_OVERRIDES)"
+  # Verify that a jvm-opts plugin hook cannot target a tier role key because the distributed tier
+  # exposes no harness JVM option variable name.
+  mkdir -p "$T_A2/tierhook/hooks"
+  printf '%s\n' PX_PLUGIN_ID=tierhook PX_PLUGIN_CONTRACT=1 PX_PLUGIN_HOOKS=jvm-opts \
+    >"$T_A2/tierhook/plugin.env"
+  printf '#!/usr/bin/env bash\nprintf "PHERF_AGENT -Dx=1\\n"\n' >"$T_A2/tierhook/hooks/jvm-opts"
+  chmod +x "$T_A2/tierhook/hooks/jvm-opts"
+  t_gen --class measurement --cluster h3h -e PX_PHERF=1 -e "PX_PLUGIN_DIRS=$T_A2/tierhook" \
+    -e PX_PLUGINS=tierhook
+  t_equals pherf_jvm_opts_hook_refuses_a_tier_key "2 yes no" "$T_STATUS $(t_flag \
+    'PHERF_AGENT' "$T_STDERR") $(t_exists "$T_A2_OUT/deploy/h3h")"
+  # Verify RQ-252: no file in the source tree contains a hardcoded external ZooKeeper quorum, and
+  # the scanner positively detects a planted quorum in a canary directory.
+  t_empty no_external_quorum_in_the_tree "$(t_h3_quorums "$PX_TREE_ROOT/dev" \
+    "$PX_TREE_ROOT/phoenix-pherf-distributed/src" \
+    "$PX_TREE_ROOT/phoenix-pherf-distributed/README.md")"
+  mkdir -p "$T_H3/canary"
+  # Construct the planted canary quorum strings dynamically so this test file itself contains no
+  # literal quorum match.
+  printf 'PHERF_ZOOKEEPER=%s:2181\n' zk1.example.com >"$T_H3/canary/a.env"
+  printf -- '-z %s:2181\n' zk2.example.com >"$T_H3/canary/b.sh"
+  got="$(t_h3_quorums "$T_H3/canary")"
+  t_equals no_external_quorum_scan_finds_a_planted_one "2" "$(printf '%s\n' "$got" | awk -F: '
+    { f[$1] = 1 } END { n = 0; for (k in f) n++; print n }')"
+}
+
+## @description  Verifies the preflight memory check for the distributed tier against a simulated
+##               48 GiB container engine (RQ-249).
+## @return       Records test assertions. Exit 0.
+t_group_h3_preflight() {
+  local pf="$PX_HOME/scripts/preflight.sh" pc="$T_BIN/px-cluster" dir="$T_A2_OUT/deploy/a2" row
+  printf '# H3: the tier in the memory check\n'
+  printf '51539607552\n' >"$T_A2_STATE/mem-total"
+  t_gen --class measurement --cluster h3p -e PX_PHERF=1
+  t_a2 PX_CLUSTER_ID=h3p "$T_BASH" "$pf" --phase memory
+  row="$(printf '%s\n' "$T_STDOUT" | grep "^memory_fit${PX_TAB}")"
+  t_equals preflight_refuses_topology_yarn_and_tier "3 yes yes yes" "$T_STATUS $(t_flag \
+    'the limits 47616 MiB' "$row") $(t_flag 'budget 45056 MiB' "$row") $(t_flag \
+    'exceed the budget by 2560 MiB' "$row")"
+  t_contains preflight_counts_the_agents_on_demand "memory:pherf-agent${PX_TAB}ok${PX_TAB}3 x \
+1536 MiB = 4608 MiB, group pherf starts on demand" "$T_STDOUT"
+  t_gen --class measurement --cluster h3p -e PX_PHERF=1 -e PX_YARN=0
+  t_a2 PX_CLUSTER_ID=h3p "$T_BASH" "$pf" --phase memory
+  t_equals preflight_admits_the_tier_without_yarn "0 yes" "$T_STATUS $(t_flag \
+    '7680 MiB (7.50 GiB) to spare' "$T_STDOUT")"
+  t_gen --class measurement --cluster h3p -e PX_PHERF=1 -e PX_RS_COUNT=2
+  t_a2 PX_CLUSTER_ID=h3p "$T_BASH" "$pf" --phase memory
+  t_equals preflight_admits_the_tier_with_two_regionservers "0 yes" "$T_STATUS $(t_flag \
+    '2048 MiB (2.00 GiB) to spare' "$T_STDOUT")"
+  # Verify that starting the on-demand group re-evaluates the memory preflight check against the
+  # recorded deployment topology.
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_gen --class measurement --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_a2 "$T_BASH" "$pc" --cluster a2 up "$dir" --no-wait
+  t_equals pherf_cluster_comes_up_with_the_tier_created "0 4" "$T_STATUS $(grep -c \
+    '|pherf|on-demand|' "$T_A2_STATE/instances.txt")"
+  printf '51539607552\n' >"$T_A2_STATE/mem-total"
+  t_shim_log_reset
+  t_a2 "$T_BASH" "$pc" --cluster a2 group start pherf --timeout 5
+  t_equals group_start_reruns_the_memory_check "3 yes no" "$T_STATUS $(t_flag \
+    'the memory check refused the start of group pherf' "$T_STDERR") $(t_flag ' start ' \
+    "$(cat "$T_SHIM_LOG")")"
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_a2 "$T_BASH" "$pc" --cluster a2 group start pherf --timeout 5
+  t_equals group_start_starts_the_tier "0 4" "$T_STATUS $(grep '|pherf|on-demand|' \
+    "$T_A2_STATE/instances.txt" | grep -c '|running|')"
+  t_equals group_start_of_the_tier_is_planned "pherf-agent pherf-controller" "$(awk -F '\t' \
+    '$2 == "group_start" && $5 == "group pherf" { print $3 }' \
+    "$T_A2_OUT/state/planned-px-a2.tsv" 2>/dev/null | LC_ALL=C sort -u | paste -sd ' ' -)"
+  t_a2 "$T_BASH" "$pc" --cluster a2 down
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+## @description  Verifies the tier build pipeline, confirming that a single switch controls the
+##               Maven module, the pherf image, and the harness staging context (RQ-248).
+## @return       Records test assertions. Exit 0.
+t_group_h3_build() {
+  local home="$T_A2/tree/dev/harness" tree="$T_A2/tree" bp="$PX_HOME/scripts/build-phoenix.sh"
+  local module="$T_A2/tree/phoenix-pherf-distributed" jdk="$T_A2/jdk/17" sa ctx text
+  local dist_pins=()
+  local pins_env=("PX_IMAGE_BASE_JDK11_SHA256_ARM64=$(printf '1%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK17_SHA256_ARM64=$(printf '7%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK21_SHA256_ARM64=$(printf '2%.0s' $(seq 1 64))")
+  sa="$PX_HOME/scripts/stage-artifacts.sh"
+  printf '# H3: the build of the tier\n'
+  mkdir -p "$module/src/main/bin" "$module/src/main/conf"
+  printf '<project/>\n' >"$module/pom.xml"
+  printf '#!/usr/bin/env bash\necho fake\n' >"$module/src/main/bin/pherf-distributed.sh"
+  printf 'status = warn\n' >"$module/src/main/conf/log4j2.properties"
+  touch -t 202001010000 "$module/pom.xml" "$module/src/main/bin/pherf-distributed.sh" \
+    "$module/src/main/conf/log4j2.properties"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" PX_PHERF=1 "$T_BASH" "$bp" --tree "$tree" -n
+  t_equals pherf_switch_builds_the_distributed_module "0 yes" "$T_STATUS $(t_flag \
+    ',phoenix-pherf-distributed' "${T_STDOUT//\\/}")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -n
+  t_equals pherf_switch_off_builds_no_distributed_module "0 no" "$T_STATUS $(t_flag \
+    phoenix-pherf-distributed "${T_STDOUT//\\/}")"
+  t_equals pherf_switch_retires_the_build_name 0 "$(grep -c 'PX_BUILD_DISTRIBUTED' \
+    "$PX_HOME/lib/varnames.txt" "$PX_HOME/$PX_DEPLOY_SUBDIR/env/defaults.env" "$bp" |
+    awk -F: '{ s += $NF } END { print s + 0 }')"
+  # Verify RQ-248: the harness image staging context excludes the distributed jar even when the
+  # build record lists one, and the harness Dockerfile accepts no build argument for it.
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_PHERF=1
+  dist_pins=("PX_DIST_HBASE_2_6_7_SHA512_ARM64=$(px_sha512 "$T_A2/dist-src/hbase-2.6.7.tar.gz")"
+    "PX_DIST_HADOOP_3_4_3_SHA512_ARM64=$(px_sha512 "$T_A2/dist-src/hadoop-3.4.3.tar.gz")")
+  t_shim_log_reset
+  t_a2 "${dist_pins[@]}" "${pins_env[@]}" "$T_BASH" "$sa"
+  ctx="$T_A2_OUT/images/$(px_image_stage_name px-harness:hbase-2.6.7-hadoop-3.4.3-profile-2.6)"
+  text="$(cat "$T_SHIM_LOG")"
+  t_equals harness_context_holds_no_distributed_jar "0 yes 0 no 0" "$T_STATUS $(t_flag \
+    distributed_jar "$(cat "$T_A2_OUT/build/phoenix/build.tsv")") $(find "$ctx/phoenix" \
+    -name 'phoenix-pherf-distributed-*' 2>/dev/null | grep -c .) $(t_flag \
+    PX_STAGED_PHOENIX_DISTRIBUTED "$text") $(grep -c 'DISTRIBUTED' \
+    "$PX_HOME/$PX_DEPLOY_SUBDIR/image/Dockerfile")"
+  # Verify px-cluster build: enabling the tier switch includes the distributed Maven module and
+  # stages the px-pherf container image alongside the harness image.
+  rm -rf "$home"
+  mkdir -p "${home%/*}"
+  cp -R "$PX_HOME" "$home"
+  : >"$T_A2_MVN_LOG"
+  t_shim_log_reset
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$jdk" "${pins_env[@]}" "${dist_pins[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$home/bin/px-cluster" -e PX_PHERF=1 build
+  t_equals build_with_the_tier_stages_the_pherf_image "0 yes 1 1" "$T_STATUS $(t_flag \
+    phoenix-pherf-distributed "$(cat "$T_A2_MVN_LOG")") $(grep -c '^build --tag px-harness:' \
+    "$T_SHIM_LOG") $(grep -c '^build --tag px-pherf:hbase-2.6.7-profile-2.6 ' "$T_SHIM_LOG")"
+  # Under --backend k8s, the build still runs against the local engine and then imports both images
+  # into the px-k3d cluster for that context, whereas any other context directs the operator to
+  # px-cluster push.
+  mkdir -p "$T_A2_OUT/state/px-k3d"
+  printf 'scope\tk3d-px\n' >"$T_A2_OUT/state/px-k3d/scope-k3d-px.tsv"
+  t_shim_log_reset
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$jdk" "${pins_env[@]}" "${dist_pins[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$home/bin/px-cluster" --backend k8s \
+    -e PX_PHERF=1 build
+  t_equals build_on_px_k3d_imports_both_images "0 1 1 2" "$T_STATUS $(grep -c \
+    '^build --tag px-harness:' "$T_SHIM_LOG") $(grep -c '^build --tag px-pherf:' \
+    "$T_SHIM_LOG") $(grep -c '^k3d image import -c px ' "$T_SHIM_LOG")"
+  t_shim_log_reset
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$jdk" "${pins_env[@]}" "${dist_pins[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$home/bin/px-cluster" --backend k8s \
+    -e PX_K8S_CONTEXT=remote-u3 build
+  t_equals build_on_a_remote_context_names_push "0 1 0 yes" "$T_STATUS $(grep -c \
+    '^build --tag px-harness:' "$T_SHIM_LOG") $(grep -c '^k3d ' "$T_SHIM_LOG") $(t_flag \
+    'promote the images with px-cluster push BUNDLE' "$T_STDERR")"
+  rm -rf "$T_A2_OUT/state/px-k3d"
+  : >"$T_A2_MVN_LOG"
+  t_shim_log_reset
+  t_a2 "PX_HOME=$home" "PX_BUILD_JAVA_HOME=$jdk" "${pins_env[@]}" "${dist_pins[@]}" \
+    PX_FAKE_MVN_PRODUCT=target/jHiccup.jar "$T_BASH" "$home/bin/px-cluster" build
+  t_equals build_without_the_tier_stages_no_pherf_image "0 no 1 0" "$T_STATUS $(t_flag \
+    phoenix-pherf-distributed "$(cat "$T_A2_MVN_LOG")") $(grep -c '^build --tag px-harness:' \
+    "$T_SHIM_LOG") $(grep -c '^build --tag px-pherf:' "$T_SHIM_LOG")"
+  # Verify that cluster bring-up when the px-pherf image is missing reports the missing image tag
+  # and directs the operator to stage the pherf image.
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  printf 'px-pherf:hbase-2.6.7-profile-2.6\n' >"$T_A2_STATE/missing-images"
+  t_a2 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 up "$T_A2_OUT/deploy/a2"
+  rm -f "$T_A2_STATE/missing-images"
+  t_equals image_check_hint_names_the_pherf_image "6 yes yes" "$T_STATUS $(t_flag \
+    'no image px-pherf:hbase-2.6.7-profile-2.6' "$T_STDERR") $(t_flag \
+    'run px-cluster build --cluster a2 -e PX_PHERF=1' "$T_STDERR")"
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  rm -rf "$module"
+}
+
+## @description  Verifies px-pherf start, status, stop, and run subcommands against the deployment
+##               fakes and the stub controller (RQ-247, RQ-251, RQ-253).
+## @return       Records test assertions. Exit 0.
+t_group_h3_pherf() {
+  local dir="$T_A2_OUT/deploy/a2" suite="$T_H3/one.suite" calls got
+  local quorum='zk1.h3.invalid:2181'
+  printf '# H3: px-pherf\n'
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  printf 'suite: h3-one\ntimeout: 60\nclass: validation\n\ntest: one\n' >"$suite"
+  printf '  driver: %s\n  args: 0\n' "$T_WORK/drivers/exit-code.sh" >>"$suite"
+  # When no cluster is recorded, start brings the cluster up with the tier enabled and leaves it
+  # running.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class validation start
+  got="$(cat "$T_SHIM_LOG")"
+  t_equals px_pherf_start_brings_the_cluster_up "0 yes yes" "$T_STATUS $(t_flag \
+    ' up --no-start' "$got") $(t_flag 'start pherf-agent-0 pherf-agent-1 pherf-controller-0' \
+    "$got")"
+  t_equals pherf_start_from_nothing_leaves_the_cluster_up "yes no yes" "$(t_exists \
+    "$T_A2_OUT/state/scope-compose-a2") $(t_flag ' down --volumes' "$got") $(t_flag \
+    "PX_PHERF='1'" "$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)")"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  t_h3_pherf --cluster a2 --class validation run
+  t_equals px_pherf_run_needs_a_suite 2 "$T_STATUS"
+  t_h3_pherf --cluster a2 bogus
+  t_equals px_pherf_refuses_an_unknown_subcommand 2 "$T_STATUS"
+  # Verify that a cluster rendered without the distributed tier enabled rejects a tier start
+  # request because the pherf role group is absent.
+  t_gen --class validation --cluster a2
+  t_a2_provision "$dir"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 up "$dir" --no-wait
+  t_h3_pherf --cluster a2 --class validation start
+  t_equals px_pherf_start_needs_the_tier_in_the_render "6 yes" "$T_STATUS $(t_flag \
+    'was rendered without the tier: run px-cluster down, then px-pherf start' "$T_STDERR")"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  # Verify RQ-253: in the validation class, starting the tier brings up the role group and waits
+  # for two agents to register as IDLE.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 up "$dir" --no-wait
+  t_h3_reset
+  t_h3_agents agents-1 pherf-agent-0:IDLE
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class validation start
+  calls="$(cat "$T_A2_STATE/pherf/calls.log" 2>/dev/null)"
+  t_equals px_pherf_validation_start_waits_for_two "0 yes 2" "$T_STATUS $(t_flag \
+    'start pherf-agent-0 pherf-agent-1 pherf-controller-0' "$(cat "$T_SHIM_LOG")")\
+ $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "IDLE"' | grep -c .)"
+  t_equals px_pherf_start_waits_for_late_registration "2 GET /v1/agents" \
+    "$(printf '%s\n' "$calls" | grep -c .) $(printf '%s\n' "$calls" | sort -u)"
+  t_contains px_pherf_reaches_the_api_inside_the_controller \
+    'exec -T --index=1 pherf-controller-0 bash -c' "$(cat "$T_SHIM_LOG")"
+  t_h3_pherf --cluster a2 status
+  t_equals px_pherf_status_reports_the_group_and_the_agents "0 pherf 3 3 up|2" "$T_STATUS\
+ $(printf '%s\n' "$T_STDOUT" | sed -n 1p | tr '\t' ' ')|$(printf '%s\n' "$T_STDOUT" |
+      grep -c '^pherf-agent-[01]')"
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 stop
+  t_equals px_pherf_stop_stops_the_group "0 0" "$T_STATUS $(grep '|pherf|on-demand|' \
+    "$T_A2_STATE/instances.txt" | grep -c '|running|')"
+  # Verify that an agent that fails to register within the readiness window causes a timeout, and
+  # that a failed start automatically stops the on-demand group unless --keep is specified.
+  t_h3_agents agents pherf-agent-0:IDLE
+  rm -f "$T_A2_STATE/pherf/agents-1"
+  t_h3_pherf --cluster a2 --class validation -e PX_TIMEOUT_READY=2 start
+  t_equals px_pherf_start_times_out_on_a_missing_agent "4 yes" "$T_STATUS $(t_flag \
+    pherf-agent-1 "$T_STDERR")"
+  t_equals px_pherf_failed_start_stops_the_tier 0 "$(grep '|pherf|on-demand|' \
+    "$T_A2_STATE/instances.txt" | grep -c '|running|')"
+  t_h3_pherf --cluster a2 --class validation --keep -e PX_TIMEOUT_READY=2 start
+  t_equals px_pherf_failed_start_keeps_the_tier_with_keep "4 3" "$T_STATUS $(grep \
+    '|pherf|on-demand|' "$T_A2_STATE/instances.txt" | grep -c '|running|')"
+  # Because only a reset clears a FAULTED agent and the harness never issues a reset, the readiness
+  # wait terminates immediately upon observing a faulted agent in the first agent list rather than
+  # polling until the timeout bound expires.
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:FAULTED
+  t_h3_pherf --cluster a2 --class validation -e PX_TIMEOUT_READY=600 start
+  t_equals px_pherf_start_fails_at_once_on_a_faulted_agent "3 yes 1" "$T_STATUS $(t_flag \
+    'pherf-agent-1 is FAULTED, and only a reset clears it: the fixture fault' "$T_STDERR")\
+ $(grep -c '^GET /v1/agents$' "$T_A2_STATE/pherf/calls.log")"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  # Verify RQ-251: in the measurement class, starting the tier brings up one controller and waits
+  # for three agents to reach the IDLE state.
+  t_gen --class measurement --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 up "$dir" --no-wait
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE pherf-agent-2:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class measurement start
+  t_equals px_pherf_start_starts_the_group_and_waits_for_three_idle "0 yes yes 3" "$T_STATUS\
+ $(t_flag 'start pherf-agent-0 pherf-agent-1 pherf-agent-2 pherf-controller-0' \
+    "$(cat "$T_SHIM_LOG")") $(t_flag "memory_fit${PX_TAB}ok" "$T_STDERR") $(printf '%s\n' \
+    "$T_STDOUT" | awk -F '\t' '$2 == "IDLE"' | grep -c .)"
+  t_equals px_pherf_start_records_the_planned_group_start "pherf-agent pherf-controller" \
+    "$(awk -F '\t' '$2 == "group_start" && $5 == "group pherf" { print $3 }' \
+      "$T_A2_OUT/state/planned-px-a2.tsv" 2>/dev/null | LC_ALL=C sort -u | paste -sd ' ' -)"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  # Verify external target lifecycle management: start brings up the standalone tier deployment,
+  # and stop tears the entire deployment down.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+    -e "PX_PHERF_ZOOKEEPER=$quorum"
+  t_a2_provision "$dir"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class validation -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+    -e "PX_PHERF_ZOOKEEPER=$quorum" start
+  t_equals px_pherf_external_start_brings_the_tier_up "0 yes 3" "$T_STATUS $(t_flag \
+    ' up --no-start' "$(cat "$T_SHIM_LOG")") $(grep -c '|running|' "$T_A2_STATE/instances.txt")"
+  t_h3_pherf --cluster a2 --class validation -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+    -e "PX_PHERF_ZOOKEEPER=$quorum" stop
+  t_equals px_pherf_stop_removes_the_external_tier "0 0 no" "$T_STATUS $(grep -c . \
+    "$T_A2_STATE/instances.txt") $(t_exists "$T_A2_OUT/state/scope-compose-a2")"
+  # Verify RQ-247: px-pherf run provisions the cluster with the distributed tier, executes the
+  # suite, and tears down every instance at session end unless --keep is specified to retain them.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class validation run "$suite"
+  got="$(cat "$T_SHIM_LOG")"
+  t_equals px_pherf_run_tears_the_tier_down_by_default "0 yes yes 0 no" "$T_STATUS $(t_flag \
+    ' up --no-start' "$got") $(t_flag 'start pherf-agent-0 pherf-agent-1 pherf-controller-0' \
+    "$got") $(grep -c . "$T_A2_STATE/instances.txt") $(t_exists \
+    "$T_A2_OUT/state/scope-compose-a2")"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_h3_pherf --cluster a2 --class validation --keep run "$suite"
+  t_equals px_pherf_run_keep_retains_the_tier "0 3 yes" "$T_STATUS $(grep '|pherf|on-demand|' \
+    "$T_A2_STATE/instances.txt" | grep -c '|running|') $(t_exists \
+    "$T_A2_OUT/state/scope-compose-a2")"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  # Because run tears down only resources it brought up, executing against an already running
+  # cluster stops the tier it started while leaving the cluster itself up.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 up "$dir" --no-wait
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class validation run "$suite" --only one
+  got="$(cat "$T_SHIM_LOG")"
+  t_equals pherf_run_on_an_up_cluster_stops_only_the_tier "0 yes 0 no" "$T_STATUS $(t_exists \
+    "$T_A2_OUT/state/scope-compose-a2") $(grep '|pherf|on-demand|' "$T_A2_STATE/instances.txt" |
+    grep -c '|running|') $(t_flag ' down --volumes' "$got")"
+  t_h3_pherf --cluster a2 --class validation run "$suite" --only one --continue-on-failure -n
+  t_equals px_pherf_run_passes_the_selection_options "0 yes" "$T_STATUS $(t_flag \
+    "--only one --continue-on-failure $suite" "$(printf '%s\n' "$T_STDOUT" |
+    grep "^plan${PX_TAB}suite${PX_TAB}px-suite ")")"
+  # Verify that the check and suite plan rows record the exact argument vectors of the underlying
+  # invocations, and that the suite row omits the -n dry-run flag.
+  t_equals px_pherf_dry_run_plans_the_argv_of_the_run \
+    "px-suite --cluster a2 --class validation --only one --continue-on-failure $suite" \
+    "$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "plan" && $2 == "suite" { print $3 }')"
+  t_equals px_pherf_dry_run_plans_the_argv_of_the_check \
+    "px-suite --cluster a2 --class validation --dry-run --only one --continue-on-failure $suite" \
+    "$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "plan" && $2 == "check" { print $3 }')"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  # Verify that a suite rejected by px-suite starts no container instances because px-pherf run
+  # validates the execution plan before provisioning. Likewise, if px-suite aborts before reaching
+  # its own teardown phase (simulated here by a pre-existing session directory), the exit hook of
+  # px-pherf run still tears down the cluster it provisioned.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 --class validation run "$T_H3/nosuch.suite"
+  t_equals px_pherf_run_of_a_missing_suite_starts_nothing "6 no no" "$T_STATUS $(t_flag \
+    ' up --no-start' "$(cat "$T_SHIM_LOG")") $(t_exists "$T_A2_OUT/state/scope-compose-a2")"
+  mkdir -p "$T_A2_OUT/sessions/h3-taken"
+  t_h3 PX_SESSION_ID=h3-taken "$T_BASH" "$T_BIN/px-pherf" --cluster a2 --class validation run \
+    "$suite"
+  t_equals px_pherf_run_removes_its_cluster_after_an_early_suite_exit "1 yes 0 no" "$T_STATUS\
+ $(t_flag ' up --no-start' "$(cat "$T_SHIM_LOG")") $(grep -c . "$T_A2_STATE/instances.txt")\
+ $(t_exists "$T_A2_OUT/state/scope-compose-a2")"
+  rm -rf "$T_A2_OUT/sessions/h3-taken"
+  # Receiving a termination signal while run is bringing the cluster up still tears down that
+  # cluster.
+  t_gen --class validation --cluster a2 -e PX_PHERF=1
+  t_a2_provision "$dir"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_shim_log_reset
+  : >"$T_H3/term.mark"
+  t_h3 "$T_BASH" "$T_WORK/probe/term-when.sh" "$T_A2_OUT/state" scope-compose-a2 \
+    "$T_H3/term.mark" "$T_BIN/px-pherf" --cluster a2 --class validation run "$suite"
+  t_equals px_pherf_run_tears_down_after_a_term_during_up "143 yes 0 no" "$T_STATUS $(t_flag \
+    ' up --no-start' "$(cat "$T_SHIM_LOG")") $(grep -c . "$T_A2_STATE/instances.txt")\
+ $(t_exists "$T_A2_OUT/state/scope-compose-a2")"
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+## @description  Verifies that the tier is treated as a load generator rather than a cluster daemon,
+##               so its log lines are not counted as daemon errors and no collector targets it.
+## @return       Records test assertions. Exit 0.
+t_group_h3_tier() {
+  local dir run
+  printf '# H3: the tier is the load generator, not a cluster daemon\n'
+  t_a5_state_reset
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|\n' c0ffee00a5f1 pherf-controller \
+    px-selftest-pherf-controller-1 running 'Up 3 minutes (healthy)' px-pherf:selftest \
+    pherf-controller-0 1 0 pherf on-demand >>"$T_A5_STATE/instances.txt"
+  dir="$(t_check_bundle tier)"
+  t_rows 9 pherf-controller-0 pherf-controller 0 pherf on-demand 1024 512 0 17 \
+    >>"$dir/cluster/services.tsv"
+  awk 'BEGIN { for (i = 0; i < 50; i++) print "2026-11-20 17:00:00 ERROR [x] e" }' \
+    >"$T_A5_STATE/logs-c0ffee00a5f1.txt"
+  t_cluster_checks "$dir"
+  t_equals tier_logs_are_kept_not_counted "PASS yes 50" "$(t_severity_of "$dir" cluster.log)\
+ $(t_flag 'load generator, kept and not counted: pherf-controller/0' "$(t_detail_of "$dir" \
+    cluster.log)") $(grep -c ERROR "$dir/logs/instance/pherf-controller-0.log" 2>/dev/null)"
+  rm -f "$T_A5_STATE/logs-c0ffee00a5f1.txt"
+  run="$PX_OUT/checks/tier"
+  t_run env "PX_RUN_DIR=$run" "$T_BASH" "$T_H3/targets.sh"
+  t_equals tier_is_no_collector_target "0 regionserver|pherf-controller" "$T_STATUS $(printf \
+    '%s\n' "$T_STDOUT" | cut -f 1 | paste -sd '|' -)"
+  t_a5_state_reset
+}
+
+## @description  Materializes the captured responses of a real controller run into a directory
+##               (directory): agents, test, run, statuses, cancel, end, 400, 409, and files/.
+## @return       Exit 0.
+t_fleet_fixture() {
+  local dir=$1
+  mkdir -p "$dir/files/drivers/pherf/results_HDR/slots"
+  # These response payloads were captured from a live execution via px-cluster exec
+  # pherf-controller 0 -- curl against the docker/pherf image in the validation class with two
+  # agents. The load step and the query step executed px_fleet_scenario.xml from suites/pherf using
+  # -schemaFile slice/px_fleet_schema.sql -l followed by -disableSchemaApply -q at 40/s for
+  # 15000 ms across 4 threads and 2000 rows. The ABORTED status payload was captured from a run of
+  # the same plan with an unknown column referenced in the query. Every payload reproduces the live
+  # capture byte for byte, except that each per-slot histogram log is truncated after its header
+  # and first two intervals. Lines exceeding 98 columns are folded with a trailing backslash and
+  # reassembled by t_unfold. Because Apache RAT rejects JSON, TSV, or log data files that lack a
+  # license header, these fixtures are materialized at runtime rather than stored as static files
+  # in the source tree.
+  t_unfold >"$dir/agents.json" <<'H3_EOF'
+{"agents":[{"id":"pherf-agent-0","incarnation":"ea05be49-0302-45a1-af7e-f3b5c56315ed","state":"ID\
+LE","phase":"IDLE","step":0,"registeredMs":1795442520704,"lastSeenMs":1795442539603,"offsetMs":20\
+,"delayMs":45},{"id":"pherf-agent-1","incarnation":"9e5dcc8c-da82-4048-9097-974322988ebc","state"\
+:"IDLE","phase":"IDLE","step":0,"registeredMs":1795442520656,"lastSeenMs":1795442539599,"offsetMs\
+":20,"delayMs":44}]}
+H3_EOF
+  t_unfold >"$dir/test.json" <<'H3_EOF'
+{"id":"t-20261123T140324434Z-2","state":"OPEN","createdMs":1795442604434,"runs":[]}
+H3_EOF
+  t_unfold >"$dir/run.json" <<'H3_EOF'
+{"runId":"20261123T140324866Z-2","state":"RUNNING","step":0,"steps":[{"index":0,"state":"RUNNING"\
+,"startAtMs":0,"slots":[{"identity":{"slot":0,"seed":7126372246263655726,"offset":0,"prefix":"p00\
+0"},"agent":"pherf-agent-0","state":"ASSIGNED","share":{"durationMs":15000,"threads":2,"rate":20,\
+"rows":1000},"heldSeq":0,"finalSeq":0,"samples":0,"counters":{}},{"identity":{"slot":1,"seed":226\
+8977538148885555,"offset":1000,"prefix":"p001"},"agent":"pherf-agent-1","state":"ASSIGNED","share\
+":{"durationMs":15000,"threads":2,"rate":20,"rows":1000},"heldSeq":0,"finalSeq":0,"samples":0,"co\
+unters":{}}]}]}
+H3_EOF
+  t_unfold >"$dir/status-running.json" <<'H3_EOF'
+{"runId":"20261123T140324866Z-2","state":"RUNNING","step":0,"steps":[{"index":0,"state":"RUNNING"\
+,"startAtMs":1795442609022,"skewMs":6,"slots":[{"identity":{"slot":0,"seed":7126372246263655726,"\
+offset":0,"prefix":"p000"},"agent":"pherf-agent-0","state":"RUNNING","share":{"durationMs":15000,\
+"threads":2,"rate":20,"rows":1000},"heldSeq":26,"finalSeq":0,"samples":542,"counters":{"query:px_\
+fleet:lookup|steady":271,"response:px_fleet:lookup|steady":271},"offsetMs":-1,"delayMs":3,"startA\
+tMs":1795442609021,"dispatchMs":1795442609022},{"identity":{"slot":1,"seed":2268977538148885555,"\
+offset":1000,"prefix":"p001"},"agent":"pherf-agent-1","state":"RUNNING","share":{"durationMs":150\
+00,"threads":2,"rate":20,"rows":1000},"heldSeq":26,"finalSeq":0,"samples":542,"counters":{"query:\
+px_fleet:lookup|steady":271,"response:px_fleet:lookup|steady":271},"offsetMs":-1,"delayMs":3,"sta\
+rtAtMs":1795442609021,"dispatchMs":1795442609022}]}]}
+H3_EOF
+  t_unfold >"$dir/status.json" <<'H3_EOF'
+{"runId":"20261123T140324866Z-2","state":"COMPLETE","step":0,"steps":[{"index":0,"state":"COMPLET\
+E","startAtMs":1795442609022,"skewMs":6,"slots":[{"identity":{"slot":0,"seed":7126372246263655726\
+,"offset":0,"prefix":"p000"},"agent":"pherf-agent-0","state":"DONE","share":{"durationMs":15000,"\
+threads":2,"rate":20,"rows":1000},"heldSeq":30,"finalSeq":30,"samples":600,"counters":{"query:px_\
+fleet:lookup|steady":300,"response:px_fleet:lookup|steady":300},"offsetMs":-1,"delayMs":3,"startA\
+tMs":1795442609021,"dispatchMs":1795442609022},{"identity":{"slot":1,"seed":2268977538148885555,"\
+offset":1000,"prefix":"p001"},"agent":"pherf-agent-1","state":"DONE","share":{"durationMs":15000,\
+"threads":2,"rate":20,"rows":1000},"heldSeq":30,"finalSeq":30,"samples":600,"counters":{"query:px\
+_fleet:lookup|steady":300,"response:px_fleet:lookup|steady":300},"offsetMs":-1,"delayMs":3,"start\
+AtMs":1795442609021,"dispatchMs":1795442609022}]}]}
+H3_EOF
+  t_unfold >"$dir/status-aborted.json" <<'H3_EOF'
+{"runId":"20261123T140408062Z-3","state":"ABORTED","reason":"agent pherf-agent-1: predicate.parse\
+ /tmp/pherf-agent-pherf-agent-1-17400994812333432315/slice/px_fleet_scenario.xml scenario px_flee\
+t querySet 1 query 1: the statement does not parse after the placeholder substitution: ERROR 602 \
+(42P00): Syntax error. Missing \"LPAREN\" at line 1, column 44.","step":0,"steps":[{"index":0,"st\
+ate":"FAILED","startAtMs":0,"slots":[{"identity":{"slot":0,"seed":7126372246263655726,"offset":0,\
+"prefix":"p000"},"agent":"pherf-agent-0","state":"FAILED","error":"agent pherf-agent-0: predicate\
+.parse /tmp/pherf-agent-pherf-agent-0-6714635016495254443/slice/px_fleet_scenario.xml scenario px\
+_fleet querySet 1 query 1: the statement does not parse after the placeholder substitution: ERROR\
+ 602 (42P00): Syntax error. Missing \"LPAREN\" at line 1, column 44.","share":{"durationMs":5000,\
+"threads":1,"rate":20,"rows":1000},"heldSeq":0,"finalSeq":0,"samples":0,"counters":{},"offsetMs":\
+-1,"delayMs":1},{"identity":{"slot":1,"seed":2268977538148885555,"offset":1000,"prefix":"p001"},"\
+agent":"pherf-agent-1","state":"FAILED","error":"agent pherf-agent-1: predicate.parse /tmp/pherf-\
+agent-pherf-agent-1-17400994812333432315/slice/px_fleet_scenario.xml scenario px_fleet querySet 1\
+ query 1: the statement does not parse after the placeholder substitution: ERROR 602 (42P00): Syn\
+tax error. Missing \"LPAREN\" at line 1, column 44.","share":{"durationMs":5000,"threads":1,"rate\
+":20,"rows":1000},"heldSeq":0,"finalSeq":0,"samples":0,"counters":{},"offsetMs":-1,"delayMs":2}]}\
+]}
+H3_EOF
+  t_unfold >"$dir/cancel.json" <<'H3_EOF'
+{"runId":"20261123T140420950Z-4","state":"CANCELLED","reason":"cancelled","step":0,"steps":[{"ind\
+ex":0,"state":"RUNNING","startAtMs":1795442665100,"slots":[{"identity":{"slot":0,"seed":712637224\
+6263655726,"offset":0,"prefix":"p000"},"agent":"pherf-agent-0","state":"CANCELLED","share":{"dura\
+tionMs":15000,"threads":2,"rate":20,"rows":1000},"heldSeq":0,"finalSeq":0,"samples":0,"counters":\
+{},"offsetMs":-1,"delayMs":4,"startAtMs":1795442665099},{"identity":{"slot":1,"seed":226897753814\
+8885555,"offset":1000,"prefix":"p001"},"agent":"pherf-agent-1","state":"CANCELLED","share":{"dura\
+tionMs":15000,"threads":2,"rate":20,"rows":1000},"heldSeq":0,"finalSeq":0,"samples":0,"counters":\
+{},"offsetMs":-1,"delayMs":3,"startAtMs":1795442665099}]}]}
+H3_EOF
+  t_unfold >"$dir/end.json" <<'H3_EOF'
+{"id":"t-20261123T140420524Z-5","state":"ENDED","createdMs":1795442660524,"endedMs":1795442664834\
+,"runs":["20261123T140420950Z-4"]}
+H3_EOF
+  t_unfold >"$dir/err-400.json" <<'H3_EOF'
+{"error":"bad_request","message":"steps[0].args[2]: -label belongs to the agent; the agent sets i\
+t"}
+H3_EOF
+  t_unfold >"$dir/err-409.json" <<'H3_EOF'
+{"error":"conflict","message":"step 0 needs 3 agents but 2 are free"}
+H3_EOF
+  t_unfold >"$dir/files/manifest.json" <<'H3_EOF'
+{
+  "bundle_format_version": 1,
+  "run": {
+    "id": "20261123T140324866Z-2",
+    "class": "validation",
+    "result": "ADVISORY",
+    "state": "COMPLETE",
+    "seed": 8070,
+    "started_ms": 1795442604866,
+    "ended_ms": 1795442624863
+  },
+  "quiet_host": {
+    "tags": [
+      "noisy-host"
+    ]
+  }
+}
+H3_EOF
+  t_unfold >"$dir/files/status.json" <<'H3_EOF'
+{
+  "runId": "20261123T140324866Z-2",
+  "state": "COMPLETE",
+  "step": 0,
+  "steps": [
+    {
+      "index": 0,
+      "state": "COMPLETE",
+      "startAtMs": 1795442609022,
+      "skewMs": 6,
+      "slots": [
+        {
+          "identity": {
+            "slot": 0,
+            "seed": 7126372246263655726,
+            "offset": 0,
+            "prefix": "p000"
+          },
+          "agent": "pherf-agent-0",
+          "state": "DONE",
+          "share": {
+            "durationMs": 15000,
+            "threads": 2,
+            "rate": 20,
+            "rows": 1000
+          },
+          "heldSeq": 30,
+          "finalSeq": 30,
+          "samples": 600,
+          "counters": {
+            "query:px_fleet:lookup|steady": 300,
+            "response:px_fleet:lookup|steady": 300
+          },
+          "offsetMs": -1,
+          "delayMs": 3,
+          "startAtMs": 1795442609021,
+          "dispatchMs": 1795442609022
+        },
+        {
+          "identity": {
+            "slot": 1,
+            "seed": 2268977538148885555,
+            "offset": 1000,
+            "prefix": "p001"
+          },
+          "agent": "pherf-agent-1",
+          "state": "DONE",
+          "share": {
+            "durationMs": 15000,
+            "threads": 2,
+            "rate": 20,
+            "rows": 1000
+          },
+          "heldSeq": 30,
+          "finalSeq": 30,
+          "samples": 600,
+          "counters": {
+            "query:px_fleet:lookup|steady": 300,
+            "response:px_fleet:lookup|steady": 300
+          },
+          "offsetMs": -1,
+          "delayMs": 3,
+          "startAtMs": 1795442609021,
+          "dispatchMs": 1795442609022
+        }
+      ]
+    }
+  ]
+}
+H3_EOF
+  t_unfold >"$dir/files/drivers/pherf/results_HDR/LATENCY_run.json" <<'H3_EOF'
+{
+  "format": "pherf-latency",
+  "version": 1,
+  "label": "run",
+  "startMs": 1795442606544,
+  "endMs": 1795442624099,
+  "recorder": {
+    "lowestUs": 1,
+    "highestUs": 600000000,
+    "significantDigits": 3
+  },
+  "hlog": "LATENCY_run.hlog",
+  "histograms": [
+    {
+      "operation": "query:px_fleet:lookup",
+      "phase": "steady",
+      "count": 600,
+      "minUs": 2418,
+      "maxUs": 1375231,
+      "meanUs": 13790.59,
+      "p50Us": 4311,
+      "p90Us": 6519,
+      "p99Us": 23087,
+      "p999Us": 1375231
+    },
+    {
+      "operation": "response:px_fleet:lookup",
+      "phase": "steady",
+      "count": 600,
+      "minUs": 2932,
+      "maxUs": 1376255,
+      "meanUs": 74359.42833333333,
+      "p50Us": 5863,
+      "p90Us": 23407,
+      "p99Us": 1234943,
+      "p999Us": 1376255
+    }
+  ],
+  "schedules": [
+    {
+      "scenario": "px_fleet",
+      "querySet": 1,
+      "operations": [
+        "query:px_fleet:lookup"
+      ],
+      "concurrency": 2,
+      "phase": "done",
+      "stopReason": "duration",
+      "startMs": 1795442609024,
+      "endMs": 1795442624025,
+      "durationMs": 15000,
+      "lastTakeMs": 1795442623976,
+      "targetRate": 0.0,
+      "queueDepth": 0,
+      "inFlight": 0,
+      "driftUs": 0,
+      "scheduled": 300,
+      "completed": 300,
+      "late": 0,
+      "dropped": 0,
+      "aborted": 0,
+      "pending": 0,
+      "maxQueueDepth": 2,
+      "maxInFlight": 2,
+      "maxDriftUs": 1278041,
+      "step": 0,
+      "slot": 0,
+      "agent": "pherf-agent-0"
+    },
+    {
+      "scenario": "px_fleet",
+      "querySet": 1,
+      "operations": [
+        "query:px_fleet:lookup"
+      ],
+      "concurrency": 2,
+      "phase": "done",
+      "stopReason": "duration",
+      "startMs": 1795442609024,
+      "endMs": 1795442624026,
+      "durationMs": 15000,
+      "lastTakeMs": 1795442623976,
+      "targetRate": 0.0,
+      "queueDepth": 0,
+      "inFlight": 0,
+      "driftUs": 0,
+      "scheduled": 300,
+      "completed": 300,
+      "late": 0,
+      "dropped": 0,
+      "aborted": 0,
+      "pending": 0,
+      "maxQueueDepth": 2,
+      "maxInFlight": 2,
+      "maxDriftUs": 1260319,
+      "step": 0,
+      "slot": 1,
+      "agent": "pherf-agent-1"
+    }
+  ],
+  "fleet": {
+    "runId": "20261123T140324866Z-2",
+    "seed": 8070,
+    "runClass": "validation",
+    "contaminated": true,
+    "state": "COMPLETE",
+    "steps": [
+      {
+        "step": 0,
+        "state": "COMPLETE",
+        "startAtMs": 1795442609022,
+        "skewMs": 6,
+        "startMs": 1795442606544,
+        "endMs": 1795442624099,
+        "slots": [
+          {
+            "slot": 0,
+            "agent": "pherf-agent-0",
+            "incarnation": "ea05be49-0302-45a1-af7e-f3b5c56315ed",
+            "seed": 7126372246263655726,
+            "offset": 0,
+            "prefix": "p000",
+            "share": {
+              "durationMs": 15000,
+              "threads": 2,
+              "rate": 20,
+              "rows": 1000
+            },
+            "state": "DONE",
+            "offsetMs": -1,
+            "delayMs": 3,
+            "startAtMs": 1795442609021,
+            "dispatchMs": 1795442609022,
+            "startLagMs": 0,
+            "frames": 30,
+            "samples": 600,
+            "counts": {
+              "query:px_fleet:lookup|steady": 300,
+              "response:px_fleet:lookup|steady": 300
+            },
+            "intervals": "slots/0-0.hlog"
+          },
+          {
+            "slot": 1,
+            "agent": "pherf-agent-1",
+            "incarnation": "9e5dcc8c-da82-4048-9097-974322988ebc",
+            "seed": 2268977538148885555,
+            "offset": 1000,
+            "prefix": "p001",
+            "share": {
+              "durationMs": 15000,
+              "threads": 2,
+              "rate": 20,
+              "rows": 1000
+            },
+            "state": "DONE",
+            "offsetMs": -1,
+            "delayMs": 3,
+            "startAtMs": 1795442609021,
+            "dispatchMs": 1795442609022,
+            "startLagMs": 0,
+            "frames": 30,
+            "samples": 600,
+            "counts": {
+              "query:px_fleet:lookup|steady": 300,
+              "response:px_fleet:lookup|steady": 300
+            },
+            "intervals": "slots/0-1.hlog"
+          }
+        ]
+      }
+    ]
+  }
+}
+H3_EOF
+  t_unfold >"$dir/files/drivers/pherf/results_HDR/LATENCY_run.hlog" <<'H3_EOF'
+#[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits, Tag=OPERA\
+TION|PHASE]
+#[Histogram log format version 1.3]
+#[StartTime: 1795442606.544 (seconds since epoch), Mon Nov 23 14:03:26 UTC 2026]
+#[BaseTime: 1795442606.544 (seconds since epoch)]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=query:px_fleet:lookup|steady,0.000,17.555,1375231.000,HISTFAAAAb942jVSu04kQQzsrXb3MBqNRqvVaHU\
+ChMQKEZ0ITieECEhOl9wHIMTvkBAiQr6EmICvICYE/uCqqod9tNt22S67fXD3uEkpn6f2yYtc6di9/E1Xn83wdYyHFU5xhkNM\
+GJGQokNGT71QQwfseOzTtsYGW1BMcvQY+B9BMUhPmAXueRQQPUA2XpLMmd+O12JDpisSg0tklutCdeULF58RSsTfJrJdwiotK\
+dHCO9NPCGJoq7mheMJY0yjBw1plGEtEYZBYzOZldA5njyH61kO2CPfXiLJKUIaLi0NaesqumJaaCeuAOTJzRK4EqC0FRkSqTF\
+qZqALV2apDsSTYSxFVWciy+55cBWPcIFxalZmcCWtr1QnFH0sfuTH2mNv7CRdmrHnQFkPN7idzgnvV3UppryRY12jQUdyYh+l\
+WQ4yAtiAaZdemnbBMQaDSWijL+CW/35fH4BjS5mvULka/CXcnDPACahFjLXCPH9w+L8+MKbwAkzYrefk04pkxO8cUVh65qAX/\
+6DlTuSMGHpruT7/6CcN+UZ7Ses5tviRi5EJf4AZiUqjf4nlF5QTXeFKhjx7vgbct7ld4/UPAb/r+A4TnGyw=
+Tag=response:px_fleet:lookup|steady,0.000,17.555,1376255.000,HISTFAAAAf942jVTPWsVQRS9c+bujsPyWB6P\
+EIIGCSGGEIKISAgprKKlRYoU4m8IYqOFhaBFsJIUIv4ASRX8BRbWYin+gPSCpLAQcs6dzds3c8/c73tm99bb04VZfmntlyeZt\
+K1/f2QP/zTF3zswXCYM2ELls4RVKvCA0Li2POMQ1C3jJp7QawEcARSFCqP0NW4VK+hQfRZhBR0RQQb/le5FwAno5Z3kwOXuqg\
+VzOcvDqJtOMmQJY0w3SfVEJ2NXOmV5KAEPWUUUbGGSi7KwhvowWmQqnl19+AAXRuZm7IYplBSBXTNY66JltnDLco+KanXgqn2\
+brES/ms2CAOnkOUOfe3OxMnhMGpzE0G69tZgO/TURLVFR2b4NWKfp24Zr7IPLOvTL6INy2SpmLugMziwdd8DqQWGO4naD4WPw\
+W6LdSkJGWhrLG42/7KP47OJug8oSq8SdD5g3FrJeABFag7lwrNG1KLC4+BKcdrgdaIleK6RF6ReY+17EzDGxVmIHFWtEY3AyR\
+5ujo85a2ogQ2ieIV21G86bzRV1l1AYPl8CbjP8Jz3He4wI4G/HD8VsknBX8Ar4VfEr46fia8MWFP2cc41/CU3wEnuEEDR3hA3\
+CAk8Tkpwn38Jofy/uE+3jFQ4AX2MW7xHYO+RzzS3nM0LvYYSs7lNvYxDr2uLbJwz4HuQLnATCe
+H3_EOF
+  t_unfold >"$dir/files/drivers/pherf/results_HDR/VERDICT_run.tsv" <<'H3_EOF'
+pherf.health.attainment	PASS	duration	pherf	lowest attainment 100.0% (step 0 slot 0 (agent pherf-\
+agent-0) scenario px_fleet query set 1: 300 of 300 completed, taken in 14952 ms of a 15000 ms win\
+dow); minimum 90%
+pherf.health.saturation	ADVISORY	duration	pherf	validation run: FAIL reads as ADVISORY; peak lag \
+1278.041 ms (step 0 slot 0 (agent pherf-agent-0) scenario px_fleet query set 1), above 1000 ms; q\
+ueue peak 2 of 2, at its bound; in-flight peak 2 of 2: the workers could not keep up; late 0, dro\
+pped 0
+pherf.health.client_pool	PASS	count	pherf	step 0 slot 0 (agent pherf-agent-0): no task waited: ta\
+sks 1, peak demand 1 of 10 threads
+pherf.health.tail_latency	ADVISORY	duration	pherf	validation run: FAIL reads as ADVISORY; 1 of 2 \
+keys over the bounds p99 1000 ms, p99.9 5000 ms; worst response:px_fleet:lookup p99 1234.943 ms, \
+p99.9 1376.255 ms
+pherf.health.read_skew	SKIP	share	pherf	step 0 slot 0 (agent pherf-agent-0): no source: pherf.ver\
+dict.serverJmx is empty
+pherf.fleet.start_skew	PASS	duration	pherf	highest start skew at most 6 ms (step 0), within the 5\
+0 ms bound
+pherf.fleet.telemetry	PASS	count	pherf	the held counts of 2 completed slots equal the counts that\
+ their agents reported
+pherf.fleet.agents	PASS	count	pherf	run COMPLETE with 2 slots done
+H3_EOF
+  t_unfold >"$dir/files/drivers/pherf/results_HDR/slots/0-0.hlog" <<'H3_EOF'
+#[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits, Tag=OPERA\
+TION|PHASE]
+#[pherf-distributed run 20261123T140324866Z-2 step 0 slot 0 agent pherf-agent-0, agent clock]
+#[Histogram log format version 1.3]
+#[StartTime: 1795442609.549 (seconds since epoch), Mon Nov 23 14:03:29 UTC 2026]
+#[BaseTime: 1795442609.549 (seconds since epoch)]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=query:px_fleet:lookup|steady,0.000,1.000,1375231.000,HISTFAAAAGF42pNpmSzMwMDgygABzFCaEUQoH3Zj\
+sP8AEVisxdTNwhTKtJCRyZRJm8mQiZNJk0mciSmaSZ1JmEkSyORkus/ExAxkKjNZMk1lBFLcTI5Mu5mYnrMCVS0sZIplAgCl1\
+g31
+Tag=response:px_fleet:lookup|steady,0.000,1.000,1376255.000,HISTFAAAAGV42pNpmSzMwMAQxgABzFCaEUQoH\
+3ZjsP8AEXhownSRm2m9FtNTPqbbHEzNbEyHWZl6WZiuMzF9Z2J6zsT0kYnpJhPTSkam44wg8iAj01oYeRgmspSRKZ4plCmWyR\
+dIgzAAsNsZgA==
+H3_EOF
+  t_unfold >"$dir/files/drivers/pherf/results_HDR/slots/0-1.hlog" <<'H3_EOF'
+#[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits, Tag=OPERA\
+TION|PHASE]
+#[pherf-distributed run 20261123T140324866Z-2 step 0 slot 1 agent pherf-agent-1, agent clock]
+#[Histogram log format version 1.3]
+#[StartTime: 1795442609.554 (seconds since epoch), Mon Nov 23 14:03:29 UTC 2026]
+#[BaseTime: 1795442609.554 (seconds since epoch)]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=query:px_fleet:lookup|steady,0.000,1.000,1354751.000,HISTFAAAAGJ42pNpmSzMwMDgygABzFCaEUQoH3Zj\
+sP8AEThtwGTOJM8kyyTJFMtkz8QkzsTExMrEwCTIxMnkzmTIxMv0lpHpLiNQajEjkzCTM1M/I9NbFqbdzCDGbCamyTlM4UwAo\
+XMOzg==
+Tag=response:px_fleet:lookup|steady,0.000,1.000,1357823.000,HISTFAAAAG142pNpmSzMwMAQxgABzFCaEUQoH\
+3ZjsP8AEThvxuTO9FuP6bYA00wuptesTLdZmbazML1mYvrKxPQSTALZFxmZNjMybWRk2s7ItJ6RaT8j00owOZGR6Sgj00xGpl\
+5GplCmeDAOZIplAgDLoxnb
+H3_EOF
+}
+
+## @description  Stages a single stub controller response file (name, HTTP status, body file) in
+##               the A5 fake state directory.
+## @return       Exit 0.
+t_h3_reply() {
+  mkdir -p "$(dirname "$T_A5_STATE/pherf/$1")"
+  { printf '%s\n' "$2" && cat "$3"; } >"$T_A5_STATE/pherf/$1"
+}
+
+## @description  Resets the A5 fakes with pherf-controller 0 and the stub controller, seeding the
+##               fixture agents, a two-poll RUNNING-to-COMPLETE run, and the fixture bundle index.
+## @return       Exit 0.
+t_h3_driver_reset() {
+  local fx="$T_H3/fx" path sep=""
+  t_a5_state_reset
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|\n' c0ffee00a5f1 pherf-controller \
+    px-selftest-pherf-controller-1 running 'Up 3 minutes (healthy)' px-pherf:selftest \
+    pherf-controller-0 1 0 pherf on-demand >>"$T_A5_STATE/instances.txt"
+  mkdir -p "$T_A5_STATE/pherf"
+  printf '404\n{"error": "not_found", "message": "no such path"}\n' \
+    >"$T_A5_STATE/pherf/not-found"
+  t_h3_reply agents 200 "$fx/agents.json"
+  t_h3_reply test 201 "$fx/test.json"
+  t_h3_reply run 201 "$fx/run.json"
+  t_h3_reply status-running 200 "$fx/status-running.json"
+  t_h3_reply status 200 "$fx/status.json"
+  t_h3_reply cancel 200 "$fx/cancel.json"
+  t_h3_reply end 200 "$fx/end.json"
+  t_h3_reply report 200 "$fx/files/drivers/pherf/results_HDR/LATENCY_run.json"
+  printf '2\n' >"$T_A5_STATE/pherf/running"
+  {
+    printf '200\n{"files":['
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      t_h3_reply "files/$path" 200 "$fx/files/$path"
+      printf '%s{"path":"%s","bytes":%s}' "$sep" "$path" "$(wc -c <"$fx/files/$path" | tr -d ' ')"
+      sep=,
+    done <<EOF
+$(cd "$fx/files" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+EOF
+    printf ']}\n'
+  } >"$T_A5_STATE/pherf/bundle.new"
+  mv "$T_A5_STATE/pherf/bundle.new" "$T_A5_STATE/pherf/bundle"
+}
+
+## @description  Executes a single lifecycle verb of the pherf-distributed driver (verb, bundle,
+##               argument...) against the A5 fakes and the stub controller, matching px-run.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_h3_verb() {
+  local verb=$1 run=$2
+  shift 2
+  t_a5 "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_RUN_DIR=$run" "PX_RUN_ID=${run##*/}" \
+    PX_DRIVER_NAME=pherf-distributed "PX_DRIVER_DIR=$run/drivers/pherf-distributed" \
+    "PX_VERB=$verb" PX_RECORD_SOURCE=driver:pherf-distributed PX_RUN_CLASS=validation \
+    PX_BACKEND=compose PX_SCOPE_ID=px-selftest "PX_PHOENIX_HOME=$T_A5/phoenix" \
+    "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$PX_HOME/drivers/pherf-distributed/driver.sh" \
+    "$verb" "$@"
+}
+
+## @description  Outputs the HTTP requests recorded by the stub controller as METHOD PATH lines.
+## @return       Writes the recorded request lines to stdout. Exit 0.
+t_h3_calls() { cat "$T_A5_STATE/pherf/calls.log" 2>/dev/null; }
+
+## @description  Verifies the pherf-distributed workload driver across its lifecycle verbs and
+##               fault conditions against the stub controller (RQ-250, RQ-253).
+## @return       Records test assertions. Exit 0.
+t_group_h3_driver() {
+  local run dir fx="$T_H3/fx" scenario schema bad="" name got calls plan pid line
+  local args=()
+  printf '# H3: the pherf-distributed driver\n'
+  scenario="$PX_HOME/suites/pherf/px_fleet_scenario.xml"
+  schema="$PX_HOME/suites/pherf/px_fleet_schema.sql"
+  args=(--scenario "$scenario" --schema "$schema" --agents 2 --rows 2000 --rate 40
+    --duration-ms 15000 --threads 4)
+  # Verify RQ-250: execute a complete end-to-end driver lifecycle run through px-run.
+  t_h3_driver_reset
+  t_shim_log_reset
+  t_a5 "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_PHOENIX_HOME=$T_A5/phoenix" \
+    "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$T_BIN/px-run" --class validation \
+    -e PX_SCOPE_ID=px-selftest pherf-distributed -- "${args[@]}"
+  run="$(t_bundle)"
+  dir="$run/drivers/pherf-distributed"
+  calls="$(t_h3_calls)"
+  t_equals driver_passes_every_verb "0 describe:0 validate:0 prepare:0 run:0 restore:0\
+ report:0" "$T_STATUS $(t_verb_codes "$run")"
+  t_equals driver_posts_the_plan_then_the_run "POST /v1/tests|POST /v1/tests/t-*-2/runs|\
+GET /v1/tests/t-*-2/runs/*-2/status" "$(printf '%s\n' "$calls" | awk '
+    /^POST \/v1\/tests$/ { n++ } n == 2 && !/^GET \/v1\/agents$/ && c < 3 {
+      sub(/t-[0-9TZ]*-/, "t-*-"); sub(/runs\/[0-9TZ]*-/, "runs/*-"); printf "%s%s", s, $0
+      s = "|"; c++ }')"
+  plan="$(t_h3_calls | grep -n '^POST /v1/tests$' | sed -n 2p | cut -d: -f1)"
+  t_equals driver_plan_is_the_posted_body yes "$(cmp -s "$dir/plan-run.json" \
+    "$T_A5_STATE/pherf/body-$plan.json" && echo yes || echo no)"
+  t_lib t_a5_json_get "$dir/plan-run.json" /steps/0/documents/px_fleet_schema.sql
+  got="$T_STDOUT"
+  t_equals driver_plan_carries_the_documents_and_shares "8070 validation true 2 -disableSchemaApply\
+ -q 40 15000 4 2000 px_fleet_scenario.xml yes yes" "$(for line in /seed /runClass \
+    /properties/pherf.verdict.noisyHost /steps/0/agents /steps/0/args/0 /steps/0/args/1 \
+    /steps/0/rate /steps/0/durationMs /steps/0/threads /steps/0/rows /steps/0/scenario; do
+    t_lib t_a5_json_get "$dir/plan-run.json" "$line"
+    printf '%s ' "$T_STDOUT"
+  done)$(t_lib t_a5_json_type "$dir/plan-run.json" /steps/0/documents/px_fleet_profile.xml
+    t_flag string "$T_STDOUT") $(t_flag 'CREATE TABLE IF NOT EXISTS PX_PHERF.FLEET' "$got")"
+  t_lib t_a5_json_get "$dir/plan-load.json" /steps/0/args/1
+  t_equals driver_load_applies_the_schema_through_the_agents \
+    "slice/px_fleet_schema.sql -l no" "$T_STDOUT $(t_lib t_a5_json_get "$dir/plan-load.json" \
+    /steps/0/args/2; printf '%s' "$T_STDOUT") $(t_lib t_a5_json_type "$dir/plan-load.json" \
+    /steps/0/rate; [ "$T_STATUS" = 6 ] && echo no || echo yes)"
+  t_equals driver_polls_until_complete "3 COMPLETE" "$(printf '%s\n' "$calls" | grep -c \
+    '/runs/[0-9TZ]*-2/status$') $(awk -F '\t' 'NR == 2 { print $5 }' "$dir/run.tsv")"
+  t_equals driver_fetches_the_report yes "$(cmp -s "$dir/report.json" \
+    "$fx/files/drivers/pherf/results_HDR/LATENCY_run.json" && echo yes || echo no)"
+  bad=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    cmp -s "$fx/files/$name" "$dir/controller/$name" || bad="$bad $name"
+  done <<EOF
+$(cd "$fx/files" && find . -type f | sed 's|^\./||')
+EOF
+  t_equals driver_copies_the_bundle_byte_for_byte "7 " "$(find "$dir/controller" -type f |
+    grep -c .) $bad"
+  t_equals driver_copies_the_load_bundle 7 "$(find "$dir/load" -type f | grep -c .)"
+  t_equals driver_bundle_validates 0 "$(t_validate "$run" >/dev/null; printf '%s' "$T_STATUS")"
+  t_equals driver_appends_the_eight_fleet_rows \
+    "$(cat "$fx/files/drivers/pherf/results_HDR/VERDICT_run.tsv")" \
+    "$(awk -F '\t' '$4 == "pherf"' "$run/verdicts.tsv")"
+  t_equals driver_records_the_merged_report "600 23087 600 1234943 PASS" \
+    "$(t_h2_value "$run" op@query_px_fleet_lookup pherf.operations)\
+ $(t_h2_value "$run" op@query_px_fleet_lookup pherf.latency.p99_us)\
+ $(t_h2_value "$run" steady@pherf pherf.operations)\
+ $(t_h2_value "$run" op@response_px_fleet_lookup pherf.latency.p99_us)\
+ $(t_severity_of "$run" pherf.latency)"
+  # Verify RQ-253: confirm agent registration evidence, per-slot workload shares for each agent,
+  # and the merged latency histogram metrics.
+  t_equals driver_records_agent_registration "yes PASS yes" "$(cmp -s "$fx/agents.json" \
+    "$dir/agents.json" && echo yes || echo no) $(t_severity_of "$run" pherf.agents) $(t_flag \
+    '2 idle agents: pherf-agent-0 pherf-agent-1' "$(t_detail_of "$run" pherf.agents)")"
+  t_equals driver_records_per_slot_shares "20 2 1000 600 0|20 2 1000 600 0" "$(for line in \
+    slot@0.0 slot@0.1; do
+    for name in rate threads rows samples start_lag_ms; do
+      printf '%s ' "$(t_h2_value "$run" "$line" "pherf.slot.$name")"
+    done
+    printf '|'
+  done | sed 's/ |/|/g; s/|$//')"
+  t_equals driver_records_one_schedule_per_slot "300 300 1278041 1260319 600" "$(for line in \
+    schedule@px_fleet.1.0.0 schedule@px_fleet.1.0.1; do
+    printf '%s ' "$(t_h2_value "$run" "$line" pherf.schedule.scheduled)"
+  done)$(for line in schedule@px_fleet.1.0.0 schedule@px_fleet.1.0.1; do
+    printf '%s ' "$(t_h2_value "$run" "$line" pherf.schedule.max_drift_us)"
+  done)$(t_h2_value "$run" steady@pherf pherf.schedule.scheduled)"
+  t_equals driver_records_the_fleet_agents_and_skew "2 6" "$(t_h2_value "$run" steady@pherf \
+    pherf.fleet.agents) $(t_h2_value "$run" steady@pherf pherf.fleet.start_skew_ms)"
+  t_equals driver_ends_each_test "yes yes 2" "$(t_flag \
+    'POST /v1/tests/t-20261123T140324434Z-1/end' "$calls") $(t_flag \
+    'POST /v1/tests/t-20261123T140324434Z-2/end' "$calls") $(awk -F '\t' \
+    'NR > 1 { t[$2] = 1 } END { n = 0; for (k in t) n++; print n }' "$dir/tests.tsv")"
+  t_contains driver_reaches_the_api_inside_the_controller \
+    'exec -T --index=1 pherf-controller-0 bash -c' "$(cat "$T_SHIM_LOG")"
+  # Verify that tampering with the merged histogram log causes the report verb latency check to
+  # fail.
+  sed '1s/highest 600000000/highest 3600000000/' \
+    "$dir/controller/drivers/pherf/results_HDR/LATENCY_run.hlog" >"$T_H3/hlog.new"
+  mv "$T_H3/hlog.new" "$dir/controller/drivers/pherf/results_HDR/LATENCY_run.hlog"
+  t_h3_verb report "$run" "${args[@]}"
+  t_equals driver_checks_the_merged_hlog FAIL "$(t_severity_of "$run" pherf.latency)"
+  # Verify RQ-250 fault handling: even when a controller run ends in the FAILED state, the driver
+  # still downloads and preserves the controller bundle.
+  t_h3_driver_reset
+  sed 's/"state":"COMPLETE"/"state":"FAILED","reason":"agent pherf-agent-1: boom"/' \
+    "$fx/status.json" >"$T_H3/failed.json"
+  t_h3_reply status 200 "$T_H3/failed.json"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals failed_run_still_copies_its_bundle "1 FAIL 7 PASS" "$T_STATUS $(t_severity_of \
+    "$run" pherf.execution) $(find "$run/drivers/pherf-distributed/controller" -type f |
+    grep -c .) $(t_severity_of "$run" pherf.bundle)"
+  # Verify that the terminal failure reason of a failed run is still recorded in the execution
+  # verdict even if downloading the controller bundle also fails.
+  t_h3_driver_reset
+  t_h3_reply status 200 "$T_H3/failed.json"
+  rm -f "$T_A5_STATE/pherf/bundle"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals failed_run_keeps_its_end_reason_after_a_failed_copy "1 FAIL yes" "$T_STATUS\
+ $(t_severity_of "$run" pherf.bundle) $(t_flag 'ended FAILED: agent pherf-agent-1: boom' \
+    "$(t_detail_of "$run" pherf.execution)")"
+  t_h3_driver_reset
+  t_h3_reply status 200 "$fx/status-aborted.json"
+  run="$(t_a5_bundle)"
+  t_h3_verb prepare "$run" "${args[@]}"
+  t_equals aborted_run_is_a_gate_failure "1 FAIL yes" "$T_STATUS $(t_severity_of "$run" \
+    pherf.gate) $(t_flag 'the statement does not parse' "$(t_detail_of "$run" pherf.gate)")"
+  t_h3_driver_reset
+  : >"$T_A5_STATE/pherf/unreachable"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals unreachable_controller_is_an_anomaly "3 ERROR" "$T_STATUS $(t_severity_of "$run" \
+    pherf.agents)"
+  t_h3_driver_reset
+  printf '{"agents":[{"id":"pherf-agent-0","incarnation":"i0","state":"IDLE"}]}\n' \
+    >"$T_H3/one-agent.json"
+  t_h3_reply agents 200 "$T_H3/one-agent.json"
+  run="$(t_a5_bundle)"
+  PX_TIMEOUT_VERB=1 t_h3_verb run "$run" "${args[@]}"
+  t_equals missing_agents_is_an_anomaly "3 ERROR yes" "$T_STATUS $(t_severity_of "$run" \
+    pherf.agents) $(t_flag pherf-agent-1:absent "$T_STDERR")"
+  t_h3_driver_reset
+  t_h3_reply run 409 "$fx/err-409.json"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals conflict_is_an_anomaly_that_names_the_cause "3 ERROR yes" "$T_STATUS $(t_severity_of \
+    "$run" pherf.agents) $(t_flag 'step 0 needs 3 agents but 2 are free' "$(t_detail_of "$run" \
+    pherf.agents)")"
+  t_h3_driver_reset
+  t_h3_reply test 400 "$fx/err-400.json"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals plan_refusal_names_the_json_path "1 FAIL yes" "$T_STATUS $(t_severity_of "$run" \
+    pherf.plan) $(t_flag 'steps[0].args[2]' "$(t_detail_of "$run" pherf.plan)")"
+  # Verify bundle integrity checks: every path in the bundle listing must stay within the target
+  # directory and match its declared byte count.
+  t_h3_driver_reset
+  t_h3_reply files/../../escaped.json 200 "$fx/files/manifest.json"
+  sed 's|"path":"manifest.json"|"path":"../../escaped.json"|' "$T_A5_STATE/pherf/bundle" \
+    >"$T_H3/bundle.new"
+  mv "$T_H3/bundle.new" "$T_A5_STATE/pherf/bundle"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals escaping_listing_path_is_refused "1 FAIL no" "$T_STATUS $(t_severity_of "$run" \
+    pherf.bundle) $(t_exists "$run/drivers/escaped.json")"
+  t_h3_driver_reset
+  sed 's|"path":"manifest.json","bytes":\([0-9]*\)|"path":"manifest.json","bytes":9\1|' \
+    "$T_A5_STATE/pherf/bundle" >"$T_H3/bundle.new"
+  mv "$T_H3/bundle.new" "$T_A5_STATE/pherf/bundle"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals short_file_fails_the_bundle "1 FAIL no" "$T_STATUS $(t_severity_of "$run" \
+    pherf.bundle) $(t_exists "$run/drivers/pherf-distributed/controller/manifest.json")"
+  t_h3_driver_reset
+  sed 's/"count": 600,/"count": 601,/' "$fx/files/drivers/pherf/results_HDR/LATENCY_run.json" \
+    >"$T_H3/report.json"
+  t_h3_reply report 200 "$T_H3/report.json"
+  run="$(t_a5_bundle)"
+  t_h3_verb run "$run" "${args[@]}"
+  t_equals report_mismatch_fails_the_bundle "1 FAIL yes" "$T_STATUS $(t_severity_of "$run" \
+    pherf.bundle) $(t_flag 'report.json differs' "$(t_detail_of "$run" pherf.bundle)")"
+  # Verify that delivering SIGTERM during the run verb cancels the active controller run.
+  t_h3_driver_reset
+  printf '1000000\n' >"$T_A5_STATE/pherf/running"
+  run="$(t_a5_bundle)"
+  (
+    exec env "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
+      "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_A5_STATE" PX_POLL_INTERVAL_S=0.2 \
+      PX_CLUSTER_ID=selftest "PX_RUN_DIR=$run" "PX_RUN_ID=${run##*/}" \
+      PX_DRIVER_NAME=pherf-distributed "PX_DRIVER_DIR=$run/drivers/pherf-distributed" \
+      PX_VERB=run PX_RECORD_SOURCE=driver:pherf-distributed PX_RUN_CLASS=validation \
+      PX_BACKEND=compose PX_SCOPE_ID=px-selftest "$T_BASH" \
+      "$PX_HOME/drivers/pherf-distributed/driver.sh" run "${args[@]}"
+  ) </dev/null >"$T_H3/term.out" 2>&1 &
+  pid=$!
+  px_wait_until 30 0.2 grep -q '/status$' "$T_A5_STATE/pherf/calls.log" || true
+  kill -s TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null
+  t_equals term_cancels_the_run "1" "$(t_h3_calls | grep -c '^POST /v1/tests/.*/runs/.*/cancel$')"
+  # Verify that delivering SIGTERM during the post-load catalog query in prepare terminates the
+  # Java process inside client 0 without sending a cancellation request, since the controller load
+  # run has already completed.
+  t_h3_driver_reset
+  : >"$T_A5_STATE/catalog-sleeps"
+  t_shim_log_reset
+  run="$(t_a5_bundle)"
+  (
+    exec env "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
+      "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_A5_STATE" PX_POLL_INTERVAL_S=0.2 \
+      PX_COLLECTORS=none "PX_JDK_ROOT=$T_A5/jdk" PX_JDK=fake "PX_CONF_DIR=$T_A5/conf" \
+      PX_LOG_DIR=/var/log/px PX_CLUSTER_ID=selftest PX_PORT_REGIONSERVER_RPC_0=16020 \
+      "PX_RUN_DIR=$run" "PX_RUN_ID=${run##*/}" PX_DRIVER_NAME=pherf-distributed \
+      "PX_DRIVER_DIR=$run/drivers/pherf-distributed" PX_VERB=prepare \
+      PX_RECORD_SOURCE=driver:pherf-distributed PX_RUN_CLASS=validation PX_BACKEND=compose \
+      PX_SCOPE_ID=px-selftest "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" \
+      "$T_BASH" "$PX_HOME/drivers/pherf-distributed/driver.sh" prepare "${args[@]}"
+  ) </dev/null >"$T_H3/term.out" 2>&1 &
+  pid=$!
+  px_wait_until 30 0.2 grep -q 'PhoenixRuntime' "$T_A5_STATE/java.log" || true
+  sleep 1
+  kill -s TERM "$pid" 2>/dev/null || true
+  got=0
+  wait "$pid" 2>/dev/null || got=$?
+  rm -f "$T_A5_STATE/catalog-sleeps"
+  t_equals term_in_prepare_stops_the_java_of_client_0 "1 yes 0" "$got $(t_stopped_after_java)\
+ $(t_h3_calls | grep -c '/cancel$')"
+  # Verify that the restore verb ends every controller test recorded in the bundle and drops the
+  # workload tables through client 0.
+  t_h3_driver_reset
+  run="$(t_a5_bundle)"
+  t_h3_verb prepare "$run" "${args[@]}"
+  t_h3_verb run "$run" "${args[@]}"
+  : >"$T_A5_STATE/pherf/calls.log"
+  : >"$T_A5_STATE/java.log"
+  t_h3_verb restore "$run" "${args[@]}"
+  t_equals restore_ends_every_test "0 2 yes" "$T_STATUS $(t_h3_calls | grep -c \
+    '^POST /v1/tests/t-[0-9TZ]*-[12]/end$') $(t_flag 'DROP TABLE IF EXISTS "PX_PHERF"."FLEET"' \
+    "$(cat "$run/drivers/pherf-distributed/restore.sql" 2>/dev/null)")"
+  # Verify that an unreachable controller during the restore verb is reported as a cluster anomaly
+  # with exit code 3.
+  : >"$T_A5_STATE/pherf/unreachable"
+  t_h3_verb restore "$run" "${args[@]}"
+  rm -f "$T_A5_STATE/pherf/unreachable"
+  t_equals restore_without_the_controller_is_an_anomaly 3 "$T_STATUS"
+  run="$(t_a5_bundle)"
+  mkdir -p "$run/cluster"
+  printf 'PX_PHERF=1\nPX_PHERF_TARGET=external\nPX_PHERF_AGENT_COUNT=2\n' \
+    >"$run/cluster/topology.env"
+  t_shim_log_reset
+  t_h3_verb restore "$run" --scenario "$scenario" --schema "$schema"
+  t_equals external_restore_skips_the_tables "0 SKIP no" "$T_STATUS $(t_severity_of "$run" \
+    pherf.tables) $(t_flag ' client-' "$(cat "$T_SHIM_LOG")")"
+  # Verify argument validation: pass-through flags that collide with driver-managed options in any
+  # spelling, scenario profile paths containing subdirectories, duplicate document basenames, and
+  # multiple schema files are all rejected.
+  run="$(t_a5_bundle)"
+  bad=""
+  for line in -l --q -label=x -scenarioFile --schemaFile=y -disableSchemaApply -runDurationMs \
+    --threadCount=2 -targetRate -rowCountOverride; do
+    t_h3_verb validate "$run" "${args[@]}" -- "$line"
+    [ "$T_STATUS" = 2 ] || bad="$bad $line:$T_STATUS"
+  done
+  t_h3_verb validate "$run" "${args[@]}" -- -allowUnknownTags
+  t_equals driver_refuses_an_owned_option_in_any_spelling " 0" "$bad $T_STATUS"
+  mkdir -p "$T_H3/docs/sub"
+  sed 's|profile="px_fleet_profile.xml"|profile="sub/p.xml"|' "$scenario" >"$T_H3/docs/a.xml"
+  cp "$schema" "$T_H3/docs/a.xml.sql"
+  cp "$scenario" "$T_H3/docs/px_fleet_schema.sql"
+  t_h3_verb validate "$run" --agents 2 --scenario "$T_H3/docs/a.xml"
+  bad="$T_STATUS"
+  t_h3_verb validate "$run" --agents 2 --scenario "$scenario" --schema \
+    "$T_H3/docs/px_fleet_schema.sql" --schema "$schema"
+  bad="$bad $T_STATUS"
+  t_h3_verb validate "$run" --agents 2 --scenario "$scenario" --schema "$schema" --schema \
+    "$T_H3/docs/a.xml.sql"
+  t_equals driver_refuses_a_profile_path_a_repeated_name_and_two_schemas "2 2 2" \
+    "$bad $T_STATUS"
+  t_h3_verb validate "$run" "${args[@]}" --weights 1,2,3
+  t_equals driver_refuses_weights_of_another_agent_count 2 "$T_STATUS"
+  t_h3_verb validate "$run" "${args[@]}"
+  t_equals driver_validate_passes "0 PASS" "$T_STATUS $(t_severity_of "$run" \
+    driver.workload_valid)"
+  t_a5_state_reset
+}
+
+## @description  Verifies the fleet measurement suite, confirming that it plans and executes three
+##               replicates and produces a validated run bundle for each (RQ-254).
+## @return       Records test assertions. Exit 0.
+t_group_h3_suite() {
+  local suite="$PX_HOME/suites/fleet.suite" session dir id runs="" bad="" n=0
+  printf '# H3: the fleet suite\n'
+  t_run env PX_SESSION_ID=h3-plan "$T_BASH" "$T_BIN/px-suite" -n "$suite"
+  t_equals fleet_suite_plans_three_replicates "0 r1 r2 r3" "$T_STATUS $(t_plan_ids "$T_STDOUT")"
+  t_equals fleet_suite_is_a_measurement_suite measurement "$(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' 'NR == 1 { print $6 }')"
+  t_h3_driver_reset
+  printf '%s\n' PX_PHERF=1 PX_PHERF_TARGET=harness PX_PHERF_AGENT_COUNT=2 \
+    >>"$T_WORK/deploy-selftest/topology.env"
+  t_a5 "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_PHOENIX_HOME=$T_A5/phoenix" \
+    "PX_HBASE_HOME=$T_A5/hbase" PX_SESSION_ID=h3-fleet PX_SCOPE_ID=px-selftest \
+    "$T_BASH" "$T_BIN/px-suite" --class validation "$suite"
+  t_equals fleet_suite_runs_every_replicate "0 3" "$T_STATUS $(printf '%s\n' "$T_STDOUT" |
+    awk -F '\t' '$3 == "PASS" || $3 == "ADVISORY"' | grep -c .)"
+  session="$PX_OUT/sessions/h3-fleet"
+  for id in r1 r2 r3; do
+    dir="$(sed -n 1p "$session/tests/$id/stdout.txt" 2>/dev/null)"
+    [ -d "$dir" ] || { bad="$bad $id:no-bundle" && continue; }
+    t_validate "$dir" >/dev/null
+    [ "$T_STATUS" = 0 ] || bad="$bad $id:validate-$T_STATUS"
+    runs="$runs$(awk -F '\t' '$1 == "run" && $3 != "" { print $3 }' \
+      "$dir/drivers/pherf-distributed/tests.tsv" 2>/dev/null)$PX_NL"
+    n=$((n + 1))
+  done
+  t_equals fleet_suite_writes_one_bundle_per_replicate "3  3" "$n $bad $(printf '%s' "$runs" |
+    sort -u | grep -c .)"
+  t_a5_state_reset
+}
+
+## @description  Verifies that a disrupted instance that exits after restart (even with exit code
+##               0) or becomes absent terminates the recovery gate immediately.
+## @return       Records test assertions. Exit 0.
+t_group_h3_gate() {
+  local run start elapsed
+  printf '# H2b follow-up: an exited instance ends the recovery gate\n'
+  t_a5_state_reset
+  printf '%s\n' 12 8 >"$T_A5_STATE/region-count"
+  : >"$T_A5_STATE/start-then-exit-0"
+  start="$(px_epoch_ms)"
+  t_a5_run phase-kill -e PX_TIMEOUT_READY=120 --disrupt 'phase:phase@kill,kill,regionserver,0'
+  elapsed=$((($(px_epoch_ms) - start) / 1000))
+  run="$(t_bundle)"
+  t_equals exited_instance_fails_the_recovery_at_once "yes fail yes" "$([ "$elapsed" -lt 30 ] &&
+    echo yes || echo "no, ${elapsed}s") $(awk -F '\t' '$1 == "recover" { print $5 }' \
+    "$run/run-record.tsv") $(t_flag exited "$T_STDERR")"
+  t_a5_state_reset
+  printf '%s\n' 12 8 >"$T_A5_STATE/region-count"
+  : >"$T_A5_STATE/start-then-absent"
+  start="$(px_epoch_ms)"
+  t_a5_run phase-kill -e PX_TIMEOUT_READY=120 --disrupt 'phase:phase@kill,kill,regionserver,0'
+  elapsed=$((($(px_epoch_ms) - start) / 1000))
+  run="$(t_bundle)"
+  t_equals absent_instance_fails_the_recovery_at_once "yes fail yes" "$([ "$elapsed" -lt 30 ] &&
+    echo yes || echo "no, ${elapsed}s") $(awk -F '\t' '$1 == "recover" { print $5 }' \
+    "$run/run-record.tsv") $(t_flag 'is absent, so it cannot recover' "$T_STDERR")"
+  t_a5_state_reset
+}
+
+# ---------------------------------------------------------------------------
 # Command-line option parsing and test suite execution
 # ---------------------------------------------------------------------------
 
@@ -11180,6 +12820,14 @@ t_group_a5_closure
 t_group_a6
 t_group_h2_report
 t_group_h2_verbs
+t_group_h3_render
+t_group_h3_preflight
+t_group_h3_build
+t_group_h3_pherf
+t_group_h3_tier
+t_group_h3_driver
+t_group_h3_suite
+t_group_h3_gate
 t_group_tree
 
 t_daemons_stop

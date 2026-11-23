@@ -276,7 +276,7 @@ ck_log() {
   local role index state ready since="-" file status counts errors=0 warnings=0 seen=0
   local error_list="" skipped="" gaps="" first="" e w x line err_max warn_max windows=""
   local excused=0 injected recovered low allow hbase hadoop allowed=0 allowed_ids="" id
-  local over_ids=""
+  local over_ids="" tier="" loader=""
   ck_live log || return 0
   ck_threshold log log.errors.max || return 0
   err_max=$CK_VALUE
@@ -310,6 +310,10 @@ EOF
   [ -f "$allow" ] || allow=/dev/null
   hbase="$(pb_env_value PX_DIST_HBASE_VERSION "$CK_RUN/cluster/topology.env")"
   hadoop="$(pb_env_value PX_DIST_HADOOP_VERSION "$CK_RUN/cluster/topology.env")"
+  # Instances belonging to the pherf group form the load generator rather than the cluster under
+  # test; the bundle still archives their logs, but their log lines are excluded from the tally.
+  tier=" $(awk -F '\t' '!/^#/ && $4 == "pherf" { printf "%s/%s ", $2, $3 }' \
+    "$CK_RUN/cluster/services.tsv" 2>/dev/null)"
   while IFS="$PX_TAB" read -r role index state ready; do
     [ -n "$role" ] || continue
     file="$CK_RUN/logs/instance/$role-$index.log"
@@ -319,6 +323,12 @@ EOF
       gaps="$gaps $role/$index:exit-$status"
       continue
     fi
+    case "$tier" in
+    *" $role/$index "*)
+      loader="$loader $role/$index"
+      continue
+      ;;
+    esac
     # The bundle still archives the log of an instance covered by a planned action, but its log
     # lines are excluded from the tally because a planned kill intentionally induces error output.
     if [[ $CK_START_MS =~ $PX_RE_INT ]] &&
@@ -434,6 +444,7 @@ EOF
 $CK_INV
 EOF
   [ -z "$skipped" ] || skipped="; planned action, kept and not counted:$skipped"
+  [ -z "$loader" ] || skipped="$skipped; load generator, kept and not counted:$loader"
   [ "$excused" = 0 ] || skipped="$skipped; $excused lines in a recovery window, not counted"
   [ -z "$gaps" ] || gaps="; unreadable:$gaps"
   if [ "$seen" = 0 ]; then

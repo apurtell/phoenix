@@ -403,8 +403,10 @@ conditions are outside the scope of this mechanism.
     `tickTime=2000`, a session lasts at most 40 s, and the paused server may have sent its last
     heartbeat ping up to one-third of that interval before receiving the `STOP` signal. A longer
     pause causes the session to expire: the Master processes the server as dead, the server aborts
-    upon resuming execution, and recovery from the pause fails. A 30 s pause triggered this
-    failure in 1 of 1 runs (run `20261123T064007Z-ro1h`).
+    upon resuming execution, and recovery from the pause fails. When this occurs, the recovery gate
+    detects that the instance has exited and fails immediately without waiting for the remainder of
+    `PX_TIMEOUT_READY`. A 30 s pause triggered this failure in 1 of 1 runs (run
+    `20261123T064007Z-ro1h`).
 
 ### Prove that the gate fails
 

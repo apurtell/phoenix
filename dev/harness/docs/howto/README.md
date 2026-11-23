@@ -278,7 +278,7 @@ builds prior to the fixes still exhibit the earlier behavior.
 * Distributed and multi-client load generation are not yet covered because Distributed Pherf (W2)
   remains under development, and its companion guides will follow once the D track lands.
 * Kubernetes backends, service mesh integration, and container image promotion are deferred until
-  the K track lands; in the current release, `px-pherf` and `px-k3d` exit with code 5.
+  the K track lands; in the current release, `px-k3d` exits with code 5.
 * Network partitions, synthetic network latency injection, and disk-full fault modes are excluded
   because the harness fault injector supports only process kill, signal delivery, and container
   restart actions (H09).

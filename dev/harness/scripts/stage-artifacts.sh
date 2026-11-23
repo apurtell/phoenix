@@ -35,8 +35,8 @@
 # The pherf context contains the image root files, only the HBase archive under dist/, the client,
 # Pherf, bson, and distributed JARs under phoenix/, and module/bin/ and module/conf/ holding the
 # launch script and logging configuration of phoenix-pherf-distributed from the source tree named
-# in the build record. Building it requires a build record produced by
-# build-phoenix.sh --distributed.
+# in the build record. Staging this image requires a build record compiled with PX_PHERF=1 (via
+# px-cluster build -e PX_PHERF=1).
 # Immediately before the script copies any archive, fetch-dist.sh verifies it against its pin. The
 # image definition unpacks the archives inside a dedicated build stage so that no archive reaches
 # the final runtime image.
@@ -120,39 +120,24 @@ SA_STAGED=""
 SA_ZOOKEEPER=""
 SA_HBASE_HADOOP=""
 
-## @description  Prints the command-line usage documentation and available options.
-## @return       Writes the help message to standard output and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: stage-artifacts.sh [option...]
-
-Stages the image build context under $PX_OUT/images/<context>/ from the image
-directory, the verified distributions and the recorded Phoenix jars, runs
-the staging checks, writes the staging record
-$PX_OUT/images/<context>.staged.tsv, and builds the image through the
-substrate contract. Run build-phoenix.sh first, with --distributed for the
-pherf image.
-
-Options:
-  --image NAME        harness, the multi-role image (default), or pherf, the
-                      Distributed Pherf controller and agent image
-  --tag TAG           the image tag, default PX_IMAGE_TAG, or
-                      PX_PHERF_IMAGE_TAG for the pherf image
-  --stage-only        stage and check, and build nothing
-  -n, --dry-run       report the plan and change nothing
-  --config FILE       an extra configuration file, repeatable
-  -v, --verbose       report detail
-  -h, --help          show this text
-
-stdout: the image row of the build, tag and image id. With --stage-only, one
-row: context and the context directory.
-
-Exit codes: 0 ok, 1 a staging check or the build failed, 2 usage, or an HBase
-release outside the range of the profile, 4 the build expired, 5 the backend
-cannot build an image, 6 no build record or no image
-directory. Any status of fetch-dist.sh passes through.
+px_cli_spec <<'EOF'
+about Stages the image build context under $PX_OUT/images/<context>/ from the image
++ directory, the verified distributions and the recorded Phoenix jars, runs the
++ staging checks, writes the staging record $PX_OUT/images/<context>.staged.tsv,
++ and builds the image through the substrate contract.
+about px-cluster build runs it after build-phoenix.sh; PX_PHERF=1 adds the pherf
++ image.
+opt --image NAME SA_IMAGE | harness, the multi-role image (default), or pherf,
++ the Distributed Pherf controller and agent image
+opt --stage-only - SA_STAGE_ONLY=1 | stage and check, and build nothing
+output the image row of the build, tag and image id. With --stage-only, one
++ row: context and the context directory.
+exits 1 also means that a staging check failed, 2 an HBase release outside the range
++ of the profile, 4 the build expired, 5 the backend cannot build an image, 6 no
++ build record or no image directory. Any status of fetch-dist.sh passes
++ through.
+example stage-artifacts.sh --image pherf
 EOF
-}
 
 ## @description  Looks up and prints the value associated with a single key in the build record.
 ## @return       Writes the value to stdout and returns 0, or returns 6 if the key is absent.
@@ -388,7 +373,7 @@ harness)
   SA_IMAGE_DIR="$PX_HOME/$PX_DEPLOY_SUBDIR/image"
   SA_IGNORE="$PX_HOME/$PX_DEPLOY_SUBDIR/.dockerignore"
   SA_TAG_VAR=PX_IMAGE_TAG
-  SA_JAR_KEYS="server_jar client_jar pherf_jar distributed_jar"
+  SA_JAR_KEYS="server_jar client_jar pherf_jar"
   SA_MODULE_FILES=""
   ;;
 pherf)

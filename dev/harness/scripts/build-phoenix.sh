@@ -63,49 +63,31 @@ set -euo pipefail
 BP_MODULES="phoenix-server,phoenix-client-parent/phoenix-client-embedded,phoenix-pherf"
 BP_DISTRIBUTED_MODULE=phoenix-pherf-distributed
 
-BP_JDK=""
 BP_TREE=""
-BP_CONFIG_FILES=()
 BP_PROFILE=""
 BP_POM_VERSION=""
 BP_POM_MODULE=""
 BP_POM_HBASE=""
 BP_POM_HADOOP=""
 
-## @description  Prints the command-line usage documentation and option reference.
-## @return       Writes usage information to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: build-phoenix.sh [option...]
-
-Cleans and builds phoenix-server, phoenix-client-embedded and phoenix-pherf
-with their dependencies from the local tree, with the HBase profile
-PX_PHOENIX_HBASE_PROFILE and no tests, and records the jars, the bson jar
-that the client needs, the profile, its compatibility module and the HBase
-and Hadoop that Phoenix compiles against in $PX_OUT/build/phoenix/build.tsv.
-The clean empties target/ of every module that the build selects, the
-dependencies included.
-
-Options:
-  --jdk N             the JDK major version of the build: 11, 17 or 21,
-                      default PX_BUILD_JDK, else 17
-  --tree DIR          the source tree, default the tree that holds the harness
-  --distributed       also build phoenix-pherf-distributed, default
-                      PX_BUILD_DISTRIBUTED
-  -n, --dry-run       print the Maven command and run nothing
-  --config FILE       an extra configuration file, repeatable
-  -v, --verbose       report detail
-  -h, --help          show this text
-
-stdout: the key and value rows of the build record (the tree, the versions,
-the JDK and the path of every built jar), or the command under --dry-run.
-
-Exit codes: 0 ok, 1 the build failed, a jar is missing or the pom does not
-map the profile to its module, 2 usage or an unknown profile, 4 the build
-expired after PX_TIMEOUT_BUILD, 5 Maven, a JDK or a module is absent,
-6 no source tree.
+px_cli_spec <<'EOF'
+about Cleans and builds phoenix-server, phoenix-client-embedded and phoenix-pherf with
++ their dependencies from the local tree, with the HBase profile
++ PX_PHOENIX_HBASE_PROFILE, the JDK PX_BUILD_JDK (11, 17 or 21, default 17) and no
++ tests, and records the jars, the bson jar that the client needs, the class path
++ of Pherf, the JDK home, the profile, its compatibility module and the HBase and
++ Hadoop that Phoenix compiles against in $PX_OUT/build/phoenix/build.tsv.
+about The clean empties target/ of every module that the build selects, the
++ dependencies included.
+opt --tree DIR BP_TREE | the source tree, default the tree that holds the
++ harness
+output the key and value rows of the build record: the tree, the versions, the
++ JDK and the path of every built jar.
+exits 1 also means that a jar is missing or that the pom does not map the profile to
++ its module, 2 an unknown profile, 4 the build expired after PX_TIMEOUT_BUILD,
++ 5 Maven, a JDK or a module is absent, 6 no source tree.
+example build-phoenix.sh -e PX_BUILD_JDK=21
 EOF
-}
 
 # Parses the target Maven POM file to extract the project version along with the compatibility
 # module, HBase version, and Hadoop version configured for BP_PROFILE, resolving any indirect
@@ -177,10 +159,6 @@ bp_pom_scan() {
 
 px_cli_parse "$@"
 px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
-
-if [ -z "$BP_DISTRIBUTED" ] && px_is_true "${PX_BUILD_DISTRIBUTED:-0}"; then
-  BP_DISTRIBUTED=1
-fi
 
 BP_TREE="${BP_TREE:-$PX_TREE_ROOT}"
 if [ -z "$BP_TREE" ]; then

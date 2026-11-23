@@ -69,51 +69,95 @@ CK_JVM_PID="pid=\"\$(pgrep -o -x java)\" || exit 6"
 # copy.
 CK_FETCH_SCRIPT="cat -- \"\$1\" || exit 1; rm -f -- \"\$1\""
 
-# Per-invocation collector state populated during initialization by ck_init and ck_main.
+# Remote scripts for the session collectors. Each script accepts the target instance's JDK name,
+# the remote recording file path, the collection duration bound in seconds, and any collector-
+# specific arguments. The profile collector runs async-profiler to capture cpu and alloc events in
+# a single session at a 7919 us sampling interval with no skipped frames. The jfr collector uses
+# the target JDK's jcmd binary to run Java Flight Recorder with settings=profile, skipping any
+# target whose JDK installation does not provide jcmd.
+CK_PROFILE_START="$(
+  cat <<'SCRIPT_EOF'
+file=$2
+seconds=$3
+shift 3
+asprof="$PX_TOOLS_DIR/async-profiler/bin/asprof"
+[ -x "$asprof" ] || exit 5
+mkdir -p "${file%/*}" || exit 1
+"$asprof" start "$@" --timeout "$seconds" -o jfr -f "$file" "$pid" || exit 1
+SCRIPT_EOF
+)"
+CK_PROFILE_STOP="$(
+  cat <<'SCRIPT_EOF'
+asprof="$PX_TOOLS_DIR/async-profiler/bin/asprof"
+[ -x "$asprof" ] || exit 5
+"$asprof" stop -o jfr -f "$2" "$pid" || exit 1
+SCRIPT_EOF
+)"
+CK_JFR_START="$(
+  cat <<'SCRIPT_EOF'
+jcmd="$PX_JDK_ROOT/$1/bin/jcmd"
+[ -x "$jcmd" ] || exit 5
+mkdir -p "${2%/*}" || exit 1
+"$jcmd" -J-Xmx16m "$pid" JFR.start "name=$4" settings=profile "duration=${3}s" \
+  "filename=$2" || exit 1
+SCRIPT_EOF
+)"
+CK_JFR_STOP="$(
+  cat <<'SCRIPT_EOF'
+jcmd="$PX_JDK_ROOT/$1/bin/jcmd"
+[ -x "$jcmd" ] || exit 5
+"$jcmd" -J-Xmx16m "$pid" JFR.stop "name=$4" "filename=$2" && [ -s "$2" ] || exit 1
+SCRIPT_EOF
+)"
+
+# Per-collection context variables initialized by ck_bind and ck_scope, together with the target
+# list and duration bound configured for the collector being started or stopped.
 CK_SCOPE=""
 CK_RUN_ID=""
 CK_REMOTE=""
-CK_ACTION=""
-CK_RUN=""
 CK_TARGETS=""
 CK_DURATION=""
 
-# Establishes the collector context for (name, bundle) by binding PX_RUN_DIR, CK_SCOPE,
-# CK_RUN_ID, CK_REMOTE, and PX_RECORD_SOURCE. Must be called directly in the tool shell rather than
-# inside a command substitution so that the exported and global variables take effect.
-## @description  Initializes collector state and binds the run bundle and substrate scope.
-## @return       Exits 0 on success, 2 when no bundle is given or it lies outside PX_OUT, or 6 when
-##               the bundle or scope is absent.
-ck_init() {
-  local dir
-  px_out_root >/dev/null
-  [ -n "${2:-}" ] || px_die "$PX_EXIT_USAGE" "name the bundle with --run, or export PX_RUN_DIR"
-  dir="$(px_out_resolve "$2")" || exit "$?"
-  [ -d "$dir" ] || px_die "$PX_EXIT_NO_OBJECT" "no such bundle: $dir"
-  PX_RUN_DIR=$dir
-  CK_RUN_ID=${dir##*/}
+# Must be invoked directly in the current shell rather than inside a subshell or command
+# substitution so that exported and global variables persist. The remote staging path is scoped by
+# the collection directory's run ID so that concurrent or separate collections never collide on
+# remote paths.
+## @description  Binds a collection directory (directory) as PX_RUN_DIR and initializes its
+##               required subdirectories.
+## @return       Exits 0 on success, or exits 1 if any subdirectory cannot be created.
+ck_bind() {
+  PX_RUN_DIR=$1
+  CK_RUN_ID=${1##*/}
   CK_REMOTE="/tmp/px/$CK_RUN_ID/collect"
-  PX_RECORD_SOURCE="collector:$1"
-  export PX_RUN_DIR PX_RECORD_SOURCE
+  export PX_RUN_DIR
+  mkdir -p "$PX_RUN_DIR/logs" "$PX_RUN_DIR/metrics" "$PX_RUN_DIR/collect" ||
+    px_die "$PX_EXIT_FAIL" "cannot create the parts of the collection $PX_RUN_DIR"
+}
+
+## @description  Loads the active backend and binds the cluster scope identifier into CK_SCOPE.
+## @return       Exits 0 on success, exits 6 if no cluster scope is recorded, or exits 2 or 1 as
+##               propagated from sb_scope_require.
+ck_scope() {
   sb_load
   CK_SCOPE="$(sb_scope_require)" || exit "$?"
 }
 
-# Selects target instances from $PX_RUN_DIR/cluster/services.tsv matching a comma-separated role
-# list (or all roles), defaulting to PX_COLLECT_TARGETS, and emits tab-separated role, index, and
-# JDK rows.
-## @description  Lists the target instances and their JDK paths from the bundle's services.tsv.
-## @return       Writes TSV rows to stdout and exits 0, or exits 6 when cluster/services.tsv is
-##               absent from the bundle.
+# Selects target instances from cluster/services.tsv matching a comma-separated role list or all
+# (the PX_COLLECT_TARGETS default), where all includes every service role except setup and the
+# pherf group.
+## @description  Lists the target instances from the bundle's cluster/services.tsv.
+## @return       Writes TSV rows to stdout and exits 0, or exits 6 when the bundle has no
+##               services.tsv.
 ck_targets() {
   local list=${1:-${PX_COLLECT_TARGETS:-all}} file="$PX_RUN_DIR/cluster/services.tsv"
   [ -f "$file" ] || px_die "$PX_EXIT_NO_OBJECT" "the bundle holds no cluster/services.tsv"
   awk -F '\t' -v list=",$list," '!/^#/ && NF >= 9 &&
-    (list == ",all," || index(list, "," $2 ",")) { print $2 "\t" $3 "\t" $9 }' "$file"
+    ((list == ",all," && $2 != "setup" && $4 != "pherf") || index(list, "," $2 ",")) {
+      print $2 "\t" $3 "\t" $9 }' "$file"
 }
 
 # Executes a remote script for (role, index, script, argument...) inside the target instance via
-# sb_exec, redirecting standard output from the script to standard error.
+# sb_exec and appends the script's standard output to logs/collect.log within the bundle.
 ## @description  Runs a remote collection script in a target instance through sb_exec.
 ## @return       Returns the sb_exec exit status: the script status, a framing code from 124 to
 ##               127, or 6.

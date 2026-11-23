@@ -657,22 +657,200 @@ pc_preflight() {
   px_die "$status" "the preflight refused the deployment $1, so no instance is created"
 }
 
-## @description  Halts cluster bring-up when the host lacks an image required by the deployment dir.
-## @return       Exits with 0, or exits with 2 reporting the commands that build the image, or with
-##               the sb_image_present status when the container engine does not respond.
-pc_image_check() {
+# Each bring-up check prints a single diagnostic detail line and returns its refusal status so that
+# a live bring-up aborts on the first refusal while up -n emits a check row for every gate. A
+# cluster record is considered stale only when its underlying scope no longer exists, ensuring that
+# PX_FORCE=1 never overwrites a running cluster.
+## @description  Verifies that the cluster is neither running nor recorded, unless PX_FORCE=1
+##               authorizes replacing a stale record whose scope no longer exists.
+## @return       Writes the detail line; exits 0, returns 2 if up or recorded, or 2 or 1 from sb_*.
+pc_check_record() {
+  local file where scope="" status=0
+  file="$(sb_scope_record)" || return $?
+  [ ! -f "$file" ] || IFS= read -r scope <"$file" || true
+  where=$file
+  [ -z "$PX_CONFIG_RECORD" ] || [ ! -f "$PX_CONFIG_RECORD" ] || where=$PX_CONFIG_RECORD
+  if [ -n "$scope" ]; then
+    sb_scope_exists "$scope" || status=$?
+    case "$status" in
+    0)
+      printf 'cluster %s is up already in scope %s, recorded in %s: %s\n' "$PX_CLUSTER_ID" \
+        "$scope" "$where" "run px-cluster down first"
+      return "$PX_EXIT_USAGE"
+      ;;
+    "$PX_EXIT_NO_OBJECT") ;;
+    *)
+      printf 'cannot tell whether scope %s of cluster %s exists\n' "$scope" "$PX_CLUSTER_ID"
+      return "$status"
+      ;;
+    esac
+  elif [ -z "$PX_CONFIG_RECORD" ] || [ ! -f "$PX_CONFIG_RECORD" ]; then
+    printf 'cluster %s has no record\n' "$PX_CLUSTER_ID"
+    return 0
+  fi
+  if px_is_true "${PX_FORCE:-0}"; then
+    printf 'PX_FORCE=1 replaces the stale record of cluster %s\n' "$PX_CLUSTER_ID"
+    return 0
+  fi
+  printf 'cluster %s is recorded in %s, and its scope is gone: %s %s\n' "$PX_CLUSTER_ID" \
+    "$where" "run px-cluster down, or set PX_FORCE=1," \
+    "to remove the stale record"
+  return "$PX_EXIT_USAGE"
+}
+
+# A Compose cluster and a local px-k3d cluster share the same container engine and host memory pool,
+# so they cannot run concurrently on the same host.
+## @description  Verifies that no local px-k3d cluster occupies the host during a Compose bring-up.
+## @return       Writes the detail to stdout and exits 0, returns 3 when px-k3d holds the host, or
+##               returns the status of sb_record_scopes (2 or 1).
+pc_check_host() {
+  local names status=0
+  if [ "$PX_BACKEND" != compose ]; then
+    printf 'the %s backend shares no engine with px-k3d\n' "$PX_BACKEND"
+    return 0
+  fi
+  names="$(sb_record_scopes px-k3d)" || status=$?
+  if [ "$status" != 0 ]; then
+    printf 'cannot read the records of px-k3d\n'
+    return "$status"
+  fi
+  if [ -n "$names" ]; then
+    printf 'px-k3d runs a local cluster on this host, context%s: %s\n' "$names" \
+      "the host runs one cluster, so run px-k3d delete first"
+    return "$PX_EXIT_ANOMALY"
+  fi
+  printf 'no cluster of px-k3d holds the host\n'
+}
+
+## @description  Checks that the host holds every image required by the deployment directory (dir).
+## @return       Writes the detail or the build command to stdout and exits 0, returns 6 when an
+##               image is missing, or returns the status of sb_image_present.
+pc_check_image() {
   local rows status=0 missing
   rows="$(sb_image_present "$1")" || status=$?
   case "$status" in
-  0) return 0 ;;
-  6) ;;
-  *) px_die "$status" "cannot ask the engine for the images that $1 names" ;;
+  0)
+    printf 'the host holds every image that %s names\n' "$1"
+    return 0
+    ;;
+  "$PX_EXIT_NO_OBJECT") ;;
+  *)
+    printf 'cannot ask the engine for the images that %s names\n' "$1"
+    return "$status"
+    ;;
   esac
   missing="$(printf '%s\n' "$rows" | awk -F '\t' '$2 == "" { print $1; exit }')"
-  px_die "$PX_EXIT_USAGE" "the host holds no image $missing, which $1 names, so no" \
-    "instance is created. Build it with the configuration of the render:" \
-    "$PX_HOME/scripts/build-phoenix.sh, $PX_HOME/scripts/build-jhiccup.sh, then" \
-    "$PX_HOME/scripts/stage-artifacts.sh --tag $missing"
+  pc_image_hint "$missing" "$1"
+  return "$PX_EXIT_NO_OBJECT"
+}
+
+# Formats the remediation command for a missing container image by forwarding the shared CLI options
+# of this bring-up so that the build resolves the same configuration. Building the Pherf image
+# requires PX_PHERF=1, which a bring-up from a pre-rendered directory might not specify on the
+# command line. A Kubernetes context is recognized as a local px-k3d cluster when a px-k3d scope
+# record exists for it, matching the detection used by both the build and the preflight checks.
+## @description  Formats the remediation message for a missing image (tag, dir): the build command,
+##               the px-k3d import guidance on a px-k3d context, or bundle promotion otherwise.
+## @return       Writes a single diagnostic line to stdout and exits with 0.
+pc_image_hint() {
+  local tag=$1 dir=$2 word words="" context=${PX_K8S_CONTEXT:-} record=""
+  if [ "$PX_BACKEND" = k8s ]; then
+    record="$(sb_record_path px-k3d scope "$context" 2>/dev/null)" || record=""
+  fi
+  if [ "$PX_BACKEND" = k8s ] && { [ -z "$record" ] || [ ! -f "$record" ]; }; then
+    printf 'the nodes of %s hold no image %s: promote a passing validation bundle with %s\n' \
+      "$context" "$tag" "px-cluster push BUNDLE"
+    return 0
+  fi
+  for word in ${PX_CLI_SHARED[@]+"${PX_CLI_SHARED[@]}"}; do
+    case "$word" in
+    -n | --dry-run | -v | --verbose) continue ;;
+    esac
+    words="$words $(printf '%q' "$word")"
+  done
+  if [ "$tag" = "${PX_PHERF_IMAGE_TAG:-}" ] && ! px_is_true "${PX_PHERF:-0}"; then
+    words="$words -e PX_PHERF=1"
+  fi
+  printf 'the host holds no image %s, which %s names, so no instance is created: run %s%s' \
+    "$tag" "$dir" "px-cluster build" "$words"
+  if [ "$PX_BACKEND" = k8s ]; then
+    printf ', which imports it into px-k3d, or px-k3d import when the host holds the image'
+  fi
+  printf '\n'
+}
+
+## @description  Executes a single bring-up check (check...) and terminates with its diagnostic
+##               detail if the check refuses the bring-up.
+## @return       Exits with 0, or terminates with the exit status of the refusing check.
+pc_up_gate() {
+  local detail status=0
+  detail="$("$@")" || status=$?
+  [ "$status" = 0 ] || px_die "$status" "$detail"
+}
+
+## @description  Executes a single bring-up check (name, check...) and formats its outcome as a
+##               dry-run check row.
+## @return       Writes the TSV check row to stdout and returns the exit status of the check.
+pc_check_row() {
+  local name=$1 detail status=0
+  shift
+  detail="$("$@")" || status=$?
+  if [ "$status" = 0 ]; then
+    px_tsv_row "$name" ok "$detail"
+  else
+    px_tsv_row "$name" fail "$detail"
+  fi
+  return "$status"
+}
+
+# Host preflight inspection is strictly read-only: it queries container engine memory capacity and
+# verifies host port availability without modifying host state.
+## @description  Runs the host preflight check for up -n against a deployment directory (dir).
+## @return       Writes the preflight rows to stdout; exits 0, 1 on no reply, 3 if refused, 4 if
+##               expired, or 5 on client refusal or a missing preflight script.
+pc_check_preflight() {
+  local script status=0
+  if ! script="$(px_preflight_script 2>/dev/null)"; then
+    status=$?
+    px_tsv_row preflight fail "no host preflight for the $PX_BACKEND backend"
+    return "$status"
+  fi
+  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" -e PX_DRY_RUN=0 \
+    --deployment "$1" || status=$?
+  case "$status" in
+  124 | 137)
+    px_tsv_row preflight fail "the preflight expired after ${PX_TIMEOUT_DEFAULT:-300}s"
+    return "$PX_EXIT_TIMEOUT"
+    ;;
+  esac
+  return "$status"
+}
+
+# Evaluates every bring-up gate even after an earlier check fails so the operator receives a
+# complete preflight report, then exits with the status of the first refusal to mirror the exit code
+# that a live bring-up would produce.
+# Appends a closing result row reporting ok when a live bring-up would proceed, or fail otherwise.
+## @description  Emits the dry-run check rows and closing result row for up -n on a directory (dir).
+## @return       Exits with 0, or with the first refusal code: 2 for the record check, 3 for the
+##               host check, 6 for a missing image, or the host preflight status code.
+pc_up_checks() {
+  local dir=$1 code=0 status check
+  for check in cluster:pc_check_record one_cluster:pc_check_host image:pc_check_image; do
+    status=0
+    pc_check_row "${check%%:*}" "${check#*:}" "$dir" || status=$?
+    [ "$code" != 0 ] || code=$status
+  done
+  status=0
+  pc_check_preflight "$dir" || status=$?
+  [ "$code" != 0 ] || code=$status
+  px_result_close "$code" "$PX_CLUSTER_ID" || exit "$?"
+  exit 0
+}
+
+## @description  Removes the temporary scratch deployment directory rendered during up -n.
+## @return       Exits with 0.
+pc_plan_clean() {
+  [ -z "$PC_PLAN_DIR" ] || rm -rf "$PC_PLAN_DIR"
 }
 
 ## @description  Records an operator action in the planned-action log or terminates the process.
@@ -1179,25 +1357,63 @@ EOF
   if [ "$status" != 0 ]; then
     px_die "$status" "scale of $role to $count failed"
   fi
+  # A cluster that was not recorded by up, such as one targeted directly via PX_SCOPE_ID, has no
+  # cluster record to update. Because the re-render derived its configuration from the cluster
+  # record, the updated cluster record is also written out as the deployment's new render.env.
+  while IFS="$PX_TAB" read -r name value; do
+    [ -n "$name" ] || continue
+    status=0
+    pc_record_set "$PX_CONFIG_RECORD" "$name" "$value" || status=$?
+    case "$status" in
+    0 | "$PX_EXIT_NO_OBJECT") ;;
+    *) px_warn "the cluster record $PX_CONFIG_RECORD keeps the earlier $name" ;;
+    esac
+  done <<EOF
+$changed
+EOF
+  [ -n "$PX_CONFIG_RECORD" ] && [ -f "$PX_CONFIG_RECORD" ] || return 0
+  if ! {
+    printf '# the settings of the render at %s\n' "$(px_timestamp)"
+    sed '/^#/d' "$PX_CONFIG_RECORD"
+  } >"$dir/render.env"; then
+    px_warn "cannot write $dir/render.env"
+  fi
 }
 
-# Invokes build-phoenix.sh, build-jhiccup.sh (when PX_DIST_ARTIFACTS includes jhiccup), and
-# stage-artifacts.sh as child processes inheriting this command's configuration.
-## @description  Builds the container image by running build-phoenix.sh, build-jhiccup.sh when
-##               PX_DIST_ARTIFACTS lists jhiccup, and stage-artifacts.sh as child processes.
-## @return       Exits 0, 2 on usage, or with the exit status of the step that failed.
+# Invokes build-phoenix.sh, build-jhiccup.sh (when PX_DIST_ARTIFACTS lists jhiccup), and
+# stage-artifacts.sh as child processes, and also runs stage-artifacts.sh --image pherf when
+# PX_PHERF=1 is enabled. Container images are always built on the local container engine; when the
+# Kubernetes backend is active, the build subsequently imports the resulting images into the local
+# px-k3d cluster for the configured context.
+## @description  Builds the container images via build-phoenix.sh, build-jhiccup.sh, and
+##               stage-artifacts.sh (twice when PX_PHERF=1), then imports them into px-k3d on k8s.
+## @return       Exits with 0, 2 on usage or an invalid version set, or the failed step's status.
 pc_build() {
-  local files=() file status=0 jhiccup=""
-  [ $# -eq 0 ] || pc_sub_usage_error build "unexpected argument: $*"
-  for file in ${PC_FILES[@]+"${PC_FILES[@]}"}; do
+  local files=() tree=() file status=0 jhiccup="" pherf=""
+  for file in ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}; do
     files+=(--config "$file")
   done
+  [ -z "$PC_TREE" ] || tree=(--tree "$PC_TREE")
   case " ${PX_DIST_ARTIFACTS//,/ } " in
-  *" jhiccup "*) jhiccup="scripts/build-jhiccup.sh, " ;;
+  *" jhiccup "*) jhiccup=1 ;;
   esac
-  pc_plan "scripts/build-phoenix.sh, ${jhiccup}then scripts/stage-artifacts.sh" && return 0
-  px_config_child "$PX_HOME/scripts/build-phoenix.sh" ${files[@]+"${files[@]}"} >&2 ||
-    status=$?
+  if px_is_true "${PX_PHERF:-0}"; then
+    pherf=1
+  fi
+  if px_is_dry_run; then
+    # Validate the version set before emitting any plan rows so that a dry run rejects an invalid
+    # version combination under the same rules as a live build.
+    px_versions_check
+    px_plan build scripts/build-phoenix.sh ${files[@]+"${files[@]}"} ${tree[@]+"${tree[@]}"}
+    [ -z "$jhiccup" ] || px_plan build scripts/build-jhiccup.sh ${files[@]+"${files[@]}"}
+    px_plan stage scripts/stage-artifacts.sh ${files[@]+"${files[@]}"}
+    [ -z "$pherf" ] || px_plan stage scripts/stage-artifacts.sh ${files[@]+"${files[@]}"} \
+      --image pherf
+    [ "$PX_BACKEND" != k8s ] || px_plan import px-k3d import ${files[@]+"${files[@]}"}
+    return 0
+  fi
+  px_config_child "$PX_HOME/scripts/build-phoenix.sh" ${files[@]+"${files[@]}"} \
+    ${tree[@]+"${tree[@]}"} >&2 || status=$?
   [ "$status" = 0 ] || px_die "$status" "the Phoenix build failed, so no image is built"
   if [ -n "$jhiccup" ]; then
     px_config_child "$PX_HOME/scripts/build-jhiccup.sh" ${files[@]+"${files[@]}"} >&2 ||
@@ -1208,6 +1424,33 @@ pc_build() {
     status=$?
   [ "$status" = 0 ] || px_die "$status" "the image build failed"
   px_info "built the image ${PX_IMAGE_TAG:-}"
+  if [ -n "$pherf" ]; then
+    px_config_child "$PX_HOME/scripts/stage-artifacts.sh" ${files[@]+"${files[@]}"} \
+      --image pherf >&2 || status=$?
+    [ "$status" = 0 ] || px_die "$status" "the build of the pherf image failed"
+    px_info "built the image ${PX_PHERF_IMAGE_TAG:-}"
+  fi
+  pc_build_import ${files[@]+"${files[@]}"}
+}
+
+# Delegates to px-k3d to import the image tags required by the active configuration. An exit status
+# of 6 indicates that the target context is a remote Kubernetes cluster rather than a local px-k3d
+# cluster, in which case its nodes receive images through bundle promotion instead.
+## @description  Imports the built images into the local px-k3d cluster for the context (option...).
+## @return       Exits with 0 (including when the context is not a px-k3d cluster), or exits with
+##               the px-k3d failure status if the import fails.
+pc_build_import() {
+  local status=0
+  [ "$PX_BACKEND" = k8s ] || return 0
+  px_config_child "$PX_HOME/bin/px-k3d" import "$@" >&2 || status=$?
+  case "$status" in
+  0) px_info "imported the images into the px-k3d cluster of ${PX_K8S_CONTEXT:-}" ;;
+  "$PX_EXIT_NO_OBJECT")
+    px_info "context ${PX_K8S_CONTEXT:-} is no px-k3d cluster: promote the images with" \
+      "px-cluster push BUNDLE"
+    ;;
+  *) px_die "$status" "the import of the images into px-k3d failed" ;;
+  esac
 }
 
 ## @description  Records a role-group transition as planned by writing one entry for each distinct

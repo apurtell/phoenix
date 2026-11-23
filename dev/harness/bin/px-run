@@ -1171,11 +1171,30 @@ gate_bound() {
   printf '%s\n' "$bound"
 }
 
+# An instance that has exited (with any exit status, including 0 which satisfies the readiness
+# check) or vanished from the scope cannot bring any hosted regions back online.
+## @description  Checks whether the target instance of a disruption (index) has exited or is absent.
+## @return       Logs the instance and its state and exits 0 when exited or absent, or exits 1.
+gate_exited() {
+  local role=${DISRUPT_ROLE[$1]} instance=${DISRUPT_INDEX[$1]} row status=0
+  row="$(sb_list "$SCOPE" "$role" "$instance" 2>/dev/null)" || status=$?
+  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
+    px_error "disruption $(($1 + 1)): $role/$instance is absent, so it cannot recover"
+    return 0
+  fi
+  if [ "$status" = 0 ] && [ "$(px_tsv_field 4 "$row")" = exited ]; then
+    px_error "disruption $(($1 + 1)): the backend reports $role/$instance as exited, so it" \
+      "cannot recover"
+    return 0
+  fi
+  return 1
+}
+
 # Restarts a killed RegionServer, waits for the scope to become ready, and waits for the online
-# region count to return to its pre-disruption baseline, writing a recover row whose timestamps
-# determine mttr_seconds.
+# region count to return to its pre-disruption baseline (aborting immediately if the target instance
+# has exited or vanished), then writes a recover row whose timestamps determine mttr_seconds.
 ## @description  Waits for full cluster recovery after an injected disruption (index).
-## @return       Writes the recover row and exits 0.
+## @return       Writes the recover row (whose timestamps determine mttr_seconds) and exits 0.
 recover_gate() {
   local index=$1 role instance status=0 out="" state recovered="" ready drain deadline regions
   local shared=0
@@ -1203,9 +1222,15 @@ recover_gate() {
   # regions-in-transition metrics because they lag behind actual availability.
   # Failing to restore the baseline region count within the readiness window is recorded as a
   # recovery failure rather than a slow recovery, whereas being cut short by the verb's shared
-  # deadline is recorded as a timeout.
+  # deadline is recorded as a timeout. Because an exited instance cannot bring any regions back
+  # online even if the aggregate region count has already recovered, each polling iteration checks
+  # the instance state first.
   if [ "$status" = 0 ]; then
     while :; do
+      if gate_exited "$index"; then
+        status=$PX_EXIT_FAIL
+        break
+      fi
       regions="$(region_count 2>/dev/null || true)"
       if [ -n "$regions" ] && [ "$regions" -ge "${DISRUPT_REGIONS[$index]}" ]; then
         break

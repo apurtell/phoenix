@@ -32,8 +32,8 @@ describe document increments this version number.
 Each driver is implemented as a single executable file: `drivers/<name>/driver.sh` for a built-in
 driver, or the executable path designated by `PX_PLUGIN_DRIVER` for a plug-in driver. The driver
 name corresponds to its directory name or its plug-in id, and a test selects its driver in a suite
-definition via `driver: <name>`. The built-in drivers are `psql`, `pherf`, and `java-main`; Round
-H3 adds `pherf-distributed`.
+definition via `driver: <name>`. The built-in drivers are `psql`, `pherf`, `pherf-distributed`, and
+`java-main`.
 
 The command line accepts the lifecycle verb followed by the test arguments:
 
@@ -375,6 +375,14 @@ configured for the client role, preserving deployment resource sizing. Client pr
 be launched inside daemon instances, where spawning an additional JVM alongside a tightly sized
 service daemon could push the container past its memory ceiling.
 
+One built-in driver interacts with an additional service role. Because `pherf-distributed` launches
+no client JVM, it invokes the REST API of the Distributed Pherf controller via `sb_exec` inside
+`pherf-controller` instance 0, where the curl binary in the pherf image queries
+`127.0.0.1:$PHERF_REST_PORT` in the same manner as the image's health probe every 5 s. This request
+helper resides in `lib/fleet.sh`. No driver ever connects to a host-published port, as the endpoint
+published on `127.0.0.1` of the host is reserved for operator access. The harness self-test scans
+both `lib/fleet.sh` and `drivers/lib/` alongside the driver implementations.
+
 A driver stages input and output files through a dedicated remote working directory located at
 `/tmp/px/<run-id>` inside the client instance. It provisions this directory via
 `sb_exec ... -- mkdir -p`, uploads workload inputs using `sb_copy_in`, and retrieves generated
@@ -395,8 +403,11 @@ rows on standard input must redirect the call's input from `/dev/null`.
 ## The driver kit
 
 The library `drivers/lib/driver.sh` provides shared helper functions used across the built-in
-drivers, and plug-in drivers are free to source it as well. Every helper terminates the calling
-process with exit code 2 if invoked improperly.
+drivers, and plug-in drivers may source it as well. Every helper terminates the calling process with
+exit code 2 if invoked improperly. In addition, `drivers/lib/pherf.sh` provides the Pherf output
+parsers shared by `pherf` and `pherf-distributed`—handling scenario profile resolution, the JSON
+latency report and its metrics, the verdict stream copy, and the latency summary record—all of
+which operate strictly on the local bundle copies without making substrate calls.
 
 * `dv_main "$@"` validates the requested verb and dispatches execution to the driver's
   `verb_<verb>` function along with the remaining arguments. It disables the shell failure trap so
@@ -582,6 +593,96 @@ driver also declares `query_errors` unsupported because the Pherf report does no
 closed-loop operations, while failed open-loop operations are tracked under `aborted`. Finally,
 `driver.storage_scans` and `driver.rpc_calls` are declared unsupported because the driver does not
 enable request-level metrics.
+
+### pherf-distributed
+
+```text
+--scenario FILE [--schema FILE] [--properties FILE] [--agents N] [--weights W,...] [--seed N]
+[--rows N] [--rate N] [--duration-ms N] [--threads N] [-- PHERF_OPTION...]
+```
+
+Executes a Pherf workload scenario across the agents of the Distributed Pherf tier through the
+controller's REST API and copies the resulting controller run bundle into the harness bundle. The
+execution plan format, the REST API, and the controller bundle layout are specified in
+`phoenix-pherf-distributed/README.md`, while `bin/px-pherf` manages the tier lifecycle. Its steady
+anchor is `steady@pherf`.
+
+**The plan.** Each data-load or measurement verb submits a single execution plan as one controller
+test containing a single step. The step documents comprise the scenario file, every profile
+referenced by a `querySet` within the scenario, and the schema file, each registered under its base
+filename. Because the controller accepts only flat document names, any profile path containing `/`,
+any document name containing characters outside `[A-Za-z0-9._-]` or beginning with a leading dot, or
+any two documents sharing the same filename causes the driver to terminate with exit 2. The agent
+count is taken from `--agents` or defaults to `PX_PHERF_AGENT_COUNT` from `cluster/topology.env`,
+and the random seed is taken from `--seed` or defaults to 8070. The run-level properties consist of
+the entries from `--properties` followed by `pherf.verdict.noisyHost`, which is set to `true` when
+`PX_CONTAMINATION` is non-empty; appending this key last ensures that no value in the properties
+file can override it. The plan's `runClass` field is populated from `PX_RUN_CLASS`. Because the
+driver directly manages `-l`, `-q`, `-label`, `-scenarioFile`, `-schemaFile`, `-disableSchemaApply`,
+`-runDurationMs`, `-threadCount`, `-targetRate`, and `-rowCountOverride`, passing any of these flags
+in `PHERF_OPTION` in any form terminates with exit 2. The controller's plan-submission validator
+remains the final authority: an HTTP 400 response produces a `FAIL` verdict row under `pherf.plan`
+identifying the rejected JSON path and terminates with exit 1.
+
+**prepare** waits until every agent required by the plan reports `IDLE` and writes the final polled
+controller agent list to `agents.json`. Encountering a `FAULTED` agent aborts the wait immediately
+because a faulted state can only be cleared by an explicit reset. Within the `setup@load` phase, the
+verb submits `plan-load.json` configured with the step options `-schemaFile slice/<schema> -l` (or
+`-disableSchemaApply -l` when no schema file is provided), along with `rows` and `weights` when
+specified by the test. Because each agent executes Pherf inside its working directory where staged
+documents reside under `slice/`, schema application is performed by the agents during the load
+phase, and at most one `--schema` argument is permitted. The verb polls the run status every
+`PX_POLL_INTERVAL_S` until the state is no longer `RUNNING`, copies the resulting controller bundle
+into `load/`, concludes the test on the controller, and appends a record to `tests.tsv`. An
+`ABORTED` run—indicating that agent-side validation rejected the plan before launching the
+workload—produces a `FAIL` verdict row under `pherf.gate`, whereas any other terminal state besides
+`COMPLETE` produces a `FAIL` row under `pherf.load`, with both cases exiting with code 1. When
+running against the harness target, `client` instance 0 then queries and records the effective
+`UPDATE_CACHE_FREQUENCY` for every table defined in the schema file.
+
+**run** waits for the required agents to become idle again and submits `plan-run.json` configured
+with `-disableSchemaApply -q` along with `rate`, `durationMs`, `threads`, and `rows`. Within the
+`steady@pherf` window, it starts the controller run, polls until the state is no longer `RUNNING`,
+and writes `run.tsv`. It then fetches the run report into `report.json`, retrieves the controller
+bundle file listing, and downloads each listed artifact into `controller/<path>` via a temporary
+`.part` file whose byte count must match the size declared in the listing. Every listed path must be
+relative, consist exclusively of characters in `[A-Za-z0-9._/-]`, and contain no empty, `.`, or `..`
+segments, and the downloaded `report.json` must match `controller/drivers/pherf/results_HDR/
+LATENCY_run.json`. Then it ends the test. The rows: `pherf.agents` lists the idle agents,
+`pherf.bundle` records `PASS` or `FAIL` with any failure cause, and `pherf.execution` records `FAIL`
+and exits with code 1 unless the run finished in the `COMPLETE` state. The controller bundle is
+copied for every terminal run state so that failed executions preserve their diagnostic evidence. An
+HTTP 409 response when starting the run (such as from a faulted agent), an unresponsive controller,
+or a missing, busy, or `FAULTED` agent produces an `ERROR` verdict row under `pherf.agents` and
+exits with code 3, as the driver never resets an agent automatically. Upon receiving TERM, the verb
+cancels any active controller run and terminates any running Java process inside `client` instance 0
+in the same manner as the other drivers.
+
+**restore** concludes every test recorded in `tests.tsv`, where an already concluded test
+idempotently returns HTTP 200. When targeting a harness cluster, it then drops the tables defined in
+the schema file through `client` instance 0 just as the `pherf` driver does. An unresponsive
+controller or `client` instance 0 causes the verb to exit with code 3. When targeting an external
+cluster, no `client` instance 0 exists, so `pherf.tables` is recorded as `SKIP` and the tables
+remain in place.
+
+**report** operates exclusively on the downloaded bundle copies. It appends the eight rows of the
+fleet verdict file, `controller/drivers/pherf/results_HDR/VERDICT_run.tsv`, to the bundle verdict
+stream without modification—comprising five `pherf.health.*` rows and three `pherf.fleet.*` rows—and
+applies the same validation rules used for the `pherf` driver's verdict copy. It parses the merged
+latency report `LATENCY_run.json` to emit the same metric records as `pherf` and validates the
+header of the merged run histogram log. Because each open-loop schedule in the report corresponds to
+an individual execution slot, its metrics are bound to the anchor
+`schedule@<scenario>.<querySet>.<step>.<slot>`. From the `fleet` object of the report, it emits
+per-slot metrics under the anchor `slot@<step>.<slot>`—`pherf.slot.{rate,threads,rows,samples}`
+(count) and `pherf.slot.start_lag_ms` (duration)—and emits fleet-wide metrics under `steady@pherf`:
+`pherf.fleet.agents` (count, recording the slot count of the largest step) and
+`pherf.fleet.start_skew_ms` (duration, recording the maximum start-skew bound across all steps). The
+`achieved_qps` metric is computed from the total steady-state operations divided by the time window
+of the fleet report. Because timestamps in the fleet report are recorded on the controller's clock,
+every emitted metric window is clamped to the host's steady window boundaries.
+
+**Unsupported.** Matching the `pherf` driver, `pherf-distributed` declares `offered_rate`,
+`query_errors`, `driver.storage_scans`, and `driver.rpc_calls` unsupported.
 
 ### java-main
 

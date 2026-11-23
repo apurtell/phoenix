@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This file defines the fleet suite, which exercises the Distributed Pherf tier against the
+# harness cluster through the pherf-distributed driver. Each test executes one replicate: the
+# prepare phase loads the co-generated table across every agent, the run phase measures the
+# open-loop workload of point lookups across the fleet, and the restore phase drops the table.
+# Every replicate produces one run bundle containing one controller bundle. Because all three
+# replicates pass identical arguments, the shared seed, agents, weights, and row counts produce
+# identical data-plane identities across replicates.
+#
+# Execute this suite through px-pherf, which provisions the cluster together with the tier:
+#   px-pherf --class measurement run fleet.suite
+#   px-pherf --class validation run fleet.suite -- --only r1
+#
+# When running Pherf -analyze, point it at <bundle>/drivers/pherf-distributed/controller inside
+# each replicate bundle rather than at the bundle root.
+
+suite: fleet
+description: Three replicates of the Distributed Pherf fleet against the harness cluster
+class: measurement
+timeout: 1200
+
+test: r1
+  name: Replicate 1 of the fleet
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: r2
+  name: Replicate 2 of the fleet
+  needs: r1
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: r3
+  name: Replicate 3 of the fleet
+  needs: r2
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
