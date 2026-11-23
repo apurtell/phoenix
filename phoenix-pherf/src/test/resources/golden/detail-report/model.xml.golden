@@ -1,0 +1,53 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns3:dataModelResult xmlns:ns2="org.apache.phoenix.pherf.configuration.DataModel" xmlns:ns3="org.apache.phoenix.pherf.result" zookeeper="zk1" name="detail_model">
+    <datamapping/>
+    <scenarios/>
+    <scenarioResult name="detail_scenario" rowCount="100" tableName="PHERF.DETAIL">
+        <idleTimes/>
+        <phoenixProperties>
+            <entry>
+                <key>phoenix.query.threadPoolSize</key>
+                <value>16</value>
+            </entry>
+            <entry>
+                <key>phoenix.query.timeoutMs</key>
+                <value>60000</value>
+            </entry>
+        </phoenixProperties>
+        <postScenarioDdls/>
+        <preScenarioDdls/>
+        <udfs/>
+        <upserts/>
+        <querySetResult concurrency="2" executionDurationInMs="10000" executionType="SERIAL" numberOfExecutions="3">
+            <queryResults id="q1" queryGroup="g1" statement="select count(*) from PHERF.DETAIL" tenantId="t1" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                <threadTimes threadName="query-1,2">
+                    <runTimesInMs elapsedDurationInMs="12" resultRowCount="100" startTime="<TIME>" timedOut="false"/>
+                    <runTimesInMs elapsedDurationInMs="30" explainPlan="plan A" message="failed, &quot;quoted&quot;" resultRowCount="0" startTime="<TIME>" timedOut="true"/>
+                    <runTimesInMs resultRowCount="7" startTime="<TIME>" timedOut="false"/>
+                </threadTimes>
+                <threadTimes threadName="query-2">
+                    <runTimesInMs elapsedDurationInMs="5" explainPlan="plan B" message="" resultRowCount="1" startTime="<TIME>" timedOut="false"/>
+                </threadTimes>
+            </queryResults>
+            <queryResults id="q2" statement="select * from PHERF.DETAIL limit 1" timeoutDuration="9223372036854775807" useGlobalConnection="false">
+                <threadTimes threadName="query-3,1">
+                    <runTimesInMs elapsedDurationInMs="9" resultRowCount="1" startTime="<TIME>" timedOut="false"/>
+                </threadTimes>
+            </queryResults>
+        </querySetResult>
+    </scenarioResult>
+</ns3:dataModelResult>

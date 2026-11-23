@@ -107,6 +107,14 @@ public class ResultUtil {
     }
   }
 
+  /**
+   * Writes the data model results using the supplied handler. A run retains every recorded run time
+   * until completion because both the XML report and the replicate analysis consume all of them. In
+   * addition, a CSV write materializes all of its rows in memory before writing the first row.
+   * Consequently, memory consumption scales linearly with the number of operations at approximately
+   * 1.5 KB per operation. Long open-loop runs should therefore be divided into a sequence of
+   * shorter runs.
+   */
   public synchronized void write(ResultHandler resultHandler, DataModelResult dataModelResult,
     RulesApplier ruleApplier) throws Exception {
     ResultFileDetails resultFileDetails = resultHandler.getResultFileDetails();

@@ -146,12 +146,15 @@ public class QueryResult extends Query {
   public List<List<ResultValue>> getCsvDetailedRepresentation(ResultUtil util,
     ResultFileDetails details) {
     List<List<ResultValue>> rows = new ArrayList<>();
+    // Computing the start time requires scanning all recorded run times, so resolve it once up
+    // front rather than recalculating it for every generated row.
+    String startTimeText = util.convertNull(getStartTimeText());
     for (ThreadTime tt : getThreadTimes()) {
       for (List<ResultValue> runTime : details.isPerformance()
         ? tt.getCsvPerformanceRepresentation(util)
         : tt.getCsvFunctionalRepresentation(util)) {
         List<ResultValue> rowValues = new ArrayList<>();
-        rowValues.add(new ResultValue(util.convertNull(getStartTimeText())));
+        rowValues.add(new ResultValue(startTimeText));
         rowValues.add(new ResultValue(util.convertNull(this.getQueryGroup())));
         rowValues.add(new ResultValue(util.convertNull(this.getId())));
         rowValues.add(new ResultValue(util.convertNull(this.getStatement())));

@@ -24,6 +24,16 @@ import java.util.List;
 import javax.xml.bind.annotation.XmlAttribute;
 
 public class ThreadTime {
+  /**
+   * Defines the number of columns in a single performance detail row: thread, concurrency, rows,
+   * time, and time out.
+   */
+  private static final int PERFORMANCE_COLUMNS = 5;
+  /**
+   * Defines the number of columns in a single functional detail row: thread, concurrency, message,
+   * and explain plan.
+   */
+  private static final int FUNCTIONAL_COLUMNS = 4;
   private List<RunTime> runTimesInMs = Collections.synchronizedList(new ArrayList<RunTime>());
   private String threadName;
 
@@ -103,7 +113,7 @@ public class ThreadTime {
     List<List<ResultValue>> rows = new ArrayList<>();
 
     for (int i = 0; i < getRunTimesInMs().size(); i++) {
-      List<ResultValue> rowValues = new ArrayList(getRunTimesInMs().size());
+      List<ResultValue> rowValues = new ArrayList<>(PERFORMANCE_COLUMNS);
       rowValues.add(new ResultValue(util.convertNull(parseThreadName(false))));
       rowValues.add(new ResultValue(util.convertNull(parseThreadName(true))));
       rowValues.add(new ResultValue(String.valueOf(getRunTimesInMs().get(i).getResultRowCount())));
@@ -123,7 +133,7 @@ public class ThreadTime {
     List<List<ResultValue>> rows = new ArrayList<>();
 
     for (int i = 0; i < getRunTimesInMs().size(); i++) {
-      List<ResultValue> rowValues = new ArrayList<>(getRunTimesInMs().size());
+      List<ResultValue> rowValues = new ArrayList<>(FUNCTIONAL_COLUMNS);
       rowValues.add(new ResultValue(util.convertNull(parseThreadName(false))));
       rowValues.add(new ResultValue(util.convertNull(parseThreadName(true))));
       rowValues.add(new ResultValue(util.convertNull(getRunTimesInMs().get(i).getMessage())));
