@@ -752,6 +752,19 @@ Any breaking change that an existing client cannot parse advances the REST endpo
   replicate driver can inspect the `faulted: <ids>` suffix in an HTTP 409 response from
   `POST .../runs` to identify and reset or replace faulted agents before retrying.
 
+A run imposes no time limit of its own; Pherf itself determines when its child process terminates,
+even when the target database stops. On a slow cluster, an open-loop workload configured with
+`lagPolicy="LATE"` executes every arrival scheduled within its window, continuing after the window
+closes until the accumulated backlog drains. Consequently, no fixed timeout after `durationMs` is
+appropriate, because a fixed cutoff either fails a healthy run on a saturated fleet or waits too
+long to be useful. Configuring `lagPolicy="DROP"` with `maxLagMs` bounds that backlog. On a stopped
+cluster, the first failed operation halts the open loop, releasing no further arrivals and aborting
+all queued arrivals. The run then finishes once the in-progress operations complete when their
+Phoenix client timeouts expire. A fault scenario that must finish promptly configures short client
+timeouts in the `phoenixProperties` of its query set. Any client that requires an explicit deadline
+cancels the run directly; in particular, the `pherf-distributed` harness driver cancels the run when
+its verb time limit expires.
+
 ## Persistence and restart
 
 All persistent controller state resides under `PHERF_RUN_DIR`:

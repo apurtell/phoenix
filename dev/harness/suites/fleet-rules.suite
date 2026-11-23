@@ -1,0 +1,36 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This file defines the rule-based fleet suite, which executes a traditional Pherf scenario on the
+# Distributed Pherf tier through the pherf-distributed driver. Column rules generate the dataset
+# without co-generation: the prepare phase loads 2000 rows through each of the 2 agents using a
+# distinct per-agent key prefix, and the run phase executes the scenario's closed-loop workload on
+# each agent. The suite specifies only the total row count because a closed-loop workload takes no
+# target rate, leaving the scenario document to define the concurrency, execution count, and
+# duration just as in a standalone Pherf run.
+#
+# Execute this suite through px-pherf, which provisions the cluster together with the tier:
+#   px-pherf --class validation run fleet-rules.suite
+
+suite: fleet-rules
+description: A rule-based closed-loop Pherf scenario across the agents of the fleet
+class: validation
+timeout: 900
+
+test: rules
+  name: Rule-based closed loop across the fleet
+  driver: pherf-distributed
+  args: --scenario pherf/px_rules_scenario.xml --schema pherf/px_rules_schema.sql
+  args: --rows 4000

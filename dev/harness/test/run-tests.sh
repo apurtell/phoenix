@@ -1205,6 +1205,12 @@ compose)
       esac
       printf '%s\t%s\n' "$fake_ms" "$fake_value" >>"$fake_state/region-count.log" 2>/dev/null
       [ ! -e "$fake_state/region-count-fails" ] || exit 1
+      # With count-then-absent, each read after the first removes every
+      # RegionServer while the read runs, and the read still gives its count.
+      if [ -e "$fake_state/count-then-absent" ] && [ "$fake_n" -gt 1 ]; then
+        awk -F '|' '$2 != "regionserver"' "$fake_inv" >"$fake_state/absent.txt"
+        mv -f "$fake_state/absent.txt" "$fake_inv"
+      fi
       # A RegionServer whose daemon JVM a STOP paused does not answer.
       case "$(ps -o stat= -p "$(cat "$fake_state/jvm-pid" 2>/dev/null)" 2>/dev/null |
         tr -d ' ')" in
@@ -12712,8 +12718,8 @@ t_group_h3_suite() {
   t_a5_state_reset
 }
 
-## @description  Verifies that a disrupted instance that exits after restart (even with exit code
-##               0) or becomes absent terminates the recovery gate immediately.
+## @description  Verifies that a disrupted instance that exits after restart (even with exit 0) or
+##               becomes absent terminates the recovery gate immediately, even after a full count.
 ## @return       Records test assertions. Exit 0.
 t_group_h3_gate() {
   local run start elapsed
@@ -12738,6 +12744,61 @@ t_group_h3_gate() {
   t_equals absent_instance_fails_the_recovery_at_once "yes fail yes" "$([ "$elapsed" -lt 30 ] &&
     echo yes || echo "no, ${elapsed}s") $(awk -F '\t' '$1 == "recover" { print $5 }' \
     "$run/run-record.tsv") $(t_flag 'is absent, so it cannot recover' "$T_STDERR")"
+  # A region count read that begins while the instance is running can return the full count after
+  # the instance stops, and the instance check after the full count must fail the recovery gate.
+  t_a5_state_reset
+  : >"$T_A5_STATE/count-then-absent"
+  t_a5_run phase-kill -e PX_TIMEOUT_READY=120 --disrupt 'phase:phase@kill,kill,regionserver,0'
+  run="$(t_bundle)"
+  t_equals full_count_of_an_absent_instance_fails_the_recovery "fail yes" "$(awk -F '\t' \
+    '$1 == "recover" { print $5 }' "$run/run-record.tsv") $(t_flag \
+    'is absent, so it cannot recover' "$T_STDERR")"
+  t_a5_state_reset
+}
+
+## @description  Extracts the driver arguments declared for a single test (suite file, test id),
+##               emitting one argument per line exactly as written in the suite file.
+## @return       Writes the driver arguments to stdout. Exit 0.
+t_d7_args() {
+  awk -v id="$2" '
+    /^test:/ { on = ($2 == id) }
+    on && /^ *args:/ { for (i = 2; i <= NF; i++) print $i }' "$1"
+}
+
+## @description  Verifies the plan and class of the three D7 fleet suites and validates each test
+##               definition for the pherf-distributed driver (RQ-255 to RQ-257).
+## @return       Records test assertions. Exit 0.
+t_group_d7_suites() {
+  local name id run line suite plans="" classes="" bad="" args=()
+  printf '# D7: the end-to-end suites of the fleet\n'
+  for name in fleet-rww fleet-rules fleet-ab; do
+    t_run env PX_SESSION_ID=d7-plan "$T_BASH" "$T_BIN/px-suite" -n \
+      "$PX_HOME/suites/$name.suite"
+    plans="$plans|$T_STATUS $(t_plan_ids "$T_STDOUT")"
+    classes="$classes $(printf '%s\n' "$T_STDOUT" | awk -F '\t' 'NR == 1 { print $6 }')"
+  done
+  t_equals d7_suites_plan_their_tests "|0 r1 r2|0 rules|0 a1 b1 a2 b2 a3 b3" "$plans"
+  t_equals d7_suites_have_their_classes " validation validation measurement" "$classes"
+  # Because the driver reads the agent count from the run topology, each validation check writes a
+  # topology of 2 agents. The driver resolves each relative path against the suite's directory.
+  for name in fleet-rww:r1 fleet-rww:r2 fleet-rules:rules fleet-ab:a1 fleet-ab:b1; do
+    id=${name#*:}
+    suite="$PX_HOME/suites/${name%%:*}.suite"
+    args=()
+    while IFS= read -r line; do
+      [ -z "$line" ] || args+=("$line")
+    done <<EOF
+$(t_d7_args "$suite" "$id")
+EOF
+    run="$(t_a5_bundle)"
+    mkdir -p "$run/cluster"
+    printf 'PX_PHERF=1\nPX_PHERF_TARGET=harness\nPX_PHERF_AGENT_COUNT=2\n' \
+      >"$run/cluster/topology.env"
+    PX_SUITE_FILE=$suite t_h3_verb validate "$run" ${args[@]+"${args[@]}"}
+    [ "$T_STATUS" = 0 ] && [ "$(t_severity_of "$run" driver.workload_valid)" = PASS ] &&
+      [ "${#args[@]}" -gt 0 ] || bad="$bad $name:$T_STATUS"
+  done
+  t_equals d7_tests_are_valid_driver_definitions "" "$bad"
   t_a5_state_reset
 }
 
@@ -12828,6 +12889,7 @@ t_group_h3_tier
 t_group_h3_driver
 t_group_h3_suite
 t_group_h3_gate
+t_group_d7_suites
 t_group_tree
 
 t_daemons_stop

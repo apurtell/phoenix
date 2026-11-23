@@ -1216,15 +1216,17 @@ recover_gate() {
     deadline=$(($(px_epoch_s) + ready))
     sb_wait_ready "$SCOPE" "$ready" >/dev/null || status=$?
   fi
-  # A server reports ready before its regions finish coming back online. Waiting for the online
-  # region count reuses the remainder of the same readiness timeout so that a single disruption
-  # consumes at most one drain timeout and two readiness timeouts, and it avoids querying
-  # regions-in-transition metrics because they lag behind actual availability.
-  # Failing to restore the baseline region count within the readiness window is recorded as a
-  # recovery failure rather than a slow recovery, whereas being cut short by the verb's shared
-  # deadline is recorded as a timeout. Because an exited instance cannot bring any regions back
-  # online even if the aggregate region count has already recovered, each polling iteration checks
-  # the instance state first.
+  # A server reports ready before its regions finish coming back online. Waiting for the regions
+  # reuses the remainder of the same readiness bound so that a single disruption consumes at most
+  # the drain bound and two readiness bounds, and it never queries regions-in-transition metrics
+  # because they lag behind actual availability.
+  # Failing to restore the region count is a failed recovery rather than a slow recovery, whereas
+  # being cut short by the verb's shared timeout bound is a timeout. Because an exited instance
+  # cannot bring any regions back online even when the aggregate count has already recovered, each
+  # poll checks the instance state before reading the count. Because a read can start while the
+  # instance is running and complete after it exits, observing a full count rechecks the instance
+  # state as well. The recovery gate therefore monitors the instance until recovery completes, and
+  # any exit after that point is handled by the anomaly watcher.
   if [ "$status" = 0 ]; then
     while :; do
       if gate_exited "$index"; then
@@ -1233,6 +1235,9 @@ recover_gate() {
       fi
       regions="$(region_count 2>/dev/null || true)"
       if [ -n "$regions" ] && [ "$regions" -ge "${DISRUPT_REGIONS[$index]}" ]; then
+        if gate_exited "$index"; then
+          status=$PX_EXIT_FAIL
+        fi
         break
       fi
       if [ "$shared" -gt 0 ] && [ "$(px_epoch_s)" -ge "$shared" ]; then

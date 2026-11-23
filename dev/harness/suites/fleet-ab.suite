@@ -1,0 +1,77 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This file defines the fleet A/B suite, which isolates a single experimental factor: the
+# UPDATE_CACHE_FREQUENCY table property. Side A applies px_fleet_schema.sql (60000 ms), whereas Side
+# B applies px_fleet_always_schema.sql (0, ALWAYS) so that every statement re-reads the table
+# metadata from SYSTEM.CATALOG. Because all other arguments are identical to those of fleet.suite,
+# any difference between the merged fleet histograms stems from this factor. The harness bundle
+# records the active table property in tables.tsv and in the tables section of manifest.json.
+#
+# Replicates execute in alternating order (a1 b1 a2 b2 a3 b3) so that any gradual host drift affects
+# both sides equally, and the three replicates on each side provide the sample size needed to
+# compute the bootstrap interval for the comparison. Comparison is performed offline by invoking
+# Pherf -analyze against the controller bundle at <bundle>/drivers/pherf-distributed/controller of
+# each replicate, passing the Side A bundles before the Side B bundles:
+#   java -cp <class path> org.apache.phoenix.pherf.Pherf -analyze A B -label ab
+#
+# Execute this suite through px-pherf, which provisions the cluster together with the tier:
+#   px-pherf --class measurement run fleet-ab.suite
+
+suite: fleet-ab
+description: A/B of UPDATE_CACHE_FREQUENCY on the merged fleet histograms, three replicates each
+class: measurement
+timeout: 1200
+
+test: a1
+  name: Side A, replicate 1, UPDATE_CACHE_FREQUENCY=60000
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: b1
+  name: Side B, replicate 1, UPDATE_CACHE_FREQUENCY=0
+  needs: a1
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_always_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: a2
+  name: Side A, replicate 2, UPDATE_CACHE_FREQUENCY=60000
+  needs: b1
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: b2
+  name: Side B, replicate 2, UPDATE_CACHE_FREQUENCY=0
+  needs: a2
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_always_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: a3
+  name: Side A, replicate 3, UPDATE_CACHE_FREQUENCY=60000
+  needs: b2
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
+
+test: b3
+  name: Side B, replicate 3, UPDATE_CACHE_FREQUENCY=0
+  needs: a3
+  driver: pherf-distributed
+  args: --scenario pherf/px_fleet_scenario.xml --schema pherf/px_fleet_always_schema.sql
+  args: --rows 20000 --rate 300 --duration-ms 60000 --threads 12
