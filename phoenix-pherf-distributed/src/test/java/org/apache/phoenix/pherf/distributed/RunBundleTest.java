@@ -121,7 +121,9 @@ public class RunBundleTest {
       "slots/0-0.hlog", "slots/0-1.hlog" }) {
       assertTrue(path, new File(results, path).isFile());
     }
-    assertEquals(Arrays.asList("drivers", "manifest.json"), sorted(bundle.list()));
+    // The status file persists the final run view so that a restarted controller can restore the
+    // run state from disk.
+    assertEquals(Arrays.asList("drivers", "manifest.json", "status.json"), sorted(bundle.list()));
     assertEquals(Arrays.asList("LATENCY_run.hlog", "LATENCY_run.json", "VERDICT_run.tsv", "slots"),
       sorted(results.list()));
 

@@ -22,15 +22,19 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -49,27 +53,43 @@ import org.apache.phoenix.pherf.verdict.HealthVerdict;
  * following the run-bundle directory layout consumed by offline analysis:
  * <ul>
  * <li>{@link #MANIFEST}: records the run id, class, result, state and reason, seed and times, and
- * contamination tags. Because this file is written last, any run directory lacking a manifest
- * represents an interrupted run.</li>
+ * contamination tags. Because it is written last, any run directory without a manifest represents
+ * an interrupted run.</li>
+ * <li>{@link #STATUS}: captures the final run view. It is written immediately before the manifest,
+ * never changes afterward, and allows a controller to restore the run.</li>
  * <li>{@link #RESULTS}/LATENCY_run.json: contains the fleet report, formatted as a version 1 P4
  * JSON report augmented with a fleet member.</li>
  * <li>{@link #RESULTS}/LATENCY_run.hlog: stores the merged run log, containing one aggregate
- * histogram per key.</li>
- * <li>{@link #RESULTS}/VERDICT_run.tsv: captures the evaluated fleet verdict.</li>
- * <li>{@link #RESULTS}/slots/&lt;step&gt;-&lt;slot&gt;.hlog: preserves the raw interval log for
- * each slot, with one line per held frame recorded against the agent clock.</li>
+ * histogram for each key.</li>
+ * <li>{@link #RESULTS}/VERDICT_run.tsv: records the evaluated fleet verdict.</li>
+ * <li>{@link #RESULTS}/slots/&lt;step&gt;-&lt;slot&gt;.hlog: preserves the raw interval log of each
+ * slot, with one line for each held frame recorded on the agent clock.</li>
  * </ul>
- * While a run is active, the bundle maintains a single fleet histogram in memory for each key
- * (operation and phase) using the pinned configuration, while streaming every held frame directly
- * to the raw log for its slot. This streaming design ensures that the memory footprint of the
- * bundle does not grow with the duration of the run. All timestamps reported in the fleet report
- * are normalized to the controller clock by taking the agent time minus the clock offset of the
- * slot.
+ * While the run is active, the bundle maintains a single fleet histogram for each key (operation
+ * and phase) using the pinned configuration, and streams each held frame directly to the raw log of
+ * its slot. Consequently, the memory footprint of the bundle does not grow with the duration of the
+ * run. All timestamps in the fleet report are normalized to the controller clock by taking the
+ * agent time minus the clock offset of the slot.
+ * <p>
+ * Every JSON file and the verdict file are committed into place using the same durability sequence:
+ * writing a temporary .tmp file, forcing its contents to disk, atomically moving it over the target
+ * path, and forcing the parent directory. A crash therefore leaves either the previous file or the
+ * complete new file, never a partially written file. Each histogram log is forced to disk when
+ * closed, and each newly created directory is forced into its parent directory. Because all of
+ * these operations complete before the manifest is written, the presence of a manifest after a
+ * process or host crash guarantees that the entire bundle is intact.
  */
 public final class RunBundle {
   public static final String MANIFEST = "manifest.json";
+  /** Names the file that stores the final run view serialized as JSON from {@link RunView}. */
+  public static final String STATUS = "status.json";
   /**
-   * Defines the subdirectory within a run bundle where Pherf results are written for offline
+   * Defines the file suffix used for staging files prior to their atomic move; readers ignore any
+   * file carrying this suffix.
+   */
+  public static final String TMP = ".tmp";
+  /**
+   * Defines the subdirectory within a run bundle where Pherf result files are stored for offline
    * analysis to read.
    */
   public static final String RESULTS = new File(Replicate.BUNDLE_JSON).getParent();
@@ -77,6 +97,8 @@ public final class RunBundle {
   static final String NOISY_HOST = "noisy-host";
   private static final String LABEL = "run";
   private static final String JSON = new File(Replicate.BUNDLE_JSON).getName();
+  /** Defines the relative path to the frozen fleet report within a run bundle. */
+  public static final String REPORT = RESULTS + "/" + JSON;
   private static final String HLOG = "LATENCY_" + LABEL + ".hlog";
   private static final String SLOTS = "slots";
   /** Specifies the initial header comment line written to a Pherf latency log (LATENCY.md). */
@@ -188,7 +210,7 @@ public final class RunBundle {
     if (failure != null) {
       throw failure;
     }
-    Files.createDirectories(results.toPath());
+    createDirectories(results.toPath());
     RunView view = run.view();
     List<FleetVerdict.Slot> slots = new ArrayList<>();
     List<JsonObject> schedules = new ArrayList<>();
@@ -253,7 +275,13 @@ public final class RunBundle {
     List<Histogram> sorted = totals();
     writeLatency(results, startMs, endMs, sorted, schedules, fleet);
     List<HealthVerdict.Row> rows = FleetVerdict.evaluate(run.spec, view, slots, sorted);
-    HealthVerdict.write(results, LABEL, rows);
+    // Format the verdict identically to HealthVerdict.write so both representations remain equal,
+    // while committing the output atomically and forcing it to disk.
+    StringBuilder verdict = new StringBuilder();
+    for (HealthVerdict.Row row : rows) {
+      verdict.append(row).append('\n');
+    }
+    writeAtomically(new File(results, HealthVerdict.fileName(LABEL)), verdict.toString());
 
     JsonObject runMember = new JsonObject();
     runMember.addProperty("id", run.runId);
@@ -274,7 +302,28 @@ public final class RunBundle {
     manifest.addProperty("bundle_format_version", 1);
     manifest.add("run", runMember);
     manifest.add("quiet_host", quietHost);
+    writeStatus(dir, view);
     writeAtomically(new File(dir, MANIFEST), GSON.toJson(manifest) + "\n");
+  }
+
+  /** Persists the view of an ended run to its {@link #STATUS} file. */
+  static void writeStatus(File dir, RunView view) throws IOException {
+    writeAtomically(new File(dir, STATUS), GSON.toJson(view) + "\n");
+  }
+
+  /** Reads and validates the run view previously persisted by {@link #writeStatus}. */
+  static RunView readStatus(File dir) throws IOException {
+    File file = new File(dir, STATUS);
+    try {
+      RunView view = GSON.fromJson(
+        new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8), RunView.class);
+      if (view == null || view.getRunId() == null || view.getState() == null) {
+        throw new IOException(file + " holds no run view");
+      }
+      return view;
+    } catch (JsonParseException e) {
+      throw new IOException(file + " is not a run view: " + e.getMessage(), e);
+    }
   }
 
   /**
@@ -379,11 +428,48 @@ public final class RunBundle {
     writeAtomically(new File(dir, JSON), GSON.toJson(report) + "\n");
   }
 
-  private static void writeAtomically(File target, String text) throws IOException {
-    Path temporary = new File(target.getPath() + ".tmp").toPath();
-    Files.write(temporary, text.getBytes(StandardCharsets.UTF_8));
+  /**
+   * Writes the given text to the target file so that a crash leaves either the old file or the
+   * complete new file, by writing to a .tmp file, forcing its data to disk, atomically moving it
+   * over the target, and forcing the parent directory to make the rename durable.
+   */
+  static void writeAtomically(File target, String text) throws IOException {
+    Path temporary = new File(target.getPath() + TMP).toPath();
+    try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.CREATE,
+      StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+      ByteBuffer bytes = ByteBuffer.wrap(text.getBytes(StandardCharsets.UTF_8));
+      while (bytes.hasRemaining()) {
+        channel.write(bytes);
+      }
+      channel.force(true);
+    }
     Files.move(temporary, target.toPath(), StandardCopyOption.ATOMIC_MOVE,
       StandardCopyOption.REPLACE_EXISTING);
+    forceDirectory(target.getAbsoluteFile().getParentFile().toPath());
+  }
+
+  /**
+   * Forces the metadata and entries of a directory to disk so that any newly created or renamed
+   * entry survives a crash.
+   */
+  static void forceDirectory(Path dir) throws IOException {
+    try (FileChannel channel = FileChannel.open(dir, StandardOpenOption.READ)) {
+      channel.force(true);
+    }
+  }
+
+  /**
+   * Creates the target directory along with any missing parent directories, forcing each newly
+   * created directory into its parent directory on disk.
+   */
+  static void createDirectories(Path dir) throws IOException {
+    Path absolute = dir.toAbsolutePath();
+    if (Files.isDirectory(absolute)) {
+      return;
+    }
+    createDirectories(absolute.getParent());
+    Files.createDirectory(absolute);
+    forceDirectory(absolute.getParent());
   }
 
   /**
@@ -395,7 +481,7 @@ public final class RunBundle {
 
     SlotLog(RunRecord.SlotRecord slot, long baseMs) throws IOException {
       File file = new File(new File(results, SLOTS), logName(slot));
-      Files.createDirectories(file.getParentFile().toPath());
+      createDirectories(file.getParentFile().toPath());
       this.log = new Log(file, baseMs,
         "pherf-distributed run " + slot.step.run.runId + " step " + slot.step.index + " slot "
           + slot.assignment.getIdentity().getSlot() + " agent " + slot.agent + ", agent clock");
@@ -417,6 +503,7 @@ public final class RunBundle {
    */
   private static final class Log {
     private final File file;
+    private final FileOutputStream stream;
     private final PrintStream out;
     private final HistogramLogWriter writer;
     private final long baseMs;
@@ -424,8 +511,9 @@ public final class RunBundle {
     Log(File file, long baseMs, String comment) throws IOException {
       this.file = file;
       this.baseMs = baseMs;
-      this.out = new PrintStream(new BufferedOutputStream(new FileOutputStream(file)), false,
-        StandardCharsets.UTF_8.name());
+      this.stream = new FileOutputStream(file);
+      this.out =
+        new PrintStream(new BufferedOutputStream(stream), false, StandardCharsets.UTF_8.name());
       this.writer = new HistogramLogWriter(out);
       writer.outputComment(COMMENT);
       if (comment != null) {
@@ -447,8 +535,15 @@ public final class RunBundle {
       check();
     }
 
+    /** Flushes and forces the log file to disk before closing the underlying writer. */
     void close() throws IOException {
-      writer.close();
+      try {
+        out.flush();
+        check();
+        stream.getFD().sync();
+      } finally {
+        writer.close();
+      }
       check();
     }
 

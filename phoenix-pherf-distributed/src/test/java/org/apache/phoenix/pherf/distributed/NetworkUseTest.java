@@ -135,6 +135,7 @@ public class NetworkUseTest {
     TreeSet<String> server = new TreeSet<>();
     server.add(HTTP + "ChannelHandler");
     server.add(HTTP + "ControllerServer");
+    server.add(HTTP + "RestHandler");
     assertEquals(server, users(constants, "com/sun/net/httpserver/"));
     TreeSet<String> client = new TreeSet<>();
     client.add(HTTP + "HttpAgentTransport");

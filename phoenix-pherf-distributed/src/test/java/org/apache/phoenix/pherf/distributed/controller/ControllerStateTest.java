@@ -25,6 +25,7 @@ import static org.junit.Assert.fail;
 import com.google.gson.JsonObject;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -415,6 +416,8 @@ public class ControllerStateTest {
     assertEquals(1, slot.getHeldSeq());
     assertEquals(1, slot.getSamples());
     assertEquals("a1", controller.agents().get(0).getId());
+    assertEquals(AgentView.State.FAULTED, controller.agents().get(0).getState());
+    assertEquals(slot.getError(), controller.agents().get(0).getFault());
   }
 
   /**
@@ -430,6 +433,7 @@ public class ControllerStateTest {
     RunView run = controller.run(runId);
     assertEquals(RunView.State.FAILED, run.getState());
     assertEquals("agent a1 reported DONE with no final report", run.getReason());
+    assertEquals(AgentView.State.FAULTED, controller.agents().get(0).getState());
   }
 
   /**
@@ -459,7 +463,7 @@ public class ControllerStateTest {
     try {
       broken.submit(Simulation.spec(1));
       fail("submitted with no run directory");
-    } catch (IllegalStateException e) {
+    } catch (UncheckedIOException e) {
       assertTrue(e.getMessage(), e.getMessage().startsWith("cannot create the run directory "));
     }
     assertNull(broken.run("20260101T000000000Z-1"));

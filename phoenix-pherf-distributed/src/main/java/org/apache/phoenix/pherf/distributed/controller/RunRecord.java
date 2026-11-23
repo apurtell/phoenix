@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.pherf.distributed.controller;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -32,6 +33,8 @@ import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 final class RunRecord {
   final String runId;
   final RunSpec spec;
+  /** Holds the bundle directory allocated for the run. */
+  final File dir;
   /** Holds the controller clock timestamp when the run was submitted. */
   final long startedMs;
   final List<StepRecord> steps = new ArrayList<>();
@@ -50,11 +53,12 @@ final class RunRecord {
    */
   boolean started;
 
-  RunRecord(String runId, RunSpec spec, long startedMs, RunBundle bundle) {
+  RunRecord(String runId, RunSpec spec, long startedMs, File dir) {
     this.runId = runId;
     this.spec = spec;
     this.startedMs = startedMs;
-    this.bundle = bundle;
+    this.dir = dir;
+    this.bundle = new RunBundle(dir);
     for (int i = 0; i < spec.getSteps().size(); i++) {
       steps.add(new StepRecord(this, i));
     }

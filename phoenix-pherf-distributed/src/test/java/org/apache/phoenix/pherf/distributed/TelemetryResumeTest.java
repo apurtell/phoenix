@@ -18,7 +18,6 @@
 package org.apache.phoenix.pherf.distributed;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
@@ -246,7 +245,10 @@ public class TelemetryResumeTest {
     int failed = simulation.count(InProcessNetwork.FAIL, "intervals");
     simulation.runFor(10000);
     assertEquals(failed, simulation.count(InProcessNetwork.FAIL, "intervals"));
+    // The agent reports the telemetry failure, and because the failure may stem from a network
+    // fault, the controller does not mark the agent as faulted.
     assertEquals(AgentView.State.IDLE, simulation.view("a1").getState());
+    assertEquals(null, simulation.view("a1").getFault());
   }
 
   /**
@@ -271,6 +273,9 @@ public class TelemetryResumeTest {
     simulation.network.policy((agent, stream, direction,
       message) -> agent.equals("a1") && stream.equals(TELEMETRY) ? 2400 : 0);
     simulation.runFor(1000);
+    // Because agent a2 cleanly reported its workload error, it is not placed in the FAULTED state
+    // and remains available to take the next run.
+    assertEquals(null, simulation.view("a2").getFault());
     String next = submit(simulation, 2, 20);
     simulation.runFor(40000);
     RunView run = simulation.run(next);
@@ -317,10 +322,10 @@ public class TelemetryResumeTest {
   }
 
   /**
-   * Verifies that restarting the controller discards the active run without double-counting frames.
-   * The replacement controller acknowledges incoming frames from the prior run without retaining
-   * them, prompting the agents to discard those frames and re-register so that the subsequent run
-   * accounts strictly for its own frames.
+   * Verifies that restarting the controller fails the active run without double-counting frames.
+   * The new controller acknowledges incoming frames from the old run without holding any of them,
+   * prompting the agents to drop those frames and register again so that the next run counts only
+   * its own frames.
    */
   @Test
   public void controllerRestartCountsNothingTwice() throws Exception {
@@ -348,7 +353,9 @@ public class TelemetryResumeTest {
     assertTrue(batches >= 2);
     simulation.network.thaw("a1", Protocol.CONTROL);
     simulation.runFor(5000);
-    assertNull(simulation.run(runId));
+    RunView lost = simulation.run(runId);
+    assertEquals(RunView.State.FAILED, lost.getState());
+    assertEquals("the controller stopped during the run", lost.getReason());
     assertEquals(RunView.State.RUNNING, old.run(runId).getState());
     for (String id : new String[] { "a1", "a2" }) {
       assertEquals(AgentView.State.IDLE, simulation.view(id).getState());

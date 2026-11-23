@@ -36,6 +36,7 @@ import org.apache.phoenix.pherf.distributed.controller.AgentView;
 import org.apache.phoenix.pherf.distributed.controller.Controller;
 import org.apache.phoenix.pherf.distributed.controller.RunSpec;
 import org.apache.phoenix.pherf.distributed.controller.RunView;
+import org.apache.phoenix.pherf.distributed.controller.TestTable;
 import org.apache.phoenix.pherf.distributed.identity.OperationalIdentity;
 import org.apache.phoenix.pherf.distributed.transport.InProcessNetwork;
 
@@ -62,6 +63,11 @@ public final class Simulation {
    * {@link #restartController()} is invoked.
    */
   public Controller controller = new Controller(clock, runDir);
+  /**
+   * Holds the test table for the active controller process, which is replaced when
+   * {@link #restartController()} is invoked.
+   */
+  public TestTable tests = new TestTable(controller, clock);
   private final Map<String, Workload> workloads = new LinkedHashMap<>();
   private final Map<String, AgentRuntime> runtimes = new LinkedHashMap<>();
   private int incarnations;
@@ -107,12 +113,14 @@ public final class Simulation {
   }
 
   /**
-   * Stops the active controller process and starts a fresh, stateless controller instance bound to
-   * the same network endpoint.
+   * Stops the active controller process and starts a new controller instance bound to the same
+   * endpoint and run directory. The new process retains only the state that it restores from the
+   * run directory.
    */
   public void restartController() {
     controller.close();
     controller = new Controller(clock, runDir);
+    tests = new TestTable(controller, clock);
     network.listen(ENDPOINT, controller);
     controller.start();
   }

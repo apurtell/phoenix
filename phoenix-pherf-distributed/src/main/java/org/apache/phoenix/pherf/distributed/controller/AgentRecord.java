@@ -48,8 +48,13 @@ final class AgentRecord {
   /** Set to true when the desired operational state for this agent is shutdown. */
   boolean leaving;
   /**
-   * Caches the encoded form of the last command sent to the agent so that a repeated command is
-   * sent at most once per poll hold interval.
+   * Records the error from a launched slot that failed due to this agent until a reset clears it,
+   * or null when the agent is not faulted.
+   */
+  String fault;
+  /**
+   * Caches the encoded form of the last command sent so that a repeated command is transmitted at
+   * most once per hold interval.
    */
   String lastCommand;
   /**
@@ -84,9 +89,12 @@ final class AgentRecord {
     lastSeenMonoMs = clock.monotonicMs();
   }
 
-  /** Returns true when the agent is available to take a new slot assignment. */
+  /**
+   * Returns true when the agent is available to accept a new slot; a faulted agent cannot accept a
+   * new slot.
+   */
   boolean free() {
-    return binding == null && !leaving && !reported.getPhase().active();
+    return binding == null && !leaving && fault == null && !reported.getPhase().active();
   }
 
   AgentView view() {
@@ -95,6 +103,8 @@ final class AgentRecord {
       state = AgentView.State.LEAVING;
     } else if (binding != null) {
       state = AgentView.State.valueOf(binding.state.name());
+    } else if (fault != null) {
+      state = AgentView.State.FAULTED;
     } else {
       switch (reported.getPhase()) {
         case PREPARING:
@@ -119,6 +129,6 @@ final class AgentRecord {
     long[] clock = clockFilter.best();
     return new AgentView(id, incarnation, state, reported.getPhase(), reported.getRunId(),
       reported.getStep(), registeredMs, lastSeenMs, clock == null ? null : clock[0],
-      clock == null ? null : clock[1]);
+      clock == null ? null : clock[1], fault);
   }
 }

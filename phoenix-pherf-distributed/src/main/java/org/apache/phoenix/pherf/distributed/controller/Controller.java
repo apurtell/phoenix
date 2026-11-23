@@ -19,15 +19,19 @@ package org.apache.phoenix.pherf.distributed.controller;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.HdrHistogram.Histogram;
 import org.apache.phoenix.pherf.distributed.clock.Clock;
 import org.apache.phoenix.pherf.distributed.protocol.Ack;
@@ -96,15 +100,39 @@ import org.slf4j.LoggerFactory;
  * is decoded once, validated against the cumulative sample count for its key, merged into the run's
  * fleet histograms, and streamed to the raw interval log of its slot.
  * <p>
- * Each run is allocated its own subdirectory within the configured run directory. Whenever a run
- * reaches a terminal state (COMPLETE, FAILED, or ABORTED), the controller writes the complete run
- * bundle, writing the manifest last, within the same monitor critical section, and then releases
- * the in-memory histogram merge state for the run.
+ * Each run is allocated its own subdirectory within the run directory. Whenever a run reaches a
+ * terminal state (COMPLETE, FAILED, ABORTED, or CANCELLED), within the same monitor critical
+ * section, the controller writes the run bundle, writing its status and then its manifest last, and
+ * then releases the merge state of the run.
+ * <p>
+ * An agent is marked FAULTED when the controller detects that the agent process itself failed its
+ * launched slot, whether through a bad histogram frame, lost or duplicated telemetry, reporting
+ * DONE with no report, or becoming idle in the slot. The agent still receives a cancel or release
+ * command as the other agents do, but it is not assigned any new slot until {@link #resetAgent} is
+ * invoked. An error reported by the agent (indicating that its workload failed, for example on a
+ * cluster fault) fails the run and faults no agent. Similarly, a failure occurring before launch is
+ * treated as a plan error and faults no agent.
+ * <p>
+ * On startup, a new controller restores the ended runs in its run directory from their status
+ * files. Any run without a committed end (having neither a manifest nor a failed status) was in
+ * flight when the previous controller stopped; it is marked FAILED because its merge state existed
+ * only in memory and its agents drop their in-progress work when they register again.
  */
 public final class Controller implements AgentChannel {
   private static final Logger LOG = LoggerFactory.getLogger(Controller.class);
-  private static final DateTimeFormatter RUN_ID =
+  /** Formats the UTC timestamp prefix used in run identifiers and test identifiers. */
+  static final DateTimeFormatter STAMP =
     DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'").withZone(ZoneOffset.UTC);
+  /**
+   * Matches a run identifier composed of the UTC submission timestamp and a contiguous,
+   * non-repeating run number.
+   */
+  public static final Pattern RUN_ID = Pattern.compile("[0-9]{8}T[0-9]{9}Z-([0-9]+)");
+  /**
+   * Records the failure reason assigned to a run that was in flight when the previous controller
+   * stopped.
+   */
+  static final String INTERRUPTED = "the controller stopped during the run";
 
   /**
    * Defines the maximum clock error bound for a single slot that still guarantees two slots remain
@@ -116,14 +144,80 @@ public final class Controller implements AgentChannel {
   private final File runDir;
   private final TreeMap<String, AgentRecord> agents = new TreeMap<>();
   private final Map<String, RunRecord> runs = new LinkedHashMap<>();
+  /**
+   * Holds the views of runs that ended before the last restart, loaded from their status files.
+   */
+  private final Map<String, RunView> restored = new LinkedHashMap<>();
   private Clock.Timer reaper;
   private long runCount;
   private boolean closed;
 
-  /** @param runDir the existing root directory in which run bundle directories are created. */
+  /**
+   * Initializes the controller and restores any previously ended runs from the run directory, which
+   * contains none when fresh.
+   * @param runDir the existing directory in which run bundles are stored.
+   */
   public Controller(Clock clock, File runDir) {
     this.clock = clock;
     this.runDir = runDir.getAbsoluteFile();
+    restore();
+  }
+
+  /**
+   * Restores the state of each run subdirectory. The presence of a manifest indicates a committed
+   * terminal run whose view is loaded from its status file. When no manifest is present, a failed,
+   * aborted, or cancelled status is preserved as is, whereas any other run is treated as
+   * interrupted and recorded as FAILED in its status file without writing a manifest. Any status
+   * file that cannot be read causes its run to be skipped with a logged warning. Subsequent run
+   * numbers continue above the highest discovered run number.
+   */
+  private void restore() {
+    File[] children = runDir.listFiles();
+    if (children == null) {
+      return;
+    }
+    Arrays.sort(children);
+    for (File dir : children) {
+      Matcher id = RUN_ID.matcher(dir.getName());
+      if (!dir.isDirectory() || !id.matches()) {
+        continue;
+      }
+      runCount = Math.max(runCount, Long.parseLong(id.group(1)));
+      String runId = dir.getName();
+      boolean committed = new File(dir, RunBundle.MANIFEST).isFile();
+      RunView view = null;
+      if (committed || new File(dir, RunBundle.STATUS).isFile()) {
+        try {
+          view = RunBundle.readStatus(dir);
+        } catch (IOException e) {
+          LOG.warn("run {} is not restored: {}", runId, e.getMessage());
+          continue;
+        }
+        if (!view.getRunId().equals(runId)) {
+          LOG.warn("run {} is not restored: {} names run {}", runId,
+            new File(dir, RunBundle.STATUS), view.getRunId());
+          continue;
+        }
+      }
+      if (!committed && (view == null || !view.getState().failure())) {
+        view = RunView.interrupted(runId, INTERRUPTED);
+        try {
+          RunBundle.writeStatus(dir, view);
+        } catch (IOException e) {
+          LOG.warn("run {}: cannot write {}: {}", runId, new File(dir, RunBundle.STATUS), e);
+        }
+        LOG.warn("run {} {}: {}", runId, view.getState(), INTERRUPTED);
+      }
+      restored.put(runId, view);
+    }
+    if (!restored.isEmpty()) {
+      LOG.info("restored {} runs from {}", restored.size(), runDir);
+    }
+  }
+
+  /** Returns the root directory where run bundles are stored. */
+  public File runDirectory() {
+    return runDir;
   }
 
   /** Starts the periodic reaper task that evicts unresponsive agents. */
@@ -161,18 +255,21 @@ public final class Controller implements AgentChannel {
     return views;
   }
 
-  /** Returns a view of the requested run, or null if the run is unknown to the controller. */
+  /**
+   * Returns the view of the specified active or restored run, or null when the run is unknown to
+   * the controller.
+   */
   public synchronized RunView run(String runId) {
     RunRecord run = runs.get(runId);
-    return run == null ? null : run.view();
+    return run == null ? restored.get(runId) : run.view();
   }
 
   /**
-   * Initiates a new run across available free agents, creates its bundle subdirectory within the
-   * run directory, and returns the assigned run identifier, assuming that {@link RunSpec#parse} has
-   * already validated the execution plan.
-   * @throws IllegalStateException when fewer free agents are available than step 0 requires, or
-   *                               when the run bundle directory cannot be created.
+   * Initiates a new run on available free agents, creates its bundle subdirectory within the run
+   * directory, and returns the assigned run identifier, assuming that {@link RunSpec#parse} has
+   * already validated the plan.
+   * @throws IllegalStateException when step 0 has fewer free agents than required.
+   * @throws UncheckedIOException  when the run bundle directory cannot be created.
    */
   public synchronized String submit(RunSpec spec) {
     String shortage = shortage(spec, 0);
@@ -180,14 +277,15 @@ public final class Controller implements AgentChannel {
       throw new IllegalStateException(shortage);
     }
     long nowMs = clock.millis();
-    String runId = RUN_ID.format(Instant.ofEpochMilli(nowMs)) + "-" + ++runCount;
+    String runId = STAMP.format(Instant.ofEpochMilli(nowMs)) + "-" + ++runCount;
     File dir = new File(runDir, runId);
     try {
       Files.createDirectory(dir.toPath());
+      RunBundle.forceDirectory(runDir.toPath());
     } catch (IOException e) {
-      throw new IllegalStateException("cannot create the run directory " + dir + ": " + e, e);
+      throw new UncheckedIOException("cannot create the run directory " + dir + ": " + e, e);
     }
-    RunRecord run = new RunRecord(runId, spec, nowMs, new RunBundle(dir));
+    RunRecord run = new RunRecord(runId, spec, nowMs, dir);
     runs.put(runId, run);
     LOG.info("run {} submitted with {} steps", runId, spec.getSteps().size());
     bindStep(run, 0);
@@ -196,8 +294,57 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Requests an orderly shutdown of the specified agent, returning false if the agent is unknown to
-   * the controller.
+   * Cancels a RUNNING run, transitioning it to the CANCELLED state with the specified reason and
+   * instructing its bound agents to cancel or release their work. Cancellation faults no agent, and
+   * a run that is already CANCELLED remains unchanged.
+   * @return the view of the run, or null when the run is unknown to the controller.
+   * @throws IllegalStateException when the run has already ended in another state.
+   */
+  public synchronized RunView cancel(String runId, String reason) {
+    RunRecord run = runs.get(runId);
+    RunView.State state =
+      run != null ? run.state : restored.containsKey(runId) ? restored.get(runId).getState() : null;
+    if (state == null) {
+      return null;
+    }
+    if (state == RunView.State.RUNNING) {
+      LOG.info("run {} cancelled: {}", runId, reason);
+      endRun(run, RunView.State.CANCELLED, reason);
+      answerHeldPolls();
+    } else if (state != RunView.State.CANCELLED) {
+      throw new IllegalStateException("run " + runId + " is " + state + ", not RUNNING");
+    }
+    return run(runId);
+  }
+
+  /**
+   * Clears the fault status of an agent so that it can be assigned execution slots again. A reset
+   * does not interrupt active work, and an agent without a fault remains unchanged.
+   * @return the view of the agent, or null when the agent is unknown to the controller.
+   * @throws IllegalStateException when the agent currently holds a slot or is leaving.
+   */
+  public synchronized AgentView resetAgent(String id) {
+    AgentRecord agent = agents.get(id);
+    if (agent == null) {
+      return null;
+    }
+    if (agent.leaving) {
+      throw new IllegalStateException("agent " + id + " is leaving");
+    }
+    if (agent.binding != null) {
+      throw new IllegalStateException(
+        "agent " + id + " has a slot of run " + agent.binding.step.run.runId);
+    }
+    if (agent.fault != null) {
+      LOG.info("agent {} reset; its fault was: {}", id, agent.fault);
+      agent.fault = null;
+    }
+    return agent.view();
+  }
+
+  /**
+   * Requests an orderly shutdown of the specified agent, returning false when the agent is unknown
+   * to the controller.
    */
   public synchronized boolean shutdownAgent(String id) {
     AgentRecord agent = agents.get(id);
@@ -323,8 +470,8 @@ public final class Controller implements AgentChannel {
               + batch.getStep() + " has a bad histogram: " + e.getMessage();
             LOG.warn("agent {}: {}", agent.id, reason);
             // Keep the agent registered in the fleet; the acknowledgment stops advancing held
-            // frames and a subsequent cancel command terminates the active workload.
-            fail(slot, "agent " + agent.id + ": " + reason);
+            // frames, and a subsequent cancel command terminates the active workload.
+            fault(slot, "agent " + agent.id + ": " + reason);
             answerHeldPolls();
             return ack(batch, slot.heldSeq);
           }
@@ -349,7 +496,7 @@ public final class Controller implements AgentChannel {
             + " has the total " + frame.getTotal() + ", but the controller holds " + held;
           LOG.warn("agent {}: {}", agent.id, reason);
           slot.lostTelemetry = reason;
-          fail(slot, "agent " + agent.id + ": " + reason);
+          fault(slot, "agent " + agent.id + ": " + reason);
           answerHeldPolls();
           return ack(batch, slot.heldSeq);
         }
@@ -388,7 +535,7 @@ public final class Controller implements AgentChannel {
     }
     if (!slot.matches(status.getRunId(), status.getStep())) {
       if (status.getPhase() == Phase.IDLE && slot.state != RunView.SlotState.ASSIGNED) {
-        fail(slot, "agent " + agent.id + " went idle during its slot");
+        fault(slot, "agent " + agent.id + " went idle during its slot");
       }
       return;
     }
@@ -411,7 +558,7 @@ public final class Controller implements AgentChannel {
       case DONE:
         if (slot.state.launched()) {
           if (status.getReport() == null) {
-            fail(slot, "agent " + agent.id + " reported DONE with no final report");
+            fault(slot, "agent " + agent.id + " reported DONE with no final report");
             break;
           }
           slot.finalSeq = status.getFinalSeq();
@@ -430,6 +577,8 @@ public final class Controller implements AgentChannel {
         }
         break;
       case FAILED:
+        // The agent's workload failed, which may reflect a cluster fault rather than a defective
+        // agent process, so the agent itself is not marked faulted.
         fail(slot, "agent " + agent.id + ": " + status.getError());
         break;
       default:
@@ -438,9 +587,10 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Records a subsequent failure reported for a slot that was already cancelled due to the failure
-   * of its run, ensuring that the run view preserves the error details of every failed slot while
-   * the overall run failure reason retains the initial error.
+   * Records a subsequent failure reported for a slot that was cancelled when its run failed, so
+   * that the run view displays the error of every failed slot while the overall run failure reason
+   * retains the initial error. The persisted run bundle remains unchanged, and its status file
+   * preserves the view captured at commit time.
    */
   private void cancelledSlotFailed(AgentRecord agent, Status status) {
     RunRecord run = status.getRunId() == null ? null : runs.get(status.getRunId());
@@ -454,6 +604,8 @@ public final class Controller implements AgentChannel {
       if (slot.agent.equals(agent.id) && slot.state == RunView.SlotState.CANCELLED) {
         slot.state = RunView.SlotState.FAILED;
         slot.error = "agent " + agent.id + ": " + status.getError();
+        LOG.warn("run {} slot of agent {} failed after the run ended: {}", run.runId, agent.id,
+          status.getError());
       }
     }
   }
@@ -622,20 +774,25 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Returns a diagnostic message explaining why the specified step cannot allocate its required
-   * free agents right now, or null if sufficient free agents are available.
+   * Returns a diagnostic message explaining why a step cannot allocate its required agents right
+   * now, including the identifiers of any faulted agents, or null when enough free agents exist.
    */
   private String shortage(RunSpec spec, int index) {
     int free = 0;
+    List<String> faulted = new ArrayList<>();
     for (AgentRecord agent : agents.values()) {
       if (agent.free()) {
         free++;
+      } else if (agent.fault != null) {
+        faulted.add(agent.id);
       }
     }
     int needed = spec.getSteps().get(index).getAgents();
-    return free >= needed
-      ? null
-      : "step " + index + " needs " + needed + " agents but " + free + " are free";
+    if (free >= needed) {
+      return null;
+    }
+    return "step " + index + " needs " + needed + " agents but " + free + " are free"
+      + (faulted.isEmpty() ? "" : "; faulted: " + String.join(", ", faulted));
   }
 
   /**
@@ -798,6 +955,24 @@ public final class Controller implements AgentChannel {
     }
   }
 
+  /**
+   * Fails a slot due to a failure of its agent process (bad or lost telemetry, reporting DONE with
+   * no report, or becoming idle during the slot). When the slot was already launched and its agent
+   * remains registered, the agent is marked FAULTED.
+   */
+  private void fault(RunRecord.SlotRecord slot, String reason) {
+    AgentRecord agent = agents.get(slot.agent);
+    if (
+      slot.state.launched() && slot.step.run.state == RunView.State.RUNNING && agent != null
+        && agent.incarnation.equals(slot.incarnation)
+    ) {
+      agent.fault = reason;
+      LOG.warn("agent {} is FAULTED until a reset: {}", agent.id, reason);
+    }
+    fail(slot, reason);
+  }
+
+  /** Fails the specified slot and its enclosing run without faulting any agent. */
   private void fail(RunRecord.SlotRecord slot, String reason) {
     slot.state = RunView.SlotState.FAILED;
     slot.error = reason;
@@ -806,16 +981,24 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Terminates the run and unbinds the agents assigned to its current step so that they receive a
-   * cancel or release command. The run transitions to ABORTED if no step has been launched, or to
-   * FAILED otherwise, and every slot that is not already DONE or FAILED is marked CANCELLED. No
-   * slot is retried or bound again, and subsequent steps do not run.
+   * Fails the specified run, transitioning it to ABORTED if no step has launched yet, or to FAILED
+   * otherwise.
    */
   private void failRun(RunRecord run, String reason) {
+    endRun(run, run.started ? RunView.State.FAILED : RunView.State.ABORTED, reason);
+  }
+
+  /**
+   * Terminates a RUNNING run in a non-COMPLETE terminal state and unbinds the agents assigned to
+   * its current step so that they receive a cancel or release command. Every slot that is not
+   * already DONE or FAILED is marked CANCELLED; no slot is retried or bound again, and subsequent
+   * steps do not execute.
+   */
+  private void endRun(RunRecord run, RunView.State state, String reason) {
     if (run.state != RunView.State.RUNNING) {
       return;
     }
-    run.state = run.started ? RunView.State.FAILED : RunView.State.ABORTED;
+    run.state = state;
     run.reason = reason;
     RunRecord.StepRecord step = run.steps.get(run.current);
     for (RunRecord.SlotRecord slot : step.slots) {
@@ -843,9 +1026,10 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Writes the run bundle to disk once a run reaches a terminal state, and then releases its
-   * in-memory histogram merge state and slot final reports. If the bundle cannot be written for a
-   * COMPLETE run, the run transitions to FAILED.
+   * Writes the result bundle for a run that has reached a terminal state, and then releases its
+   * in-memory merge state and the final reports of its slots. A COMPLETE run whose bundle cannot be
+   * written transitions to FAILED; with no manifest written, the status file records that failure
+   * so that a subsequent restore preserves it as well.
    */
   private void writeBundle(RunRecord run) {
     RunBundle bundle = run.bundle;
@@ -862,6 +1046,12 @@ public final class Controller implements AgentChannel {
       if (run.state == RunView.State.COMPLETE) {
         run.state = RunView.State.FAILED;
         run.reason = "cannot write the run bundle: " + e;
+      }
+      try {
+        RunBundle.writeStatus(run.dir, run.view());
+      } catch (IOException | RuntimeException again) {
+        LOG.error("run {}: cannot write {}: {}", run.runId, new File(run.dir, RunBundle.STATUS),
+          again.toString());
       }
     }
     for (RunRecord.StepRecord step : run.steps) {

@@ -20,6 +20,9 @@ package org.apache.phoenix.pherf.distributed;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -28,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.phoenix.pherf.distributed.agent.AgentRuntime;
 import org.apache.phoenix.pherf.distributed.controller.AgentView;
+import org.apache.phoenix.pherf.distributed.controller.RunBundle;
 import org.apache.phoenix.pherf.distributed.controller.RunView;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
@@ -40,7 +44,8 @@ import org.junit.Test;
  * Verifies the run failure propagation rules: a single failing slot causes the entire run to fail.
  * If the failure occurs before any launch, the run transitions to the ABORTED state; otherwise, it
  * transitions to the FAILED state. All other participating agents receive either a cancel or a
- * release command, ensuring that every agent returns to an idle and free state.
+ * release command, ensuring that every agent returns to an idle and free state. A workload failure
+ * reported by an agent does not fault any agent, so the fleet can immediately accept the next run.
  */
 public class FailureRuleTest {
   private static final String[] AGENTS = { "a1", "a2", "a3" };
@@ -160,11 +165,12 @@ public class FailureRuleTest {
   }
 
   /**
-   * Verifies that every failed slot retains its own distinct error message while the overall run
-   * failure reason records the first error encountered.
+   * Verifies that every failed slot retains its own error message while the overall run failure
+   * reason records the first error encountered. Because the second error arrives after the bundle
+   * is committed, it is reflected only in the in-memory view while the status file remains frozen.
    */
   @Test
-  public void everyFailedSlotKeepsItsError() {
+  public void everyFailedSlotKeepsItsError() throws Exception {
     Simulation simulation = fleet("a1", "a2");
     Map<String, String> properties = new LinkedHashMap<>();
     properties.put("fake.prepareError.0", "error of slot 0");
@@ -180,6 +186,16 @@ public class FailureRuleTest {
     }
     assertEquals(Arrays.asList("agent a1: error of slot 0", "agent a2: error of slot 1"), errors);
     assertTrue(run.getReason(), errors.contains(run.getReason()));
+    List<String> frozen = new ArrayList<>();
+    JsonObject status = Bundles.json(new File(simulation.bundle(runId), RunBundle.STATUS));
+    for (JsonElement slot : status.getAsJsonArray("steps").get(0).getAsJsonObject()
+      .getAsJsonArray("slots")) {
+      frozen.add(slot.getAsJsonObject().get("state").getAsString());
+    }
+    int first = errors.indexOf(run.getReason());
+    assertEquals(
+      first == 0 ? Arrays.asList("FAILED", "CANCELLED") : Arrays.asList("CANCELLED", "FAILED"),
+      frozen);
     allIdleAndFree(simulation, "a1", "a2");
   }
 
@@ -220,6 +236,9 @@ public class FailureRuleTest {
     for (String id : AGENTS) {
       assertEquals(AgentRuntime.State.IDLE, simulation.agentRuntime(id).state());
     }
+    // Because a workload error can originate from the cluster, it does not fault any agent.
+    assertEquals(AgentView.State.IDLE, simulation.view("a2").getState());
+    assertEquals(null, simulation.view("a2").getFault());
     allIdleAndFree(simulation, AGENTS);
   }
 

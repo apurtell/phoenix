@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.pherf.distributed.controller;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,8 +36,21 @@ public final class RunView {
      * database traffic.
      */
     ABORTED,
-    /** Indicates that the run failed after at least one step had already been launched. */
-    FAILED
+    /** Indicates that the run failed after at least one step was launched. */
+    FAILED,
+    /**
+     * Indicates that an operator cancelled the run. This state alone makes no statement about
+     * traffic; the individual slot states and dispatch times show what was executed.
+     */
+    CANCELLED;
+
+    /**
+     * Returns true when the run ended in a state other than COMPLETE, specifically ABORTED, FAILED,
+     * or CANCELLED.
+     */
+    public boolean failure() {
+      return this == ABORTED || this == FAILED || this == CANCELLED;
+    }
   }
 
   /** Defines the lifecycle states of an individual step within a run. */
@@ -60,8 +74,8 @@ public final class RunView {
     DONE,
     FAILED,
     /**
-     * Indicates that the run failed on another slot and this slot received a cancel or release
-     * command.
+     * Indicates that the run ended on another slot or via a cancellation, and this slot received a
+     * cancel or release command.
      */
     CANCELLED;
 
@@ -80,6 +94,13 @@ public final class RunView {
   private final int step;
   private final List<StepView> steps;
 
+  /**
+   * Constructs a view with no step views for a run that was interrupted by a controller restart.
+   */
+  static RunView interrupted(String runId, String reason) {
+    return new RunView(runId, State.FAILED, reason, 0, new ArrayList<StepView>());
+  }
+
   RunView(String runId, State state, String reason, int step, List<StepView> steps) {
     this.runId = runId;
     this.state = state;
@@ -97,7 +118,8 @@ public final class RunView {
   }
 
   /**
-   * Returns the failure reason when the run is in the ABORTED or FAILED state, or null otherwise.
+   * Returns the termination reason when the run is in the ABORTED, FAILED, or CANCELLED state, or
+   * null otherwise.
    */
   public String getReason() {
     return reason;

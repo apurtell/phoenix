@@ -28,8 +28,8 @@ request and response bodies, avoiding any external RPC framework or servlet web 
 | Process | Main class | Role |
 |---|---|---|
 | Controller | `org.apache.phoenix.pherf.distributed.controller.ControllerMain` | Maintains the
-active agent table and orchestrates test runs. Passively listens for inbound agent connections and
-never initiates outbound connections to an agent. |
+active agent registry, test definitions, and execution runs. Exposes the REST management API and
+listens for inbound agent connections, while never initiating outbound connections to any agent. |
 | Agent | `org.apache.phoenix.pherf.distributed.agent.AgentMain` | Establishes two outbound
 connections to the controller to receive and execute assigned workloads, without exposing any
 network listener of its own. |
@@ -45,22 +45,63 @@ Both processes report their termination cause through a shared set of exit statu
 | 1 | The process terminated due to an unexpected internal error. |
 | 2 | The process halted due to a bad configuration or because the controller rejected the agent. |
 
-When an agent receives SIGTERM, it cancels any in-flight workload, sends a `goodbye` message to the
-controller, and terminates within 5 seconds. When the controller receives SIGTERM, it stops its
-agent listener.
+Upon receiving SIGTERM, an agent cancels any active workload, transmits a `goodbye` message, and
+terminates within 5 seconds. When the controller receives SIGTERM, it shuts down its network
+listeners without finalizing active state, so a SIGTERM signal and an unexpected crash have the
+same effect on any in-flight run (see Persistence and restart).
 
 ## Environment
 
-| Variable | Process | Meaning |
-|---|---|---|
-| `PHERF_AGENT_PORT` | controller | The port of the agent listener. Default 8790. `0` takes a free port; the log line `agent channel listening on port N` gives it. |
-| `PHERF_RUN_DIR` | controller | Required. The directory of the run bundles (see Run bundle). The controller makes it when it does not exist. Without it, or when it cannot be made, the controller stops with status 2. |
-| `PHERF_CONTROLLER` | agent | Required. The agent listener of the controller, for example `http://pherf-controller:8790`. |
-| `PHERF_ZOOKEEPER` | agent | Required. The ZooKeeper quorum of the target cluster, given to Pherf as `-z`. |
-| `PHERF_AGENT_ID` | agent | The operational id. If it is not set, the agent uses `HOSTNAME`, then the local host name. The id matches `[A-Za-z0-9._-]{1,63}`. |
+This environment contract governs the D6 container images and the test harness (H3, K5). The
+controller and agent JVM processes consume their respective process variables directly, while
+`pherf-distributed.sh` consumes the script-level variables.
 
-The class path of an agent must hold `pherf.properties`, as the phoenix-pherf jar does. An agent
-without `PHERF_CONTROLLER`, `PHERF_ZOOKEEPER` or `pherf.properties` stops with status 2.
+| Variable | Used by | Default | Meaning |
+|---|---|---|---|
+| `PHERF_RUN_DIR` | controller | required | The controller data directory housing run bundles,
+`tests/`, `controller.lock`, and `controller.pid`. The controller creates this directory
+automatically if it does not already exist. On Kubernetes deployments, this path corresponds to the
+PersistentVolumeClaim mount point. |
+| `PHERF_REST_PORT` | controller | 8780 | The TCP port for the REST listener. Setting `0` binds an
+ephemeral free port, which is reported in the `REST API listening on port N` log entry. |
+| `PHERF_AGENT_PORT` | controller | 8790 | The TCP port for the agent channel listener. Setting `0`
+binds an ephemeral free port, which is reported in the `agent channel listening on port N` log
+entry. |
+| `PHERF_BIND_ADDRESS` | controller | all interfaces | The network bind address for both listeners,
+specified as an IP literal or a host name that is resolved once at startup. |
+| `PHERF_CONTROLLER` | agent | required | The base URL of the controller's agent channel listener,
+such as `http://host:8790`. |
+| `PHERF_ZOOKEEPER` | agent | required | The ZooKeeper quorum string of the target cluster, passed
+through to Pherf via `-z`. In H3, the harness injects an external quorum through this variable
+(RQ-252). |
+| `PHERF_AGENT_ID` | agent | `HOSTNAME`, then the host name | The agent's operational identifier
+matching `[A-Za-z0-9._-]{1,63}`. On Kubernetes deployments, this value is the pod name (RQ-318). |
+| `PHERF_CLASSPATH` | script | `<bin>/../lib/*` | The JVM class path containing the module jar,
+phoenix-pherf, the Phoenix client and its transitive dependencies, and an slf4j logging binding. |
+| `PHERF_JAVA_OPTS` | script | empty | Additional JVM command-line options. The value is split on
+whitespace without quote or glob processing, so individual options cannot contain spaces. Because
+these options are appended after `-Djava.io.tmpdir=${TMPDIR:-/tmp}`, they can override the
+temporary directory property. Since an agent passes these same options to its Pherf child JVMs,
+memory sizing for D6 and H3 must account for both the agent process and one concurrent child JVM. |
+| `TMPDIR` | script | `/tmp` | The directory passed as the JVM `java.io.tmpdir` property, which
+determines where the agent creates its working directory and stores its pid file. |
+| `JAVA_HOME` | script | `java` on `PATH` | The installation directory of the JDK or JRE used to
+launch the process. |
+
+Any invalid configuration value causes the process to terminate with exit status 2; termination is
+immediate except when contending for a held run-directory lock, which aborts only after the bounded
+wait described below. For the controller, fatal configuration errors include an unset
+`PHERF_RUN_DIR`, a run directory that cannot be created, a port outside the range 0 to 65535, an
+unresolvable bind address, or a run directory that continues to be locked by another controller
+instance. If a starting controller discovers that `controller.lock` is held, it logs a single
+informational message and retries lock acquisition every 500 ms for up to 150 s, accommodating
+Kubernetes pod replacements where a new pod starts while the pod it replaces is still shutting
+down. This timeout encompasses the default 120 s harness stop grace period (`PX_TIMEOUT_STOP`) plus
+30 s for forced termination and kernel lock release. If the lock remains held for the full 150 s,
+the process exits with status 2 and logs `another controller uses PHERF_RUN_DIR <dir>`. For an
+agent, fatal errors include a missing
+`PHERF_CONTROLLER`, a missing `PHERF_ZOOKEEPER`, or the absence of `pherf.properties` on the class
+path (normally provided by the phoenix-pherf jar).
 
 The logging context key `pherf.agent` holds the operational id of the agent. A log4j2 pattern
 shows it with `%X{pherf.agent}`.
@@ -255,7 +296,11 @@ agent log, with the exception of the two start gate marker lines (see Start sync
 | `RUNNING` | The run has a step that is not complete. |
 | `COMPLETE` | Every step is complete, and the run bundle is written. A run whose bundle cannot be written is `FAILED` with the reason `cannot write the run bundle: ...`. |
 | `ABORTED` | The run failed before any step got `launch`, so it sent no database traffic. |
-| `FAILED` | The run failed after a step got `launch`. |
+| `FAILED` | The run failed after at least one step received `launch`, or the run was still in
+flight when the controller stopped. |
+| `CANCELLED` | An operator explicitly cancelled the run or ended its enclosing test. This state
+alone does not indicate whether database traffic was sent; the individual slot states, dispatch
+timestamps, and retained telemetry frames record how far execution progressed. |
 
 | Slot state | Meaning |
 |---|---|
@@ -266,15 +311,20 @@ agent log, with the exception of the two start gate marker lines (see Start sync
 | `RUNNING` | The slot has its start time. |
 | `DONE` | The controller holds every frame of the slot and its final report. |
 | `FAILED` | The slot failed. Its error is `agent <id>: <error>`. |
-| `CANCELLED` | Another slot failed the run, and this slot got `cancel` or `release`. |
+| `CANCELLED` | Another slot caused the run to fail, or an operator cancelled the run, and this
+slot consequently received a `cancel` or `release` command. |
 
 One failing slot fails the run: a prepare error (for example a validation finding), a start
 failure, an eviction, a `goodbye`, a new incarnation, a misconfigured recorder or a telemetry count
 that does not match. The run reason is the first slot error.
 The other agents of the step get `cancel` (while they prepare, wait or run) or `release` (when
 done), and all go idle. Their slots that are not `DONE` become `CANCELLED`. A cancelled slot that
-then reports its own failure becomes `FAILED` with its error, so the run shows every error. No slot
-is tried again, and the later steps do not run.
+subsequently reports its own failure transitions to `FAILED` and records its error so that the live
+run view surfaces every failure. Because a committed run bundle is immutable, its on-disk
+`status.json` preserves the snapshot captured at commit time. Failed slots are never retried and
+subsequent steps are skipped. All participating agents return to idle, except that any agent
+observed by the controller to have failed a launched slot due to an agent-side fault is marked
+`FAULTED` and excluded from future slot assignments until reset (see Cancel, faults and reset).
 
 ## Agent channel
 
@@ -465,10 +515,12 @@ after 6 seconds and recovers before either side evicts or cancels the other.
 - An agent restart during a run is not supported: the run child stops with its agent. The new
   incarnation replaces the record, its slot fails and the run is `FAILED`. The frames of the old
   incarnation get an ack and are never held, so nothing is counted twice.
-- A controller restart loses the active runs. The agents get `reregister`, cancel their work and
-  drop their frames, and the new controller acks old frames without holding them. Nothing is
-  counted twice, and no lost run is reported complete. The directory of a lost run has no
-  `manifest.json`.
+- A controller restart terminates any runs in flight: each transitions to `FAILED` with reason `the
+  controller stopped during the run`, and its directory has no `manifest.json`. Connected agents
+  receive `reregister`, cancel their active workloads, and discard any buffered frames, while the
+  restarted controller instance acknowledges stale frames without retaining them. Consequently, no
+  telemetry is double-counted and no interrupted run is ever reported as complete. Previously
+  completed runs and their committed bundles remain intact (see Persistence and restart).
 - The memory of an active run does not grow with its length: one histogram of about 172 KB for each
   key, the counters of each slot, and one buffered raw log for each slot. When the bundle is
   written, the controller drops the histograms and the final reports. Decode and merge run under
@@ -478,14 +530,21 @@ after 6 seconds and recovers before either side evicts or cancels the other.
 ## Run bundle
 
 `submit` makes the directory `$PHERF_RUN_DIR/<runId>/` (a failure refuses the submit). Each held
-frame goes to the raw log of its slot at once. At each end of the run (`COMPLETE`, `FAILED` or
-`ABORTED`), in the same step that sets the state, the controller writes the rest of the bundle, with
-`manifest.json` last. So a run is `COMPLETE` only when its bundle is in place, and a directory with
-no manifest is an interrupted run. The layout is the run-bundle layout of the Pherf offline
-analysis (ANALYSIS.md), so `-analyze` reads a bundle as it is.
+frame is appended immediately to the raw interval log of its slot. When a run reaches any terminal
+state (`COMPLETE`, `FAILED`, `ABORTED`, or `CANCELLED`), the controller writes the remaining bundle
+artifacts atomically with the state transition, writing `status.json` followed by `manifest.json`
+last. Consequently, a run reaches `COMPLETE` only after its entire bundle is on disk, and any run
+directory lacking a manifest represents an interrupted run. The directory structure conforms to the
+standard Pherf offline analysis run-bundle layout (ANALYSIS.md), allowing `-analyze` to consume a
+bundle directly without conversion.
 
 | Path | Content |
 |---|---|
+| `status.json` | The committed final run view, containing the same JSON payload returned by
+`GET .../status` at commit time. This file is never modified after the manifest is written: if a
+cancelled slot subsequently reports its own failure, that late error appears only in live
+`GET .../status` responses and the controller log until the next controller restart. Upon restart,
+the controller reconstructs the run view from this file. |
 | `manifest.json` | `bundle_format_version` 1; `run{id, class, result, state, reason, seed, started_ms, ended_ms}`, where `result` is the highest severity of the fleet verdict rows; `quiet_host{tags}`, which is `["noisy-host"]` when the run-level `pherf.verdict.noisyHost` is true, else `[]` |
 | `drivers/pherf/results_HDR/LATENCY_run.json` | The fleet report |
 | `drivers/pherf/results_HDR/LATENCY_run.hlog` | The merged run log: the header of LATENCY.md, base time `startMs`, one histogram for each key over `[startMs, endMs]` |
@@ -542,8 +601,282 @@ adds the 8 rows to the verdict stream of the harness run.
 
 ### Version rule
 
-The controller and all agents in a deployment must be provisioned from the same build. Message
-parsers ignore unrecognized JSON fields to allow additive evolution, whereas any breaking change
-that an existing reader cannot parse must advance both the protocol version `v` and the HTTP path
-prefix to `/v2/`. Any request bearing a mismatched `v` value is refused with HTTP status 400 and a
-`rejected` reply.
+The controller and all agents in a fleet must be deployed from the same build. Message parsers
+ignore unrecognized JSON fields so that additive changes remain backward-compatible, whereas any
+incompatible change that an existing parser cannot read must increment the protocol version `v` and
+advance the HTTP path prefix to `/v2/`. Any request carrying a different `v` value is rejected with
+HTTP status 400 and a `rejected` response.
+
+## REST API
+
+The REST listener (`PHERF_REST_PORT`, defaulting to 8780) services external clients such as the
+`pherf-distributed` harness driver. It shares a single request executor, agent registry, and run
+execution engine with the agent channel listener (port 8790), ensuring that both interfaces observe
+a consistent view of system state. Each listener strictly serves only its designated routes:
+requesting a REST path on port 8790 returns the standard JDK HTTP server 404 response, whereas
+requesting an agent channel path on port 8780 returns a JSON 404 error response.
+
+### Resources
+
+- An **agent** represents a registered agent process indexed by its operational identifier. The
+  controller does not persist the agent registry to disk; following a controller restart, live
+  agents automatically re-register within approximately 6 seconds.
+- A **test** encapsulates a validated execution plan (see Plans). Each **run** under a test
+  represents a distinct execution of that plan—such as an individual replicate—with its own unique
+  run identifier and output bundle. A test is in either the `OPEN` or `ENDED` state and permits at
+  most one `RUNNING` run at a time, preventing concurrent executions of the same plan from writing
+  overlapping keys simultaneously.
+- Test identifiers follow the format `t-<UTC time>-<n>`, run identifiers follow `<UTC time>-<n>`
+  (where the timestamp uses `yyyyMMdd'T'HHmmssSSS'Z'`), and agent identifiers match
+  `[A-Za-z0-9._-]{1,63}`. Sequence numbers are strictly monotonic and never repeat within a given
+  run directory. Any URL path segment that fails to match its resource identifier pattern receives
+  an HTTP 404 response.
+
+### Endpoints
+
+Request and response payloads use UTF-8 JSON with `Content-Type: application/json; charset=utf-8`
+and a maximum body size of 16 MiB. URL query strings are ignored. Resource creation endpoints return
+HTTP 201 with the assigned identifiers in the response body and omit the `Location` header.
+Endpoints that take no input parameters accept either an empty body or `{}` and return HTTP 400 for
+any other payload.
+
+| Call | Success | Errors |
+|---|---|---|
+| `GET /v1/agents` | 200 with `{"agents": [AgentView...]}` sorted in ascending id order. | |
+| `POST /v1/tests`, body: the plan | 201 with the created TestView. | 400 with the plan validation
+failure message naming the offending JSON path; 413 if the body exceeds the size limit; 500 if
+`plan.json` or `test.json` cannot be persisted. |
+| `POST /v1/tests/{id}/runs` | 201 with the RunView of the newly created run in state `RUNNING`
+with slots `ASSIGNED`. | 404 if the test does not exist; 409 if the test has already ended, already
+has an active `RUNNING` run, or lacks sufficient idle agents
+(`step 0 needs N agents but M are free`, appending `; faulted: <ids>` when any agents are faulted);
+500 if the run directory cannot be created or if `test.json` cannot be updated to record the run
+(in which case the run is transitioned to `CANCELLED` and omitted from the test's run list). |
+| `GET /v1/tests/{id}/runs/{runId}/status` | 200 with the current RunView. | 404 if the run is
+unknown or does not belong to the specified test. |
+| `GET /v1/tests/{id}/runs/{runId}/report` | 200 returning the exact byte contents of
+`drivers/pherf/results_HDR/LATENCY_run.json`, the immutable fleet report. | 409 while the run is
+still `RUNNING`; 404 if the run terminated without a committed bundle. |
+| `POST /v1/tests/{id}/runs/{runId}/cancel` | 200 with the RunView in state `CANCELLED`
+(idempotent, returning 200 if already cancelled). | 404 if the run is not found; 409 if the run has
+already terminated in a different state. |
+| `POST /v1/agents/{agentId}/reset` | 200 with the updated AgentView (a no-op if the agent is not
+currently faulted). | 404 if the agent is unknown; 409 if the agent currently holds an active slot
+or is in the process of leaving. |
+| `POST /v1/tests/{id}/end` | 200 with the TestView in state `ENDED` (idempotent, returning 200 if
+already ended). | 404 if the test is unknown. |
+| `GET /v1/tests/{id}/runs/{runId}/bundle` | 200 with `{"files": [{"path", "bytes"}...]}` listing
+every regular file in the run directory in sorted order, excluding any `.tmp` files. | 409 while
+the run is `RUNNING`; 404 if the run has no committed bundle. |
+| `GET /v1/tests/{id}/runs/{runId}/bundle/{path}` | 200 returning the raw bytes of the requested
+file, where `.json` is served as `application/json`, `.tsv` as `text/tab-separated-values`, `.hlog`
+as `text/plain`, and any other extension as `application/octet-stream`. | Same run-state errors as
+the bundle listing endpoint, plus 404 if the requested path is not among the listed bundle files. |
+
+Both the fleet report and the run bundle become available only after `manifest.json` has been
+written as the terminal commit point of the run. Rather than streaming a single archive, the bundle
+API exposes a JSON file manifest paired with individual file download requests because the standard
+JDK lacks a built-in tar archive writer and this design allows clients to retrieve artifacts using
+only a basic HTTP client and JSON parser.
+
+- **TestView**: Contains `id`, `state` (`OPEN` or `ENDED`), `createdMs`, `endedMs` (included only
+  when `ENDED`), and `runs` (the list of run identifiers in submission order).
+- **RunView**: Contains `runId`, `state`, `reason`, `step`, and
+  `steps[{index, state, startAtMs, skewMs,
+  slots[{identity, agent, state, error, share, heldSeq, finalSeq, samples, counters, offsetMs,
+  delayMs, startAtMs, dispatchMs}]}]`. Any field without a value is omitted from the JSON object.
+- **AgentView**: Contains `id`, `incarnation`, `state` (`IDLE`, `ASSIGNED`, `READY`, `LAUNCHED`,
+  `ARMED`, `RUNNING`, `DONE`, `LEAVING`, or `FAULTED`), `phase`, `runId`, `step`, `registeredMs`,
+  `lastSeenMs`, `offsetMs`, `delayMs`, and `fault`.
+
+A typical client workflow first registers the execution plan via `POST /v1/tests`, launches each
+replicate execution by calling `POST .../runs`, and then polls `GET
+.../status` until the state is not `RUNNING`, `GET .../report` and the bundle files, then `POST
+.../end` to close the test.
+
+### Errors
+
+Every non-2xx response returned by the REST listener carries a JSON payload formatted as
+`{"error": "<code>", "message": "<text>"}`. The error codes form the programmatic contract, whereas
+the message strings provide human-readable diagnostics.
+
+| Status | Code |
+|---|---|
+| 400 | `bad_request` |
+| 404 | `not_found` |
+| 405 | `method_not_allowed`, accompanied by an `Allow` response header |
+| 409 | `conflict` |
+| 413 | `too_large` |
+| 500 | `internal` |
+
+Every state-mutating request logs a single INFO entry recording the HTTP method, request path,
+response status code, and resource identifier. Read-only `GET` requests emit no access log entries
+so that frequent status polling does not flood the controller log.
+
+### REST version rule
+
+Additive JSON fields may be introduced in any build, and clients must ignore unrecognized fields.
+Any breaking change that an existing client cannot parse advances the REST endpoint prefix to
+`/v2/`. This versioning policy operates independently of the agent channel protocol version `v`.
+
+## Cancel, faults and reset
+
+- **Cancel**: Cancelling an active `RUNNING` run transitions its state to `CANCELLED`, setting
+  the termination reason to `cancelled`, or to `cancelled: the
+  test ended` when `end` cancels it. The slots that are not `DONE` or `FAILED` become `CANCELLED`,
+  and the controller commits the run bundle so that the fleet report of a cancelled run remains
+  inspectable. In the committed bundle, the manifest state is `CANCELLED` and the
+  `pherf.fleet.agents` verdict row is recorded as `FAIL`. Participating agents receive `cancel` or
+  `release` commands and return to idle; any live Pherf child process is sent SIGTERM followed by
+  SIGKILL after 5 seconds. Cancelling a run never marks an agent as faulted.
+- **Faulted agent**: When a slot fails after receiving `launch` and the controller determines that
+  the agent process itself violated the protocol or internal invariants (by sending a corrupt
+  histogram frame, exhibiting lost or duplicated telemetry sequence counts, reporting `DONE` without
+  a final report, or reporting idle while assigned to an active slot), the controller transitions
+  that agent to `FAULTED` and records the diagnostic reason in `fault`. The agent receives `release`
+  and its process returns to idle, but the controller excludes it from future slot assignments until
+  it is explicitly reset. By contrast, an execution error reported by the agent itself (such as a
+  non-zero Pherf child exit or a prolonged telemetry stream failure) fails the current run without
+  faulting the agent: external database or network disruptions—such as those induced during
+  fault-injection testing—commonly trigger such errors, and subsequent replicates require the full
+  agent fleet to remain available. Similarly, any failure occurring prior to the launch (such as an
+  offline validation finding or slice preparation error) reflects a plan issue and does not fault
+  the agent. Finally, a heartbeat timeout eviction, a `goodbye` message, a new incarnation, or a
+  misconfigured histogram recorder removes the agent entry entirely, allowing a healthy process to
+  rejoin under a fresh registration record.
+- **Reset**: Resetting a faulted agent clears its fault state, returning the agent to the available
+  pool so that subsequent runs can be scheduled. A reset operation only updates controller state and
+  does not terminate runaway processes on the agent host; an agent whose child workload fails to
+  stop must have its OS process restarted. Because agent fault state is held exclusively in memory,
+  a controller restart allows all agents to re-register cleanly without faults. An automated
+  replicate driver can inspect the `faulted: <ids>` suffix in an HTTP 409 response from
+  `POST .../runs` to identify and reset or replace faulted agents before retrying.
+
+## Persistence and restart
+
+All persistent controller state resides under `PHERF_RUN_DIR`:
+
+| Path | Content |
+|---|---|
+| `controller.lock` | An empty lock file on which the controller acquires and holds an exclusive
+file lock for its entire lifetime. Any concurrent controller targeting the same run directory
+polls for up to 150 s to acquire this lock before terminating with exit status 2 and reporting
+`another controller uses PHERF_RUN_DIR`. |
+| `controller.pid` | The process identifier of the running controller, written by
+`pherf-distributed.sh`. |
+| `tests/<testId>/plan.json` | The raw test plan payload as submitted, written once upon creation. |
+| `tests/<testId>/test.json` | The serialized TestView. It is persisted after `plan.json` and prior
+to returning HTTP 201—serving as the creation commit point for the test—and is rewritten after each
+run submission and when the test ends. |
+| `<runId>/` | The run bundle directory (see Run bundle), finalized by writing `status.json`
+followed by `manifest.json` last. |
+
+Every JSON metadata file and the fleet verdict file are updated using the same crash-safe sequence:
+the controller writes the content to `<file>.tmp`, forces the file data to disk, atomically renames
+the temporary file over the destination path, and forces the parent directory entry to disk. An
+unexpected crash therefore leaves either the complete previous version or the complete new version.
+Similarly, each per-slot raw interval log and the merged latency log are flushed and synced to disk
+when closed, and every newly created directory (`<runId>/`, `tests/<testId>/`, and the nested bundle
+subdirectories) is synced into its parent directory. Because all of these durability barriers
+complete before `manifest.json` is committed, the presence of a manifest after a process or host
+crash guarantees that the entire run bundle is intact, and any test creation request that received
+HTTP 201 is guaranteed to have its test directory on disk. Once the manifest is written, no file
+within the run bundle is ever modified. The controller intentionally does not persist the active
+agent table, agent fault states, clock offset samples, pending long-poll connections, or in-memory
+histogram aggregation state for in-flight runs.
+
+During startup, the controller restores the state of the directory:
+
+- A run directory containing `manifest.json` is treated as a completed terminal run, and its
+  RunView is loaded directly from `status.json`.
+- A run directory without a manifest that contains a `status.json` recording `ABORTED`, `FAILED`, or
+  `CANCELLED` retains that terminal state, indicating that the failure was recorded before the
+  bundle commit could finish.
+- Any other run directory represents a run that was in flight when the previous controller stopped.
+  The controller transitions it to `FAILED` with the recorded reason `the controller
+  stopped during the run` in `status.json`, and leaves the directory without a manifest.
+- A test directory containing `test.json` is restored and its plan is re-parsed. A test directory
+  lacking `test.json` is ignored because its creation call never completed. If a restored plan fails
+  validation under the current build, the test is forced to `ENDED` so that its historical runs
+  remain accessible for inspection.
+- Leftover `.tmp` files are ignored. Any unreadable or corrupt metadata file causes the controller
+  to skip the affected run or test, emit a WARN log entry naming the file, and continue starting up.
+- Monotonic sequence counters for new test and run identifiers resume strictly above the highest
+  sequence numbers discovered in the directory.
+
+Runs that are in flight when the controller stops are always marked as failed rather than resumed.
+Their partially merged fleet histograms existed only in controller memory, re-registering agents
+abort their active workloads and discard unacknowledged telemetry frames, an interrupted open-loop
+arrival schedule incurs a timing gap that cannot be repaired by resumption, and a synchronized start
+epoch cannot be re-issued mid-step. Such runs are classified as `FAILED` rather than `ABORTED`
+because the restarting controller cannot prove that no step had received a `launch` command prior to
+the outage. Following restart, agents re-register through the standard control loop and any `OPEN`
+test can immediately accept a new run. Graceful termination via SIGTERM follows this exact same
+recovery path as an abrupt crash.
+
+## Scripts
+
+The launcher script `src/main/bin/pherf-distributed.sh ROLE VERB` manages a single process instance,
+where `ROLE` is `controller` or `agent` and `VERB` is `start`, `stop`, `restart`, or `status`. The
+script resolves `../conf` and `../lib` relative to its own installation directory, so a runtime
+image requires only the `bin/`, `conf/`, and `lib/` directories. It places `conf/log4j2.properties`
+(sourced from `src/main/conf`) at the head of the class path, configuring single-line standard
+output logging that includes the operational agent identifier on every event.
+
+| Verb | Effect | Exit status |
+|---|---|---|
+| `start` | Runs in the foreground by recording its pid in the pid file and replacing the shell
+process with the JVM, ensuring that logs stream to standard output, signals are delivered directly
+to the JVM, and the exit status reflects the JVM exit code. | The JVM exit status (see Processes);
+1 if a live process for the same role is already running; 2 if no Java executable is found, or if
+`lib/` contains no jars and `PHERF_CLASSPATH` is unset. |
+| `stop` | Sends TERM and waits up to 15 seconds for termination before sending KILL, then removes
+the pid file (including any stale pid file). | 0 if the process stopped cleanly or no live process
+existed; 1 after KILL. |
+| `restart` | Executes `stop` followed immediately by `start` in the caller's shell, intended
+solely for host-managed processes. | 1 if the stop operation fails; otherwise returns the exit
+status of `start`. |
+| `status` | Prints either `running as pid N` or `not running` to standard output. | 0 when
+running; 3 when not running. |
+
+Any command-line usage error exits with status 2. Because the controller pid file is stored at
+`$PHERF_RUN_DIR/controller.pid`, every controller verb requires `PHERF_RUN_DIR` to be set. The agent
+pid file is stored at `${TMPDIR:-/tmp}/pherf-agent-<id>.pid`; the script resolves the operational
+agent identifier using the same fallback rules as the agent JVM and exports it to the environment.
+The launcher passes `-Djava.io.tmpdir=${TMPDIR:-/tmp}` ahead of `PHERF_JAVA_OPTS`, ensuring that the
+agent's temporary working directory (`pherf-agent-<id>-*`, holding its workload slices, property
+overlays, and Pherf child output) is also created under `TMPDIR`. In addition, the JVM command line
+includes `-Dpherf.role.id=<id>` for an agent or `-Dpherf.role.id=<run dir>` for the controller. A
+recorded pid is considered live only if it responds to `kill -0`, is not the current launcher script
+process itself, and has an OS command line containing both the expected main class name and the role
+identifier. Consequently, an OS pid recycled for a different agent instance or unrelated process on
+the same host is never misidentified as live. Because all files are confined to the run directory
+and `TMPDIR`, the script operates without root privileges.
+
+Inside a container image, the JVM runs as PID 1 via the `exec` in `start`, streaming its output
+directly to the container logging driver. In containerized deployments, restarting a process must be
+performed by restarting the container or pod (`docker restart` or a Kubernetes pod restart) rather
+than invoking the `restart` verb: a `stop` of PID 1 terminates the container before `start` can
+run, and launching a replacement process via `docker exec` would attach its output to that
+interactive exec session instead of the container log. The `restart` verb is intended exclusively
+for standalone host deployments.
+
+## Security
+
+The D5 module implements neither authentication nor TLS, as the design specifies plain HTTP over the
+standard JDK HTTP server. Any client able to reach port 8780 can initiate database load and read run
+bundles, and any process able to reach port 8790 can join the agent fleet and receive workload
+plans. Network exposure must therefore be restricted through `PHERF_BIND_ADDRESS` and deployment
+topology: Docker Compose binds published ports exclusively to `127.0.0.1`, while Kubernetes
+deployments expose the controller through a ClusterIP Service accessed via loopback port-forwarding.
+For input hardening, the REST listener caps request bodies at 16 MiB, validates every resource
+identifier against its strict regular expression pattern, and serves bundle downloads exclusively
+from regular files (rejecting symbolic links) confined within the target run directory. Both HTTP
+listeners close any connection that fails to transmit its complete request (request line, headers,
+and body) within 60 seconds, enforced via the `sun.net.httpserver.maxReqTime` system property
+configured by `ControllerMain`. Because this timer applies only until the request body has been
+fully read, long-polled agent control requests are unaffected during their server-side hold window.
+The HTTP server places no cap on concurrent connections—spawning a handler thread per request—so an
+untrusted client with access to port 8780 could exhaust controller heap memory by submitting many
+large request bodies concurrently. Network isolation via the bind address and deployment environment
+serves as the primary access control boundary.

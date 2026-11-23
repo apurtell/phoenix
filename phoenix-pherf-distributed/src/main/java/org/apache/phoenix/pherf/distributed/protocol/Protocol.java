@@ -43,6 +43,8 @@ public final class Protocol {
 
   /** Specifies the default port used by the agent listener. */
   public static final int AGENT_PORT = 8790;
+  /** Specifies the default port used by the REST listener. */
+  public static final int REST_PORT = 8780;
 
   /**
    * Specifies the maximum duration, in milliseconds, that the controller holds open a poll request

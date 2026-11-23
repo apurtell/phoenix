@@ -59,9 +59,22 @@ final class ChannelHandler implements HttpHandler {
     this.channel = channel;
   }
 
+  /**
+   * Echoes the "Connection: close" header in the reply whenever the request specifies "Connection:
+   * close". The JDK HTTP server closes the connection after servicing such a request but omits the
+   * header from the reply; without it, a client may retain the closed connection for a subsequent
+   * request (RFC 7230 section 6.6).
+   */
+  static void closeIfAsked(HttpExchange exchange) {
+    if ("close".equalsIgnoreCase(exchange.getRequestHeaders().getFirst("Connection"))) {
+      exchange.getResponseHeaders().set("Connection", "close");
+    }
+  }
+
   @Override
   public void handle(HttpExchange exchange) throws IOException {
     try {
+      closeIfAsked(exchange);
       if (!"POST".equals(exchange.getRequestMethod())) {
         exchange.getResponseHeaders().set("Allow", "POST");
         exchange.sendResponseHeaders(405, -1);
@@ -137,7 +150,7 @@ final class ChannelHandler implements HttpHandler {
    * Reads and returns the HTTP request body as text, or returns null when the payload exceeds the
    * maximum permitted size bound.
    */
-  private static String read(HttpExchange exchange) throws IOException {
+  static String read(HttpExchange exchange) throws IOException {
     String length = exchange.getRequestHeaders().getFirst("Content-Length");
     if (length != null) {
       try {

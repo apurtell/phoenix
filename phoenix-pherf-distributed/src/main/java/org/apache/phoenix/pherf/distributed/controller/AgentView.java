@@ -30,7 +30,12 @@ public final class AgentView {
     ARMED,
     RUNNING,
     DONE,
-    LEAVING
+    LEAVING,
+    /**
+     * Indicates that the agent failed its launched slot due to its own error; the agent holds no
+     * slot and cannot take a new slot until a reset occurs.
+     */
+    FAULTED
   }
 
   private final String id;
@@ -43,9 +48,10 @@ public final class AgentView {
   private final long lastSeenMs;
   private final Long offsetMs;
   private final Long delayMs;
+  private final String fault;
 
   AgentView(String id, String incarnation, State state, Phase phase, String runId, int step,
-    long registeredMs, long lastSeenMs, Long offsetMs, Long delayMs) {
+    long registeredMs, long lastSeenMs, Long offsetMs, Long delayMs, String fault) {
     this.id = id;
     this.incarnation = incarnation;
     this.state = state;
@@ -56,6 +62,7 @@ public final class AgentView {
     this.lastSeenMs = lastSeenMs;
     this.offsetMs = offsetMs;
     this.delayMs = delayMs;
+    this.fault = fault;
   }
 
   public String getId() {
@@ -105,6 +112,14 @@ public final class AgentView {
    */
   public Long getDelayMs() {
     return delayMs;
+  }
+
+  /**
+   * Returns the error message that placed the agent in a faulted state, or null when the agent is
+   * not faulted; a reset clears this error.
+   */
+  public String getFault() {
+    return fault;
   }
 
   @Override
