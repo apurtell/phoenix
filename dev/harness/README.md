@@ -71,6 +71,13 @@ px-cluster --class measurement --config dev/harness/docker/env/override-24gib.en
 px-cluster down                            # idempotent: exits 0 when nothing is recorded
 ```
 
+The Distributed Pherf controller and agents execute in a second local container image defined in
+`docker/pherf`, built on the `PX_IMAGE_BASE_JRE17` JRE base image and pinned by digest under the
+same policy (`PX_IMAGE_BASE_JRE17_SHA256_<ARCH>`). Running `build-phoenix.sh --distributed` followed
+by `stage-artifacts.sh --image pherf` builds this image as `PX_PHERF_IMAGE_TAG`. The
+`docker/pherf/compose.yaml` manifest runs the image standalone against any cluster, and the module
+README of `phoenix-pherf-distributed` describes the image in detail.
+
 When invoked without a directory argument, `px-cluster up` first renders the deployment for the
 active run class into `$PX_OUT/deploy/<cluster>`. Calling it without a directory,
 `PX_DEPLOYMENT_DIR`, or a run class constitutes a usage error and exits with code 2. Prior to

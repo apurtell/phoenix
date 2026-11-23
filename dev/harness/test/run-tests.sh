@@ -5218,9 +5218,12 @@ t_group_a2_dist() {
   t_equals fetch_refuses_non_https "2 yes" \
     "$T_STATUS $(t_flag 'only HTTPS addresses are fetched' "$T_STDERR")"
   t_empty fetch_refuses_non_https_before_a_request "$(cat "$T_A2_CURL_LOG")"
-  bad="$(grep -rn 'http://' "$PX_HOME/scripts" "$PX_HOME/$PX_DEPLOY_SUBDIR" 2>/dev/null |
-    grep -v ':[[:space:]]*#' | grep -v 'www.apache.org/licenses' |
-    grep -vE "http://(127\\.0\\.0\\.1|\\\$host)")"
+  # The scan must locate the agent channel in docker/pherf; otherwise, the subsequent check proves
+  # nothing. Neither a loopback probe nor that agent channel represents an external download.
+  text="$(grep -rn 'http://' "$PX_HOME/scripts" "$PX_HOME/$PX_DEPLOY_SUBDIR" 2>/dev/null)"
+  t_contains fetch_http_scan_reads_the_tree "pherf/compose.yaml:" "$text"
+  bad="$(printf '%s\n' "$text" | grep -v ':[[:space:]]*#' | grep -v 'www.apache.org/licenses' |
+    grep -vE "http://(127\\.0\\.0\\.1|\\\$host|controller:)")"
   t_empty fetch_no_http_download_target "$bad"
   t_curl_body 'https://www.apache.org/dyn/closer.lua?path=x/bar-1.tar.gz&asjson=1' \
     '{"preferred": "https://dlcdn.apache.org/"}'
@@ -5695,9 +5698,264 @@ mrapp-generated-classpath" "$T_STDERR") $(t_exists "$T_A2_OUT/build/phoenix/buil
   t_equals build_jhiccup_verifies_a_declared_pin 1 "$T_STATUS"
 }
 
-## @description  Verifies that each cross-platform helper produces identical results when isolated
-##               to each supported underlying system utility in turn.
-## @return       Records the platform fallback assertions. Exit 0.
+## @description  Extracts the lines of a single service block (file, service) from a Compose file.
+## @return       Writes the service block lines to stdout. Exit 0.
+t_d6_service() {
+  awk -v s="  $2:" '$0 == s { f = 1; next } f && /^(  )?[a-z]/ { f = 0 } f' "$1"
+}
+
+## @description  Extracts the first RUN instruction following the FROM ... AS runtime line (file).
+## @return       Writes the matching instruction lines to stdout. Exit 0.
+t_d6_first_runtime_run() {
+  awk '/^FROM .* AS runtime$/ { r = 1; next }
+    r && !f && /^RUN / { f = 1 }
+    f { print; if ($0 !~ /\\$/) exit }' "$1"
+}
+
+# shellcheck disable=SC2016 # The patterns hold the literal ${NAME} text of the files.
+## @description  Verifies the Distributed Pherf container image: its image definition, standalone
+##               Compose deployment, health probe, and --image pherf staging workflow (round D6).
+## @return       Records the Distributed Pherf image assertions. Exit 0.
+t_group_d6() {
+  local dir="$PX_HOME/$PX_DEPLOY_SUBDIR/pherf" df compose hc tree="$T_A2/tree" bad="" line text
+  local sa="$PX_HOME/scripts/stage-artifacts.sh" bp="$PX_HOME/scripts/build-phoenix.sh"
+  local jdk="$T_A2/jdk/17" module="$T_A2/tree/phoenix-pherf-distributed" ctx tag sum jre run
+  local versions="$PX_HOME/$PX_DEPLOY_SUBDIR/versions.env" bin="$T_WORK/d6/bin" ctl agent
+  local pins=() jdks=()
+  df="$dir/Dockerfile"
+  compose="$dir/compose.yaml"
+  hc="$dir/healthcheck.sh"
+  tag=px-pherf:hbase-2.6.7-profile-2.6
+  printf '# the Distributed Pherf image and its standalone deployment\n'
+  # Verify RQ-246: a single container image built on a pinned JRE base image that validates the
+  # presence of jdk.httpserver.
+  text="$(grep '^FROM ' "$df" 2>/dev/null)"
+  t_equals pherf_dockerfile_froms_pinned "2 " "$(printf '%s\n' "$text" | grep -c \
+    '^FROM ${PX_IMAGE_BASE_JRE17}@sha256:${PX_IMAGE_BASE_JRE17_SHA256} AS ') \
+$(printf '%s\n' "$text" | grep -v '@sha256:')"
+  t_contains pherf_base_is_a_jre '-jre-' "$(t_env_value "$versions" PX_IMAGE_BASE_JRE17)"
+  run="$(t_d6_first_runtime_run "$df" 2>/dev/null)"
+  bad=""
+  for line in '-Xlog:class+load' 'com.sun.net.httpserver.HttpServer' 'jrt:/jdk.httpserver' \
+    'lacks the jdk.httpserver module' 'exit 1'; do
+    case "$run" in
+    *"$line"*) ;;
+    *) bad="$bad [$line]" ;;
+    esac
+  done
+  t_empty pherf_dockerfile_proves_httpserver_first "$bad"
+  text="$(cat "$df" 2>/dev/null)"
+  bad=""
+  for line in 'USER ${PX_UID}:${PX_GID}' 'PX_UID must not be 0: the image runs as non-root' \
+    'ENTRYPOINT ["/usr/bin/tini", "--", "/opt/pherf/bin/pherf-distributed.sh"]' \
+    'CMD ["controller", "start"]' 'COPY healthcheck.sh /opt/pherf/' \
+    'install -y --no-install-recommends curl procps tini' \
+    'COPY module/bin/ /opt/pherf/bin/' 'COPY module/conf/ /opt/pherf/conf/' \
+    'PHERF_RUN_DIR=/var/lib/pherf/run'; do
+    case "$text" in
+    *"$line"*) ;;
+    *) bad="$bad [$line]" ;;
+    esac
+  done
+  t_empty pherf_dockerfile_non_root_entrypoint_and_probe "$bad"
+  t_equals pherf_dockerfile_leaves_the_healthcheck_to_the_deployment "0 1" \
+    "$(grep -c '^HEALTHCHECK' "$df" 2>/dev/null) $(grep -c '^# No HEALTHCHECK here' "$df" \
+      2>/dev/null)"
+  # Verify that the class path assembled in the image matches the class path of the harness pherf
+  # driver.
+  bad=""
+  for line in 'client-facing-thirdparty/' 'lib/jdk11/' 'lib/commons-codec-'; do
+    case "$text" in *"$line"*) ;; *) bad="$bad image:[$line]" ;; esac
+    grep -qF "$line" "$PX_HOME/drivers/lib/driver.sh" || bad="$bad driver:[$line]"
+  done
+  t_empty pherf_dockerfile_class_path_matches_the_pherf_driver "$bad"
+  bad=""
+  for line in PX_IMAGE_BASE_JRE17 PX_IMAGE_BASE_JRE17_SHA256 PX_STAGED_HBASE \
+    PX_STAGED_PHOENIX_CLIENT PX_STAGED_PHOENIX_PHERF PX_STAGED_PHOENIX_BSON \
+    PX_STAGED_PHOENIX_DISTRIBUTED PX_UID PX_GID PX_PHOENIX_VERSION; do
+    grep -q "^ARG $line\$" "$df" 2>/dev/null || bad="$bad $line"
+  done
+  for line in PX_STAGED_HADOOP PX_STAGED_PHOENIX_SERVER PX_STAGED_JHICCUP; do
+    grep -q "^ARG $line" "$df" 2>/dev/null && bad="$bad extra:$line"
+  done
+  t_empty pherf_dockerfile_declares_the_build_arguments "$bad"
+  # Verify RQ-245 and RQ-249 through static inspection of the standalone deployment definition.
+  ctl="$(t_d6_service "$compose" controller 2>/dev/null)"
+  agent="$(t_d6_service "$compose" agent 2>/dev/null)"
+  t_equals pherf_compose_memory_limits "1024m 1024m 1536m 1536m 3" \
+    "$(printf '%s\n' "$ctl" | sed -n 's/^    mem_limit: //p;s/^    memswap_limit: //p' |
+      tr '\n' ' ')$(printf '%s\n' "$agent" |
+      sed -n 's/^    mem_limit: //p;s/^    memswap_limit: //p' | tr '\n' ' ')$(printf '%s\n' \
+      "$agent" | sed -n 's/^      replicas: //p')"
+  t_equals pherf_compose_fleet_is_5632_mib 5632 "$(printf '%s\n%s\n' "$ctl" "$agent" | awk '
+    /^  *mem_limit: [0-9]+m$/ { m[n++] = $2 + 0 }
+    /^  *replicas: / { r = $2 }
+    END { print m[0] + r * m[1] }')"
+  line='test: ["CMD", "/opt/pherf/healthcheck.sh",'
+  t_equals pherf_compose_healthcheck_per_role "$line \"controller\"] $line \"agent\"]" \
+    "$(printf '%s\n' "$ctl" | sed -n 's/^      \(test: .*\)/\1/p') $(printf '%s\n' "$agent" |
+      sed -n 's/^      \(test: .*\)/\1/p')"
+  t_equals pherf_compose_never_pulls_or_restarts "2 2" \
+    "$(grep -c '^    pull_policy: never$' "$compose") $(grep -c '^    restart: "no"$' "$compose")"
+  t_equals pherf_compose_publishes_on_loopback_only '- "127.0.0.1:8780:8780"|' \
+    "$(printf '%s\n' "$ctl" | awk '/^    ports:/ { p = 1; next } p && /^      - / {
+      sub(/^ +/, ""); printf "%s|", $0; next } { p = 0 }')$(printf '%s\n' "$agent" |
+      grep -c '^    ports:' | sed 's/^0$//')"
+  t_equals pherf_compose_quorum_only_from_the_operator \
+    '      PHERF_ZOOKEEPER: "${PHERF_ZOOKEEPER:?set the ZooKeeper quorum of the target cluster}"' \
+    "$(grep -v '^ *#' "$compose" | grep 'PHERF_ZOOKEEPER')"
+  t_equals pherf_compose_image_only_from_the_variable 2 \
+    "$(grep -c '^    image: "${PX_PHERF_IMAGE_TAG:?' "$compose")"
+  # Because Docker Compose rejects start_interval on an Engine older than version 25 and the minimum
+  # supported Engine floor is older than 25, the deployment must omit start_interval.
+  t_equals pherf_compose_has_no_start_interval 0 "$(grep -c 'start_interval' "$compose")"
+  t_equals pherf_compose_is_not_a_harness_cluster "1 no" "$(grep -c \
+    '^name: px-pherf-standalone$' "$compose" 2>/dev/null) $(t_flag px.harness \
+    "$(cat "$compose" 2>/dev/null)")"
+  # Exercise the health probe using a fake curl binary and a fake pherf-distributed.sh script.
+  mkdir -p "$bin"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s"\nexit "${PX_FAKE_PD_STATUS:-0}"\n' \
+    "$T_WORK/d6/pd.log" >"$bin/pherf-distributed.sh"
+  chmod +x "$bin/pherf-distributed.sh"
+  t_curl_body 'http://127.0.0.1:8780/v1/agents' '{"agents":[]}'
+  : >"$T_A2_CURL_LOG"
+  t_image -- "$T_BASH" "$hc" controller
+  t_equals pherf_probe_controller_healthy "0 yes yes yes" "$T_STATUS $(t_flag \
+    'http://127.0.0.1:8780/v1/agents' "$(cat "$T_A2_CURL_LOG")") $(t_flag '--max-time ' \
+    "$(cat "$T_A2_CURL_LOG")") $(t_flag '--noproxy ' "$(cat "$T_A2_CURL_LOG")")"
+  : >"$T_A2_CURL_LOG"
+  t_image PHERF_REST_PORT=9999 -- "$T_BASH" "$hc" controller
+  t_equals pherf_probe_controller_unhealthy_on_a_failed_request "22 yes" "$T_STATUS $(t_flag \
+    'http://127.0.0.1:9999/v1/agents' "$(cat "$T_A2_CURL_LOG")")"
+  : >"$T_A2_CURL_LOG"
+  t_image PHERF_BIND_ADDRESS=::1 -- "$T_BASH" "$hc" controller
+  t_contains pherf_probe_controller_brackets_an_ipv6_literal 'http://[::1]:8780/v1/agents' \
+    "$(cat "$T_A2_CURL_LOG")"
+  : >"$T_WORK/d6/pd.log"
+  : >"$T_A2_CURL_LOG"
+  t_curl_body 'http://controller:8790/v1/channel/' ''
+  t_image "PATH=$bin:$T_A2_BIN:$PATH" PHERF_CONTROLLER=http://controller:8790/ -- "$T_BASH" \
+    "$hc" agent
+  t_equals pherf_probe_agent_runs_the_liveness_verb "0 agent status" \
+    "$T_STATUS $(cat "$T_WORK/d6/pd.log")"
+  t_equals pherf_probe_agent_reaches_the_channel "yes yes no" "$(t_flag \
+    'http://controller:8790/v1/channel/' "$(cat "$T_A2_CURL_LOG")") $(t_flag '--noproxy ' \
+    "$(cat "$T_A2_CURL_LOG")") $(t_flag '-f' "$(cat "$T_A2_CURL_LOG")")"
+  t_image "PATH=$bin:$T_A2_BIN:$PATH" PHERF_CONTROLLER=http://controller:8790 \
+    PX_FAKE_PD_STATUS=3 -- "$T_BASH" "$hc" agent
+  t_equals pherf_probe_agent_not_running_is_unhealthy 3 "$T_STATUS"
+  t_image "PATH=$bin:$T_A2_BIN:$PATH" PHERF_CONTROLLER=http://controller:8791 -- "$T_BASH" \
+    "$hc" agent
+  t_equals pherf_probe_agent_unhealthy_without_its_controller 22 "$T_STATUS"
+  t_image "PATH=$bin:$T_A2_BIN:$PATH" -- "$T_BASH" "$hc" agent
+  t_equals pherf_probe_agent_needs_its_controller "2 yes" "$T_STATUS $(t_flag \
+    'PHERF_CONTROLLER is not set' "$T_STDERR")"
+  bad=""
+  for line in "" bogus "agent extra"; do
+    # shellcheck disable=SC2086 # Each line is a word list.
+    t_image -- "$T_BASH" "$hc" $line
+    [ "$T_STATUS" = 2 ] || bad="$bad [$line] gave $T_STATUS"
+  done
+  t_empty pherf_probe_usage_is_2 "$bad"
+  # Verify the --image pherf artifact staging and image build workflow.
+  sum="$(px_sha512 "$T_A2/dist-src/hbase-2.6.7.tar.gz")"
+  jre="$(printf 'e%.0s' $(seq 1 64))"
+  pins=("PX_DIST_HBASE_2_6_7_SHA512_ARM64=$sum" "PX_DIST_HBASE_2_6_7_SHA512_AMD64=$sum"
+    "PX_IMAGE_BASE_JRE17_SHA256_ARM64=sha256:$jre")
+  t_a2 "${pins[@]}" "$T_BASH" "$sa" --image bogus --stage-only
+  t_equals pherf_stage_unknown_image_is_usage "2 yes" "$T_STATUS $(t_flag \
+    "the image 'bogus' is not harness or pherf" "$T_STDERR")"
+  t_a2 "${pins[@]}" "$T_BASH" "$sa" --image pherf --stage-only
+  t_equals pherf_stage_needs_the_distributed_jar "1 yes" "$T_STATUS $(t_flag \
+    'has no distributed_jar. Build it with px-cluster build -e PX_PHERF=1.' "$T_STDERR")"
+  mkdir -p "$module/src/main/bin" "$module/src/main/conf"
+  printf '<project/>\n' >"$module/pom.xml"
+  printf '#!/usr/bin/env bash\necho fake\n' >"$module/src/main/bin/pherf-distributed.sh"
+  printf 'status = warn\n' >"$module/src/main/conf/log4j2.properties"
+  touch -t 202001010000 "$module/pom.xml" "$module/src/main/bin/pherf-distributed.sh" \
+    "$module/src/main/conf/log4j2.properties"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree" -e PX_PHERF=1
+  t_a2 "${pins[@]}" "$T_BASH" "$sa" --image pherf -n
+  t_equals pherf_stage_dry_run_names_the_image_directory "0 yes yes no" "$T_STATUS $(t_flag \
+    "$PX_DEPLOY_SUBDIR/pherf" "$T_STDOUT") $(t_flag "build${PX_TAB}$tag" "$T_STDOUT") \
+$(t_flag hadoop "$T_STDOUT")"
+  t_a2 "${pins[@]}" "$T_BASH" "$sa" --image pherf --stage-only
+  t_equals pherf_stage_checks 0 "$T_STATUS"
+  ctx="$(px_tsv_field 2 "$T_STDOUT")"
+  t_equals pherf_stage_context_is_named_by_the_tag \
+    "$T_A2_OUT/images/px-pherf_hbase-2.6.7-profile-2.6" "$ctx"
+  t_equals pherf_stage_record_names_no_hadoop "2.6.7 0" "$(t_tsv_values "$ctx.staged.tsv" \
+    hbase_version) $(grep -c '^hadoop_version' "$ctx.staged.tsv" 2>/dev/null)"
+  bad=""
+  for line in Dockerfile healthcheck.sh compose.yaml module/bin/pherf-distributed.sh \
+    module/conf/log4j2.properties dist/hbase-2.6.7-hadoop3-bin.tar.gz \
+    phoenix/phoenix-client-embedded-hbase-2.6-5.4.0-SNAPSHOT.jar \
+    phoenix/phoenix-pherf-5.4.0-SNAPSHOT.jar phoenix/bson-5.3.1.jar \
+    phoenix/phoenix-pherf-distributed-5.4.0-SNAPSHOT.jar; do
+    [ -f "$ctx/$line" ] || bad="$bad $line"
+  done
+  t_empty pherf_stage_context_holds_every_part "$bad"
+  bad=""
+  [ -f "$ctx/Dockerfile" ] || bad="no context"
+  for line in phoenix/phoenix-server-hbase-2.6-5.4.0-SNAPSHOT.jar dist/hadoop-3.4.3-aarch64.tar.gz \
+    dist/async-profiler-4.1-linux-arm64.tar.gz dist/jHiccup.jar plugins .dockerignore \
+    entrypoint.sh; do
+    [ ! -e "$ctx/$line" ] || bad="$bad $line"
+  done
+  t_empty pherf_stage_context_lacks_the_harness_parts "$bad"
+  t_a2 "${pins[@]}" PX_PLUGINS=example "$T_BASH" "$sa" --image pherf --stage-only
+  t_equals pherf_stage_takes_no_plugin "0 no" "$T_STATUS $(t_exists "$ctx/plugins")"
+  t_a2 "${pins[@]:0:2}" "$T_BASH" "$sa" --image pherf --stage-only
+  t_equals pherf_stage_requires_the_jre_digest "1 yes" "$T_STATUS $(t_flag \
+    'build argument PX_IMAGE_BASE_JRE17_SHA256, and PX_IMAGE_BASE_JRE17_SHA256_ARM64 holds' \
+    "$T_STDERR")"
+  mv "$module/src/main/conf/log4j2.properties" "$T_WORK/d6/log4j2.properties"
+  t_a2 "${pins[@]}" "$T_BASH" "$sa" --image pherf --stage-only
+  mv "$T_WORK/d6/log4j2.properties" "$module/src/main/conf/log4j2.properties"
+  t_equals pherf_stage_needs_each_module_file "1 yes" "$T_STATUS $(t_flag \
+    "presence: $module/src/main/conf/log4j2.properties is absent" "$T_STDERR")"
+  t_shim_log_reset
+  t_a2 "${pins[@]}" "$T_BASH" "$sa" --image pherf
+  t_equals pherf_stage_builds_through_contract "0 $tag" "$T_STATUS $(px_tsv_field 1 "$T_STDOUT")"
+  text="$(cat "$T_SHIM_LOG") "
+  bad=""
+  for line in "build --tag $tag " "--build-arg PX_IMAGE_BASE_JRE17=eclipse-temurin:17-jre-noble " \
+    "--build-arg PX_IMAGE_BASE_JRE17_SHA256=$jre " \
+    '--build-arg PX_STAGED_HBASE=dist/hbase-2.6.7-hadoop3-bin.tar.gz ' \
+    '--build-arg PX_STAGED_PHOENIX_DISTRIBUTED=phoenix/phoenix-pherf-distributed-5.4.0-' \
+    "--build-arg PX_UID=$(id -u) " "--build-arg PX_GID=$(id -g) " \
+    '--build-arg PX_PHOENIX_VERSION=5.4.0-SNAPSHOT ' "--file $ctx/Dockerfile $ctx"; do
+    case "$text" in
+    *"$line"*) ;;
+    *) bad="$bad [$line]" ;;
+    esac
+  done
+  t_empty pherf_stage_passes_the_build_arguments "$bad"
+  t_equals pherf_stage_passes_no_harness_argument "yes no no" "$(t_flag 'build --tag' \
+    "$text") $(t_flag PX_IMAGE_BASE_JDK "$text") $(t_flag PX_STAGED_HADOOP "$text")"
+  t_shim_log_reset
+  t_a2 "${pins[@]:0:2}" "$T_BASH" "$sa" --image pherf
+  t_equals pherf_jre_digest_trust_on_first_use "0 yes sha256:$(printf 'b%.0s' $(seq 1 64))" \
+    "$T_STATUS $(t_flag 'trust on first use: the base image eclipse-temurin:17-jre-noble' \
+      "$T_STDERR") $(t_env_value "$T_A2_OUT/images/pins.env" PX_IMAGE_BASE_JRE17_SHA256_ARM64)"
+  t_a2 "$T_BASH" "$T_BIN/px-cluster" config
+  t_contains pherf_image_tag_is_derived "$(t_rows 3 PX_PHERF_IMAGE_TAG "$tag" derived)" \
+    "$T_STDOUT"
+  # Verify that the harness image remains the default staging target when --image is omitted.
+  jdks=("PX_IMAGE_BASE_JDK11_SHA256_ARM64=$(printf '1%.0s' $(seq 1 64))"
+    "PX_IMAGE_BASE_JDK17_SHA256_ARM64=$(printf '7%.0s' $(seq 1 64))")
+  t_a2 "${pins[@]:0:2}" "${jdks[@]}" "PX_DIST_HADOOP_3_4_3_SHA512_ARM64=$(px_sha512 \
+    "$T_A2/dist-src/hadoop-3.4.3.tar.gz")" "$T_BASH" "$sa" --stage-only
+  ctx="$(px_tsv_field 2 "$T_STDOUT")"
+  t_equals pherf_stage_default_is_the_harness_image "0 yes no" "$T_STATUS $(t_exists \
+    "$ctx/entrypoint.sh") $(t_exists "$ctx/module")"
+  t_a2 "PX_BUILD_JAVA_HOME=$jdk" "$T_BASH" "$bp" --tree "$tree"
+  rm -rf "$module"
+}
+
+## @description  Verifies that each platform helper produces a consistent result when isolated to
+##               each underlying utility program individually.
+## @return       Records the platform helper assertions. Exit 0.
 t_group_a2_platform() {
   local file="$T_A2/sha-abc.txt" want tool dir bad="" tried="" path name
   printf '# platform fallbacks\n'
@@ -10906,6 +11164,7 @@ t_group_a2_generator
 t_group_a2_image
 t_group_a2_preflight
 t_group_a2_dist
+t_group_d6
 t_group_a2_platform
 t_group_a2_cluster
 t_group_a2_matrix

@@ -853,13 +853,59 @@ identifier. Consequently, an OS pid recycled for a different agent instance or u
 the same host is never misidentified as live. Because all files are confined to the run directory
 and `TMPDIR`, the script operates without root privileges.
 
-Inside a container image, the JVM runs as PID 1 via the `exec` in `start`, streaming its output
-directly to the container logging driver. In containerized deployments, restarting a process must be
-performed by restarting the container or pod (`docker restart` or a Kubernetes pod restart) rather
-than invoking the `restart` verb: a `stop` of PID 1 terminates the container before `start` can
-run, and launching a replacement process via `docker exec` would attach its output to that
-interactive exec session instead of the container log. The `restart` verb is intended exclusively
-for standalone host deployments.
+Inside a container image, the JVM process runs as the single child of the init process (tini),
+launched via `exec` in `start`, and streams its output directly to the container log. In
+containerized environments, restarting a role must be performed by restarting the container or pod
+(`docker restart` or a pod restart) rather than invoking the `restart` verb: executing `stop`
+terminates the process—and therefore the container itself—before `start` can run, while launching a
+replacement process via `docker exec` would bind its log output to that interactive session. The
+`restart` verb is intended strictly for processes running directly on a host.
+
+## Container image
+
+A single container image serves both the controller and agent roles, defined by
+`dev/harness/docker/pherf/Dockerfile` on top of the harness's pinned JRE 17 base image
+`PX_IMAGE_BASE_JRE17`. The harness builds this image from the local source tree:
+
+```sh
+dev/harness/bin/px-cluster -e PX_PHERF=1 build   # also the harness image; tag PX_PHERF_IMAGE_TAG
+```
+
+- `/opt/pherf/bin/pherf-distributed.sh`: Serves as the container entrypoint, whose default command
+  is `controller
+  start`; an agent runs `agent start`.
+- `/opt/pherf/conf/`: Houses `log4j2.properties` and is placed first on the class path. A volume
+  mount can supply additional configuration files here, such as an `hbase-site.xml`.
+- `/opt/pherf/lib/`: Contains the 38 jars that form the class path of the harness Pherf driver: the
+  client-embedded, Pherf, bson, and distributed jars, together with `lib/client-facing-thirdparty`,
+  `lib/jdk11`, and the commons-codec jar from the HBase release.
+- `/opt/pherf/healthcheck.sh`: Implements the role-specific health probe. The `controller` probe
+  issues a single `GET /v1/agents` request; the `agent` probe runs `agent status` and then issues a
+  single request to the agent channel of `PHERF_CONTROLLER`, treating any HTTP response as healthy.
+  Because a healthy agent is not necessarily registered yet, fleet readiness is determined when
+  `GET /v1/agents` lists the expected agent count; startup procedures waiting for the fleet must
+  wait for that count rather than for agent container health.
+- `/var/lib/pherf/run`: Serves as the `PHERF_RUN_DIR` directory, owned by the image user.
+
+The container runs as a non-root user configured with the uid and gid of the host user. Running as
+PID 1, tini forwards termination signals to the JVM and reaps any orphaned processes reparented to
+PID 1. During image construction, the build fails immediately if the JRE cannot load
+`com.sun.net.httpserver.HttpServer` from the `jdk.httpserver` module required by both listeners.
+The image itself omits a default health check so that each deployment can declare a role-specific
+probe using `healthcheck.sh`.
+
+The Compose specification `dev/harness/docker/pherf/compose.yaml` defines the standalone
+deployment: one controller (1024 MiB) and three agents (1536 MiB each, for a total fleet footprint
+of 5.5 GiB), targeting whichever cluster is specified by `PHERF_ZOOKEEPER`. The controller REST
+port is published exclusively on the host loopback interface at `127.0.0.1:8780`:
+
+```sh
+export PX_PHERF_IMAGE_TAG="$(dev/harness/bin/px-cluster config PX_PHERF_IMAGE_TAG | cut -f 2)"
+export PHERF_ZOOKEEPER="$QUORUM"   # the ZooKeeper quorum of the target cluster
+docker compose -f dev/harness/docker/pherf/compose.yaml up -d --wait  # --scale agent=N
+curl -fsS http://127.0.0.1:8780/v1/agents
+docker compose -f dev/harness/docker/pherf/compose.yaml down -v
+```
 
 ## Security
 

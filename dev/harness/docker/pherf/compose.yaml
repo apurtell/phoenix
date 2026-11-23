@@ -1,0 +1,86 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The standalone deployment of Distributed Pherf: one controller and a fleet
+# of agents (three by default) that drive any cluster by its ZooKeeper quorum.
+# The harness generates its own deployment of the same image (px-pherf), which
+# joins the network of a harness cluster. This file is not a harness cluster.
+#
+# Set two variables for every command, also for down:
+#   PX_PHERF_IMAGE_TAG  the local image that stage-artifacts.sh --image pherf
+#                       built; px-cluster config shows it
+#   PHERF_ZOOKEEPER     the ZooKeeper quorum of the target cluster
+# Then, with this file:
+#   docker compose -f compose.yaml up -d --wait   one controller, three agents
+#   docker compose -f compose.yaml up -d --wait --scale agent=N
+#   curl -fsS http://127.0.0.1:8780/v1/agents      the registered agents
+# --wait returns when each container is healthy. An agent is healthy when it
+# runs and reaches the agent channel; it can register some seconds later.
+#   docker compose -f compose.yaml down -v        remove all, the run volume too
+#
+# Sizing: 1024 MiB for the controller and 1536 MiB for each agent, which holds
+# the agent JVM and one Pherf JVM; one controller and three agents take
+# 5632 MiB, 5.5 GiB. The REST port 8780 is published on 127.0.0.1 only. The
+# agent channel 8790 stays on the network of this deployment.
+
+name: px-pherf-standalone
+
+services:
+  controller:
+    image: "${PX_PHERF_IMAGE_TAG:?set the image that px-cluster build -e PX_PHERF=1 built}"
+    pull_policy: never
+    command: ["controller", "start"]
+    restart: "no"
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    environment:
+      PHERF_JAVA_OPTS: "-XX:MaxRAMPercentage=50"
+    volumes:
+      - run:/var/lib/pherf/run
+    ports:
+      - "127.0.0.1:8780:8780"
+    healthcheck:
+      test: ["CMD", "/opt/pherf/healthcheck.sh", "controller"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
+
+  agent:
+    image: "${PX_PHERF_IMAGE_TAG:?set the image that px-cluster build -e PX_PHERF=1 built}"
+    pull_policy: never
+    command: ["agent", "start"]
+    restart: "no"
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    deploy:
+      replicas: 3
+    depends_on:
+      controller:
+        condition: service_healthy
+    environment:
+      PHERF_CONTROLLER: "http://controller:8790"
+      PHERF_ZOOKEEPER: "${PHERF_ZOOKEEPER:?set the ZooKeeper quorum of the target cluster}"
+      # The agent and its one Pherf JVM each take at most this share.
+      PHERF_JAVA_OPTS: "-XX:MaxRAMPercentage=35"
+    healthcheck:
+      test: ["CMD", "/opt/pherf/healthcheck.sh", "agent"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  run: {}

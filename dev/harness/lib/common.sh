@@ -1895,6 +1895,14 @@ px_versions_resolve() {
     [ -n "${PX_DIST_HADOOP_VERSION:-}" ] && [ -n "${PX_PHOENIX_HBASE_PROFILE:-}" ]; then
     px_config_set PX_IMAGE_TAG "$tag" derived
   fi
+  # Because the Distributed Pherf image packages the client JARs of the selected HBase release
+  # without bundling a Hadoop distribution or selectable JDKs, its derived image tag encodes only
+  # the HBase release and the Phoenix HBase profile.
+  tag="px-pherf:hbase-${PX_DIST_HBASE_VERSION:-}-profile-${PX_PHOENIX_HBASE_PROFILE:-}"
+  if [ -z "${PX_PHERF_IMAGE_TAG:-}" ] && [ -n "${PX_DIST_HBASE_VERSION:-}" ] &&
+    [ -n "${PX_PHOENIX_HBASE_PROFILE:-}" ]; then
+    px_config_set PX_PHERF_IMAGE_TAG "$tag" derived
+  fi
 }
 
 ## @description  Verifies that the configured HBase release falls within the patch range admitted by

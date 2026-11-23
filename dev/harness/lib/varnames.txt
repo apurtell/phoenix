@@ -216,7 +216,8 @@ PX_DIST_*                # the pinned distributions that fetch-dist.sh retrieves
 PX_PHOENIX_HBASE_PROFILE # the HBase profile of the Phoenix build, -Dhbase.profile
 PX_PHOENIX_HBASE_PROFILE_DEFAULT # the profile when no stage selects one
 PX_IMAGE_TAG             # the one local image that every service runs
-PX_IMAGE_BASE_*          # the JDK base images and their digest pins
+PX_PHERF_IMAGE_TAG       # the local image of the Distributed Pherf controller and agents
+PX_IMAGE_BASE_*          # the JDK and JRE base images and their digest pins
 PX_STAGED_*              # build arguments: the context path of each staged file
 PX_UID                   # build argument: the host user id of the image user
 PX_GID                   # build argument: the host group id of the image user

@@ -15,11 +15,13 @@
 # limitations under the License.
 
 # Assembles the container image build context and builds the image through the substrate contract.
+# The --image option selects the target image: harness for the default multi-role image in
+# docker/image, or pherf for the Distributed Pherf controller and agent image in docker/pherf.
 #
 # The build context directory is $PX_OUT/images/<context>/, where <context> is the image tag with
 # every : and / character replaced by _. The script recreates this directory from scratch on every
-# invocation so that no residue from an earlier staging run remains. The context contains only the
-# following entries, arranged in the layout expected by the image definition:
+# invocation so that no residue from an earlier staging run remains. The harness context contains
+# only the following entries, arranged in the layout expected by the image definition:
 #   <root>        Every file and directory from the layout's image directory, along with its
 #                 ignore file when one is present.
 #   dist/         The release archives for HBase and Hadoop, plus the async-profiler archive when
@@ -30,9 +32,14 @@
 #                 with the bson JAR required by the client.
 #   plugins/<id>/ Every file belonging to each plug-in enabled by PX_PLUGINS; the plugins/
 #                 directory remains present and empty when no plug-in is enabled.
-# Immediately before the script copies any archive, fetch-dist.sh verifies it against its declared
-# pin. The image definition unpacks the archives inside a dedicated build stage so that no archive
-# reaches the final runtime image.
+# The pherf context contains the image root files, only the HBase archive under dist/, the client,
+# Pherf, bson, and distributed JARs under phoenix/, and module/bin/ and module/conf/ holding the
+# launch script and logging configuration of phoenix-pherf-distributed from the source tree named
+# in the build record. Building it requires a build record produced by
+# build-phoenix.sh --distributed.
+# Immediately before the script copies any archive, fetch-dist.sh verifies it against its pin. The
+# image definition unpacks the archives inside a dedicated build stage so that no archive reaches
+# the final runtime image.
 #
 # Five staging validation checks run prior to the build, and any single failure stops the process:
 #   presence    Every expected component is present in the build context, no artifact file is
@@ -93,6 +100,7 @@ SA_ARG_RE='^ARG[[:space:]]+(PX_[A-Za-z0-9_]+)(=.*)?$'
 SA_DIGEST_RE='^(sha256:)?([0-9a-f]{64})$'
 
 SA_TAG=""
+SA_IMAGE=harness
 SA_STAGE_ONLY=0
 SA_RECORD=""
 SA_CTX=""
@@ -122,10 +130,14 @@ Stages the image build context under $PX_OUT/images/<context>/ from the image
 directory, the verified distributions and the recorded Phoenix jars, runs
 the staging checks, writes the staging record
 $PX_OUT/images/<context>.staged.tsv, and builds the image through the
-substrate contract. Run build-phoenix.sh first.
+substrate contract. Run build-phoenix.sh first, with --distributed for the
+pherf image.
 
 Options:
-  --tag TAG           the image tag, default PX_IMAGE_TAG
+  --image NAME        harness, the multi-role image (default), or pherf, the
+                      Distributed Pherf controller and agent image
+  --tag TAG           the image tag, default PX_IMAGE_TAG, or
+                      PX_PHERF_IMAGE_TAG for the pherf image
   --stage-only        stage and check, and build nothing
   -n, --dry-run       report the plan and change nothing
   --config FILE       an extra configuration file, repeatable
@@ -295,7 +307,7 @@ sa_computed_arg() {
   PX_ZOOKEEPER_VERSION) printf '%s\n' "$SA_ZOOKEEPER" ;;
   PX_HBASE_HADOOP_VERSION) printf '%s\n' "$SA_HBASE_HADOOP" ;;
   PX_STAGED_*) px_tsv_get "$name" "$SA_STAGED" || true ;;
-  PX_IMAGE_BASE_JDK*_SHA256)
+  PX_IMAGE_BASE_*_SHA256)
     pin="${name}_$SA_ARCH_KEY"
     value="${!pin:-$(sa_base_digest "$pin" "${name%_SHA256}")}"
     [[ $value =~ $SA_DIGEST_RE ]] || return 0
@@ -349,7 +361,7 @@ sa_collect_args() {
       SA_BUILD_ARGS+=("$name=$value")
     elif [ -z "$computed" ]; then
       case "$name" in
-      PX_IMAGE_BASE_JDK*_SHA256)
+      PX_IMAGE_BASE_*_SHA256)
         sa_fail "presence: the image declares the build argument $name, and" \
           "${name}_$SA_ARCH_KEY holds no digest of 64 hexadecimal digits. A build" \
           "without --stage-only records it on first use in $SA_PINS when the" \
@@ -364,24 +376,36 @@ sa_collect_args() {
   done <"$file"
 }
 
-while [ $# -gt 0 ]; do
-  px_cli_common "$1" || case "$1" in
-  --tag) px_cli_need_value "$@" && SA_TAG="$2" && shift ;;
-  --stage-only) SA_STAGE_ONLY=1 ;;
-  --config) px_cli_need_value "$@" && SA_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *) px_usage_error "unexpected argument: $1" ;;
-  esac
-  shift
-done
-
-px_config_load -- ${SA_CONFIG_FILES[@]+"${SA_CONFIG_FILES[@]}"}
+px_cli_parse "$@"
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 px_versions_check
 
-SA_TAG="${SA_TAG:-${PX_IMAGE_TAG:-}}"
+# Configure the staging parameters for the selected image target. The pherf image omits Hadoop,
+# profiling tools, and plug-ins, while its runtime JVMs require the distributed JAR and the launch
+# files from the phoenix-pherf-distributed module.
+case "$SA_IMAGE" in
+harness)
+  SA_IMAGE_DIR="$PX_HOME/$PX_DEPLOY_SUBDIR/image"
+  SA_IGNORE="$PX_HOME/$PX_DEPLOY_SUBDIR/.dockerignore"
+  SA_TAG_VAR=PX_IMAGE_TAG
+  SA_JAR_KEYS="server_jar client_jar pherf_jar distributed_jar"
+  SA_MODULE_FILES=""
+  ;;
+pherf)
+  SA_IMAGE_DIR="$PX_HOME/$PX_DEPLOY_SUBDIR/pherf"
+  SA_IGNORE=""
+  SA_TAG_VAR=PX_PHERF_IMAGE_TAG
+  SA_REQUIRED_DISTS=hbase
+  SA_TOOL_DISTS=""
+  SA_JAR_KEYS="client_jar pherf_jar distributed_jar"
+  SA_MODULE_FILES="bin/pherf-distributed.sh conf/log4j2.properties"
+  ;;
+*) px_die "$PX_EXIT_USAGE" "the image '$SA_IMAGE' is not harness or pherf" ;;
+esac
+
+SA_TAG="${!SA_TAG_VAR:-}"
 if ! sb_image_tag_local "$SA_TAG"; then
-  px_usage_error "the image tag '$SA_TAG' is not a local repository:tag; set PX_IMAGE_TAG" \
-    "or --tag"
+  px_die "$PX_EXIT_USAGE" "the image tag '$SA_TAG' is not a local repository:tag; set $SA_TAG_VAR"
 fi
 
 SA_ROOT="$(px_out_root)" || exit $?
@@ -397,12 +421,14 @@ for SA_KEY in tree phoenix_version hbase_profile compat_module hbase_version had
       "Run build-phoenix.sh again."
   fi
 done
+if [ "$SA_IMAGE" = pherf ] && ! sa_record_get distributed_jar >/dev/null; then
+  px_die "$PX_EXIT_FAIL" "the build record $SA_RECORD_FILE has no distributed_jar." \
+    "Build it with px-cluster build -e PX_PHERF=1."
+fi
 SA_TREE="$(sa_record_get tree)"
 SA_PHOENIX_VERSION="$(sa_record_get phoenix_version)"
 SA_PROFILE="$(sa_record_get hbase_profile)"
 
-SA_IMAGE_DIR="$PX_HOME/$PX_DEPLOY_SUBDIR/image"
-SA_IGNORE="$PX_HOME/$PX_DEPLOY_SUBDIR/.dockerignore"
 if [ ! -f "$SA_IMAGE_DIR/Dockerfile" ]; then
   px_die "$PX_EXIT_NO_OBJECT" "no image definition at $SA_IMAGE_DIR/Dockerfile"
 fi
@@ -420,10 +446,9 @@ for SA_NAME in $SA_TOOL_DISTS; do
 done
 
 if px_is_dry_run; then
-  px_info "dry run: would stage Phoenix $SA_PHOENIX_VERSION of profile $SA_PROFILE for HBase" \
-    "$PX_DIST_HBASE_VERSION and Hadoop $PX_DIST_HADOOP_VERSION from $SA_IMAGE_DIR, the" \
-    "distributions ${SA_DISTS[*]} and the jars of" \
-    "$SA_RECORD_FILE under $SA_ROOT/images, then build the image $SA_TAG"
+  px_plan stage "$SA_IMAGE" "$SA_IMAGE_DIR" "${SA_DISTS[*]}" "$SA_RECORD_FILE" \
+    "$SA_ROOT/images"
+  [ "$SA_STAGE_ONLY" = 1 ] || px_plan build "$SA_TAG"
   exit 0
 fi
 
@@ -467,13 +492,21 @@ EOF
 if [ -f "$SA_IGNORE" ]; then
   sa_stage "$SA_IGNORE" .dockerignore image
 fi
+# Stage the launch files of phoenix-pherf-distributed from the source tree recorded in the build
+# record, which is also validated by the source-tree freshness check.
+for SA_PATH in $SA_MODULE_FILES; do
+  sa_stage "$SA_TREE/phoenix-pherf-distributed/src/main/$SA_PATH" "module/$SA_PATH" image
+done
 
-# Stage the enabled plug-ins. Because the image installs each plug-in under /opt/px/plugins, a
-# plug-in enters the image exclusively through the staged build context. If the configured plug-in
-# set fails to load, the script aborts the staging process immediately.
-mkdir -p "$SA_CTX/plugins" || sa_fail "presence: cannot create the directory plugins/"
-SA_PLUGINS="$(pl_enabled || exit "$?")" ||
-  px_die "$PX_EXIT_USAGE" "the plug-ins of PX_PLUGINS do not load, so nothing is staged"
+# Stage the enabled plug-ins. Because the harness image installs each plug-in under
+# /opt/px/plugins, a plug-in enters the image exclusively through the staged build context. If the
+# configured plug-in set fails to load, the script aborts the staging process immediately.
+SA_PLUGINS=""
+if [ "$SA_IMAGE" = harness ]; then
+  mkdir -p "$SA_CTX/plugins" || sa_fail "presence: cannot create the directory plugins/"
+  SA_PLUGINS="$(pl_enabled || exit "$?")" ||
+    px_die "$PX_EXIT_USAGE" "the plug-ins of PX_PLUGINS do not load, so nothing is staged"
+fi
 while IFS="$PX_TAB" read -r SA_ID SA_DIR; do
   [ -n "$SA_ID" ] || continue
   while IFS= read -r SA_PATH; do
@@ -500,8 +533,8 @@ for SA_NAME in "${SA_DISTS[@]}"; do
   fi
 done
 # Stage the jHiccup artifact from its build record at $PX_OUT/build/jhiccup/jHiccup.jar.
-case " ${PX_DIST_ARTIFACTS//,/ } " in
-*" jhiccup "*)
+case "$SA_IMAGE: ${PX_DIST_ARTIFACTS//,/ } " in
+"harness:"*" jhiccup "*)
   SA_PATH="$SA_ROOT/build/jhiccup/jHiccup.jar"
   if [ -s "$SA_PATH" ]; then
     sa_stage "$SA_PATH" dist/jHiccup.jar
@@ -522,7 +555,7 @@ fi
 
 # Stage the Phoenix JARs listed in the build record.
 SA_JARS=()
-for SA_KEY in server_jar client_jar pherf_jar distributed_jar; do
+for SA_KEY in $SA_JAR_KEYS; do
   SA_PATH="$(sa_record_get "$SA_KEY")" || continue
   sa_stage "$SA_PATH" "phoenix/${SA_PATH##*/}"
   SA_ARG="PX_STAGED_PHOENIX_$(px_upper "${SA_KEY%_jar}")"
@@ -559,7 +592,7 @@ SA_STAGED_RECORD="$SA_CTX.staged.tsv"
   px_tsv_row hbase_profile "$SA_PROFILE"
   px_tsv_row compat_module "$(sa_record_get compat_module)"
   px_tsv_row hbase_version "$PX_DIST_HBASE_VERSION"
-  px_tsv_row hadoop_version "$PX_DIST_HADOOP_VERSION"
+  if [ "$SA_IMAGE" = harness ]; then px_tsv_row hadoop_version "$PX_DIST_HADOOP_VERSION"; fi
   px_tsv_row zookeeper_version "$SA_ZOOKEEPER"
   px_tsv_row hbase_hadoop_version "$SA_HBASE_HADOOP"
   px_tsv_row arch "$SA_ARCH"
