@@ -20,6 +20,7 @@ package org.apache.phoenix.pherf.distributed.agent;
 import java.util.List;
 import org.HdrHistogram.Histogram;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
+import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 
 /**
  * Defines the asynchronous execution contract for work assigned to an agent. Every method returns
@@ -69,8 +70,12 @@ public interface Workload {
     /** Delivers a single interval histogram recorded for a given operation and phase. */
     void interval(String operation, String phase, long startMs, long endMs, Histogram histogram);
 
-    /** Signals that the workload has completed execution after emitting its final interval. */
-    void finished();
+    /**
+     * Signals that the workload has completed execution after emitting its final interval and
+     * delivers its final report. The report may be null only following a cancellation; otherwise, a
+     * null report causes the workload to fail.
+     */
+    void finished(FinalReport report);
 
     /** Signals that workload execution terminated abnormally due to an error. */
     void failed(String reason);

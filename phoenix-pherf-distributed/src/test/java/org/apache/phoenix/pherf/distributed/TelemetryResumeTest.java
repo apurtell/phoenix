@@ -81,7 +81,6 @@ public class TelemetryResumeTest {
       assertEquals(RunView.SlotState.DONE, slot.getState());
       assertEquals(workload.emitted.size(), slot.getHeldSeq());
       assertEquals(slot.getHeldSeq(), slot.getFinalSeq());
-      assertEquals(slot.getHeldSeq(), slot.getFrames());
       assertEquals(slot.getAgent(), workload.emittedCount(), slot.getSamples());
     }
   }
@@ -278,7 +277,6 @@ public class TelemetryResumeTest {
     assertEquals(run.toString(), RunView.State.COMPLETE, run.getState());
     for (RunView.SlotView slot : run.getSteps().get(0).getSlots()) {
       assertEquals(20, slot.getHeldSeq());
-      assertEquals(20, slot.getFrames());
     }
   }
 
@@ -370,7 +368,6 @@ public class TelemetryResumeTest {
         workload.emitted.subList(emittedBefore.get(slot.getAgent()), workload.emitted.size());
       assertEquals(3, own.size());
       assertEquals(3, slot.getHeldSeq());
-      assertEquals(3, slot.getFrames());
       assertEquals(own.get(0) + own.get(1) + own.get(2), slot.getSamples());
     }
   }
@@ -413,7 +410,6 @@ public class TelemetryResumeTest {
     assertEquals("agent a1 restarted", run.getReason());
     RunView.SlotView slot = run.getSteps().get(0).getSlots().get(0);
     assertEquals(held, slot.getHeldSeq());
-    assertEquals(held, slot.getFrames());
     int acked = 0;
     List<InProcessNetwork.Event> events = simulation.network.events();
     for (int i = before; i < events.size(); i++) {

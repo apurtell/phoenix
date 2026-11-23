@@ -41,7 +41,10 @@ import org.apache.phoenix.pherf.distributed.Plans;
 import org.apache.phoenix.pherf.distributed.clock.SystemClock;
 import org.apache.phoenix.pherf.distributed.identity.DataPlaneIdentity;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
+import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 import org.apache.phoenix.pherf.distributed.protocol.Share;
+import org.apache.phoenix.pherf.latency.LatencyReport;
+import org.apache.phoenix.pherf.verdict.HealthVerdict;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -73,6 +76,7 @@ public class PherfProcessTest {
     final CountDownLatch ended = new CountDownLatch(1);
     volatile List<String> errors;
     volatile long startedMs;
+    volatile FinalReport report;
 
     @Override
     public void prepared(List<String> errors) {
@@ -97,7 +101,8 @@ public class PherfProcessTest {
     }
 
     @Override
-    public synchronized void finished() {
+    public synchronized void finished(FinalReport report) {
+      this.report = report;
       ends.add("finished");
       ended.countDown();
     }
@@ -155,6 +160,26 @@ public class PherfProcessTest {
       assertTrue(expected.toString(), expected.size() >= 3);
       synchronized (recorder) {
         assertEquals(expected, recorder.counts);
+      }
+      // Verify that the final report emitted by the child process contains the same operation
+      // counts keyed by log tag and records the same measurement time window.
+      FinalReport finalReport = recorder.report;
+      Map<String, Long> reported = new TreeMap<>();
+      for (Map.Entry<String, Long> key : finalReport.getCounts().entrySet()) {
+        String[] parsed = LatencyReport.parseTag(key.getKey());
+        reported.put(parsed[0] + "|" + parsed[1], key.getValue());
+      }
+      assertEquals(expected, reported);
+      assertEquals(report.get("startMs").getAsLong(), finalReport.getStartMs());
+      assertEquals(report.get("endMs").getAsLong(), finalReport.getEndMs());
+      assertEquals(1, finalReport.getSchedules().size());
+      assertEquals(report.getAsJsonArray("schedules").get(0), finalReport.getSchedules().get(0));
+      // Verify that the final report includes all five rows of the Pherf health verdict produced
+      // by the child process.
+      assertEquals(HealthVerdict.CHECKS.size(), finalReport.getVerdict().size());
+      for (int i = 0; i < HealthVerdict.CHECKS.size(); i++) {
+        assertTrue(finalReport.getVerdict().get(i),
+          finalReport.getVerdict().get(i).startsWith(HealthVerdict.CHECKS.get(i) + "\t"));
       }
       // Running with -runDurationMs 500 and -targetRate 100 produces 50 scheduled arrivals,
       // each of which runs to completion.

@@ -32,15 +32,19 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.function.Consumer;
 import org.apache.phoenix.pherf.distributed.clock.Clock;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
+import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 import org.apache.phoenix.pherf.distributed.protocol.Protocol;
 import org.apache.phoenix.pherf.distributed.protocol.Share;
+import org.apache.phoenix.pherf.latency.LatencyReport;
 import org.apache.phoenix.pherf.validation.ScenarioValidator;
+import org.apache.phoenix.pherf.verdict.HealthVerdict;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,9 +63,11 @@ import org.slf4j.LoggerFactory;
  * tails its interval log. The child process warms up and prints an armed marker when it holds at
  * the Pherf start gate. Starting the workload writes the start time to the child process's standard
  * input (stdin), which opens the gate at that time and prints a started marker with that timestamp.
- * Cancellation sends SIGTERM and escalates to SIGKILL after {@link Protocol#STOP_GRACE_MS}. Each
- * lifecycle stage notifies the listener only after its child process has exited, ensuring the agent
- * never transitions to idle while a child remains alive.
+ * Once the run child process exits with status 0, the agent constructs the final report from its
+ * JSON latency report and health verdict file. Cancellation sends SIGTERM and escalates to SIGKILL
+ * after {@link Protocol#STOP_GRACE_MS}. Each lifecycle stage notifies the listener only after its
+ * child process has exited, ensuring the agent never transitions to idle while a child remains
+ * alive.
  * <p>
  * Listener callbacks always execute on the clock thread without holding the workload lock, because
  * the agent runtime invokes the workload while holding its own lock; this serialization also
@@ -569,7 +575,7 @@ public final class PherfWorkload implements Workload, AutoCloseable {
 
   /**
    * Completes a run on the clock thread by performing a final drain of the interval log and
-   * notifying the listener whether the workload finished or failed.
+   * notifying the listener whether the workload finished with its final report or failed.
    */
   private void finish(Job j, int status, List<String> lines) {
     drain(j);
@@ -583,8 +589,18 @@ public final class PherfWorkload implements Workload, AutoCloseable {
       cancelled = j.cancelled;
       failure = j.failure;
     }
-    if (cancelled || failure == null && status == 0) {
-      j.listener.finished();
+    if (cancelled) {
+      j.listener.finished(null);
+    } else if (failure == null && status == 0) {
+      File dir = new File(workDir, RESULTS + "_HDR");
+      FinalReport report;
+      try {
+        report = report(dir);
+      } catch (IOException | RuntimeException e) {
+        j.listener.failed("pherf wrote no valid LATENCY_" + RUN_LABEL + ".json: " + e);
+        return;
+      }
+      j.listener.finished(report);
     } else if (failure != null) {
       j.listener.failed(failure);
     } else {
@@ -593,8 +609,47 @@ public final class PherfWorkload implements Workload, AutoCloseable {
   }
 
   /**
+   * Constructs the final report for a completed run from the child process output files:
+   * LATENCY_run.json (conforming to version 1 of the LATENCY.md JSON report format) and the lines
+   * of VERDICT_run.tsv when that file is present.
+   */
+  private static FinalReport report(File dir) throws IOException {
+    JsonObject json = JsonParser.parseString(
+      new String(Files.readAllBytes(new File(dir, "LATENCY_" + RUN_LABEL + ".json").toPath()),
+        StandardCharsets.UTF_8))
+      .getAsJsonObject();
+    if (
+      !LatencyReport.FORMAT.equals(json.get("format").getAsString())
+        || json.get("version").getAsInt() != LatencyReport.VERSION
+    ) {
+      throw new IllegalArgumentException(
+        "the format is " + json.get("format") + " version " + json.get("version") + ", not "
+          + LatencyReport.FORMAT + " version " + LatencyReport.VERSION);
+    }
+    Map<String, Long> counts = new LinkedHashMap<>();
+    for (JsonElement element : json.getAsJsonArray("histograms")) {
+      JsonObject entry = element.getAsJsonObject();
+      counts.put(
+        LatencyReport.tag(entry.get("operation").getAsString(), entry.get("phase").getAsString()),
+        entry.get("count").getAsLong());
+    }
+    List<JsonObject> schedules = new ArrayList<>();
+    if (json.has("schedules")) {
+      for (JsonElement element : json.getAsJsonArray("schedules")) {
+        schedules.add(element.getAsJsonObject());
+      }
+    }
+    File verdict = new File(dir, HealthVerdict.fileName(RUN_LABEL));
+    List<String> rows = verdict.isFile()
+      ? Files.readAllLines(verdict.toPath(), StandardCharsets.UTF_8)
+      : Collections.<String> emptyList();
+    return new FinalReport(json.get("startMs").getAsLong(), json.get("endMs").getAsLong(), counts,
+      schedules, rows);
+  }
+
+  /**
    * Assembles the Pherf command-line arguments for a child process by starting with the step
-   * options and appending the options controlled by the agent.
+   * options and appending the options managed by the agent.
    */
   private List<String> args(Assignment assignment, File dir, boolean validate) {
     List<String> args = new ArrayList<>(assignment.getArgs());

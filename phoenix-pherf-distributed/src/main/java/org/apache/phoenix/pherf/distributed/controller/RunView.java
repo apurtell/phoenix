@@ -18,7 +18,9 @@
 package org.apache.phoenix.pherf.distributed.controller;
 
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.phoenix.pherf.distributed.identity.DataPlaneIdentity;
 import org.apache.phoenix.pherf.distributed.protocol.Share;
 
@@ -172,16 +174,16 @@ public final class RunView {
     private final Share share;
     private final long heldSeq;
     private final long finalSeq;
-    private final int frames;
     private final long samples;
+    private final Map<String, Long> counters;
     private final Long offsetMs;
     private final Long delayMs;
     private final Long startAtMs;
     private final Long dispatchMs;
 
     SlotView(DataPlaneIdentity identity, String agent, SlotState state, String error, Share share,
-      long heldSeq, long finalSeq, int frames, long samples, Long offsetMs, Long delayMs,
-      Long startAtMs, Long dispatchMs) {
+      long heldSeq, long finalSeq, long samples, Map<String, Long> counters, Long offsetMs,
+      Long delayMs, Long startAtMs, Long dispatchMs) {
       this.identity = identity;
       this.agent = agent;
       this.state = state;
@@ -189,8 +191,8 @@ public final class RunView {
       this.share = share;
       this.heldSeq = heldSeq;
       this.finalSeq = finalSeq;
-      this.frames = frames;
       this.samples = samples;
+      this.counters = Collections.unmodifiableMap(new LinkedHashMap<>(counters));
       this.offsetMs = offsetMs;
       this.delayMs = delayMs;
       this.startAtMs = startAtMs;
@@ -236,19 +238,24 @@ public final class RunView {
       return finalSeq;
     }
 
-    /** Returns the total number of interval frames currently held for this slot. */
-    public int getFrames() {
-      return frames;
-    }
-
     /** Returns the cumulative sample count across all currently held frames for this slot. */
     public long getSamples() {
       return samples;
     }
 
     /**
-     * Returns the estimated clock offset of the agent when the step start epoch was established, or
-     * null if not set.
+     * Returns the cumulative count for each key across the currently held frames, indexed by log
+     * tag. Each frame verifies the count for its key against the cumulative total reported by the
+     * agent.
+     */
+    public Map<String, Long> getCounters() {
+      return counters;
+    }
+
+    /**
+     * Returns the clock offset of the agent recorded when the start epoch was established. A slot
+     * with no start gate retains the clock offset of its agent at DONE, and the other slots retain
+     * their agent's offset at the end of the run. Returns null if no offset is available.
      */
     public Long getOffsetMs() {
       return offsetMs;

@@ -44,7 +44,8 @@ import org.junit.Test;
  * request.
  */
 public class ChannelHandlerTest {
-  private final Controller controller = new Controller(new VirtualClock(Simulation.START_MS));
+  private final Controller controller =
+    new Controller(new VirtualClock(Simulation.START_MS), Simulation.runDir());
   private final ChannelHandler handler = new ChannelHandler(controller);
 
   private static String json(AgentMessage message, String agent, String trace) {

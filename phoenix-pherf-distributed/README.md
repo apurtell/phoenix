@@ -54,6 +54,7 @@ agent listener.
 | Variable | Process | Meaning |
 |---|---|---|
 | `PHERF_AGENT_PORT` | controller | The port of the agent listener. Default 8790. `0` takes a free port; the log line `agent channel listening on port N` gives it. |
+| `PHERF_RUN_DIR` | controller | Required. The directory of the run bundles (see Run bundle). The controller makes it when it does not exist. Without it, or when it cannot be made, the controller stops with status 2. |
 | `PHERF_CONTROLLER` | agent | Required. The agent listener of the controller, for example `http://pherf-controller:8790`. |
 | `PHERF_ZOOKEEPER` | agent | Required. The ZooKeeper quorum of the target cluster, given to Pherf as `-z`. |
 | `PHERF_AGENT_ID` | agent | The operational id. If it is not set, the agent uses `HOSTNAME`, then the local host name. The id matches `[A-Za-z0-9._-]{1,63}`. |
@@ -108,8 +109,8 @@ type are errors, and each error names its JSON path, for example
 `steps[1].weights: 3 weights for 2 agents`. The steps run in order.
 
 ```json
-{"seed": 8070,
- "properties": {"pherf.verdict.x": "..."},
+{"seed": 8070, "runClass": "measurement",
+ "properties": {"pherf.verdict.noisyHost": "false"},
  "steps": [{
    "agents": 3, "weights": [1, 2, 1],
    "scenario": "relational_scenario.xml",
@@ -123,7 +124,8 @@ type are errors, and each error names its JSON path, for example
 | Field | Required | Meaning |
 |---|---|---|
 | `seed` | yes | Any 64-bit integer. It derives the data-plane identities. |
-| `properties` | no | Run-level Pherf properties. They win over the step properties. |
+| `runClass` | yes | `validation` or `measurement`. In a validation run, a FAIL of class duration of the fleet verdict reads as ADVISORY. |
+| `properties` | no | Run-level Pherf properties. They win over the step properties. The `pherf.verdict.*` keys of this level (VERDICT.md) also set the fleet verdict; the step properties do not. |
 | `steps` | yes | At least one step. |
 | `steps[].agents` | yes | 1 to 1000. |
 | `steps[].weights` | no | One integer of at least 1 for each agent. Absent means all 1. |
@@ -151,7 +153,9 @@ The submit check refuses a plan before any agent gets work:
 - `${pherf.slot.offset}` in a step with no `rows`;
 - a slot with a share of 0 of `rate`, `threads` or `rows`, and a row share over 2147483647;
 - an `assign` of slot 0 of a step that does not fit 1 KiB below the 16 MiB body limit. In step 0
-  it holds the later slices that slot 0 validates (see Agent workload).
+  it holds the later slices that slot 0 validates (see Agent workload);
+- a run-level `pherf.verdict.*` value that Pherf refuses, for example
+  `properties: pherf.verdict.noisyHost=maybe is not true or false`.
 
 A step with more agents than are free fails the submit, or for a later step, the run.
 
@@ -230,43 +234,43 @@ agent log, with the exception of the two start gate marker lines (see Start sync
   `step <step> slot <slot>: `. The prepare reports the errors of all its slices, so a bad slice of
   any step aborts the run before the first `start`. Each later step validates its own slices again
   in its prepare.
-- **Launch** immediately spawns the run child process. The child connects to the cluster, applies
-  the schema, performs its warmup phase, and then pauses at its start gate, at which point the
-  agent reports `ARMED`. Every 1000 ms from launch onward, the agent reads newly completed lines
-  from `RESULTS_HDR/LATENCY_run_intervals.hlog` and transmits each line as a telemetry frame for
-  every operation and phase, allowing warmup frames to stream before the start gate opens. The
-  interval time bounds are parsed directly from the decimal text of each line so that they remain
-  exact to the millisecond. Once the child process exits, a final read drains any remaining lines;
-  an exit status of 0 completes the slot, whereas any other exit status or a malformed line causes
-  the slot to fail.
-- **Start** writes `startAtMs` to the standard input stream of the armed child process, which opens
-  its start gate at that timestamp.
-- **Cancel** sends SIGTERM to a live child process, including one holding at its start gate, and
-  escalates to SIGKILL after 5 seconds. Each stage reports its termination only after its child
-  process has exited.
+- **Launch** starts the run child at once. The child connects, applies the schema, warms up and
+  then holds at its start gate (the agent reports `ARMED`). Every 1000 ms the agent reads the new
+  complete lines of `RESULTS_HDR/LATENCY_run_intervals.hlog` and sends each one as a frame, for
+  every operation and phase, from the launch on, so the warmup frames come before the gate. The
+  time bounds come from the decimal text of the line, so they are exact to the ms. After the exit,
+  a last read sends the rest. Exit 0 then completes the slot with its final report: the window and
+  the count of each key of `RESULTS_HDR/LATENCY_run.json`, its `schedules` entries as they are, and
+  the lines of `RESULTS_HDR/VERDICT_run.tsv` (none when the file is absent). Exit 0 with no valid
+  JSON report fails the slot with `pherf wrote no valid LATENCY_run.json: ...`. Another exit or a
+  bad line fails it.
+- **Start** writes `startAtMs` to the stdin of the armed child, which opens its gate at that time.
+- **Cancel** sends SIGTERM to a live child, also to a child at its gate, and SIGKILL after 5
+  seconds. Each stage reports its end only after its child has exited.
 
 ## Run states
 
 | State | Meaning |
 |---|---|
 | `RUNNING` | The run has a step that is not complete. |
-| `COMPLETE` | Every step is complete. |
-| `ABORTED` | The run failed before any step received `launch`, so it sent no database traffic. |
-| `FAILED` | The run failed after a step received `launch`. |
+| `COMPLETE` | Every step is complete, and the run bundle is written. A run whose bundle cannot be written is `FAILED` with the reason `cannot write the run bundle: ...`. |
+| `ABORTED` | The run failed before any step got `launch`, so it sent no database traffic. |
+| `FAILED` | The run failed after a step got `launch`. |
 
 | Slot state | Meaning |
 |---|---|
 | `ASSIGNED` | The agent has the slot and prepares it. |
 | `READY` | The prepare passed. The slot waits for the other slots of the step. |
-| `LAUNCHED` | The step received `launch` and the run child process is warming up. |
-| `ARMED` | The run child process is holding at its start gate. |
-| `RUNNING` | The slot has received its scheduled start time. |
-| `DONE` | The controller holds every frame of the slot. |
+| `LAUNCHED` | The step got `launch`. The run child warms up. |
+| `ARMED` | The run child holds at its start gate. |
+| `RUNNING` | The slot has its start time. |
+| `DONE` | The controller holds every frame of the slot and its final report. |
 | `FAILED` | The slot failed. Its error is `agent <id>: <error>`. |
 | `CANCELLED` | Another slot failed the run, and this slot got `cancel` or `release`. |
 
 One failing slot fails the run: a prepare error (for example a validation finding), a start
-failure, an eviction, a `goodbye` or a new incarnation. The run reason is the first slot error.
+failure, an eviction, a `goodbye`, a new incarnation, a misconfigured recorder or a telemetry count
+that does not match. The run reason is the first slot error.
 The other agents of the step get `cancel` (while they prepare, wait or run) or `release` (when
 done), and all go idle. Their slots that are not `DONE` become `CANCELLED`. A cancelled slot that
 then reports its own failure becomes `FAILED` with its error, so the run shows every error. No slot
@@ -310,14 +314,9 @@ controller wall-clock time when the request arrived, and `txMs`, the time when t
 
 | Request | Fields | Meaning |
 |---|---|---|
-| `register` | | Requests admission of the agent into the active fleet. |
-| `heartbeat` |
-`seq, status{phase, runId, step, finalSeq, error, startedMs}, clock{sentMs, rxMs, txMs, receivedMs}`
-| Issues a long-polled status report where `phase` is `IDLE`, `PREPARING`, `READY`, `LAUNCHED`,
-`ARMED`, `RUNNING`, `DONE`, or `FAILED`, `startedMs` records the agent clock time when the start
-gate opened (or 0 otherwise), and `clock` reports the timestamps of the last completed control
-exchange (omitted before the first completed exchange). |
-| `goodbye` | | Notifies the controller that the agent is leaving the fleet immediately. |
+| `register` | | Join the fleet |
+| `heartbeat` | `seq, status{phase, runId, step, finalSeq, error, startedMs, report}, clock{sentMs, rxMs, txMs, receivedMs}` | The long poll. `phase` is `IDLE`, `PREPARING`, `READY`, `LAUNCHED`, `ARMED`, `RUNNING`, `DONE` or `FAILED`. `startedMs` is the agent time when the start gate opened, else 0. `report` is present only with `DONE`: `{startMs, endMs, counts{tag: n}, schedules[], verdict[]}`, the final report of the slot (see Agent workload). `clock` holds the times of the last completed control exchange; it is absent before the first one |
+| `goodbye` | | Leave the fleet now |
 
 | Reply | Fields | Meaning |
 |---|---|---|
@@ -342,9 +341,8 @@ monotonic time. The slot of an evicted agent fails, and so does its run (see Run
 that gets no reply on either stream for more than 10 seconds cancels its work, so an evicted agent
 does not keep its Pherf child running against the database.
 
-To guarantee lossless telemetry delivery before completion, an agent reports the `DONE` phase only
-after its final telemetry frame has been acknowledged, and the controller marks a slot complete
-only after it holds every frame up to `finalSeq`.
+An agent reports `DONE` only when the ack holds the last frame, and the controller completes a slot
+only when it holds every frame up to `finalSeq`. A `DONE` with no `report` fails the slot.
 
 ### Start synchronization
 
@@ -407,36 +405,39 @@ valid clock sample, no skew value is computed for the step.
 
 | Message | Fields |
 |---|---|
-| `intervals` | `runId, step, frames[{seq, operation, phase, startMs, endMs, recorder{lowestUs, highestUs, significantDigits}, histogram}]` |
+| `intervals` | `runId, step, frames[{seq, operation, phase, startMs, endMs, total, recorder{lowestUs, highestUs, significantDigits}, histogram}]` |
 | `ack` | `runId, step, heldSeq` |
 
-- `seq` numbers frames sequentially starting at 1 for each run and step. Each request batch carries
-  at most 256 frames starting from the lowest unacknowledged sequence number, with at most one
-  batch in flight at a time.
-- `recorder` captures the actual precision and range parameters of the underlying histogram; Pherf
-  recorders use 1 us, 600,000,000 us, and 3 significant digits.
-- `histogram` carries the recorded latency distribution in the compressed base64 representation of
-  an HdrHistogram log line.
-- `heldSeq` reports the highest contiguous sequence number that the controller currently holds with
-  no missing frames below it, and the agent retransmits every frame whose sequence number is above
-  `heldSeq`. When a batch pertains to an unrecognized run, an unbound slot, or a superseded agent
-  incarnation, the controller sets `heldSeq` to the highest sequence number in the batch without
-  retaining any of its frames so that the agent discards them.
-- The controller accepts a frame only when its sequence number equals `heldSeq + 1`, skipping any
-  sequence number it already holds and stopping at the first gap. Each newly accepted frame is
-  decoded once and its sample count is added to the slot total. If a frame cannot be decoded, the
-  slot fails, the acknowledgment accepts no further frames, and the agent receives a `cancel`
-  command while remaining in the active fleet.
-- If the listener cannot decode a telemetry batch payload at all, it responds with HTTP 400
-  `rejected`, causing the agent to terminate with status 2.
-- If telemetry requests fail continuously for more than 10 seconds measured from the first failure
-  following an acknowledgment while unacknowledged frames remain pending, the agent terminates its
-  run child process and reports `FAILED` with the error
-  `telemetry stream failed for more than 10000 ms`. Consequently, an agent buffers unacknowledged
-  frames for at most approximately 15 seconds.
-- Receiving an acknowledgment whose `heldSeq` is below the previously acknowledged sequence number
-  indicates that the controller lost frames that the agent has already discarded; the agent fails
-  its active work in the same manner.
+- `seq` starts at 1 for each run and step. A batch has at most 256 frames, from the lowest unacked
+  sequence, and one batch is in flight.
+- `total` is the cumulative count of the key (operation and phase) on the agent, through this frame.
+- `recorder` holds the actual parameters of the histogram. Pherf recorders use 1 us, 600,000,000 us
+  and 3 digits.
+- `histogram` is the histogram in the compressed base64 form of an HdrHistogram log line.
+- `heldSeq` is the highest sequence that the controller holds with no gap below it. The agent sends
+  each frame above `heldSeq` again. For a run that the controller does not know, an unbound slot
+  or an old incarnation, `heldSeq` is the highest sequence of the batch, and the controller holds
+  nothing of it.
+- The controller holds a frame only when its sequence is `heldSeq + 1`. It skips a sequence that it
+  holds, and stops at a gap. It decodes each held frame once and adds its count to the samples and
+  to the counter of its key of the slot. The run view shows these cumulative counters
+  (`SlotView.getCounters`). A frame that does not decode fails the slot. The ack holds no more
+  frames, the agent gets `cancel`, and it stays in the fleet.
+- A frame whose `recorder` is not 1 us, 600,000,000 us and 3 digits, or whose histogram has other
+  parameters than its `recorder`, is never held. A merge equals one recorder only for one
+  configuration. The controller removes the agent and fails its slot, and so the run, with a reason
+  that names each parameter, for example `agent a2 is misconfigured: frame 4 has highestUs
+  3600000000, not 600000000`. The reply is `rejected`, and the agent stops with status 2.
+- A frame whose `total` is not the counter of its key plus its own count shows a lost or a
+  duplicated frame: the slot fails with `lost or duplicated telemetry: ...`. The ack holds no more
+  frames, and the agent stays in the fleet.
+- A batch that the listener cannot decode gets 400 `rejected`; the agent then stops with status 2.
+- When the telemetry requests fail for more than 10 seconds from the first failure after an ack,
+  and frames are pending, the agent stops its run child and then reports `FAILED` with the error
+  `telemetry stream failed for more than 10000 ms`. Thus the agent holds frames for at most about
+  15 seconds.
+- An ack below the acked sequence means that the controller lost frames that the agent no longer
+  has. The agent fails its work in the same way.
 
 ### Keepalives
 
@@ -457,19 +458,86 @@ after 6 seconds and recovers before either side evicts or cancels the other.
 
 ### Guarantees
 
-- Across transient disconnects, duplicate transmissions, or late copies of a request, the
-  controller accepts each frame sequence of a slot exactly once, ensuring that the aggregated
-  sample count of the slot equals the exact count recorded by the agent. Any fault that causes
-  frame loss fails the run, guaranteeing that a run with missing frames never reaches `COMPLETE`.
-- Restarting an agent during an active run is not supported: the run child process terminates
-  alongside its parent agent. When the new incarnation registers, it replaces the previous agent
-  record, marks the assigned slot as failed, and transitions the run to `FAILED`. Any stale frames
-  from the old incarnation are acknowledged without being retained, ensuring that no samples are
-  counted twice.
-- Restarting the controller loses all active runs. Connected agents receive `reregister`, cancel
-  their active workloads, and discard their buffered frames, while the restarted controller
-  acknowledges any stale frames without retaining them. Consequently, no samples are counted twice
-  and no interrupted run is ever reported as complete.
+- A disconnect, a duplicate or a late copy of a request: the controller holds each sequence of a
+  slot exactly once, and the counter of each key equals the count that the agent recorded. The
+  fleet verdict compares the counters of each completed slot with its final report.
+  A fault that loses frames fails the run, so a run with lost frames is never `COMPLETE`.
+- An agent restart during a run is not supported: the run child stops with its agent. The new
+  incarnation replaces the record, its slot fails and the run is `FAILED`. The frames of the old
+  incarnation get an ack and are never held, so nothing is counted twice.
+- A controller restart loses the active runs. The agents get `reregister`, cancel their work and
+  drop their frames, and the new controller acks old frames without holding them. Nothing is
+  counted twice, and no lost run is reported complete. The directory of a lost run has no
+  `manifest.json`.
+- The memory of an active run does not grow with its length: one histogram of about 172 KB for each
+  key, the counters of each slot, and one buffered raw log for each slot. When the bundle is
+  written, the controller drops the histograms and the final reports. Decode and merge run under
+  the controller monitor, at about 100 us for each frame, so the controller holds about 1000 agents
+  with 12 keys each.
+
+## Run bundle
+
+`submit` makes the directory `$PHERF_RUN_DIR/<runId>/` (a failure refuses the submit). Each held
+frame goes to the raw log of its slot at once. At each end of the run (`COMPLETE`, `FAILED` or
+`ABORTED`), in the same step that sets the state, the controller writes the rest of the bundle, with
+`manifest.json` last. So a run is `COMPLETE` only when its bundle is in place, and a directory with
+no manifest is an interrupted run. The layout is the run-bundle layout of the Pherf offline
+analysis (ANALYSIS.md), so `-analyze` reads a bundle as it is.
+
+| Path | Content |
+|---|---|
+| `manifest.json` | `bundle_format_version` 1; `run{id, class, result, state, reason, seed, started_ms, ended_ms}`, where `result` is the highest severity of the fleet verdict rows; `quiet_host{tags}`, which is `["noisy-host"]` when the run-level `pherf.verdict.noisyHost` is true, else `[]` |
+| `drivers/pherf/results_HDR/LATENCY_run.json` | The fleet report |
+| `drivers/pherf/results_HDR/LATENCY_run.hlog` | The merged run log: the header of LATENCY.md, base time `startMs`, one histogram for each key over `[startMs, endMs]` |
+| `drivers/pherf/results_HDR/VERDICT_run.tsv` | The fleet verdict |
+| `drivers/pherf/results_HDR/slots/<step>-<slot>.hlog` | The raw interval log of a slot: the header of LATENCY.md, the comment `#[pherf-distributed run R step S slot I agent A, agent clock]`, base time the start of the first frame, and one line for each held frame. Absent for a slot with no frame |
+
+### Fleet report
+
+The fleet report is the JSON report of version 1 of LATENCY.md, so a reader of a Pherf report reads
+it with no change: label `run`, the pinned recorder, `hlog` `LATENCY_run.hlog`, and no `intervals`
+(the interval series is in the raw logs). Each key (operation and phase) has one histogram that
+merges every held frame of every slot of every step, sorted by operation and then phase. The merge
+equals one recorder that took all samples: the same count, p50, p99, p99.9 and max.
+
+Each time is on the controller clock: the agent time minus the clock offset of its slot. A slot with
+no start gate takes the offset of its agent at `DONE`. `startMs` and `endMs` cover the recording
+windows of all slots, each from its final report, else from its first and last held frame. With no
+held frame, both are the end time of the run. `schedules` holds the entries of each slot, in step
+and slot order, with `startMs`, `endMs` and `lastTakeMs` on the controller clock and the added
+fields `step`, `slot` and `agent`.
+
+The added member `fleet`, which a LATENCY.md reader ignores:
+
+| Field | Meaning |
+|---|---|
+| `runId`, `seed`, `runClass`, `contaminated`, `state`, `reason` | The run |
+| `steps[]` | `step, state, startAtMs, skewMs, startMs, endMs, slots[]`: the epoch and the skew bound of the step, and the window of its slots |
+| `steps[].slots[]` | `slot, agent, incarnation, seed, offset, prefix, share, state, error, offsetMs, delayMs, startAtMs` (agent clock), `dispatchMs`, `startLagMs` (the dispatch time minus the earliest one of the step: the skew of each agent), `frames` (the held sequence), `samples`, `counts{tag: n}` and `intervals` (the raw log path) |
+
+### Fleet verdict
+
+`VERDICT_run.tsv` has the row format of VERDICT.md, source `pherf`, and 8 rows in this order:
+
+| Check | Class | Rule |
+|---|---|---|
+| `pherf.health.attainment` | duration | The Pherf check over the schedules of all slots, so the worst schedule counts |
+| `pherf.health.saturation` | duration | The Pherf check over the schedules of all slots |
+| `pherf.health.client_pool` | count | The row of the agent with the highest severity, the lowest step and slot on a tie, after `step S slot I (agent A): `. The evidence exists only on each agent host. SKIP when no slot reported a verdict |
+| `pherf.health.tail_latency` | duration | The Pherf check over the merged histograms |
+| `pherf.health.read_skew` | share | As `client_pool` |
+| `pherf.fleet.start_skew` | duration | FAIL when the skew bound of a step is over 50 ms. Else SKIP when a gated step has no skew (a slot with no clock sample, or no dispatch), or when no step has a start gate |
+| `pherf.fleet.telemetry` | count | FAIL when a frame total failed a slot (lost or duplicated telemetry), or when the counter of a key of a `DONE` slot differs from the count of its final report. SKIP when no slot is `DONE` |
+| `pherf.fleet.agents` | count | PASS when the run is `COMPLETE` and each slot is `DONE`, else FAIL with the state, the reason and each failed slot |
+
+The settings are the run-level `pherf.verdict.*` properties. A FAIL of class duration reads as
+ADVISORY, with the prefix `validation run: ` in a validation run or the noisy host prefix of
+VERDICT.md in a contaminated run. A row of class count or share never changes.
+
+The harness `px-bundle validate` validates a run directory of the harness, not a controller
+bundle: the controller has no backend, no cluster facts and no steady window. In the harness, the
+`pherf-distributed` driver (round H3) copies the controller bundle into its driver directory and
+adds the 8 rows to the verdict stream of the harness run.
 
 
 ### Version rule

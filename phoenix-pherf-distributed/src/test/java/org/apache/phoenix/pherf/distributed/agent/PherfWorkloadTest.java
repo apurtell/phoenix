@@ -40,6 +40,7 @@ import java.util.Properties;
 import java.util.TreeMap;
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.HistogramLogWriter;
+import org.apache.phoenix.pherf.distributed.Bundles;
 import org.apache.phoenix.pherf.distributed.Plans;
 import org.apache.phoenix.pherf.distributed.Simulation;
 import org.apache.phoenix.pherf.distributed.clock.VirtualClock;
@@ -47,6 +48,7 @@ import org.apache.phoenix.pherf.distributed.controller.RunView;
 import org.apache.phoenix.pherf.distributed.identity.DataPlaneIdentity;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
+import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 import org.apache.phoenix.pherf.distributed.protocol.HistogramBlob;
 import org.apache.phoenix.pherf.distributed.protocol.IntervalFrame;
 import org.apache.phoenix.pherf.distributed.protocol.Intervals;
@@ -107,15 +109,37 @@ public class PherfWorkloadTest {
         + histogram.getTotalCount());
     }
 
+    final List<FinalReport> reports = new ArrayList<>();
+
     @Override
-    public synchronized void finished() {
+    public synchronized void finished(FinalReport report) {
       calls.add("finished");
+      reports.add(report);
     }
 
     @Override
     public synchronized void failed(String reason) {
       calls.add("failed " + reason);
     }
+  }
+
+  /**
+   * Constructs a Pherf LATENCY_run.json payload containing every field defined in LATENCY.md.
+   */
+  private static String latency(long startMs, long endMs, String... keys) {
+    StringBuilder histograms = new StringBuilder();
+    for (int i = 0; i < keys.length; i += 3) {
+      histograms.append(i == 0 ? "" : ",").append("{\"operation\":\"").append(keys[i])
+        .append("\",\"phase\":\"").append(keys[i + 1]).append("\",\"count\":").append(keys[i + 2])
+        .append(",\"minUs\":1,\"maxUs\":9,\"meanUs\":4.5,\"p50Us\":4,")
+        .append("\"p90Us\":8,\"p99Us\":9,\"p999Us\":9}");
+    }
+    return "{\"format\":\"pherf-latency\",\"version\":1,\"label\":\"run\",\"startMs\":" + startMs
+      + ",\"endMs\":" + endMs + ",\"recorder\":{\"lowestUs\":1,"
+      + "\"highestUs\":600000000,\"significantDigits\":3},\"hlog\":\"LATENCY_run.hlog\","
+      + "\"intervals\":\"LATENCY_run_intervals.hlog\",\"histograms\":[" + histograms + "],"
+      + "\"schedules\":[{\"scenario\":\"s\",\"querySet\":1,\"startMs\":" + startMs
+      + ",\"scheduled\":7,\"futureField\":[1]}]}";
   }
 
   private static Properties shippedForTest() {
@@ -208,6 +232,7 @@ public class PherfWorkloadTest {
     assertEquals(Collections.singletonList(Long.toString(startAtMs)), run.sent);
     run.started(startAtMs + 1);
     clock.advance(0);
+    run.results(latency(startAtMs, startAtMs + 9, "query:s:q", "steady", "3"));
     run.exit(0);
     clock.advance(0);
     assertEquals(Arrays.asList("prepared []", "armed", "started " + (startAtMs + 1), "finished"),
@@ -224,9 +249,77 @@ public class PherfWorkloadTest {
     workload.launch(assignment(), events);
     FakeLauncher.Launch run = launcher.last();
     workload.start(RUN, clock.millis());
+    run.results(latency(1, 2));
     run.exit(0);
     clock.advance(0);
     assertEquals(Collections.singletonList("finished"), events.calls);
+  }
+
+  /**
+   * Verifies that when the run child process exits with code 0, it produces a final report
+   * containing the time window and per-key sample counts from its JSON report, its schedule entries
+   * unchanged, and its verdict rows.
+   */
+  @Test
+  public void finishedRunGivesTheFinalReport() {
+    prepared(assignment());
+    workload.launch(assignment(), events);
+    FakeLauncher.Launch run = launcher.last();
+    String verdict = "pherf.health.client_pool\tPASS\tcount\tpherf\tno task waited";
+    run.results(latency(1000, 5000, "query:s:a b", "steady", "12", "query:s:a b", "warmup", "2"),
+      verdict, "pherf.health.read_skew\tSKIP\tshare\tpherf\tno source");
+    run.exit(0);
+    clock.advance(0);
+    assertEquals(Collections.singletonList("finished"), events.calls);
+    FinalReport report = events.reports.get(0);
+    assertEquals(1000, report.getStartMs());
+    assertEquals(5000, report.getEndMs());
+    Map<String, Long> counts = new LinkedHashMap<>();
+    counts.put("query:s:a%20b|steady", 12L);
+    counts.put("query:s:a%20b|warmup", 2L);
+    assertEquals(counts, report.getCounts());
+    assertEquals(1, report.getSchedules().size());
+    assertEquals(7, report.getSchedules().get(0).get("scheduled").getAsLong());
+    assertTrue(report.getSchedules().get(0).has("futureField"));
+    assertEquals(Arrays.asList(verdict, "pherf.health.read_skew\tSKIP\tshare\tpherf\tno source"),
+      report.getVerdict());
+  }
+
+  /**
+   * Verifies that a run child process exiting with code 0 without a valid JSON report fails the
+   * workload, whereas an absent verdict file yields an empty list of verdict rows.
+   */
+  @Test
+  public void finishedRunNeedsItsJsonReport() {
+    String[] bad = { null, "{\"format\":\"pherf-latency\",\"version\":2}", "[1]",
+      "{\"format\":\"pherf-latency\",\"version\":1,\"startMs\":1,\"endMs\":2,"
+        + "\"histograms\":[{\"operation\":\"q\"}]}" };
+    for (String json : bad) {
+      events.calls.clear();
+      prepared(assignment());
+      workload.launch(assignment(), events);
+      FakeLauncher.Launch run = launcher.last();
+      if (json != null) {
+        run.results(json);
+      } else {
+        new File(work, "RESULTS_HDR/LATENCY_run.json").delete();
+      }
+      run.exit(0);
+      clock.advance(0);
+      assertEquals(1, events.calls.size());
+      assertTrue(events.calls.get(0),
+        events.calls.get(0).startsWith("failed pherf wrote no valid LATENCY_run.json: "));
+    }
+    events.calls.clear();
+    events.reports.clear();
+    prepared(assignment());
+    workload.launch(assignment(), events);
+    launcher.last().results(latency(1, 2));
+    launcher.last().exit(0);
+    clock.advance(0);
+    assertEquals(Collections.singletonList("finished"), events.calls);
+    assertEquals(Collections.emptyList(), events.reports.get(0).getVerdict());
+    assertEquals(Collections.emptyMap(), events.reports.get(0).getCounts());
   }
 
   @Test
@@ -267,6 +360,7 @@ public class PherfWorkloadTest {
     assertEquals(expected, new LinkedHashMap<Object, Object>(overlay));
     launcher.last().exit(0);
     simulation.runFor(1000);
+    launcher.last().results(latency(1, 2));
     launcher.last().exit(0);
     simulation.runFor(5000);
     assertEquals(RunView.State.COMPLETE, simulation.run(runId).getState());
@@ -461,6 +555,7 @@ public class PherfWorkloadTest {
     run.exit(143);
     clock.advance(0);
     assertEquals(Arrays.asList("armed", "finished"), events.calls);
+    assertEquals(Collections.singletonList(null), events.reports);
     assertEquals(2, launcher.launches.size());
   }
 
@@ -660,6 +755,8 @@ public class PherfWorkloadTest {
       .add(log.interval("scan:s:range", LatencyRecorders.STEADY, base + 3000, base + 3500, 3));
     log.flush();
     simulation.network.freeze("a1", Protocol.TELEMETRY);
+    run.results(latency(base, base + 3500, "load:PHERF.T", "steady", "1", "query:relational:lookup",
+      "warmup", "2", "response:s:q 1,x%", "steady", "5", "scan:s:range", "steady", "3"));
     run.exit(0);
     simulation.runFor(3000);
     // The transition to DONE waits until the controller acknowledges the final telemetry frame.
@@ -677,6 +774,8 @@ public class PherfWorkloadTest {
     assertEquals(Long.valueOf(startAtMs), slot.getStartAtMs());
     assertEquals(Long.valueOf(startAtMs), slot.getDispatchMs());
     assertEquals(Long.valueOf(0), done.getSteps().get(0).getSkewMs());
+    // The counters held by the controller match the counts reported in the child's JSON report.
+    assertEquals("PASS", Bundles.row(simulation.bundle(runId), "pherf.fleet.telemetry")[1]);
   }
 
   @Test

@@ -22,13 +22,18 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import com.google.gson.JsonObject;
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.HdrHistogram.Histogram;
+import org.apache.phoenix.pherf.distributed.Bundles;
 import org.apache.phoenix.pherf.distributed.Plans;
 import org.apache.phoenix.pherf.distributed.Simulation;
 import org.apache.phoenix.pherf.distributed.agent.AgentRuntime;
@@ -37,6 +42,7 @@ import org.apache.phoenix.pherf.distributed.protocol.Ack;
 import org.apache.phoenix.pherf.distributed.protocol.AgentMessage;
 import org.apache.phoenix.pherf.distributed.protocol.Assign;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
+import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 import org.apache.phoenix.pherf.distributed.protocol.Heartbeat;
 import org.apache.phoenix.pherf.distributed.protocol.HistogramBlob;
 import org.apache.phoenix.pherf.distributed.protocol.IntervalFrame;
@@ -59,7 +65,8 @@ import org.junit.Test;
  */
 public class ControllerStateTest {
   private final VirtualClock clock = new VirtualClock(Simulation.START_MS);
-  private final Controller controller = new Controller(clock);
+  private final File runDir = Simulation.runDir();
+  private final Controller controller = new Controller(clock, runDir);
   private int traces;
 
   /**
@@ -93,9 +100,24 @@ public class ControllerStateTest {
     return reply;
   }
 
+  /**
+   * Sends a heartbeat in which a DONE status carries a final report for a single key covering
+   * finalSeq frames.
+   */
   private Reply heartbeat(String agent, Phase phase, String runId, int step, long finalSeq) {
+    FinalReport report = phase != Phase.DONE
+      ? null
+      : new FinalReport(0, 1, Collections.singletonMap("query:s:q|steady", total(finalSeq)),
+        Collections.<JsonObject> emptyList(), Collections.<String> emptyList());
     return control(from(agent, "i-" + agent,
-      new Heartbeat(traces + 1, new Status(phase, runId, step, finalSeq, null, 0), null)));
+      new Heartbeat(traces + 1, new Status(phase, runId, step, finalSeq, null, 0, report), null)));
+  }
+
+  /**
+   * Computes the cumulative sample count through frame seq when each frame n holds n samples.
+   */
+  private static long total(long seq) {
+    return seq * (seq + 1) / 2;
   }
 
   private Reply heartbeat(String agent, Phase phase, String runId) {
@@ -117,7 +139,8 @@ public class ControllerStateTest {
 
   /**
    * Sends a telemetry batch containing one interval frame for each sequence number, where frame seq
-   * records seq latency samples.
+   * holds seq samples and carries a total equal to the cumulative sample count of all frames up to
+   * that sequence number.
    */
   private Message telemetryReply(String agent, String runId, long... seqs) {
     List<IntervalFrame> frames = new ArrayList<>();
@@ -125,7 +148,7 @@ public class ControllerStateTest {
       Histogram histogram = new Histogram(LatencyRecorders.LOWEST_US, LatencyRecorders.HIGHEST_US,
         LatencyRecorders.DIGITS);
       histogram.recordValueWithCount(10, seq);
-      frames.add(new IntervalFrame(seq, "query:s:q", LatencyRecorders.STEADY, 0, 1,
+      frames.add(new IntervalFrame(seq, "query:s:q", LatencyRecorders.STEADY, 0, 1, total(seq),
         RecorderConfig.of(histogram), HistogramBlob.encode(histogram)));
     }
     Intervals batch = from(agent, "i-" + agent, new Intervals(runId, 0, frames));
@@ -173,7 +196,7 @@ public class ControllerStateTest {
     assertEquals(RunView.State.COMPLETE, run.getState());
     RunView.SlotView slot = run.getSteps().get(0).getSlots().get(0);
     assertEquals(2, slot.getHeldSeq());
-    assertEquals(2, slot.getFrames());
+    assertEquals(Collections.singletonMap("query:s:q|steady", 3L), slot.getCounters());
     assertEquals(RunView.SlotState.DONE, slot.getState());
     // When the controller does not recognize the run, the acknowledgment reports the highest
     // sequence number in the batch.
@@ -298,8 +321,8 @@ public class ControllerStateTest {
     register("a1");
     String runId = controller.submit(Simulation.spec(1));
     Heartbeat late = from("a1", "i-a1", new Heartbeat(100, Status.IDLE, null));
-    Heartbeat ready =
-      from("a1", "i-a1", new Heartbeat(101, new Status(Phase.READY, runId, 0, 0, null, 0), null));
+    Heartbeat ready = from("a1", "i-a1",
+      new Heartbeat(101, new Status(Phase.READY, runId, 0, 0, null, 0, null), null));
     assertEquals(MessageType.ASSIGN, type(heartbeat("a1", Phase.IDLE, null)));
     // Heartbeats traverse the serialized wire format, requiring the codec to preserve the seq
     // field across encoding and decoding.
@@ -347,20 +370,38 @@ public class ControllerStateTest {
     assertEquals(4, telemetry("a1", runId, 1, 2, 3, 4).getHeldSeq());
     assertEquals(4, telemetry("a1", runId, 3, 4).getHeldSeq());
     RunView.SlotView slot = controller.run(runId).getSteps().get(0).getSlots().get(0);
-    assertEquals(4, slot.getFrames());
+    assertEquals(4, slot.getHeldSeq());
     assertEquals(1 + 2 + 3 + 4, slot.getSamples());
   }
 
   /**
-   * Verifies that an interval frame whose histogram fails to decode transitions its slot to the
-   * failed state, returns an ack that holds no additional frames, and leaves the agent registered.
+   * Verifies that once closed, the controller holds no further frames, ensuring that a late
+   * telemetry batch cannot truncate the raw log of a slot, which is the only artifact that an
+   * interrupted run retains.
+   */
+  @Test
+  public void closedControllerKeepsTheSlotLog() throws Exception {
+    String runId = running();
+    assertEquals(2, telemetry("a1", runId, 1, 2).getHeldSeq());
+    controller.close();
+    assertEquals(2, telemetry("a1", runId, 3).getHeldSeq());
+    File log = new File(Bundles.results(new File(runDir, runId)), "slots/0-0.hlog");
+    List<Histogram> frames = Bundles.hlog(log);
+    assertEquals(2, frames.size());
+    assertEquals(1 + 2, Bundles.counts(frames).get("query:s:q|steady").longValue());
+    assertEquals(2, controller.run(runId).getSteps().get(0).getSlots().get(0).getHeldSeq());
+  }
+
+  /**
+   * Verifies that an interval frame that fails to decode transitions its slot to the failed state,
+   * returns an acknowledgment that holds no additional frames, and leaves the agent registered.
    */
   @Test
   public void badHistogramFailsTheSlot() {
     String runId = running();
     assertEquals(1, telemetry("a1", runId, 1).getHeldSeq());
     List<IntervalFrame> frames = new ArrayList<>();
-    frames.add(new IntervalFrame(2, "query:s:q", LatencyRecorders.STEADY, 0, 1,
+    frames.add(new IntervalFrame(2, "query:s:q", LatencyRecorders.STEADY, 0, 1, total(2),
       RecorderConfig.PINNED, "not-a-histogram"));
     Message reply = controller.telemetry(from("a1", "i-a1", new Intervals(runId, 0, frames)));
     assertEquals(MessageType.ACK, reply.type());
@@ -374,5 +415,53 @@ public class ControllerStateTest {
     assertEquals(1, slot.getHeldSeq());
     assertEquals(1, slot.getSamples());
     assertEquals("a1", controller.agents().get(0).getId());
+  }
+
+  /**
+   * Verifies that a DONE status reported without a final report transitions the slot to the failed
+   * state.
+   */
+  @Test
+  public void doneWithNoReportFailsTheSlot() {
+    String runId = running();
+    assertEquals(1, telemetry("a1", runId, 1).getHeldSeq());
+    control(from("a1", "i-a1",
+      new Heartbeat(traces + 1, new Status(Phase.DONE, runId, 0, 1, null, 0, null), null)));
+    RunView run = controller.run(runId);
+    assertEquals(RunView.State.FAILED, run.getState());
+    assertEquals("agent a1 reported DONE with no final report", run.getReason());
+  }
+
+  /**
+   * Verifies that starting the controller requires a valid run directory and that submitting a run
+   * requires creating its dedicated run bundle directory.
+   */
+  @Test
+  public void runDirectoryIsRequired() throws Exception {
+    for (String unset : new String[] { null, " " }) {
+      try {
+        ControllerMain.runDir(unset);
+        fail("no run directory");
+      } catch (IllegalArgumentException e) {
+        assertEquals("PHERF_RUN_DIR is not set", e.getMessage());
+      }
+    }
+    File made = new File(Simulation.runDir(), "a/b");
+    assertEquals(made.getAbsoluteFile(), ControllerMain.runDir(made.getPath()));
+    assertTrue(made.isDirectory());
+    File file = new File(Simulation.runDir(), "file");
+    Files.write(file.toPath(), new byte[0]);
+    Controller broken = new Controller(clock, file);
+    controller.close();
+    Reply registered = new Reply();
+    Register register = from("a1", "i-a1", new Register());
+    broken.control(register, registered);
+    try {
+      broken.submit(Simulation.spec(1));
+      fail("submitted with no run directory");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage(), e.getMessage().startsWith("cannot create the run directory "));
+    }
+    assertNull(broken.run("20260101T000000000Z-1"));
   }
 }

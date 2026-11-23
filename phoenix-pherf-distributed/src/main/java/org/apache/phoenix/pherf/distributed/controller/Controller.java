@@ -17,6 +17,9 @@
  */
 package org.apache.phoenix.pherf.distributed.controller;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -25,6 +28,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import org.HdrHistogram.Histogram;
 import org.apache.phoenix.pherf.distributed.clock.Clock;
 import org.apache.phoenix.pherf.distributed.protocol.Ack;
 import org.apache.phoenix.pherf.distributed.protocol.AgentMessage;
@@ -40,6 +44,7 @@ import org.apache.phoenix.pherf.distributed.protocol.Message;
 import org.apache.phoenix.pherf.distributed.protocol.Phase;
 import org.apache.phoenix.pherf.distributed.protocol.Protocol;
 import org.apache.phoenix.pherf.distributed.protocol.ProtocolException;
+import org.apache.phoenix.pherf.distributed.protocol.RecorderConfig;
 import org.apache.phoenix.pherf.distributed.protocol.Registered;
 import org.apache.phoenix.pherf.distributed.protocol.Rejected;
 import org.apache.phoenix.pherf.distributed.protocol.Release;
@@ -50,6 +55,7 @@ import org.apache.phoenix.pherf.distributed.protocol.Status;
 import org.apache.phoenix.pherf.distributed.protocol.Wait;
 import org.apache.phoenix.pherf.distributed.transport.AgentChannel;
 import org.apache.phoenix.pherf.distributed.transport.Callback;
+import org.apache.phoenix.pherf.latency.LatencyReport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -84,8 +90,16 @@ import org.slf4j.LoggerFactory;
  * spread of the dispatch times, calculated as the measured spread plus the two largest error bounds
  * across the slots.
  * <p>
- * The controller retains each frame sequence of a slot exactly once without gaps, decoding each
- * retained frame once to accumulate its sample count.
+ * The controller retains each frame sequence of a slot exactly once without gaps. A frame is
+ * accepted only when both its header and its decoded histogram match the pinned recorder
+ * configuration; otherwise, the controller removes the agent as misconfigured. Each retained frame
+ * is decoded once, validated against the cumulative sample count for its key, merged into the run's
+ * fleet histograms, and streamed to the raw interval log of its slot.
+ * <p>
+ * Each run is allocated its own subdirectory within the configured run directory. Whenever a run
+ * reaches a terminal state (COMPLETE, FAILED, or ABORTED), the controller writes the complete run
+ * bundle, writing the manifest last, within the same monitor critical section, and then releases
+ * the in-memory histogram merge state for the run.
  */
 public final class Controller implements AgentChannel {
   private static final Logger LOG = LoggerFactory.getLogger(Controller.class);
@@ -93,20 +107,23 @@ public final class Controller implements AgentChannel {
     DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'").withZone(ZoneOffset.UTC);
 
   /**
-   * Defines the maximum single-slot clock error bound in milliseconds that still guarantees two
-   * slots remain within the 50 ms start-skew bound.
+   * Defines the maximum clock error bound for a single slot that still guarantees two slots remain
+   * within the maximum start-skew bound.
    */
-  private static final long MAX_PROVEN_ERROR_MS = 25;
+  private static final long MAX_PROVEN_ERROR_MS = Protocol.MAX_START_SKEW_MS / 2;
 
   private final Clock clock;
+  private final File runDir;
   private final TreeMap<String, AgentRecord> agents = new TreeMap<>();
   private final Map<String, RunRecord> runs = new LinkedHashMap<>();
   private Clock.Timer reaper;
   private long runCount;
   private boolean closed;
 
-  public Controller(Clock clock) {
+  /** @param runDir the existing root directory in which run bundle directories are created. */
+  public Controller(Clock clock, File runDir) {
     this.clock = clock;
+    this.runDir = runDir.getAbsoluteFile();
   }
 
   /** Starts the periodic reaper task that evicts unresponsive agents. */
@@ -116,11 +133,19 @@ public final class Controller implements AgentChannel {
     }
   }
 
-  /** Stops the periodic reaper task and answers every currently held poll. */
+  /**
+   * Stops the periodic reaper task, answers every currently held poll, and closes the raw interval
+   * logs of all active runs. Once closed, the controller accepts no further telemetry frames.
+   */
   public synchronized void close() {
     closed = true;
     if (reaper != null) {
       reaper.cancel();
+    }
+    for (RunRecord run : runs.values()) {
+      if (run.bundle != null) {
+        run.bundle.close(run);
+      }
     }
     for (AgentRecord agent : agents.values()) {
       answerHeld(agent, new Wait());
@@ -143,17 +168,26 @@ public final class Controller implements AgentChannel {
   }
 
   /**
-   * Initiates a new run across available free agents and returns its assigned run identifier,
-   * assuming that {@link RunSpec#parse} has already validated the execution plan.
-   * @throws IllegalStateException when fewer free agents are available than step 0 requires.
+   * Initiates a new run across available free agents, creates its bundle subdirectory within the
+   * run directory, and returns the assigned run identifier, assuming that {@link RunSpec#parse} has
+   * already validated the execution plan.
+   * @throws IllegalStateException when fewer free agents are available than step 0 requires, or
+   *                               when the run bundle directory cannot be created.
    */
   public synchronized String submit(RunSpec spec) {
     String shortage = shortage(spec, 0);
     if (shortage != null) {
       throw new IllegalStateException(shortage);
     }
-    String runId = RUN_ID.format(Instant.ofEpochMilli(clock.millis())) + "-" + ++runCount;
-    RunRecord run = new RunRecord(runId, spec);
+    long nowMs = clock.millis();
+    String runId = RUN_ID.format(Instant.ofEpochMilli(nowMs)) + "-" + ++runCount;
+    File dir = new File(runDir, runId);
+    try {
+      Files.createDirectory(dir.toPath());
+    } catch (IOException e) {
+      throw new IllegalStateException("cannot create the run directory " + dir + ": " + e, e);
+    }
+    RunRecord run = new RunRecord(runId, spec, nowMs, new RunBundle(dir));
     runs.put(runId, run);
     LOG.info("run {} submitted with {} steps", runId, spec.getSteps().size());
     bindStep(run, 0);
@@ -267,27 +301,66 @@ public final class Controller implements AgentChannel {
     if (slot == null || !slot.matches(batch.getRunId(), batch.getStep())) {
       return ack(batch, highest);
     }
+    if (closed) {
+      // Once the raw interval logs are closed, the controller accepts no further frames so that
+      // the agent retains its unacknowledged frames.
+      return ack(batch, slot.heldSeq);
+    }
     long before = slot.heldSeq;
     // Telemetry frames arrive in sequence order; append the next contiguous frame, skip any
     // duplicates, and stop processing as soon as a sequence gap is encountered.
     for (IntervalFrame frame : batch.getFrames()) {
       if (frame.getSeq() == slot.heldSeq + 1) {
-        long count;
-        try {
-          count = HistogramBlob.decode(frame.getHistogram()).getTotalCount();
-        } catch (ProtocolException e) {
-          String reason = "frame " + frame.getSeq() + " of run " + batch.getRunId() + " step "
-            + batch.getStep() + " has a bad histogram: " + e.getMessage();
+        String misconfigured = frame.getRecorder() == null
+          ? "no recorder"
+          : frame.getRecorder().differences(RecorderConfig.PINNED);
+        Histogram histogram = null;
+        if (misconfigured.isEmpty()) {
+          try {
+            histogram = HistogramBlob.decode(frame.getHistogram());
+          } catch (ProtocolException e) {
+            String reason = "frame " + frame.getSeq() + " of run " + batch.getRunId() + " step "
+              + batch.getStep() + " has a bad histogram: " + e.getMessage();
+            LOG.warn("agent {}: {}", agent.id, reason);
+            // Keep the agent registered in the fleet; the acknowledgment stops advancing held
+            // frames and a subsequent cancel command terminates the active workload.
+            fail(slot, "agent " + agent.id + ": " + reason);
+            answerHeldPolls();
+            return ack(batch, slot.heldSeq);
+          }
+          String actual = RecorderConfig.of(histogram).differences(RecorderConfig.PINNED);
+          misconfigured = actual.isEmpty() ? "" : "a histogram with " + actual;
+        }
+        if (!misconfigured.isEmpty()) {
+          // Merged histograms match a single recorder only when all inputs share one configuration,
+          // so a frame with mismatched parameters is never merged.
+          String reason = "agent " + agent.id + " is misconfigured: frame " + frame.getSeq()
+            + " has " + misconfigured;
+          LOG.warn(reason);
+          remove(agent, reason, new Rejected(reason));
+          Rejected rejected = new Rejected(reason);
+          rejected.setTrace(batch.getTrace());
+          return rejected;
+        }
+        String key = LatencyReport.tag(frame.getOperation(), frame.getPhase());
+        long held = slot.counts.getOrDefault(key, 0L) + histogram.getTotalCount();
+        if (held != frame.getTotal()) {
+          String reason = "lost or duplicated telemetry: frame " + frame.getSeq() + " of " + key
+            + " has the total " + frame.getTotal() + ", but the controller holds " + held;
           LOG.warn("agent {}: {}", agent.id, reason);
-          // Keep the agent registered in the fleet; the acknowledgment stops advancing held frames
-          // and a subsequent cancel command terminates the active workload.
+          slot.lostTelemetry = reason;
           fail(slot, "agent " + agent.id + ": " + reason);
           answerHeldPolls();
           return ack(batch, slot.heldSeq);
         }
-        slot.frames.add(frame);
-        slot.samples += count;
+        slot.counts.put(key, held);
+        slot.samples += histogram.getTotalCount();
         slot.heldSeq++;
+        if (slot.firstStartMs == null) {
+          slot.firstStartMs = frame.getStartMs();
+        }
+        slot.lastEndMs = frame.getEndMs();
+        slot.step.run.bundle.add(slot, frame, histogram);
       } else if (frame.getSeq() > slot.heldSeq + 1) {
         break;
       }
@@ -337,11 +410,17 @@ public final class Controller implements AgentChannel {
         break;
       case DONE:
         if (slot.state.launched()) {
+          if (status.getReport() == null) {
+            fail(slot, "agent " + agent.id + " reported DONE with no final report");
+            break;
+          }
           slot.finalSeq = status.getFinalSeq();
+          slot.report = status.getReport();
           if (slot.heldSeq >= slot.finalSeq) {
             // A slot without a start gate transitions directly from LAUNCHED to DONE, unblocking
             // the remaining armed slots to start.
             boolean gated = slot.state != RunView.SlotState.LAUNCHED;
+            freezeClock(slot);
             slot.state = RunView.SlotState.DONE;
             if (!gated) {
               startIfArmed(slot.step);
@@ -581,8 +660,8 @@ public final class Controller implements AgentChannel {
         break;
       }
       if (agent.free()) {
-        agent.binding =
-          new RunRecord.SlotRecord(step, agent.id, run.spec.assignment(run.runId, index, slot));
+        agent.binding = new RunRecord.SlotRecord(step, agent.id, agent.incarnation,
+          run.spec.assignment(run.runId, index, slot));
         step.slots.add(agent.binding);
         slot++;
       }
@@ -708,12 +787,14 @@ public final class Controller implements AgentChannel {
     step.state = RunView.StepState.COMPLETE;
     unbind(step);
     RunRecord run = step.run;
+    run.bundle.close(step);
     LOG.info("run {} step {} complete", run.runId, step.index);
     if (step.index + 1 < run.steps.size()) {
       bindStep(run, step.index + 1);
     } else {
       run.state = RunView.State.COMPLETE;
-      LOG.info("run {} complete", run.runId);
+      writeBundle(run);
+      LOG.info("run {} {}", run.runId, run.state);
     }
   }
 
@@ -744,6 +825,50 @@ public final class Controller implements AgentChannel {
     }
     unbind(step);
     LOG.warn("run {} {}: {}", run.runId, run.state, reason);
+    writeBundle(run);
+  }
+
+  /**
+   * Captures the current clock offset and delay estimate from the assigned agent for any slot that
+   * has not yet recorded one (such as a slot without a start gate), allowing the run bundle to
+   * translate that slot's timestamps onto the controller clock.
+   */
+  private void freezeClock(RunRecord.SlotRecord slot) {
+    AgentRecord agent = agents.get(slot.agent);
+    long[] best = agent == null ? null : agent.clockFilter.best();
+    if (slot.offsetMs == null && best != null) {
+      slot.offsetMs = best[0];
+      slot.delayMs = best[1];
+    }
+  }
+
+  /**
+   * Writes the run bundle to disk once a run reaches a terminal state, and then releases its
+   * in-memory histogram merge state and slot final reports. If the bundle cannot be written for a
+   * COMPLETE run, the run transitions to FAILED.
+   */
+  private void writeBundle(RunRecord run) {
+    RunBundle bundle = run.bundle;
+    run.bundle = null;
+    for (RunRecord.StepRecord step : run.steps) {
+      for (RunRecord.SlotRecord slot : step.slots) {
+        freezeClock(slot);
+      }
+    }
+    try {
+      bundle.write(run, clock.millis());
+    } catch (IOException | RuntimeException e) {
+      LOG.error("run {}: cannot write the run bundle", run.runId, e);
+      if (run.state == RunView.State.COMPLETE) {
+        run.state = RunView.State.FAILED;
+        run.reason = "cannot write the run bundle: " + e;
+      }
+    }
+    for (RunRecord.StepRecord step : run.steps) {
+      for (RunRecord.SlotRecord slot : step.slots) {
+        slot.report = null;
+      }
+    }
   }
 
   private void unbind(RunRecord.StepRecord step) {

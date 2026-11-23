@@ -81,6 +81,11 @@ public final class Protocol {
    */
   public static final long START_LEAD_MS = 2000;
   /**
+   * Defines the upper bound on the start skew of a step; the fleet verdict fails any measurement
+   * step whose start skew bound exceeds this threshold.
+   */
+  public static final long MAX_START_SKEW_MS = 50;
+  /**
    * Specifies the number of most recent valid clock samples used to estimate the clock offset of an
    * agent.
    */

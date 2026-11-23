@@ -19,6 +19,9 @@ package org.apache.phoenix.pherf.distributed.agent;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -105,6 +108,26 @@ public final class FakeLauncher implements Launcher {
     /** Simulates the start gate of the child process opening at the specified timestamp. */
     public void started(long startedMs) {
       listener.started(startedMs);
+    }
+
+    /**
+     * Writes the output reports produced by a Pherf run child process to
+     * RESULTS_HDR/LATENCY_run.json and, when verdict rows are provided, to
+     * RESULTS_HDR/VERDICT_run.tsv.
+     */
+    public void results(String latency, String... verdict) {
+      File dir = new File(workDir, PherfWorkload.RESULTS + "_HDR");
+      try {
+        Files.createDirectories(dir.toPath());
+        Files.write(new File(dir, "LATENCY_run.json").toPath(),
+          latency.getBytes(StandardCharsets.UTF_8));
+        if (verdict.length > 0) {
+          Files.write(new File(dir, "VERDICT_run.tsv").toPath(), Arrays.asList(verdict),
+            StandardCharsets.UTF_8);
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
     }
 
     /**

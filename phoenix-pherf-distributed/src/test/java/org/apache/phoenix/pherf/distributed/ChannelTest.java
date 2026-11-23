@@ -88,7 +88,6 @@ public class ChannelTest {
     for (RunView.SlotView slot : run.getSteps().get(0).getSlots()) {
       assertEquals(5, slot.getHeldSeq());
       assertEquals(5, slot.getFinalSeq());
-      assertEquals(5, slot.getFrames());
     }
     assertEquals(Arrays.asList(1L, 2L, 3L, 4L, 5L),
       simulation.workload("a1").emitted.subList(0, 5));

@@ -303,4 +303,31 @@ public class RunSpecTest {
     expected.put("b", "${pherf.slot.prefix}");
     assertEquals(expected, spec.getSteps().get(0).getProperties());
   }
+
+  /**
+   * Verifies that the run class is required and that all run-level verdict configuration settings
+   * are validated at submission time.
+   */
+  @Test
+  public void runClassAndVerdictSettings() {
+    RunSpec validation = Plans.plan(1).step(step(1)).spec();
+    assertEquals("validation", validation.getRunClass());
+    assertEquals(90.0, validation.getVerdictSettings().getAttainmentMinPct(), 0);
+    RunSpec measurement = Plans.plan(1).runClass("measurement")
+      .property("pherf.verdict.tail.p99MaxMs", "2.5").property("pherf.verdict.noisyHost", "true")
+      .step(step(1).property("pherf.verdict.tail.p99MaxMs", "9")).spec();
+    assertEquals("measurement", measurement.getRunClass());
+    // Ensure that only the run-level properties configure the fleet verdict settings.
+    assertEquals(2500, measurement.getVerdictSettings().getP99MaxUs());
+    assertTrue(measurement.getVerdictSettings().isNoisyHost());
+    refused(Plans.plan(1).step(step(1)).remove("runClass"), "runClass: required");
+    refused(Plans.plan(1).step(step(1)).runClass("smoke"),
+      "runClass: smoke is not validation or measurement");
+    refused(Plans.plan(1).step(step(1)).set("runClass", new JsonPrimitive(1)),
+      "runClass: not a string");
+    refused(Plans.plan(1).property("pherf.verdict.noisyHost", "maybe").step(step(1)),
+      "properties: pherf.verdict.noisyHost=maybe is not true or false");
+    refused(Plans.plan(1).property("pherf.verdict.attainment.minPct", "0").step(step(1)),
+      "properties: pherf.verdict.attainment.minPct=0 is not in (0, 100]");
+  }
 }

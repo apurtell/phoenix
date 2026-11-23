@@ -65,6 +65,24 @@ public final class RecorderConfig {
     return significantDigits;
   }
 
+  /**
+   * Describes each parameter that differs from the expected configuration formatted as "name
+   * actual, not expected", or returns "" when no parameters differ.
+   */
+  public String differences(RecorderConfig expected) {
+    StringBuilder text = new StringBuilder();
+    Object[][] parameters =
+      { { "lowestUs", lowestUs, expected.lowestUs }, { "highestUs", highestUs, expected.highestUs },
+        { "significantDigits", significantDigits, expected.significantDigits } };
+    for (Object[] parameter : parameters) {
+      if (!parameter[1].equals(parameter[2])) {
+        text.append(text.length() == 0 ? "" : ", ").append(parameter[0]).append(' ')
+          .append(parameter[1]).append(", not ").append(parameter[2]);
+      }
+    }
+    return text.toString();
+  }
+
   @Override
   public boolean equals(Object other) {
     if (!(other instanceof RecorderConfig)) {

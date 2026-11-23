@@ -17,7 +17,9 @@
  */
 package org.apache.phoenix.pherf.distributed.controller;
 
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.apache.phoenix.pherf.distributed.clock.SystemClock;
@@ -27,9 +29,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Entry point for the controller process. The listener port is configured via the PHERF_AGENT_PORT
- * environment variable, which defaults to 8790 or binds to an arbitrary free port when set to 0.
- * Receiving SIGTERM gracefully stops the active listeners and terminates the process with exit
+ * Entry point for the controller process. The process is configured via the PHERF_AGENT_PORT
+ * environment variable (which defaults to 8790, or selects an available free port when set to 0)
+ * and the required PHERF_RUN_DIR environment variable (which specifies the directory for run
+ * bundles, creating it if it does not exist). Receiving SIGTERM stops the listeners and exits with
  * status 0. The process exits with status 2 on a bad configuration and with status 1 on an
  * unexpected error.
  */
@@ -41,15 +44,17 @@ public final class ControllerMain {
 
   public static void main(String[] args) throws InterruptedException {
     int port;
+    File runDir;
     try {
       port = port(System.getenv("PHERF_AGENT_PORT"));
+      runDir = runDir(System.getenv("PHERF_RUN_DIR"));
     } catch (IllegalArgumentException e) {
       LOG.error("bad configuration: {}", e.getMessage());
       System.exit(2);
       return;
     }
     SystemClock clock = new SystemClock("pherf-controller-clock");
-    Controller controller = new Controller(clock);
+    Controller controller = new Controller(clock, runDir);
     ControllerServer server;
     try {
       server = new ControllerServer(controller, port);
@@ -71,6 +76,20 @@ public final class ControllerMain {
     controller.start();
     LOG.info("agent channel listening on port {}", server.agentPort());
     new CountDownLatch(1).await();
+  }
+
+  /** Resolves and returns the run directory, creating it if it does not exist. */
+  static File runDir(String text) {
+    if (text == null || text.trim().isEmpty()) {
+      throw new IllegalArgumentException("PHERF_RUN_DIR is not set");
+    }
+    File dir = new File(text.trim()).getAbsoluteFile();
+    try {
+      Files.createDirectories(dir.toPath());
+    } catch (IOException e) {
+      throw new IllegalArgumentException("PHERF_RUN_DIR " + dir + " is not a directory: " + e, e);
+    }
+    return dir;
   }
 
   static int port(String text) {

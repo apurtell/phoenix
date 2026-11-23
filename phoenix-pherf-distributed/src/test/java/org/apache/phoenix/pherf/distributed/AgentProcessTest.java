@@ -40,6 +40,7 @@ public class AgentProcessTest {
   public void sigtermStopsAgentAndControllerWithZero() throws Exception {
     Map<String, String> controllerEnv = new HashMap<>();
     controllerEnv.put("PHERF_AGENT_PORT", "0");
+    controllerEnv.put("PHERF_RUN_DIR", Simulation.runDir().getPath());
     try (ChildProcess controller =
       ChildProcess.start("controller", ControllerMain.class, controllerEnv)) {
       String line = controller.awaitLine(LISTENING, TIMEOUT_MS);

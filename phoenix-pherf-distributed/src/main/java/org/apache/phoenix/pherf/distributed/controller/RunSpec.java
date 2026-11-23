@@ -31,18 +31,22 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
+import org.apache.phoenix.pherf.analysis.Replicate;
 import org.apache.phoenix.pherf.distributed.identity.DataPlaneIdentity;
 import org.apache.phoenix.pherf.distributed.protocol.Assign;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Codec;
 import org.apache.phoenix.pherf.distributed.protocol.Protocol;
 import org.apache.phoenix.pherf.distributed.protocol.Share;
+import org.apache.phoenix.pherf.verdict.VerdictSettings;
 
 /**
- * Defines a distributed run specification comprising a seed, run-level properties, and an ordered
- * sequence of steps that execute sequentially. The seed is used to derive the data-plane identity
- * for each execution slot.
+ * Defines a distributed run specification comprising a seed, a run class, run-level properties, and
+ * an ordered sequence of steps that execute sequentially. The seed is used to derive the data-plane
+ * identity for each execution slot, while the run class (validation or measurement) and the verdict
+ * settings derived from the run-level properties determine the fleet verdict.
  * <p>
  * {@link #parse} parses the JSON execution plan and performs all static validation checks that do
  * not require an active agent, ensuring that no agent receives an assignment for an invalid or
@@ -71,7 +75,7 @@ public final class RunSpec {
   private static final String NAME_RULE =
     "not a document name; a name matches" + " [A-Za-z0-9._-]{1,128} and does not start with '.'";
   private static final Set<String> PLAN_KEYS =
-    new HashSet<>(Arrays.asList("seed", "properties", "steps"));
+    new HashSet<>(Arrays.asList("seed", "runClass", "properties", "steps"));
   private static final Set<String> STEP_KEYS = new HashSet<>(Arrays.asList("agents", "weights",
     "scenario", "documents", "args", "rate", "durationMs", "threads", "rows", "properties"));
   /**
@@ -109,14 +113,19 @@ public final class RunSpec {
   }
 
   private final long seed;
+  private final String runClass;
   private final Map<String, String> properties;
+  private final VerdictSettings verdictSettings;
   private final List<StepSpec> steps;
   /** Stores the partitioned workload slices calculated for the execution slots of each step. */
   private final List<List<Split.Slice>> slices = new ArrayList<>();
 
-  private RunSpec(long seed, Map<String, String> properties, List<StepSpec> steps) {
+  private RunSpec(long seed, String runClass, Map<String, String> properties,
+    VerdictSettings verdictSettings, List<StepSpec> steps) {
     this.seed = seed;
+    this.runClass = runClass;
     this.properties = new LinkedHashMap<>(properties);
+    this.verdictSettings = verdictSettings;
     this.steps = new ArrayList<>(steps);
     for (StepSpec step : steps) {
       slices.add(Split.slices(step));
@@ -125,6 +134,19 @@ public final class RunSpec {
 
   public long getSeed() {
     return seed;
+  }
+
+  /** Returns the run class of this specification, which is either validation or measurement. */
+  public String getRunClass() {
+    return runClass;
+  }
+
+  /**
+   * Returns the verdict settings derived from the run-level properties. Step-level properties do
+   * not alter these settings.
+   */
+  public VerdictSettings getVerdictSettings() {
+    return verdictSettings;
   }
 
   /**
@@ -186,6 +208,14 @@ public final class RunSpec {
     long seed = integer(plan, "", "seed");
     Map<String, String> properties = strings(plan, "", "properties", false);
     agentProperties(properties, "properties");
+    Properties verdict = new Properties();
+    verdict.putAll(properties);
+    VerdictSettings verdictSettings;
+    try {
+      verdictSettings = VerdictSettings.of(verdict);
+    } catch (IllegalArgumentException e) {
+      throw error("properties", e.getMessage());
+    }
     if (!plan.containsKey("steps")) {
       throw error("steps", "required");
     }
@@ -197,7 +227,15 @@ public final class RunSpec {
     for (int i = 0; i < elements.size(); i++) {
       steps.add(step(elements.get(i), "steps[" + i + "]"));
     }
-    RunSpec spec = new RunSpec(seed, properties, steps);
+    if (!plan.containsKey("runClass")) {
+      throw error("runClass", "required");
+    }
+    String runClass = string(plan.get("runClass"), "runClass");
+    if (!Replicate.VALIDATION.equals(runClass) && !Replicate.MEASUREMENT.equals(runClass)) {
+      throw error("runClass",
+        runClass + " is not " + Replicate.VALIDATION + " or " + Replicate.MEASUREMENT);
+    }
+    RunSpec spec = new RunSpec(seed, runClass, properties, verdictSettings, steps);
     for (int i = 0; i < steps.size(); i++) {
       spec.checkSlots(i, "steps[" + i + "]");
     }

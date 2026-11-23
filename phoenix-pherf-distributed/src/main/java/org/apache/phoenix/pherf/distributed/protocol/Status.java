@@ -19,13 +19,14 @@ package org.apache.phoenix.pherf.distributed.protocol;
 
 /**
  * Represents the complete operational state of an agent. The runId and step fields identify the
- * current assignment, while finalSeq records the last frame sequence of a DONE assignment and error
- * captures the failure reason of a FAILED one. The startedMs field records the agent wall-clock
- * time when the start gate of the workload opened, or 0 before that point.
+ * current assignment, while finalSeq records the last frame sequence of a DONE assignment, report
+ * holds its final report, and error captures the failure reason of a FAILED assignment. The
+ * startedMs field records the agent wall-clock time when the start gate of the workload opened, or
+ * 0 before that point.
  */
 public final class Status {
   /** Represents the status of an agent that currently has no assignment. */
-  public static final Status IDLE = new Status(Phase.IDLE, null, 0, 0, null, 0);
+  public static final Status IDLE = new Status(Phase.IDLE, null, 0, 0, null, 0, null);
 
   private Phase phase;
   private String runId;
@@ -33,17 +34,20 @@ public final class Status {
   private long finalSeq;
   private String error;
   private long startedMs;
+  private FinalReport report;
 
   private Status() {
   }
 
-  public Status(Phase phase, String runId, int step, long finalSeq, String error, long startedMs) {
+  public Status(Phase phase, String runId, int step, long finalSeq, String error, long startedMs,
+    FinalReport report) {
     this.phase = phase;
     this.runId = runId;
     this.step = step;
     this.finalSeq = finalSeq;
     this.error = error;
     this.startedMs = startedMs;
+    this.report = report;
   }
 
   public Phase getPhase() {
@@ -68,5 +72,10 @@ public final class Status {
 
   public long getStartedMs() {
     return startedMs;
+  }
+
+  /** Returns the final report for a DONE assignment, or null otherwise. */
+  public FinalReport getReport() {
+    return report;
   }
 }

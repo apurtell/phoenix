@@ -42,10 +42,20 @@ public final class Plans {
 
   private Plans(long seed) {
     plan.addProperty("seed", seed);
+    plan.addProperty("runClass", "validation");
   }
 
   public static Plans plan(long seed) {
     return new Plans(seed);
+  }
+
+  /**
+   * Configures the execution run class on the plan, such as validation (the default for tests) or
+   * measurement.
+   */
+  public Plans runClass(String runClass) {
+    plan.addProperty("runClass", runClass);
+    return this;
   }
 
   /** Registers a run-level configuration property on the plan. */
@@ -65,6 +75,12 @@ public final class Plans {
    */
   public Plans set(String key, JsonElement value) {
     plan.add(key, value);
+    return this;
+  }
+
+  /** Removes a top-level field from the plan to support plan validation refusal tests. */
+  public Plans remove(String key) {
+    plan.remove(key);
     return this;
   }
 

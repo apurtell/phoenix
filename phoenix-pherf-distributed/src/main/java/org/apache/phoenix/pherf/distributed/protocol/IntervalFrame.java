@@ -19,8 +19,9 @@ package org.apache.phoenix.pherf.distributed.protocol;
 
 /**
  * An interval frame encapsulates a single interval histogram captured for a specific operation and
- * phase. The sequence number seq begins at 1 for each assignment. The recorder header carries the
- * actual parameters of the histogram, while the histogram field holds its {@link HistogramBlob}.
+ * phase. The sequence number seq begins at 1 for each assignment, and total records the cumulative
+ * count for the key on the agent through this frame. The recorder header carries the actual
+ * parameters of the histogram, while the histogram field holds its {@link HistogramBlob}.
  */
 public final class IntervalFrame {
   private long seq;
@@ -28,6 +29,7 @@ public final class IntervalFrame {
   private String phase;
   private long startMs;
   private long endMs;
+  private long total;
   private RecorderConfig recorder;
   private String histogram;
 
@@ -35,12 +37,13 @@ public final class IntervalFrame {
   }
 
   public IntervalFrame(long seq, String operation, String phase, long startMs, long endMs,
-    RecorderConfig recorder, String histogram) {
+    long total, RecorderConfig recorder, String histogram) {
     this.seq = seq;
     this.operation = operation;
     this.phase = phase;
     this.startMs = startMs;
     this.endMs = endMs;
+    this.total = total;
     this.recorder = recorder;
     this.histogram = histogram;
   }
@@ -63,6 +66,11 @@ public final class IntervalFrame {
 
   public long getEndMs() {
     return endMs;
+  }
+
+  /** Returns the cumulative count recorded for the key on the agent through this frame. */
+  public long getTotal() {
+    return total;
   }
 
   public RecorderConfig getRecorder() {

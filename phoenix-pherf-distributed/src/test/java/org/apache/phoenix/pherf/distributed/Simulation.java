@@ -17,7 +17,11 @@
  */
 package org.apache.phoenix.pherf.distributed;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -49,10 +53,15 @@ public final class Simulation {
   public final VirtualClock clock = new VirtualClock(START_MS);
   public final InProcessNetwork network = new InProcessNetwork(clock);
   /**
+   * Holds the root run directory used by the controller, initialized as a new temporary directory
+   * under target.
+   */
+  public final File runDir = runDir();
+  /**
    * Holds the active simulated controller process instance, which is replaced when
    * {@link #restartController()} is invoked.
    */
-  public Controller controller = new Controller(clock);
+  public Controller controller = new Controller(clock, runDir);
   private final Map<String, Workload> workloads = new LinkedHashMap<>();
   private final Map<String, AgentRuntime> runtimes = new LinkedHashMap<>();
   private int incarnations;
@@ -103,7 +112,7 @@ public final class Simulation {
    */
   public void restartController() {
     controller.close();
-    controller = new Controller(clock);
+    controller = new Controller(clock, runDir);
     network.listen(ENDPOINT, controller);
     controller.start();
   }
@@ -161,9 +170,30 @@ public final class Simulation {
     return controller.run(runId);
   }
 
+  /** Returns the output bundle directory corresponding to the specified run identifier. */
+  public File bundle(String runId) {
+    return new File(runDir, runId);
+  }
+
+  /** Creates and returns a new empty temporary run directory under the module target directory. */
+  public static File runDir() {
+    try {
+      File target =
+        new File(Simulation.class.getProtectionDomain().getCodeSource().getLocation().toURI())
+          .getParentFile();
+      File runs = new File(target, "test-runs");
+      Files.createDirectories(runs.toPath());
+      return Files.createTempDirectory(runs.toPath(), "runs-").toFile();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    } catch (Exception e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
   /**
    * Constructs a run specification containing one execution step for each specified agent count,
-   * configuring every step with the provided property map.
+   * configuring every step with the provided step properties.
    */
   public static RunSpec spec(long seed, Map<String, String> properties, int... agents) {
     Plans plan = Plans.plan(seed);

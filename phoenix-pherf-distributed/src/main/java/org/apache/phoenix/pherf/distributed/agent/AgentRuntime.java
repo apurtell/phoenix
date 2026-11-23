@@ -20,7 +20,9 @@ package org.apache.phoenix.pherf.distributed.agent;
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.HdrHistogram.Histogram;
@@ -33,6 +35,7 @@ import org.apache.phoenix.pherf.distributed.protocol.Assign;
 import org.apache.phoenix.pherf.distributed.protocol.Assignment;
 import org.apache.phoenix.pherf.distributed.protocol.Cancel;
 import org.apache.phoenix.pherf.distributed.protocol.ClockSample;
+import org.apache.phoenix.pherf.distributed.protocol.FinalReport;
 import org.apache.phoenix.pherf.distributed.protocol.Goodbye;
 import org.apache.phoenix.pherf.distributed.protocol.Heartbeat;
 import org.apache.phoenix.pherf.distributed.protocol.HistogramBlob;
@@ -51,6 +54,7 @@ import org.apache.phoenix.pherf.distributed.protocol.Status;
 import org.apache.phoenix.pherf.distributed.transport.AgentTransport;
 import org.apache.phoenix.pherf.distributed.transport.Callback;
 import org.apache.phoenix.pherf.distributed.transport.RejectedException;
+import org.apache.phoenix.pherf.latency.LatencyReport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,12 +78,14 @@ import org.slf4j.LoggerFactory;
  * clock time at which the gate opens. The workload may emit telemetry frames starting immediately
  * from the launch phase.
  * <p>
- * Workload completion also proceeds in two phases so that the agent reports DONE only after
- * receiving an acknowledgment that covers the final frame. Incoming commands are idempotent for
- * each run and step. Following a cancellation, the agent continues to report its active phase until
- * the underlying workload stops, guaranteeing that two runs never overlap within a single process.
- * If the workload throws a runtime exception, the current work transitions to a failed state while
- * the communication loops continue operating.
+ * Each telemetry frame carries the cumulative sample count for its key so that the controller can
+ * detect any lost or duplicated frames. Workload completion also proceeds in two phases: the agent
+ * reports DONE, together with the final report of the workload, only after receiving an
+ * acknowledgment that covers the final frame. Incoming commands are idempotent for each run and
+ * step. Following a cancellation, the agent continues to report its active phase until the
+ * underlying workload stops, guaranteeing that two runs never overlap within a single process. If
+ * the workload throws a runtime exception, the current work transitions to a failed state while the
+ * communication loops continue operating.
  * <p>
  * The agent automatically cancels its active work when no reply arrives on either stream for longer
  * than {@link Protocol#DEADLINE_MS}, matching the controller's eviction threshold. This ensures
@@ -208,8 +214,9 @@ public final class AgentRuntime {
       return Status.IDLE;
     }
     Assignment assignment = work.assignment;
+    boolean done = work.phase == Phase.DONE;
     return new Status(work.phase, assignment.getRunId(), assignment.getStep(),
-      work.phase == Phase.DONE ? work.finalSeq : 0, work.error, work.startedMs);
+      done ? work.finalSeq : 0, work.error, work.startedMs, done ? work.report : null);
   }
 
   /**
@@ -676,6 +683,10 @@ public final class AgentRuntime {
     long nextSeq = 1;
     long ackedSeq;
     long finalSeq;
+    /** Final report produced by the workload upon completion. */
+    FinalReport report;
+    /** Cumulative sample count emitted across frames so far for each key, indexed by log tag. */
+    final Map<String, Long> totals = new HashMap<>();
     /** Agent clock timestamp when the workload start gate opened, or 0 if not yet opened. */
     long startedMs;
     /**
@@ -777,28 +788,37 @@ public final class AgentRuntime {
       Histogram histogram) {
       String blob = HistogramBlob.encode(histogram);
       RecorderConfig recorder = RecorderConfig.of(histogram);
+      long count = histogram.getTotalCount();
       call(() -> {
         // Warmup frames arrive before the start gate opens, so any launched workload is permitted
         // to enqueue telemetry frames.
         if (!current() || !phase.launched() || cancelling || finishing) {
           return;
         }
-        unacked.add(
-          new IntervalFrame(nextSeq++, operation, measurePhase, startMs, endMs, recorder, blob));
+        long total = totals.merge(LatencyReport.tag(operation, measurePhase), count, Long::sum);
+        unacked.add(new IntervalFrame(nextSeq++, operation, measurePhase, startMs, endMs, total,
+          recorder, blob));
         pumpTelemetry();
       });
     }
 
     @Override
-    public void finished() {
+    public void finished(FinalReport finalReport) {
       call(() -> {
         if (!current()) {
           return;
         }
         if (cancelling) {
           stopped();
+        } else if (phase.launched() && !finishing && finalReport == null) {
+          phase = Phase.FAILED;
+          error = "the workload finished with no final report";
+          unacked.clear();
+          LOG.warn("agent {} failed run {} step {}: {}", identity.getId(), assignment.getRunId(),
+            assignment.getStep(), error);
         } else if (phase.launched() && !finishing) {
           finishing = true;
+          report = finalReport;
           finalSeq = nextSeq - 1;
           checkDone();
         }

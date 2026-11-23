@@ -24,6 +24,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import com.google.gson.JsonObject;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.lang.reflect.Field;
@@ -84,11 +85,18 @@ public class CodecTest {
         new Share(60000L, 4L, 33L, 250L), properties, Arrays.asList(later));
     Histogram histogram = sampleHistogram();
     IntervalFrame frame = new IntervalFrame(1, "query:s:q1", LatencyRecorders.STEADY, 1000, 2000,
-      RecorderConfig.of(histogram), HistogramBlob.encode(histogram));
+      histogram.getTotalCount(), RecorderConfig.of(histogram), HistogramBlob.encode(histogram));
+    Map<String, Long> counts = new LinkedHashMap<>();
+    counts.put("query:s:q1|steady", histogram.getTotalCount());
+    JsonObject schedule = new JsonObject();
+    schedule.addProperty("scenario", "s");
+    schedule.addProperty("startMs", 1767225601000L);
+    FinalReport report = new FinalReport(1767225600000L, 1767225602000L, counts,
+      Arrays.asList(schedule), Arrays.asList("pherf.health.client_pool\tPASS\tcount\tpherf\tok"));
     return Arrays.asList(traced(new Register(), "a1/control/1"),
       traced(
         new Heartbeat(2,
-          new Status(Phase.DONE, "20260101T000000000Z-1", 2, 9, "none", 1767225601003L),
+          new Status(Phase.DONE, "20260101T000000000Z-1", 2, 9, "none", 1767225601003L, report),
           new ClockSample(1767225601000L, 1767225601001L, 1767225601002L, 1767225601004L)),
         "a1/control/2"),
       traced(new Goodbye(), "a1/control/3"), traced(new Registered(), "a1/control/1"),
