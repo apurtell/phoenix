@@ -53,6 +53,7 @@
     <module>phoenix-core-server</module>
     <module>phoenix-core</module>
     <module>phoenix-pherf</module>
+    <module>phoenix-pherf-distributed</module>
     <module>phoenix-tracing-webapp</module>
     <!-- shaded artifact and assembly modules are added in shade-and-assembly profile -->
   </modules>
