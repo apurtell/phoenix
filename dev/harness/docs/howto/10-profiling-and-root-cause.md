@@ -166,28 +166,34 @@ single variable, or if a host stall occurs in the control JVM during only one of
 
 ### Run the baseline with every collector
 
-5. Execute the baseline run. Because a validation run enables no collectors by default, `--collect`
-   explicitly specifies all six. The `profile`, `jfr`, and `hiccup` collectors target the service
-   roles listed in `PX_COLLECT_TARGETS`, while the periodic samplers record one sample every
+4. Run the baseline workload. Because the validation class disables collectors by default,
+   `--collect` explicitly enables all six. The `profile`, `jfr`, and `hiccup` collectors instrument
+   the roles designated by `--targets`, while the periodic samplers capture one sample every
    `PX_COLLECT_INTERVAL_S` seconds:
 
    ```sh
-   RUN_A="$(px-run --keep -c validation -d pherf -t 900 \
-     --collect profile,jfr,hiccup,host,container,trace \
-     -e PX_COLLECT_TARGETS=regionserver,client -e PX_COLLECT_INTERVAL_S=2 -- \
-     --scenario "$HOWTO/walk.xml" --schema "$HOWTO/walk-a.sql")"; echo "exit $? $RUN_A"
+   RUN_A="$(px-run pherf --collect profile,jfr,hiccup,host,container,trace \
+     --targets regionserver,client -e PX_COLLECT_INTERVAL_S=2 -- \
+     --scenario "$HOWTO/walk.xml" --schema "$HOWTO/walk-a.sql")"
    ```
 
-   Setting `PX_COLLECTORS=profile,jfr,hiccup,host,container,trace` in the environment has the same
-   effect, whereas `--collect` overrides that setting for a single run. The measurement run class
-   enables all six collectors by default. `px-run` starts the collectors immediately before
-   invoking the `run` verb and stops them immediately afterward, including when the run fails or
-   receives an interrupt. Every start and stop operation is bounded by `PX_TIMEOUT_VERB`, and each
-   remote collection session automatically self-terminates one verb timeout bound after the `run`
-   verb deadline expires.
+   Passing `-e PX_COLLECTORS=profile,jfr,hiccup,host,container,trace` produces the same result,
+   while `--collect` overrides that variable for an individual execution. By default, the
+   measurement run class activates all six collectors automatically. `px-run` initiates collection
+   via `px-collect start` right before executing the `run` verb and terminates it via
+   `px-collect stop` immediately afterward, even if the run fails or is interrupted. Each start and
+   stop operation is bounded by `PX_TIMEOUT_VERB`, and every remote collection session
+   self-terminates one verb timeout interval after the `run` verb deadline elapses.
 
-6. Inspect the collector index and the collector verdicts, where each target row records the
-   artifact produced by the corresponding collector:
+   The default target value `all` encompasses every service role except `setup` and the `pherf`
+   service group, which consists of the controller and agent instances in the Distributed Pherf
+   tier. Because that tier operates as an external load generator rather than a database cluster
+   component, the pherf container image omits the profiler, JFR tooling, and jHiccup. For details,
+   refer to
+   [How to run Pherf on a fleet through the harness](14-fleet-through-the-harness.md).
+
+5. Examine the collector index and verdict rows, where each target entry identifies the output
+   artifact written by the corresponding collector:
 
    ```sh
    cat "$RUN_A/metrics/index.tsv"

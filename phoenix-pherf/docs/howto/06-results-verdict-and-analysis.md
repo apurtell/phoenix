@@ -48,16 +48,15 @@ who prepare them.
   the reference scenario.
 * Install `jq` to inspect and query the JSON analysis reports.
 
-| Cost | Value |
-|---|---|
-| Wall time | Part 1 takes approximately 10 min to execute 9 runs; part 2 takes approximately
-5 min. |
-| Docker memory | Part 1 requires 8704 MiB of container memory limits for a harness validation
-cluster with 1 RegionServer; part 2 requires none. |
-| Disk | The workflow consumes under 50 MB of disk space. |
-| Files written | In `$HOWTO`, the steps write the scenario, `conf/`, the replicate sets under
-`sets/`, and the bundle sets under `bsets/`; in `$HOWTO/work`, they populate `RESULTS/` and
-`RESULTS_HDR/`. |
+**Cost.**
+
+* Wall time: Part 1 takes approximately 10 min to execute 9 runs; part 2 takes approximately 5 min.
+* Docker memory: Required for part 1 only, reserving 8704 MiB of container memory limits for a
+  harness validation cluster with 1 RegionServer; part 2 requires none.
+* Disk: The workflow consumes under 50 MB of disk space.
+* Files written: `$HOWTO` stores the scenario definition, `conf/`, the replicate sets under
+  `sets/`, and the bundle sets under `bsets/`, while `$HOWTO/work` stores the generated `RESULTS/`
+  and `RESULTS_HDR/` directories.
 
 ## Method
 
@@ -277,17 +276,15 @@ one worker using a 70/20/10 operation mix.
     p50, p99, and p99.9. These timing values are illustrative. Each operation key follows the
     `<kind>:<scenario>:<name>` naming structure:
 
-    | Kind | One sample |
-    |---|---|
-    | `query` | Measures a single query execution from connection acquisition through the retrieval
-    of the final row; in an open loop, this represents the server-side service time. |
-    | `scan`, `delete` | Measures a single `SCAN` or `DELETE` statement execution, where a `DELETE`
-    measurement concludes once its transaction commits. |
-    | `response` | Recorded in open-loop mode only, measuring from the scheduled dispatch timestamp
-    to the final row; subtracting `query` from `response` yields the client-side queueing delay. |
-    | `load` | Measures a single committed batch during the data load phase. |
-    | `operation` | Measures a single operation executed within a `-mt` multi-threaded load
-    profile. |
+    - `query`: Measures a single query execution from connection acquisition through retrieval of
+      the final row; in an open-loop workload, this represents the server-side service time.
+    - `scan`, `delete`: Measures a single `SCAN` or `DELETE` execution, where a `DELETE`
+      measurement concludes once its commit completes.
+    - `response`: Recorded for open-loop workloads only, measuring from the intended dispatch
+      timestamp through retrieval of the final row; subtracting `query` from `response` yields the
+      client-side queueing delay.
+    - `load`: Measures a single committed batch during the data load phase.
+    - `operation`: Measures a single operation executed within a `-mt` load profile.
 
     The phase field is `steady` for measured workload executions and `warmup` for the initial
     `warmupExecutions` of a query set. When a key has only 10 samples, p99 and p99.9 simply reflect
@@ -307,10 +304,12 @@ one worker using a 70/20/10 operation mix.
       -i RESULTS_HDR/LATENCY_base1.hlog -listtags
     ```
 
-    Expected output (illustrative, not captured from a live cluster):
+    Expected output, not captured from a live cluster (with the first line wrapped here for
+    readability):
 
     ```text
-    #[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits, Tag=OPERATION|PHASE]
+    #[Pherf latency log 1: microseconds, lowest 1, highest 600000000, 3 significant digits,
+    Tag=OPERATION|PHASE]
     Tags found in input file:
     delete:referenceRelational:rangeDelete|steady
     load:referenceRelational:PHERF.REF_RELATIONAL|steady
@@ -358,12 +357,14 @@ one worker using a 70/20/10 operation mix.
     cat lookup; tail -2 lookup.hgrm
     ```
 
-    Expected output (illustrative, not captured from a live cluster):
+    Expected output, not captured from a live cluster (with the column header line wrapped here for
+    readability):
 
     ```text
     #[Interval percentile log between 0.000 and <Infinite> seconds (relative to StartTime)]
     ...
-    Time: IntervalPercentiles:count ( 50% 90% Max ) TotalPercentiles:count ( 50% 90% 99% 99.9% 99.99% Max )
+    Time: IntervalPercentiles:count ( 50% 90% Max ) TotalPercentiles:count ( 50% 90% 99%
+    99.9% 99.99% Max )
     2.812: I:17 (   3.103   4.915   7.999 ) T:17 (   3.103   4.915   7.999   7.999   7.999   7.999 )
     3.312: I:18 (   3.007   4.371   5.103 ) T:35 (   3.055   4.711   7.999   7.999   7.999   7.999 )
     #[Max     =        7.999, Total count    =           70]
@@ -410,22 +411,22 @@ one worker using a 70/20/10 operation mix.
     `SKIP` < `ADVISORY` < `FAIL` < `ERROR`, where only `FAIL` and `ERROR` constitute health check
     failures.
 
-    | Check | Class | FAIL when | SKIP when |
-    |---|---|---|---|
-    | `pherf.health.attainment` | duration | The lowest rate attainment across any open-loop
-    schedule falls below `attainment.minPct` (90). | No open-loop schedule executed during the
-    run. |
-    | `pherf.health.saturation` | duration | The highest peak dispatch lag across any open-loop
-    schedule exceeds `lag.maxMs` (1000). | No open-loop schedule executed during the run. |
-    | `pherf.health.client_pool` | count | One or more tasks had to wait for an available thread in
-    the Pherf executor pool. | No tasks executed on the Pherf thread pool. |
-    | `pherf.health.tail_latency` | duration | The p99 or p99.9 latency of any measured key exceeds
-    `tail.p99MaxMs` (1000) or `tail.p999MaxMs` (5000). | The run produced no measured latency
-    keys. |
-    | `pherf.health.read_skew` | share | The ratio of requests on the busiest server to the cluster
-    mean exceeds `readSkew.max` (1.5). | No JMX source was configured, the measurement window was
-    under 60 s, fewer than 2 servers participated, no reads occurred, or a counter moved
-    backward. |
+    - `pherf.health.attainment` (class duration): Reports FAIL when the lowest rate attainment
+      across any open-loop schedule falls below `attainment.minPct` (90), and reports SKIP when no
+      open-loop schedule executed during the run.
+    - `pherf.health.saturation` (class duration): Reports FAIL when the highest peak dispatch lag
+      across any open-loop schedule exceeds `lag.maxMs` (1000), and reports SKIP when no open-loop
+      schedule executed during the run.
+    - `pherf.health.client_pool` (class count): Reports FAIL when one or more tasks had to wait for
+      an available worker thread in the Pherf executor pool, and reports SKIP when no tasks
+      executed on the pool.
+    - `pherf.health.tail_latency` (class duration): Reports FAIL when the p99 or p99.9 latency of
+      any measured key exceeds `tail.p99MaxMs` (1000) or `tail.p999MaxMs` (5000), and reports SKIP
+      when no latency keys were measured.
+    - `pherf.health.read_skew` (class share): Reports FAIL when the ratio of read requests on the
+      busiest server to the cluster mean exceeds `readSkew.max` (1.5), and reports SKIP when no JMX
+      source is configured, the measurement window is shorter than 60 s, fewer than 2 servers
+      participate, no reads occur, or a counter moves backward.
 
     Each threshold is configured via `pherf.verdict.<name>` in `pherf.properties`, and an observed
     value that exactly equals its configured bound passes the check. Setting
@@ -901,48 +902,57 @@ executed at 100 operations per second.
 
 ## Read the result
 
-* **One run.** Begin by checking the health verdict file. PASS verdicts for both `attainment` and
-  `saturation` confirm that the load generator delivered the declared arrival schedule. Next,
-  compare the open-loop `response` latency percentiles against your service-level objective. The
-  operation service keys isolate the execution time spent inside the cluster, whereas the difference
-  between `response` latency and service latency reveals the queueing delay inside the client.
+* **One run.** Begin by inspecting the health verdict file. PASS verdicts on both `attainment` and
+  `saturation` confirm that the load generator actually delivered the declared arrival schedule.
+  Next, evaluate the open-loop `response` latency percentiles against your service-level objective.
+  The operation service keys isolate execution time spent inside the cluster, whereas the
+  difference between `response` latency and service latency quantifies queueing delay inside the
+  client.
 * **A set.** A PASS verdict on `count_parity` across exact keys proves that all replicates executed
   identical workloads. Once parity is established, the replicate median provides the point estimate
-  for each metric and the confidence interval quantifies its run-to-run dispersion. A wide
-  confidence interval indicates that you need additional replicates, a quieter host environment, or
-  a longer measurement window.
+  for each metric and the confidence interval measures its run-to-run dispersion. A wide confidence
+  interval indicates the need for additional replicates, a quieter host environment, or a longer
+  measurement window.
 * **Two sets.** A FAIL verdict on `regression` is authoritative only when the runs use the
-  measurement run class on an uncontaminated host with at least 3 replicates per set. An ADVISORY
-  verdict indicates that the data suggests a performance regression greater than the threshold but
+  measurement run class on a quiet host with at least 3 replicates in each set. An ADVISORY verdict
+  indicates that the empirical evidence points toward a regression exceeding the threshold but
   lacks the experimental authority to prove it, with the specific reason recorded in the verdict
   detail column.
-* **Small samples.** When comparing 3 replicates per set, a bootstrap confidence interval that
-  excludes 0 means that the observations from the two sets do not overlap. Under the null
-  hypothesis where two independent sets are drawn from the exact same continuous distribution,
-  complete non-overlap in a specific direction occurs purely by chance with a probability of 1/20
-  for 3 replicates per set, and 1/6 for 2 replicates per set. Because the analyzer does not apply a
-  multiple-comparisons correction across the up to five metrics produced per operation key, a
-  single metric regression is sufficient to mark the overall regression verdict row as FAIL. You
-  should therefore treat an isolated regression on a single metric among many as an investigative
-  lead and run additional replicates to confirm it.
+* **Small samples.** With 3 replicates in each set, a bootstrap confidence interval that excludes 0
+  means that the observations from the two sets do not overlap. Under the null hypothesis where two
+  independent sets are drawn from a single continuous distribution, complete one-sided non-overlap
+  occurs purely by chance with a probability of 1/20 for 3 observations per set, and 1/6 for 2
+  observations per set. Because the analysis does not apply a multiple-comparisons correction—where
+  each operation key produces up to five metrics and a single metric regression marks the verdict
+  row FAIL—you should treat an isolated regression on one metric among many as an investigative
+  lead and confirm it with additional replicates.
 * **False alarms and power.** For any single metric, one-sided non-overlap between two sets of n
-  replicates drawn from the same distribution occurs with probability 1 / C(2n, n): this equals
-  1/20 for 3 versus 3, 1/70 for 4 versus 4, and 1/252 for 5 versus 5. When evaluating roughly 10
-  metrics under run-to-run noise close to the 10% effect threshold (where the magnitude threshold
-  itself does not filter out random swings), an unchanged build produces a false regression alarm
-  with a probability of approximately 1 - (19/20)^10, or 40%, at 3 versus 3 replicates. Increasing
-  the sample size to 5 versus 5 reduces this family-wise false-alarm rate to roughly 4%, so you
-  should use 5 replicates per set for an automated regression gate. Always validate your testbed by
-  comparing two independent baseline sets first (an A/A comparison), which must produce no
-  regression and whose observed deltas establish the natural noise floor of your environment.
-  Because the regression threshold is fixed at 10%, `-analyze` cannot be used to substantiate
-  performance claims for effects smaller than 10%.
+  replicates drawn from the same distribution occurs with probability 1 / C(2n, n): 1/20 at 3
+  against 3, 1/70 at 4 against 4, and 1/252 at 5 against 5. When evaluating roughly 10 metrics
+  under run-to-run noise close to the 10% threshold (where the magnitude threshold does not filter
+  out random swings), an unchanged build produces a false regression alarm with a probability of
+  approximately 1 - (19/20)^10, or 40%, at 3 against 3 replicates. Increasing the sample size to 5
+  against 5 reduces this false-alarm probability to roughly 4%, so automated regression gates
+  should use 5 replicates per set. Always compare two independent baseline sets first (an A/A
+  comparison): it must produce no regression, and its observed deltas establish the natural noise
+  floor. Because the regression threshold is fixed at 10%, `-analyze` cannot substantiate claims for
+  effects smaller than 10%.
+* **Fleet reports.** A Distributed Pherf fleet report conforms to the version 1 latency report
+  schema of LATENCY.md with one additional top-level member, `fleet`, which standard consumers of
+  this format ignore. Consequently, both the analysis commands in this HOWTO and `-analyze` ingest
+  a controller run bundle without modification. The fleet verdict appends three fleet-level checks
+  to the five single-node checks covered in this guide: `pherf.fleet.start_skew`,
+  `pherf.fleet.telemetry`, and `pherf.fleet.agents` ([D02][d02], [H15][h15]). Each metric key in a
+  fleet report is computed from a single merged histogram that combines the raw samples from all
+  participating agents, ensuring that reported percentiles reflect the true fleet-wide distribution.
+  Never average percentile values across agents, because the arithmetic mean of two p99 values is
+  not a p99 ([D04][d04]).
 * **Automation.** The `-analyze` mode exits 0 when no verdict row reports `FAIL`, exits 1 on an
-  invalid command-line invocation or unusable input directory, exits 66 when replicate run classes
-  conflict, and exits 67 when the generated report contains at least one `FAIL` verdict row. It
-  never exits 65, which is reserved for the scenario validator. Continuous integration pipelines can
-  gate directly on the process exit code and archive the resulting JSON report; because the report
-  omits wall-clock timestamps, identical inputs and labels produce byte-for-byte identical files.
+  invalid command-line invocation or unusable input, exits 66 when replicate run classes differ,
+  and exits 67 when the report contains at least one `FAIL` row. It never exits 65, which is
+  reserved for the scenario validator. Continuous integration jobs can gate directly on the exit
+  code and archive the JSON report; because the report omits timestamps, identical inputs and
+  labels always produce byte-for-byte identical output.
 
 ## Reproduce it
 
@@ -972,15 +982,19 @@ pherf -z "$ZK" -disableSchemaApply -drop 'PHERF\.REF_RELATIONAL'
 
 ## See also
 
-* [LATENCY.md](../../LATENCY.md): reference documentation for the latency output artifacts, key
-  formats, histogram logs, and legacy millisecond conversions.
-* [VERDICT.md](../../VERDICT.md): reference documentation for the five run health checks, their
+* [LATENCY.md](../../LATENCY.md): Reference documentation for the latency output artifacts, metric
+  keys, histogram logs, and legacy millisecond conversions.
+* [VERDICT.md](../../VERDICT.md): Reference documentation for the five run health checks, their
   configurable thresholds, and the noisy-host demotion rule.
-* [ANALYSIS.md](../../ANALYSIS.md): reference documentation for the offline analysis inputs,
+* [ANALYSIS.md](../../ANALYSIS.md): Reference documentation for the offline analysis inputs,
   bootstrap statistics, count parity verification, and exit codes.
-* [P04](04-co-generation.md): an explanation of why co-generated workload counts are deterministic
-  and exact.
-* [H03](../../../dev/harness/docs/howto/03-result-bundles-and-automation.md): a guide to harness
+* [P04](04-co-generation.md): Explanation of why co-generated workload counts are deterministic and
+  exact.
+* [H03](../../../dev/harness/docs/howto/03-result-bundles-and-automation.md): Guide to harness
   result bundle structure and exit codes in automated workflows.
-* [H12](../../../dev/harness/docs/howto/12-regression-ab-and-matrices.md): a guide to executing A/B
+* [H12](../../../dev/harness/docs/howto/12-regression-ab-and-matrices.md): Guide to executing A/B
   comparisons across two builds using measurement-class harness bundles.
+
+[d02]: ../../../phoenix-pherf-distributed/docs/howto/02-first-fleet-run.md
+[d04]: ../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
+[h15]: ../../../dev/harness/docs/howto/15-fleet-replicates-ab-and-faults.md

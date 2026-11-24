@@ -150,12 +150,14 @@ daemon log (which causes the `cluster.log` check to fail).
    ...
    ```
 
-   This command executes `scripts/build-phoenix.sh`, `scripts/build-jhiccup.sh`, and
-   `scripts/stage-artifacts.sh`. It downloads the HBase and Hadoop archives once, verifies their
-   SHA-512 checksums against the declared pins, and builds the `PX_IMAGE_TAG` image inside the local
-   container engine. The harness never pulls or pushes a prebuilt harness image.
+   This step compiles the working-tree Phoenix JARs and jHiccup, downloads the HBase and Hadoop
+   archives once, validates their SHA-512 checksums against the declared pins, and builds the
+   `PX_IMAGE_TAG` image in the local engine. Use `px-cluster build --tree DIR` to build another
+   source tree. The harness never pulls or pushes a prebuilt harness image. Running
+   `px-cluster -e PX_PHERF=1 build` additionally compiles `phoenix-pherf-distributed` and builds
+   the pherf image for the Distributed Pherf tier; see [H14](14-fleet-through-the-harness.md).
 
-6. Confirm that the build record captures your working tree state and target build profile:
+5. Verify that the generated build record reflects your working tree and target build profile:
 
    ```sh
    grep -E '^(tree|phoenix_version|hbase_profile|jdk)' "$PX_OUT/build/phoenix/build.tsv"
@@ -320,46 +322,46 @@ daemon log (which causes the `cluster.log` check to fail).
 
     ```text
     1	sql	Create, load, index and query one table	driver	psql	validation		600
-    2	client	Read the catalog with a Phoenix client class	driver	java-main	validation		600
+    2	client	Extract the DDL of a user table with a Phoenix client class	driver	java-main	validation		600
     ```
 
     The output columns list the test position, the test id, the descriptive name, the execution
     mode, the driver, the target run class, any required role groups, and the time limit in
     seconds. The suite definition resides in `dev/harness/suites/smoke.suite`.
 
-15. Execute the smoke suite:
+14. Run the smoke suite and capture its result stream:
 
     ```sh
-    px-suite smoke; echo "exit $?"
+    px-suite smoke | tee "$HOWTO/smoke.tsv"
     ```
 
     ```text
-    ... INFO  px-suite: session 20261123T022725Z-qc1m in .../phoenix-harness/sessions/...
-    1	sql	SKIP	0	68661	the verdicts of this test reach SKIP
-    2	client	SKIP	0	23123	the verdicts of this test reach SKIP
-    ... INFO  px-suite: session 20261123T022725Z-qc1m ends at SKIP: 0 pass, 2 skip, 0 advisory,
-    0 fail, 0 error
-    ... INFO  px-suite: the session ends, so scope px-default comes down (teardown by default)
-    exit 0
+    ... INFO  px-suite: session 20261127T090450Z-fb1x in .../phoenix-harness/sessions/...
+    1	sql	SKIP	0	65092	the verdicts of this test reach SKIP	.../runs/...
+    2	client	SKIP	0	43182	the verdicts of this test reach SKIP	.../runs/...
+    result	SKIP	0	.../phoenix-harness/sessions/20261127T090450Z-fb1x
+    ... INFO  px-suite: session 20261127T090450Z-fb1x ends at SKIP: 0 pass, 2 skip, 0 advisory,
+    0 fail, 0 error (exit 0, ok)
     ```
 
     Each result row reports the test position, the test id, the aggregate severity, the exit code,
-    the elapsed time in milliseconds, and a summary reason. A healthy smoke run finishes with `SKIP`
-    rather than `PASS` because verdict aggregation retains the highest severity observed, and `SKIP`
-    ranks above `PASS`. Because the psql and java-main drivers record neither per-operation latency
-    nor a pacing schedule, metrics such as `query_latency.p50_ms`, `offered_rate`, and related
-    timing checks evaluate to documented `SKIP` rows. All row-count and functional checks evaluate
-    to `PASS`, and an aggregate `SKIP` verdict exits 0. In the `sql` test, the `prepare` phase
-    creates a table and a covered index, while the `run` phase executes a row count, a point lookup
-    through the index, an upsert write, a delete, and a range count. The `client` test executes
-    `SchemaTool` inside `client-0`, verifying both the runtime classpath and the client
-    configuration. The suite completed in 148 s on the reference host. Because the suite session
-    assumes ownership of the cluster, it tears the cluster down automatically when the session ends.
+    the elapsed duration in milliseconds, a summary explanation, and the path to the test's result
+    bundle. The final `result` row records the session severity, its exit code, and the session
+    directory. A healthy smoke run resolves to `SKIP` rather than `PASS` because verdict aggregation
+    retains the highest observed severity, and `SKIP` outranks `PASS`. Because the psql and
+    java-main drivers capture neither per-operation latency nor a pacing schedule, timing checks
+    such as `query_latency.p50_ms` and `offered_rate` emit documented `SKIP` rows. All row-count and
+    functional assertions evaluate to `PASS`, and an aggregate `SKIP` verdict exits 0. In the `sql`
+    test, the `prepare` phase creates a table and a covered index, while the `run` phase performs a
+    row count, an indexed point lookup, an upsert write, a delete, and a range count. The `client`
+    test runs `SchemaTool` inside `client-0` to verify the runtime classpath and client settings.
+    On the reference host, the suite completed in 109 s. The session keeps the cluster running; step
+    17 tears it down.
 
-16. Inspect the session summary record:
+15. Examine the generated session summary record:
 
     ```sh
-    SESSION="$(ls -d "$PX_OUT"/sessions/* | tail -n 1)"
+    SESSION="$(awk -F '\t' '$1 == "result" { print $4 }' "$HOWTO/smoke.tsv")"
     grep -E '^(hbase_version|hadoop_version|jdks|severity|result|exit_code)' \
       "$SESSION/summary.tsv"
     ```
@@ -551,15 +553,17 @@ To reproduce the run, record the `tree` and `phoenix_version` rows from
 
 ## See also
 
-* [01-measurement-protocol.md](01-measurement-protocol.md): explains run classes and the memory
+* [01-measurement-protocol.md](01-measurement-protocol.md): Explains run classes and the memory
   budget arithmetic.
-* [03-result-bundles-and-automation.md](03-result-bundles-and-automation.md): documents result
+* [03-result-bundles-and-automation.md](03-result-bundles-and-automation.md): Documents result
   bundles, verdicts, and exit codes.
-* [04-pherf-through-the-harness.md](04-pherf-through-the-harness.md): walks through running the
+* [04-pherf-through-the-harness.md](04-pherf-through-the-harness.md): Walks through running the
   first Pherf workload.
-* [11-scale-out-capacity-and-skew.md](11-scale-out-capacity-and-skew.md): covers scaling across 1,
+* [11-scale-out-capacity-and-skew.md](11-scale-out-capacity-and-skew.md): Covers scaling across 1,
   3, and 5 RegionServers.
-* [../../README.md](../../README.md): summarizes the CLI commands, operational policy, and host
+* [14-fleet-through-the-harness.md](14-fleet-through-the-harness.md): Introduces the Distributed
+  Pherf tier and the `pherf-distributed` workload driver.
+* [../../README.md](../../README.md): Summarizes the CLI commands, operational policy, and host
   safety rules.
-* [../backends.md](../backends.md): details the container network, the port map, and scope
+* [../backends.md](../backends.md): Details the container network, the port map, and scope
   resolution.

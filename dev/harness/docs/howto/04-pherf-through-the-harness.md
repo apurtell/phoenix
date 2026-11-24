@@ -99,14 +99,18 @@ performance benchmarks, as each comes from a single validation-class execution.
 The driver implements six lifecycle verbs, which are formally specified in the "pherf" section of
 `docs/driver-contract.md`.
 
-| Verb | Where | What it does |
-|---|---|---|
-| `describe` | host | Emits the describe document with the anchors, metric keys, and artifacts. |
-| `validate` | host | Checks files exist: `.xml` scenario holds `<scenario>`; schemas are `.sql`. |
-| `prepare` | client 0 | Stages files; runs Pherf with `-l -label load` in anchor `setup@load`. |
-| `run` | client 0 | Runs `-disableSchemaApply -q -label run` in `steady@pherf`; bundles results. |
-| `restore` | client 0 | Drops every table declared by `CREATE TABLE` in the `--schema` files. |
-| `report` | host | Reads only the bundled copies and emits the metric records and verdict rows. |
+- `describe` (host) emits the driver description document declaring the stage anchors, metric keys,
+  and output artifacts.
+- `validate` (host) verifies that all input files exist, that the scenario file contains a
+  `<scenario>` element and ends in `.xml`, and that each schema file ends in `.sql`.
+- `prepare` (client 0) stages the workload files into the container working directory and runs
+  Pherf with `-l -label load` inside the `setup@load` stage anchor.
+- `run` (client 0) executes Pherf with `-disableSchemaApply -q -label run` inside the
+  `steady@pherf` stage anchor, and then copies the generated result files into the result bundle.
+- `restore` (client 0) drops every table identified by a `CREATE TABLE` statement across the
+  supplied `--schema` files.
+- `report` (host) reads exclusively from the artifact copies stored in the bundle and emits the
+  normalized metric records and verdict rows.
 
 During preparation, the driver stages two categories of workload files into the test working
 directory on client 0: it places the `--scenario` file under `stage/scenario/` and each `--schema`
@@ -126,18 +130,17 @@ Four operational rules follow directly from this design:
 - The driver manages execution labels internally; passing a `-label` option after `--` is rejected
   as a usage error with exit code 2.
 - Arguments placed after `--` are forwarded to Pherf. The `-runDurationMs`, `-threadCount`, and
-  `-targetRate` options are passed exclusively to the `run` verb because Pherf rejects them when
+  `-targetRate` options are forwarded exclusively to the `run` verb because Pherf rejects them when
   `-q` is absent. Every other option, including `-allowUnknownTags`, is forwarded to both execution
   verbs because the Pherf pre-run validation gate executes during both phases.
 - The driver stages the scenario file, the schema files, and every profile referenced by the
   scenario. A query set configured with `profile="..."` references a file located next to the
   scenario, and the driver stages it at that same relative path. Specifying a profile with an
   absolute path or a `..` path segment is rejected as a usage error with exit code 2. The
-  standalone Pherf HOWTO guide
-  [How to drive an open-loop workload with profiles and operation mixes](../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md)
-  covers profiles in detail.
+  standalone Pherf HOWTO [How to drive an open-loop workload with profiles and operation
+  mixes][p03] covers profiles in detail.
 - Specify every input file as an absolute path on the command line, because the driver resolves
-  relative paths only relative to a suite definition file.
+  relative paths only against a suite definition file.
 
 ## Steps
 
@@ -191,11 +194,10 @@ Four operational rules follow directly from this design:
    ```
 
    The `*_run` artifacts are produced during the `run` verb, and the reporting phase consumes only
-   those files. The `*_load` artifacts are generated during the `prepare` verb and are preserved in
-   the bundle to support ingest analysis, as covered in
-   [How to measure ingest throughput, check query plans and cost a secondary index](08-ingest-plans-and-index-cost.md).
-   The `LATENCY_run_intervals.hlog` file is not present because interval histogram export is
-   disabled by default.
+   those files. The `*_load` artifacts are generated during the `prepare` verb and are retained in
+   the bundle to support ingest analysis; see [How to measure ingest throughput, check query plans
+   and cost a secondary index](08-ingest-plans-and-index-cost.md). The `LATENCY_run_intervals.hlog`
+   file is absent because interval histogram export is disabled by default.
 
 4. Inspect the operation keys in the JSON latency report, whose schema is defined in
    `phoenix-pherf/LATENCY.md`.
@@ -425,63 +427,49 @@ Four operational rules follow directly from this design:
     the single variable changed relative to the cold baseline run.
 
     ```sh
-    RUN_WARM="$(px-run --keep -c validation -d pherf -- --scenario "$HOWTO/warm.xml" \
-      --schema "$PWD/dev/harness/suites/pherf/px_functional_schema.sql" \
-      --properties "$HOWTO/pherf.properties")"; echo "exit $?"
-    grep -E '"(operation|phase|count|maxUs)"' \
+    WARM=(--scenario "$HOWTO/warm.xml" --schema "$SUITES/pherf/px_functional_schema.sql"
+      --properties "$HOWTO/pherf.properties")
+    RUN_WARM="$(px-run pherf -- "${WARM[@]}")"
+    jq -r '.histograms[] | [.operation, .phase, .count, .maxUs] | @tsv' \
       "$RUN_WARM/drivers/pherf/results_HDR/LATENCY_run.json"
     ```
 
     ```text
-    exit 0
-          "operation": "query:px_warm:count",
-          "phase": "steady",
-          "count": 20,
-          "maxUs": ...,
-          "operation": "query:px_warm:count",
-          "phase": "warmup",
-          "count": 5,
-          "maxUs": ...,
+    query:px_warm:count	steady	20	14143
+    query:px_warm:count	warmup	5	1093631
+    query:px_warm:scan	steady	20	5271
     ...
     ```
 
-    Because the live verification pass did not record numeric output for this intermediate run, the
-    excerpt above illustrates the structure of the report. The `steady` phase keys record only the
-    20 measured executions, whereas the `warmup` phase keys capture the 5 warmup executions,
-    including the cold initial query. Because p99 equals the single slowest execution across 20
-    samples, compare the `maxUs` field directly: the difference between the warmup maximum and the
-    steady-state maximum reflects the effect of warmup alone.
+    The steady-phase metric keys record only the 20 measured executions, whereas the warmup-phase
+    keys capture the 5 warmup executions, including the cold initial query. Across 20 samples, the
+    reported p99 equals the single slowest sample, which is given directly by `maxUs`. Comparing
+    the warmup maximum against the steady-state maximum isolates the effect of warmup alone: 1.09 s
+    versus 14 ms for the count query.
 
 13. Execute the same warmup-enabled scenario with the connection cache enabled, introducing
     connection caching as a second controlled change.
 
     ```sh
-    RUN_CACHE="$(px-run --keep -c validation -d pherf -- --scenario "$HOWTO/warm.xml" \
-      --schema "$PWD/dev/harness/suites/pherf/px_functional_schema.sql" \
-      --properties "$HOWTO/pherf.properties" -- -connectionCache)"; echo "exit $?"
-    grep -E '"(operation|phase|count|maxUs)"' \
+    RUN_CACHE="$(px-run pherf -- "${WARM[@]}" -- -connectionCache)"
+    jq -r '.histograms[] | [.operation, .phase, .count, .maxUs] | @tsv' \
       "$RUN_CACHE/drivers/pherf/results_HDR/LATENCY_run.json"
     ```
 
     ```text
-    exit 0
-          "operation": "query:px_warm:count",
-          "phase": "steady",
-          "count": 20,
-          "maxUs": 9607,
-          "operation": "query:px_warm:count",
-          "phase": "warmup",
-          "count": 5,
-          "maxUs": 1049599,
+    query:px_warm:count	steady	20	9815
+    query:px_warm:count	warmup	5	1129471
+    query:px_warm:scan	steady	20	3627
     ...
     ```
 
-    The numeric values shown above are illustrative. In this run, the maximum latency of the count
-    query drops from roughly 1.1 s during the warmup phase to about 10 ms during the steady-state
-    phase. Comparing the steady-state maximum of this run against the steady-state maximum from
-    step 12 isolates the effect of the connection cache; report the warmup effect and the cache
-    effect separately. Because each run constitutes only a single trial, variations of a few
-    milliseconds between runs represent experimental noise.
+    In this run, the maximum latency of the count query drops from about 1.1 s during the warmup
+    phase to about 10 ms during the steady-state phase. Comparing the steady-state maximum of this
+    run against the steady-state maximum from step 12 isolates the effect of the connection cache:
+    9.8 ms versus 14.1 ms for the count query, and 3.6 ms versus 5.3 ms for the scan query. Always
+    report the warmup effect and the cache effect separately. Because each run constitutes only a
+    single statistical sample, a variation of a few milliseconds between runs represents
+    experimental noise.
 
     Running 5 warmup executions absorbs the initial cold-start overhead of establishing the
     connection, fetching table metadata, and caching region locations, but it is not sufficient to
@@ -580,10 +568,18 @@ Four operational rules follow directly from this design:
 
 ## See also
 
-- [How to validate a latency SLO with an open loop, and hold it in a soak](05-latency-slo-and-soak.md)
-- [How to read, validate, archive and automate on result bundles](03-result-bundles-and-automation.md)
+- [How to validate a latency SLO with an open loop, and hold it in a soak][h05]
+- [How to read, validate, archive and automate on result bundles][h03]
+- [How to run Pherf on a fleet through the harness][h14]: Shows how the `pherf-distributed` driver
+  executes the same class of scenario across the agents of the Distributed Pherf tier.
 - [The driver contract, section "pherf"](../driver-contract.md) and
   [the result bundle, section "The pherf driver files"](../bundle-format.md)
 - [Pherf latency outputs](../../../../phoenix-pherf/LATENCY.md) and
   [the Pherf health verdict](../../../../phoenix-pherf/VERDICT.md)
-- [How to author a scenario and validate it offline](../../../../phoenix-pherf/docs/howto/02-scenario-authoring-and-validation.md)
+- [How to author a scenario and validate it offline][p02]
+
+[h03]: 03-result-bundles-and-automation.md
+[h05]: 05-latency-slo-and-soak.md
+[h14]: 14-fleet-through-the-harness.md
+[p02]: ../../../../phoenix-pherf/docs/howto/02-scenario-authoring-and-validation.md
+[p03]: ../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md

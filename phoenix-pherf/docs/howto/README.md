@@ -43,19 +43,40 @@ The Pherf reference documents define the foundational contracts applied througho
 
 ## The HOWTOs
 
-| # | HOWTO | Purpose | Cost |
-|---|---|---|---|
-| 01 | [How to run your first Pherf workload on a cluster](01-first-pherf-run.md) | Build Pherf, write a scenario, load data, run a closed loop with warmup and replicates, and find the outputs. | User cluster; build about 8 min warm; runs a few minutes; 3 GiB client heap |
-| 02 | [How to author a scenario and validate it offline](02-scenario-authoring-and-validation.md) | Find scenario defects with no cluster: the validator, its rule ids, the pre-run gate and unknown tags. | Offline; about 5 min; under 1 MiB |
-| 03 | [How to drive an open-loop workload with profiles and operation mixes](03-open-loop-profiles-and-mixes.md) | Offer load at a set rate, step or ramp it, mix operation kinds, and override the curve at launch. | User cluster, or a harness cluster through option B of step 2 (checked against the code, not run on a cluster); about 15 min of runs; under 50 MB |
-| 04 | [How to generate verifiable data with co-generation](04-co-generation.md) | Make each value a function of the row index and a seed, so readers find what writers wrote. | User cluster, or a harness cluster through option B of P03 step 2 (checked against the code, not run on a cluster); about 10 min of runs; under 50 MB |
-| 05 | [How to cover Phoenix types and multi-tenant workloads](05-types-and-multi-tenant.md) | Exercise arrays, VARBINARY_ENCODED, JSON and BSON, tenant views and the `-mt` load profile. | User cluster; about 20 min |
-| 06 | [How to read Pherf results, grade a run and compare replicates](06-results-verdict-and-analysis.md) | Read the latency report and the verdict, and compare replicate sets with `-analyze`. | Part 1 on a cluster, about 10 min; part 2 offline, about 5 min; under 50 MB |
-| 07 | [How to extend Pherf with providers, report sections, metrics sinks and generators](07-extending-pherf.md) | Write, package and check the Pherf extension points. | Offline build of one jar; a user cluster to run it |
+Each entry summarizes the objective of the guide and its approximate resource and time cost. The
+"Before you start" section of each HOWTO provides the complete cost breakdown.
 
-Each guide details its resource and time requirements. Using a harness cluster adds approximately
-5 min for cluster bring-up and requires 8704 MiB in container memory limits (corresponding to the
-validation cluster class with 1 RegionServer).
+1. [How to run your first Pherf workload on a cluster][p01]. This guide covers building Pherf,
+   authoring a scenario, loading data, executing a closed-loop workload with warmup and replicate
+   runs, and locating the generated outputs. The estimated cost includes a user cluster, a warm
+   build of about 8 min, workload runs lasting a few minutes, and a 3 GiB client heap.
+2. [How to author a scenario and validate it offline][p02]. This guide explains how to detect
+   scenario defects without a cluster by using the validator, its rule IDs, the pre-run gate, and
+   unknown-tag detection. The procedure executes entirely offline, takes about 5 min, and requires
+   under 1 MiB.
+3. [How to drive an open-loop workload with profiles and operation mixes][p03]. This guide
+   demonstrates how to offer load at a fixed rate, apply step or ramp profiles, combine multiple
+   operation kinds, and override the load curve at launch time. The estimated cost is a user
+   cluster—or a harness cluster via option B of step 2 (which is verified against the codebase
+   rather than executed on a live cluster)—along with about 15 min of runs and under 50 MB.
+4. [How to generate verifiable data with co-generation][p04]. This guide shows how to compute each
+   column value as a deterministic function of the row index and a seed so that read operations
+   reliably locate the records created by write operations. The estimated cost is a user
+   cluster—or a harness cluster via option B of P03 step 2 (which is verified against the codebase
+   rather than executed on a live cluster)—along with about 10 min of runs and under 50 MB.
+5. [How to cover Phoenix types and multi-tenant workloads][p05]. This guide exercises array types,
+   VARBINARY_ENCODED columns, JSON and BSON documents, tenant-specific views, and the `-mt`
+   multi-tenant load profile. Running the guide requires a user cluster and takes about 20 min.
+6. [How to read Pherf results, grade a run and compare replicates][p06]. This guide explains how
+   to interpret the latency report and run health verdict, and how to compare replicate sets using
+   `-analyze`. For cost, part 1 runs on a cluster in about 10 min, while part 2 runs offline in
+   about 5 min, requiring under 50 MB in total.
+7. [How to extend Pherf with providers, report sections, metrics sinks and generators][p07].
+   This guide demonstrates how to implement, package, and verify custom Pherf extension points.
+   The required cost consists of an offline build of one JAR and a user cluster to execute it.
+
+Using a harness cluster adds about 5 min for cluster bring-up and requires 8704 MiB in container
+resource limits (corresponding to the validation cluster class with 1 RegionServer).
 
 ## Reading paths
 
@@ -69,10 +90,18 @@ multi-tenant views. To evaluate the test harness as well, follow the harness gui
 [02](../../../dev/harness/docs/howto/02-first-cluster-and-smoke.md),
 [04](../../../dev/harness/docs/howto/04-pherf-through-the-harness.md), and
 [05](../../../dev/harness/docs/howto/05-latency-slo-and-soak.md).
+When a single client is insufficient or the workload must be driven concurrently across multiple
+clients, consult the Distributed Pherf HOWTOs [D01][d01] (which covers the controller, the agents,
+and the REST API without requiring a cluster) and [D02][d02] (which walks through an initial fleet
+run).
 
-**(b) Phoenix developer validating a change** and **(c) committer reviewing a performance
-claim.** Both of these workflows begin with the test harness. Consult the reading paths outlined in
-[the harness HOWTO index](../../../dev/harness/docs/howto/README.md).
+**(b) Phoenix developer validating a change.** This workflow begins with the test harness; consult
+the reading paths in [the harness HOWTO index](../../../dev/harness/docs/howto/README.md).
+
+**(c) Committer reviewing a performance claim.** This workflow also begins in the harness index.
+When evaluating a claim produced by a fleet of load generators, also review [D04][d04], which
+explains how to distinguish a client bound from a cluster bound and why fleet-wide percentiles are
+computed from merged histograms.
 
 **(d) Harness or Pherf contributor.** Begin with harness guide
 [13](../../../dev/harness/docs/howto/13-extending-the-harness.md), followed by
@@ -84,6 +113,9 @@ validator rules). Next, review the architectural reference contracts:
 [PLUGINS.md](../../../dev/harness/docs/PLUGINS.md),
 [backends.md](../../../dev/harness/docs/backends.md), [LATENCY.md](../../LATENCY.md),
 [VERDICT.md](../../VERDICT.md), and [ANALYSIS.md](../../ANALYSIS.md).
+For Distributed Pherf contributions, also review [D01][d01] (which details the runtime processes,
+the environment contract, and the REST API) and [D03][d03] (which covers run cancellation, agent
+fault handling, and controller restart behavior).
 
 ## Performance engineering tasks
 
@@ -107,7 +139,10 @@ automated result bundle processing.
 | Noise control and result validity: the verdict, the noisy-host rule | 06 |
 | Regression detection and A/B comparison with replicates: medians, bootstrap intervals | 06 |
 | Extending Pherf: connection provider, report sections, metrics sinks, generator classes | 07 |
-| Reproducibility: seeds, labels, pinned recorder configuration, archived result directories | 01, 04, 06 |
+| Reproducibility: seeds, labels, pinned recorder, archived result directories | 01, 04, 06 |
+| Multi-client load and load-generator scale-out | [D02][d02], [D04][d04] |
+| Fleet latency: merged histograms, per-agent skew | [D04][d04] |
+| Fleet A/B with replicates and `-analyze` | [H15][h15] |
 
 ## Conventions
 
@@ -135,18 +170,19 @@ every subsequent guide that executes Pherf on the host.
 
 **Launcher forms.** Pherf can be launched in three ways:
 
-- The `pherf` shell function defined in `pherf-env.sh` invokes `java -cp` using the Pherf JAR, the
-  Phoenix embedded client JAR, the bson JAR, the JAXB JARs, and a log4j backend compiled from this
-  source tree. The guides use this invocation method, which runs cleanly on JDK 17.
-- The `bin/pherf-standalone.py` script packaged in a Phoenix assembly omits the JAXB JARs from its
-  classpath; on JDK 11 and later, executing a scenario file fails with
+- The `pherf` shell function defined in `pherf-env.sh` invokes `java -cp` with the Pherf JAR, the
+  Phoenix embedded client JAR, the bson JAR, the OpenTelemetry API JARs, `jcl-over-slf4j`, the JAXB
+  JARs, and a log4j backend compiled from this source tree. The HOWTO guides use this launcher
+  form, which runs cleanly on JDK 17.
+- The `bin/pherf-standalone.py` script packaged in a Phoenix assembly omits the JAXB JAR from its
+  classpath; on JDK 11 and later, executing a run with a scenario file fails with
   `NoClassDefFoundError: javax/xml/bind/JAXBException` (observed on JDK 17 when running from the
   source tree). When invoked from the source tree, it also fails to locate the bson JAR because it
-  searches only within `lib/`. Accordingly, these guides do not use this script.
-- The test harness executes Pherf inside the client container of a harness-managed cluster, either
-  through the `pherf` driver
+  searches only within `lib/`. Accordingly, the HOWTO guides do not use this script.
+- The test harness executes Pherf inside the client container of a harness cluster, either through
+  the `pherf` driver
   ([harness HOWTO 04](../../../dev/harness/docs/howto/04-pherf-through-the-harness.md)) or via
-  `px-cluster exec` on client 0.
+  `px-cluster exec` into client 0.
 
 **Files.** Each guide generates all required configuration and source files (including scenarios,
 schemas, `pherf.properties`, and Java sources) under `$HOWTO` using heredocs. Always pass scenario
@@ -161,9 +197,8 @@ Commands and their corresponding outputs are presented in separate `sh` and `tex
 each command block can be copied and pasted directly, and harness log line prefixes are elided as
 `... INFO  px-x:`.
 
-**Paths and lines.** All guides reference paths through `$PX_OUT`, `$HOWTO`, and `$HOME` rather
-than hard-coded user home directories. Prose and code lines wrap at a maximum of 100 columns,
-whereas table rows may exceed that width.
+**Paths and lines.** All guides reference paths using `$PX_OUT`, `$HOWTO`, and `$HOME`, never a
+hard-coded user home path. Every line, including table rows, is formatted to at most 100 columns.
 
 **Clean up.** Any guide that modifies cluster state drops its tables upon completion by passing
 `-drop` with a pattern scoped exclusively to the tables created by that guide. The `-drop` option
@@ -186,32 +221,59 @@ for Pherf. Because Pherf itself prints no such status line, a guide echoes the P
 
 ## Memory of a long run
 
-Pherf retains every operation record in memory for the duration of a run because both XML report
-generation and replicate analysis operate over the complete dataset. CSV export likewise buffers
-all formatted rows in memory before writing the first row to disk. Consequently, memory consumption
-scales linearly with the number of operations at approximately 1.5 KB per operation (as noted in
-`ResultUtil.write`). The 3 GiB heap configured by the `pherf` function accommodates approximately
-2 million operations; partition longer workloads into a sequence of separate runs. Builds prior to
-63c9dd0ec2 allocated memory in proportion to the square of the operation count within a single
-query set, exhausting a 1 GiB heap above approximately 10,000 operations.
+Pherf retains every operation record in memory until the run completes because both XML report
+generation and replicate analysis process the entire dataset. CSV export similarly constructs all
+formatted rows in memory before writing the first row to disk. Consequently, memory consumption
+scales linearly with the operation count at about 1.5 KB per operation (as documented in the
+comment on `ResultUtil.write`). The 3 GiB heap configured by the `pherf` function accommodates
+about 2 million operations; partition longer workloads into a sequence of separate runs.
 
-## Coming later
+## Distributed Pherf
 
-Distributed Pherf (W2) is planned for a future release, and its corresponding guides will be added
-once the D track lands.
+Distributed Pherf coordinates a single Pherf execution plan across a fleet of agents managed by a
+central controller and merges their individual outputs into a unified fleet report. Its guides are
+collected in [the Distributed Pherf HOWTO index][d-index]:
+
+- [D01][d01] explains how to deploy a standalone controller and agent processes and interact with
+  the REST API.
+- [D02][d02] demonstrates how to execute a plan across a fleet, covering work splitting, slot
+  tokens, start synchronization, and the fleet report.
+- [D03][d03] details how to cancel active runs, recover from agent faults, and restart the
+  controller.
+- [D04][d04] describes how to scale out the load generator fleet and accurately interpret
+  fleet-wide latency metrics.
+- [H14][h14] shows how to orchestrate a Distributed Pherf fleet through the test harness using
+  `px-pherf` and the `pherf-distributed` driver.
+- [H15][h15] covers fleet comparison and stress testing, including replicate runs, A/B analysis
+  with `-analyze`, and fault injection under fleet load.
 
 ## Out of scope
 
-- Distributed and multi-client load generation are deferred to W2 (the D track).
 - Kubernetes backends, service mesh integration, and environment promotion belong to the K track.
 - Network partitions, artificial latency injection, and disk-full faults are excluded because the
   test harness currently implements only process kill, signal, and restart faults (see
   [harness HOWTO 09](../../../dev/harness/docs/howto/09-fault-injection-and-recovery.md)).
-- Running a direct JDBC client on the host against a harness cluster is unsupported by design;
-  when targeting a harness cluster, always execute Pherf through the harness.
-- The Phoenix Query Server and thin JDBC driver are not covered; although Pherf provides the `-t`
-  and `-s` options, none of these guides exercise them.
-- Vector data types are excluded from scope by owner decision in round P2.
-- MapReduce bulk loading (`CsvBulkLoadTool`) is not covered because the MapReduce job client and
-  container image configuration remain unverified
-  ([harness HOWTO 08, "Not covered"](../../../dev/harness/docs/howto/08-ingest-plans-and-index-cost.md#not-covered-mapreduce-bulk-load)).
+- Running a direct JDBC client on the host of a harness cluster is not supported by the harness
+  design; when targeting a harness cluster, always run Pherf through the harness.
+- The Phoenix Query Server and the thin JDBC driver are not covered; although Pherf provides the
+  `-t` and `-s` options, none of the HOWTO guides exercise them.
+- Vector data types remain out of scope by owner decision in round P2.
+- MapReduce bulk load (`CsvBulkLoadTool`) is not covered because the MapReduce job client and the
+  container image configuration remain unverified ([harness HOWTO 08, "Not covered"][h08-mr]).
+
+[p01]: 01-first-pherf-run.md
+[p02]: 02-scenario-authoring-and-validation.md
+[p03]: 03-open-loop-profiles-and-mixes.md
+[p04]: 04-co-generation.md
+[p05]: 05-types-and-multi-tenant.md
+[p06]: 06-results-verdict-and-analysis.md
+[p07]: 07-extending-pherf.md
+[d-index]: ../../../phoenix-pherf-distributed/docs/howto/README.md
+[d01]: ../../../phoenix-pherf-distributed/docs/howto/01-standalone-fleet-and-rest-api.md
+[d02]: ../../../phoenix-pherf-distributed/docs/howto/02-first-fleet-run.md
+[d03]: ../../../phoenix-pherf-distributed/docs/howto/03-faults-cancel-and-restart.md
+[d04]: ../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
+[h08-mr]:
+  ../../../dev/harness/docs/howto/08-ingest-plans-and-index-cost.md#not-covered-mapreduce-bulk-load
+[h14]: ../../../dev/harness/docs/howto/14-fleet-through-the-harness.md
+[h15]: ../../../dev/harness/docs/howto/15-fleet-replicates-ab-and-faults.md

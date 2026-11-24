@@ -39,12 +39,14 @@ for contributors developing Pherf.
 - For the cluster execution step only, provide a running cluster and its ZooKeeper quorum as
   described in HOWTO 01.
 
-| Cost | Value |
-|---|---|
-| Wall time | Offline steps take about 5 minutes; the run step takes about 1 minute on a cluster. |
-| Memory | The Pherf JVM on the host uses a heap of up to 3 GiB. |
-| Disk | The artifacts require under 1 MiB of disk space. |
-| Files written | `$HOWTO/ext/` (sources, classes, `howto-pherf-ext.jar`), `$HOWTO/codes_scenario.xml`, `$HOWTO/work/RESULTS*`, the table `PHERF.HOWTO_CODES` |
+**Cost.**
+
+- Wall time: Approximately 5 minutes for the offline steps, plus about 1 minute to execute the run
+  step against a cluster.
+- Memory: A single Pherf JVM on the client host configured with a heap of up to 3 GiB.
+- Disk: Less than 1 MiB of disk space.
+- Files written: `$HOWTO/ext/` (Java sources, compiled classes, and `howto-pherf-ext.jar`),
+  `$HOWTO/codes_scenario.xml`, `$HOWTO/work/RESULTS*`, and the Phoenix table `PHERF.HOWTO_CODES`.
 
 The offline steps—compiling, packaging, verifying service registration, validating the scenario,
 and probing the generator—were executed directly, and their output excerpts are captured below.
@@ -58,11 +60,25 @@ extension jar registers an implementation by bundling a descriptor file under `M
 named after the service interface and containing the fully qualified implementation class name.
 Extension discovery requires no command-line option and no system property.
 
-| Interface (`org.apache.phoenix.pherf.spi`) | Count | Called | What it gives |
-|---|---|---|---|
-| `ConnectionProvider` | at most 1 | for each connection that Pherf opens, with the URL and the final properties | the connection: a pool, an authentication wrapper, a tracing wrapper |
-| `ReportSection` | any | On data model XML report write. | Adds `NAME.KEY` entries to `sections`. |
-| `MetricsSink` | any | Runs on each record Pherf reports. | Sends values to an external backend. |
+The service provider interfaces reside in the `org.apache.phoenix.pherf.spi` package:
+
+- `ConnectionProvider` (at most 1 registered implementation): Pherf invokes this provider whenever
+  it opens a database connection, passing the target JDBC URL and the resolved connection
+  properties. The provider returns the `Connection` instance, allowing you to interpose a
+  connection pool, an authentication wrapper, or a distributed tracing wrapper.
+- `ReportSection` (any number of implementations): Pherf invokes each registered section whenever
+  it writes the XML result report for a data model. Each section supplies key-value entries that
+  are serialized as `NAME.KEY` under the report's `sections` element.
+- `MetricsSink` (any number of implementations): Pherf invokes each registered sink for every
+  metric record it emits, enabling real-time forwarding of measurements to an external telemetry
+  backend.
+
+Pherf also provides `org.apache.phoenix.pherf.workload.StartGate`, which holds the first measured
+operation until an external host process opens the gate. A Distributed Pherf agent installs this
+gate in its child Pherf process so that all agents across a fleet begin executing at a synchronized
+epoch. Unlike the SPI interfaces, `StartGate` is an internal coordination hook for Distributed
+Pherf rather than a user extension point: no service descriptor file registers it, and when no gate
+is installed, Pherf begins execution immediately.
 
 Data generation uses explicit scenario configuration rather than service discovery: a column rule
 specifies a custom generator class via `<generatorClass>`. The class must implement
@@ -75,11 +91,13 @@ maintains its own value sequence, which is therefore not a function of the row i
 
 **The metrics.** Each reported record emits two metrics, `<kind>.elapsed_ms` and `<kind>.rows`:
 
-| Kind | One record | Tags |
-|---|---|---|
-| `query` | one execution of a query, closed or open loop (the service time) | `scenario`, `query`, `tenant`, `outcome` (`ok`, `timeout` or `error`) |
-| `load` | Records one row of the data load summary for a load or a scenario DDL. | `table` |
-| `operation` | one `-mt` operation | `scenario`, `operation`, `type`, `tenant`, `tenant_group`, `status` |
+- `query`: Represents a single query execution in either closed-loop or open-loop mode (measuring
+  server-side service time), tagged with `scenario`, `query`, `tenant`, and `outcome` (`ok`,
+  `timeout`, or `error`).
+- `load`: Represents a single entry in the data load summary corresponding to a table load or a
+  scenario DDL execution, tagged with `table`.
+- `operation`: Represents a single operation executed within a `-mt` multi-tenant workload, tagged
+  with `scenario`, `operation`, `type`, `tenant`, `tenant_group`, and `status`.
 
 Any tag without an assigned value is omitted from the tag map. Warmup executions do not emit
 metrics.

@@ -50,14 +50,16 @@ change, as well as committers who evaluate and review such claims.
 
 | Cost | Value |
 |---|---|
-| Wall time | About 8 minutes per Phoenix build, and about 3 minutes per replicate including
-  bring-up (roughly 30 minutes for 3 rounds of A, B, and A); a matrix of two version sets took
-  23 minutes in round A8. |
-| Docker memory | 8704 MiB limits (validation class); 19 GiB (measurement, `override-24gib.env`). |
-| Disk | Two container images of about 5 GB each, plus a few MiB for each validation bundle. |
-| Files written | `$HOWTO/ab_schema.sql`, `ab.xml`, `ab.suite`, `set-*.env`, `bad.env`,
-  `baseline/`, `candidate/`, `baseline2/`, `RESULTS/ANALYSIS_ab.json`, and
-  `RESULTS/ANALYSIS_aa.json`, plus a git worktree at `$HOME/phoenix-baseline`. |
+| Wall time | Approximately 30 minutes for 3 rounds of A, B, and A, plus 8 minutes per build. |
+| Docker memory | 8704 MiB for validation; about 19 GiB for measurement (`override-24gib.env`). |
+| Disk | Two container images of about 5 GB each, plus a few MiB per validation bundle. |
+| Files written | Writes 10 entries under `$HOWTO` (enumerated below) and a git worktree. |
+
+Each individual replicate requires approximately 3 minutes, including cluster bring-up, while a
+version matrix of two sets completed in 23 minutes during round A8. The artifacts written under
+`$HOWTO` are `ab_schema.sql`, `ab.xml`, `ab.suite`, `set-*.env`, `bad.env`, `baseline/`,
+`candidate/`, `baseline2/`, `RESULTS/ANALYSIS_ab.json`, and `RESULTS/ANALYSIS_aa.json`, alongside a
+git worktree at `$HOME/phoenix-baseline`.
 
 Initialize every shell session for this guide with the following three environment commands:
 
@@ -87,9 +89,9 @@ explicitly in your performance claim:
 
 | Unit | What it captures | Cost |
 |---|---|---|
-| a run on one kept cluster | Workload execution variance and transient host noise. | One run. |
-| a fresh cluster for each run | Bring-up: region placement, cold JVMs. | One bring-up and one run |
-| alternating sides, A B A B A B | Also gradual host drift over time. | A bring-up for each run. |
+| a run on one kept cluster | Captures workload and host execution noise. | Requires one run. |
+| a fresh cluster per run | Adds bring-up: region placement and cold JVMs. | A bring-up per run. |
+| alternating sides, A B A B A B | Also accounts for host drift over time. | A bring-up per run. |
 
 This HOWTO provisions a fresh cluster for every replicate and interleaves the sides in each round:
 A, B, and then a second A set used for the A/A calibration check. Consequently, the variance within
@@ -303,142 +305,117 @@ renders the test inconclusive.
    baseline2 px-harness:ab-baseline
    ```
 
-8. Verify that no active cluster remains running, confirming that every replicate cleanly tore down
-   its cluster.
-
-   ```sh
-   px-cluster status; echo "exit $?"
-   ```
-
-   ```text
-   ... ERROR px-cluster: no scope recorded for cluster default. Run px-cluster up, or name the
-   scope in PX_SCOPE_ID.
-   exit 6
-   ```
-
 ### Compare the sets
 
-9. Construct the Java classpath for the offline analysis using the build record and the local Maven
-   repository. Place a JDK 17 `java` binary first on `PATH`; on macOS, the first command below
-   configures this automatically.
+8. Extract the JDK path and runtime classpath for the offline analyzer from the build manifest.
+   `px-cluster build` records `java_home` (the JDK used to compile Phoenix) along with
+   `pherf_classpath`, which bundles the Pherf jar together with the client, bson, JAXB, activation,
+   and Log4j dependencies required by the analyzer.
 
    ```sh
-   export PATH="$(/usr/libexec/java_home -v 17)/bin:$PATH"
-   BUILD="$PX_OUT/build/phoenix/build.tsv"; M2="$HOME/.m2/repository"
-   build_jar() { awk -F '\t' -v k="$1" '$1 == k { print $2 }' "$BUILD"; }
-   CP="$(build_jar pherf_jar):$(build_jar client_jar):$(build_jar bson_jar)"
-   CP="$CP:$M2/javax/xml/bind/jaxb-api/2.3.1/jaxb-api-2.3.1.jar"
-   CP="$CP:$M2/com/sun/xml/bind/jaxb-impl/2.3.9/jaxb-impl-2.3.9.jar"
-   CP="$CP:$M2/javax/activation/activation/1.1/activation-1.1.jar"
-   L="$M2/org/apache/logging/log4j"; V=2.25.5
-   CP="$CP:$L/log4j-slf4j-impl/$V/log4j-slf4j-impl-$V.jar"
-   CP="$CP:$L/log4j-api/$V/log4j-api-$V.jar:$L/log4j-core/$V/log4j-core-$V.jar"
+   B="$PX_OUT/build/phoenix/build.tsv"
+   JAVA="$(awk -F '\t' '$1 == "java_home" { print $2 }' "$B")/bin/java"
+   CP="$(awk -F '\t' '$1 == "pherf_classpath" { print $2 }' "$B")"
    ```
 
    The offline analysis parses the XML result files in each bundle via JAXB, which is no longer
-   bundled in the JDK. Omitting the three JAXB jars causes execution to abort with
-   `NoClassDefFoundError: javax/xml/bind/JAXBContext`. Furthermore, Pherf logs refusal reasons, such
-   as exit 66, exclusively through its logging framework; without the three Log4j jars (matching
-   `log4j2.version` in the root `pom.xml`), SLF4J falls back to a no-op logger and exits silently
-   without explaining the refusal. Because the analysis operates purely on local files and opens no
-   database connections, no running cluster is required. Use a single Pherf jar to analyze both
-   sides, as the analyzer functions as an external evaluation tool rather than a participant in the
-   comparison.
+   shipped with the JDK, while Pherf reports refusal diagnostics such as exit 66 strictly through
+   Log4j; because the recorded classpath includes both dependency sets, refusals are never silent.
+   The analyzer reads local bundle files exclusively and establishes no database connections, so no
+   active cluster is needed. Always invoke a single Pherf jar to evaluate both sets, since the
+   analyzer acts as an independent grading tool rather than a subject of the test.
 
-10. Execute the offline analysis, passing the baseline directory first and the candidate directory
-    second. Because Pherf writes its output report to `RESULTS/` relative to its current working
-    directory, invoke the command from inside `$HOWTO`.
+9. Run the offline comparison, specifying the baseline set directory first and the candidate set
+   directory second. Because Pherf writes the output report under `RESULTS/` relative to the active
+   working directory, execute the command from within `$HOWTO`.
+
+   ```sh
+   (cd "$HOWTO" && "$JAVA" -cp "$CP" org.apache.phoenix.pherf.Pherf \
+     -analyze "$HOWTO/baseline" "$HOWTO/candidate" -label ab)
+   ```
+
+   ```text
+   Set baseline .../howto/h12/baseline: run class validation
+     20261123T101501Z-a11x bundle 20261123T101501Z-a11x class validation contamination
+     [quiet-host] result PASS
+     ...
+   Set candidate .../howto/h12/candidate: run class validation
+     ...
+   Regression response:ab:get steady p99Us +18.4% [+11.2%, +26.9%]
+   pherf.analysis.count_parity	PASS	count	pherf	4 count key(s) equal in 2 set(s)
+   pherf.analysis.regression	ADVISORY	duration	pherf	1 regression(s) of 9 metric(s); worst:
+   response:ab:get steady p99Us +18.4% [+11.2%, +26.9%]; timing is not authoritative: run class
+   validation
+   Analysis: ADVISORY. Report: RESULTS/ANALYSIS_ab.json
+   ```
+
+   While the numerical figures above are illustrative, the output structure matches the exact
+   format produced by the analyzer (with long lines wrapped here for legibility). The comparison
+   summary is written to stdout, whereas Pherf directs INFO log messages and any refusal
+   diagnostics to stderr. The analyzer exits with one of the following status codes:
+
+   - 0: The analysis report was generated and contains no FAIL verdict rows.
+   - 1: An invalid command invocation or unusable input bundle (for instance, a bundle missing its
+     latency report) prevented analysis; no report file is produced.
+   - 66: The input replicates mix different run classes; no report file is produced.
+   - 67: The analysis report was generated and includes at least one FAIL verdict caused by a
+     metric regression or a count-parity mismatch.
+
+10. Query the metric comparison rows and top-level metadata from the generated JSON analysis report.
 
     ```sh
-    (cd "$HOWTO" && java -cp "$CP" org.apache.phoenix.pherf.Pherf \
-      -analyze "$HOWTO/baseline" "$HOWTO/candidate" -label ab); echo "exit $?"
+    jq -r '.comparisons[] | [.operation, .metric, .deltaPct, .ciLowPct, .ciHighPct, .outcome] |
+      @tsv' "$HOWTO/RESULTS/ANALYSIS_ab.json"
+    jq -c '{timingAuthoritative, regressionThresholdPct, seed: .bootstrap.seed, result}' \
+      "$HOWTO/RESULTS/ANALYSIS_ab.json"
     ```
 
     ```text
-    Set baseline .../howto/12/baseline: run class validation
-      20261123T101501Z-a11x bundle 20261123T101501Z-a11x class validation contamination
-      [quiet-host] result PASS
-      ...
-    Set candidate .../howto/12/candidate: run class validation
-      ...
-    Regression response:ab:get steady p99Us +18.4% [+11.2%, +26.9%]
-    pherf.analysis.count_parity	PASS	count	pherf	4 count key(s) equal in 2 set(s)
-    pherf.analysis.regression	ADVISORY	duration	pherf	1 regression(s) of 9 metric(s); worst:
-    response:ab:get steady p99Us +18.4% [+11.2%, +26.9%]; timing is not authoritative: run class
-    validation
-    Analysis: ADVISORY. Report: RESULTS/ANALYSIS_ab.json
-    exit 0
+    query:ab:get	p50Us	3.0864197530864197	-1.9230769230769231	6.024096385542169	unchanged
+    query:ab:get	p99Us	7.6923076923076925	2.0408163265306123	12.359550561797752	unchanged
+    response:ab:get	p99Us	18.421052631578947	11.214953271028037	26.881720430107528	regression
+    run	opsPerSec	-0.08333333333333333	-0.4166666666666667	0.20833333333333334	unchanged
+    {"timingAuthoritative":false,"regressionThresholdPct":10.0,"seed":8070,"result":"ADVISORY"}
     ```
 
-    The numeric values shown above are illustrative, whereas the line structure reflects the exact
-    output format emitted by the analysis tool (with long lines wrapped here for readability). The
-    analysis summary is printed to stdout, while Pherf emits several INFO log lines and any refusal
-    diagnostics to stderr. The tool returns the following exit codes:
-
-    | Exit | Meaning |
-    |---|---|
-    | 0 | The analysis report was written successfully with no FAIL verdict rows. |
-    | 1 | Bad invocation or unusable input (e.g., a bundle with no latency report); no report. |
-    | 66 | The run classes differ across replicates; no report is written. |
-    | 67 | The report is written with a FAIL row from a regression or a count-parity failure. |
-
-11. Inspect all metric comparisons and summary metadata in the generated JSON report.
-
-    ```sh
-    awk -F '"' '/"comparisons"/ { c = 1 } /"unpaired"|"verdicts"/ { c = 0 }
-      c && $2 ~ /^(operation|metric)$/ { printf "%s ", $4 }
-      c && $2 ~ /^(deltaPct|ciLowPct|ciHighPct)$/ {
-        v = $3; gsub(/[:, ]/, "", v); printf "%s %+.1f%% ", $2, v }
-      c && $2 == "outcome" { print $4 }' "$HOWTO/RESULTS/ANALYSIS_ab.json"
-    grep -E '"(timingAuthoritative|regressionThresholdPct|seed|result)"' \
-      "$HOWTO/RESULTS/ANALYSIS_ab.json" | sort -u
-    ```
-
-    ```text
-    query:ab:get p50Us deltaPct +3.1% ciLowPct -1.9% ciHighPct +6.0% unchanged
-    query:ab:get p99Us deltaPct +7.7% ciLowPct +2.0% ciHighPct +12.4% unchanged
-    response:ab:get p99Us deltaPct +18.4% ciLowPct +11.2% ciHighPct +26.9% regression
-    run opsPerSec deltaPct -0.1% ciLowPct -0.4% ciHighPct +0.2% unchanged
-        "result": "ADVISORY"
-        "result": "PASS",
-      "regressionThresholdPct": 10.0,
-      "seed": 8070
-      "timingAuthoritative": false,
-    ```
-
-    The numbers above are illustrative. A median shift exceeding 10% whose confidence interval still
-    straddles zero is classified as `unchanged`, indicating that run-to-run noise is too large to
-    confirm a real difference. Any operation key present in only one of the two sets is listed under
-    `unpaired`. Within `sets`, each entry records the individual replicate measurements, the set
-    median, and its bootstrap interval. Under an open-loop workload, throughput remains equal to the
-    offered rate as long as the cluster keeps pace, meaning that performance regressions manifest in
-    latency first; detecting a throughput regression requires driving the workload at a rate above
-    the saturation knee, as detailed in
+    The figures shown above are illustrative, and each percentage is formatted at full double
+    precision. A median shift greater than 10% whose confidence interval crosses zero is graded as
+    `unchanged`, signifying that run-to-run variance is too wide to establish a statistically
+    significant difference. Operation keys that appear in only one set are recorded under
+    `unpaired`, while each entry under `sets` lists the per-replicate values, the set median, and
+    the bootstrap confidence bounds. In an open-loop workload, throughput matches the offered rate
+    whenever the cluster keeps pace, so regressions surface in latency before affecting throughput;
+    observing a throughput regression requires driving load beyond the saturation knee, as covered
+    in
     [How to find the maximum sustainable throughput and the saturation knee](06-saturation-knee.md).
 
-12. Run the A/A calibration comparison by evaluating the primary baseline set against the second
+11. Execute the A/A calibration check by comparing the primary baseline set against the second
     baseline set. Because both sets executed the exact same container image, the analysis must
     report no regressions.
 
     ```sh
-    (cd "$HOWTO" && java -cp "$CP" org.apache.phoenix.pherf.Pherf \
-      -analyze "$HOWTO/baseline" "$HOWTO/baseline2" -label aa); echo "exit $?"
+    (cd "$HOWTO" && "$JAVA" -cp "$CP" org.apache.phoenix.pherf.Pherf \
+      -analyze "$HOWTO/baseline" "$HOWTO/baseline2" -label aa)
     ```
 
     ```text
     ...
     Analysis: ADVISORY. Report: RESULTS/ANALYSIS_aa.json
-    exit 0
     ```
 
     The output excerpt illustrates only the format, as these steps were not run live. Inspect the
-    individual comparisons in `RESULTS/ANALYSIS_aa.json` using the `awk` command from step 11 and
+    comparison entries in `RESULTS/ANALYSIS_aa.json` with the `jq` query from step 10 and
     confirm that every outcome is `unchanged`. The largest observed `deltaPct` and the widest
     confidence interval define the empirical noise floor of this experimental design; no A/B
     performance effect falling within those bounds can be credibly claimed. If a regression appears
     in the A/A comparison, the experimental setup is too noisy to support valid conclusions. In that
     case, increase the replicate count, extend the run duration, or quiet the host environment
     before repeating the A/A comparison.
+
+    A fleet-wide A/B comparison evaluates merged latency histograms that aggregate each operation
+    key across all participating agents. The `fleet-ab.suite` definition interleaves baseline and
+    candidate runs using this same alternating protocol, and `-analyze` consumes the controller
+    bundle generated for each replicate; see [H15][h15] for complete details.
 
 ### Compare two configurations of one build
 
@@ -672,11 +649,18 @@ renders the test inconclusive.
 
 ## See also
 
-- [Pherf offline analysis](../../../../phoenix-pherf/ANALYSIS.md) documents the required analysis
-  inputs, evaluation rules, and JSON report schema.
-- [How to read Pherf results, grade a run and compare replicates](../../../../phoenix-pherf/docs/howto/06-results-verdict-and-analysis.md)
-  explains how to inspect Pherf outputs, evaluate run verdicts, and compare replicate sets.
-- [The README of the harness, sections "Versions and the HBase profile" and "The version matrix"](../../README.md)
-  covers version pinning, HBase profile selection, and matrix execution.
-- [The result bundle, section "manifest.json"](../bundle-format.md) describes the structure and
+- [Pherf offline analysis](../../../../phoenix-pherf/ANALYSIS.md) specifies the required analysis
+  inputs, evaluation rules, and output report schema.
+- [How to read Pherf results, grade a run and compare replicates][p06] details how to interpret
+  run outputs, evaluate verdict rows, and compare replicate sets.
+- [The README of the harness][readme], sections "Versions and the HBase profile" and "The
+  version matrix", documents version pinning, profile resolution, and matrix execution.
+- [How to compare and stress a fleet: replicates, A/B with -analyze, and faults under fleet
+  load][h15] applies this same A/B methodology to the merged histograms of a distributed fleet
+  using `fleet-ab.suite`.
+- [The result bundle, section "manifest.json"](../bundle-format.md) defines the structure and
   metadata fields of the bundle manifest.
+
+[h15]: 15-fleet-replicates-ab-and-faults.md
+[p06]: ../../../../phoenix-pherf/docs/howto/06-results-verdict-and-analysis.md
+[readme]: ../../README.md

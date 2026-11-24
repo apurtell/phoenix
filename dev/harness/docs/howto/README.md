@@ -26,50 +26,60 @@ underlying hypothesis, the experimental controls and noise sources, the metrics 
 methodology for interpreting results, the conditions that would invalidate the findings, and the
 steps required for full reproduction.
 
-The guides in this directory execute directly on the test harness, which orchestrates Pherf across
-several workflows. By contrast, the companion Pherf guides in `phoenix-pherf/docs/howto` execute
-Pherf against an existing, pre-provisioned cluster; see the [Pherf HOWTO index][pherf-index] for
-that sequence.
+The guides in this directory execute workflows on the test harness, which drives Pherf across
+several scenarios. By contrast, the standalone Pherf guides in `phoenix-pherf/docs/howto` run Pherf
+against an existing, pre-provisioned cluster; see the [Pherf HOWTO index][pherf-index]. The
+Distributed Pherf guides in `phoenix-pherf-distributed/docs/howto` operate a central controller and
+a fleet of load-generation agents; see the [Distributed Pherf HOWTO index][d-index]. Guides H14 and
+H15 orchestrate that distributed fleet directly through the harness.
 
 ## Reading paths
 
 **(a) Prospective users evaluating the tooling.**
 
 * For standalone Pherf evaluation, start with [P01][p01], [P02][p02], [P03][p03], and [P06][p06],
-  and then proceed to [P04][p04] or [P05][p05] as your workload requires. The
+  and then proceed to [P04][p04] or [P05][p05] as your workload requires; the
   [Pherf HOWTO index][pherf-index] catalogues the complete sequence.
 * For harness-managed workflows, follow [H01][h01], [H02][h02], [H04][h04], and [H05][h05].
+* For distributed fleet load generation, start with [D01][d01] to learn the controller, agents, and
+  REST API, and then proceed to [H14][h14] to orchestrate the fleet through the harness.
 
 **(b) Phoenix developers validating a code change.**
 
-* Every validation cycle should run [H02][h02] for build smoke verification, [H04][h04] for
-  baseline scenario execution, [H07][h07] to verify data correctness under load, and [H09][h09] to
-  confirm fault resilience.
-* Run [H08][h08] whenever a modification affects the write path, secondary indexes, or query
-  execution plans.
-* Run [H10][h10] when a change alters CPU utilization or memory allocation profiles.
+* Every validation pass should run [H02][h02] for build smoke testing, [H04][h04] for scenario
+  execution, [H07][h07] for data correctness under load, and [H09][h09] for fault resilience.
+* Run [H08][h08] whenever a change modifies the write path, secondary indexes, or query plans.
+* Run [H10][h10] when a change alters CPU utilization or memory allocation cost.
 * Run [H12][h12] to establish statistically rigorous proof of a performance effect.
+* Run [H14][h14] (`fleet-rww.suite` for read-what-you-wrote verification across agents) and
+  [H15][h15] (fleet replicates, A/B comparisons, and fault injection under fleet load) when a
+  change must be validated under high client concurrency.
 
 **(c) Committers reviewing a performance claim.**
 
-* Review the methodology and evidence using [H01][h01], [H03][h03], and [H12][h12], and then
-  inspect [P06][p06], [H05][h05] for tail latency behavior, and [H10][h10] for root-cause
+* Review the experimental design and evidence using [H01][h01], [H03][h03], and [H12][h12], and
+  then consult [P06][p06], [H05][h05] for tail latency analysis, and [H10][h10] for root-cause
   profiling evidence.
-* Verify the submission against the review checklist defined in [H01][h01]: the runs must use the
+* When evaluating a claim measured across a distributed fleet, consult [D04][d04] for merged
+  histograms, client-bound detection, and start skew, alongside [H15][h15] for fleet replicates and
+  A/B analysis.
+* Verify every submission against the review checklist in [H01][h01]: the runs must use the
   measurement class on a quiet host with no contamination tag, provide at least 3 replicates per
   side (or 5 for a gate), demonstrate a clean A/A comparison, show a confidence interval that
-  excludes zero with an effect size of at least 10%, confirm equal operation counts, achieve PASS
-  verdicts for both attainment and saturation, collect enough samples for each reported
-  percentile, prove that the client was not the bottleneck, keep the version set and random seed
-  identical across sides, and supply archived result bundles.
+  excludes zero with an effect size of at least 10%, confirm equal operation counts, record PASS
+  for both attainment and saturation, collect sufficient samples for each percentile, prove that
+  the client was not the bottleneck (see [D04][d04] for a fleet), preserve the same version set and
+  seed across sides, and supply archived bundles.
 
 **(d) Contributors extending the harness or Pherf.**
 
-* Begin with [H13][h13] and [P07][p07] for extension patterns, alongside [H03][h03] for the bundle
-  layout and exit code semantics and [P02][p02] for the scenario validator rules.
-* Consult the formal architectural contracts in [driver-contract.md][driver],
-  [PLUGINS.md][plugins], [backends.md][backends], [LATENCY.md][latency], [VERDICT.md][verdict],
-  and [ANALYSIS.md][analysis].
+* Start with [H13][h13] and [P07][p07] for extension workflows, alongside [H03][h03] for the bundle
+  structure and exit codes and [P02][p02] for the scenario validator rules.
+* Next, consult the formal architectural contracts: [driver-contract.md][driver],
+  [PLUGINS.md][plugins], [backends.md][backends], [LATENCY.md][latency], [VERDICT.md][verdict], and
+  [ANALYSIS.md][analysis].
+* For distributed fleet extensions, review [D01][d01], [D03][d03], and the
+  [README of phoenix-pherf-distributed][module].
 
 ## The HOWTOs
 
@@ -82,27 +92,37 @@ workflow that operates without a running cluster.
 
 | # | Purpose | Cost | Live |
 |---|---|---|---|
-| [H01][h01] | Establish a trustworthy measurement protocol. | 10 min, no cluster | offline |
-| [H02][h02] | Compile code, boot a cluster, and smoke-test a build. | 45 min, 8.5-18.8 GiB | yes |
-| [H03][h03] | Inspect, validate, and archive bundles; script exit codes. | 20 min, 8.5 GiB | yes |
+| [H01][h01] | Plan a trustworthy performance measurement. | 10 min, no cluster | offline |
+| [H02][h02] | Build, bring up a cluster, and smoke-test a build. | 45 min, 8.5-18.8 GiB | yes |
+| [H03][h03] | Read, validate, archive bundles; automate on exit codes. | 20 min, 8.5 GiB | yes |
 | [H04][h04] | Execute a Pherf scenario through the test harness. | 12 min, 8.5 GiB | yes |
-| [H05][h05] | Verify an open-loop latency SLO and soak. | 25 min and the soak, 8.5 GiB | partly |
-| [H06][h06] | Identify maximum sustainable throughput and the knee. | 30 min, 8.5 GiB | partly |
-| [H07][h07] | Verify read-what-you-wrote correctness under load. | 10 min, 8.5 GiB | partly |
-| [H08][h08] | Measure ingest, inspect plans, and cost a secondary index. | 25 min, 11.8 GiB | no |
-| [H09][h09] | Inject service faults and quantify recovery behavior. | 30 min, 11.0 GiB | yes |
-| [H10][h10] | Profile an active workload run and isolate root causes. | 25 min, 8.5 GiB | yes |
-| [H11][h11] | Plan capacity, hotspots on 1, 3, 5 RegionServers. | 80-100 min, up to 18.9 GiB | no |
-| [H12][h12] | Compare builds, configs, versions for regressions. | 2 builds, 30 min, 8.5 GiB | no |
+| [H05][h05] | Validate an open-loop SLO and soak (code only). | 25 min + soak, 8.5 GiB | yes |
+| [H06][h06] | Find the maximum sustainable throughput and the knee. | 30 min, 8.5 GiB | yes |
+| [H07][h07] | Prove read-what-you-wrote correctness under load. | 10 min, 8.5 GiB | yes |
+| [H08][h08] | Measure ingest, check plans, and cost a secondary index. | 25 min, 11.8 GiB | no |
+| [H09][h09] | Inject service faults and quantify cluster recovery. | 30 min, 11.0 GiB | yes |
+| [H10][h10] | Profile an active workload run and isolate the root cause. | 25 min, 8.5 GiB | yes |
+| [H11][h11] | Plan capacity on 1, 3, and 5 RegionServers; hotspots. | 80-100 min, 18.9 GiB | no |
+| [H12][h12] | Detect regressions; compare builds and configs. | 2 builds + 30 min, 8.5 GiB | no |
 | [H13][h13] | Extend the harness with plug-ins, checks, and drivers. | 20 min, 8.5 GiB | no |
+| [H14][h14] | Run Pherf across a fleet through the harness. | 15 min + build, 12.5-15 GiB | yes |
+| [H15][h15] | Run fleet replicates, A/B with -analyze, faults under load. | 40 min, 15 GiB | yes |
 
-A status of "partly" designates a guide whose procedure was updated after its initial live cluster
-verification. Specifically, H05 and H06 were expanded to use longer measurement windows, and H07
-was extended with a correctness proof under concurrent load; those added or lengthened runs were
-verified statically against the code, and each guide notes which output excerpts originated from
-the earlier live executions. Finally, H13 was not executed during the live verification pass: both
-its custom plug-in execution (steps 16 and 17) and the example plug-in workflow, which requires
-rebuilding the container image, were verified directly against the source code.
+Certain sections within the "yes" guides were verified statically against the codebase rather than
+executed live: the one-hour soak section of H05, and part 3 of H15 (because executing the
+measurement class on a 24 GiB container engine requires a quiet host, that section cites the H3
+window 2 evidence). Step 12 of H09 references the live absent-instance proof from round D7, which
+requires a manually timed container deletion. The live verification pass did not execute H13: both
+its custom plug-in execution (steps 15 and 16) and the example plug-in workflow, which requires
+rebuilding the container image, were verified directly against the source code. A second live
+verification pass on a Docker Desktop engine configured with 24001 MiB of memory executed steps 10
+through 14 of H04, the updated procedures for H05 through H07, and guides H14 and H15.
+
+The companion guides in the Distributed Pherf series cover standalone fleet operations: [D01][d01]
+deploys a standalone controller and agent fleet and exercises the REST API; [D02][d02] executes a
+multi-step workload plan across a fleet; [D03][d03] covers run cancellation, agent fault handling,
+and controller restarts; and [D04][d04] demonstrates how to scale out the load generator and
+interpret aggregated fleet latency accurately.
 
 ## Shared conventions
 
@@ -223,8 +243,11 @@ executes in the measurement class on a quiet host with full measurement sizing.
 
 ## Coverage of the performance engineering tasks
 
-In the matrix below, an H prefix denotes a harness guide in this directory and a P prefix denotes
-a standalone Pherf guide in `phoenix-pherf/docs/howto`.
+In the coverage matrix below, an H prefix denotes a harness HOWTO in this directory, a P prefix
+denotes a standalone Pherf HOWTO in `phoenix-pherf/docs/howto`, and a D prefix denotes a
+Distributed Pherf HOWTO in `phoenix-pherf-distributed/docs/howto`. The
+[Distributed Pherf HOWTO index][d-index] provides the complete feature coverage matrix for the
+distributed fleet.
 
 | Task | HOWTOs |
 |---|---|
@@ -236,70 +259,91 @@ a standalone Pherf guide in `phoenix-pherf/docs/howto`.
 | Maximum sustainable throughput, the knee | H06 |
 | Capacity planning and scale-out | H11, H01 (sizing) |
 | Bulk load, burst and sustained ingest throughput | H08 |
-| Read-what-you-wrote correctness under load | H07, P04 |
+| Read-what-you-wrote correctness under load | H07, P04, H14 (`fleet-rww.suite`) |
 | Hotspots and skew | H11, P04 |
 | Multi-tenant workloads | P05 |
 | Schema and type coverage | P05, H07 |
 | Query plans and secondary index cost | H08 |
-| Fault injection, resilience, MTTR | H09 |
+| Fault injection, resilience, MTTR | H09, H15 |
 | Soak and endurance | H05, H08 (sustained ingest) |
 | Profiling and root cause | H10, H08 (trace counters) |
 | Noise control and result validity | H01, H03, H05 |
-| Regression detection and A/B with replicates | H12, P06 |
+| Warmup and a cold start inside the measured window | H04, H05 (step 15), D04 |
+| The A/A noise floor and drift between sets | H15 (step 14), H12 |
+| Regression detection and A/B with replicates | H12, P06, H15 |
 | Version and configuration matrices | H12 |
 | Scenario authoring and offline validation | P02 |
 | Extending the harness and Pherf | H13, P07 |
 | Reading and archiving result bundles | H03 |
 | CI and automation | H03 |
 | Reproducibility | H01, H03, H12, P04 |
+| Distributed load generation (fleet) | H14, D01, D02 |
+| Load-generator scale-out: client vs cluster bound | D04, H06, H11 |
+| Coordinated omission across agents, merged histograms | D04 |
+| Per-agent start skew and clock offsets | D04, H14 |
+| Fleet replicates and A/B | H15 |
+| Resilience under fleet load | H15, D03 |
 
 ## Known defects
 
-Live verification of these HOWTOs surfaced four defects. All four have been resolved, though
-builds prior to the fixes still exhibit the earlier behavior.
-* **Memory retention in the Pherf detail report**, resolved in 63c9dd0ec2: builds prior to that
-  commit exhausted a 1 GiB heap once a single query set exceeded approximately 10,000 operations.
+Live verification of these HOWTOs surfaced five defects. The first four have been resolved (though
+builds compiled prior to the fixes still exhibit the earlier behavior), while the fifth remains
+open.
+* **Memory retention in the Pherf detail report**, resolved in 63c9dd0ec2: builds prior to that fix
+  exhausted a 1 GiB heap once a single query set exceeded approximately 10,000 operations.
 * **Spurious HBase `ERROR` log line.** The HBase Master can log `RemoteProcedureDispatcher:
   DelayQueue for RemoteProcedureDispatcher is not empty when timed waiting elapsed` while a table
-  is being dropped, which caused `cluster.log` to report `FAIL` in 2 of 59 runs. The harness allow
-  list now includes this signature so that it is not counted as an error, and the `cluster.log`
-  detail reports `1 allowed: hbase-dispatcher-delayqueue` (H03 step 4).
-* **Missing region count prior to a disruption.** Immediately after a rebalance, a RegionServer
+  is being dropped, which caused `cluster.log` to evaluate to `FAIL` in 2 of 59 runs. The harness
+  allow list now recognizes this signature so that it is not counted as an error, and the
+  `cluster.log` detail records `1 allowed: hbase-dispatcher-delayqueue` (see H03, step 3).
+* **Missing region count prior to a disruption.** Immediately following a rebalance, a RegionServer
   can respond to JMX queries without publishing `regionCount`, which previously prevented the next
-  `--disrupt` entry from being injected. `px-run` now retries reading the region count within the
-  readiness timeout bound (H09 step 13).
+  `--disrupt` action from being injected. `px-run` now retries reading the region count within the
+  configured readiness timeout bound (see H09, step 12).
 * **`signal STOP` did not pause the JVM.** Container signals were previously delivered to `tini`,
-  the initial process of the container. Every signal other than `KILL` and `TERM` is now delivered
+  the initial process of the container. Every signal other than `KILL` and `TERM` is now routed
   directly to the JVM process, and any `STOP` signal that fails to place the JVM into a stopped
-  state is reported as a failure (H09 step 13).
+  state is immediately recorded as a failure (see H09, step 12).
+* **Open: the recovery gate misses a delayed process exit after the initial readiness check
+  succeeds.** In a cluster with 2 RegionServers, a 50 s pause expired the ZooKeeper session of
+  RegionServer 0, causing it to abort 3.5 s after receiving `CONT`. Because the initial readiness
+  poll had already observed RegionServer 0 as ready, the recovery barrier proceeded to wait on the
+  Master, which reported `1 of 2 RegionServers checked in`. Consequently, the gate waited out the
+  full 600 s of `PX_TIMEOUT_READY` and terminated with `timeout, exit 4` rather than failing
+  immediately. The `cluster.recovery` check evaluates to FAIL in either case, and on a cluster with
+  1 RegionServer the gate fails immediately (H15 step 22, H09 step 13).
 
 ## Out of scope
 
-* Distributed and multi-client load generation are not yet covered because Distributed Pherf (W2)
-  remains under development, and its companion guides will follow once the D track lands.
-* Kubernetes backends, service mesh integration, and container image promotion are deferred until
-  the K track lands; in the current release, `px-k3d` exits with code 5.
-* Network partitions, synthetic network latency injection, and disk-full fault modes are excluded
-  because the harness fault injector supports only process kill, signal delivery, and container
-  restart actions (H09).
-* Direct execution of JDBC or HBase clients on the host machine is excluded by architectural
+* Kubernetes backends, service mesh integration, and image promotion are deferred to the upcoming
+  Kubernetes HOWTOs in the K track. The harness README documents the local workflow: run
+  `px-k3d create` followed by `px-cluster --backend k8s` commands; `px-cluster down` tears down
+  only the harness cluster, whereas `px-cluster down --label k3d.cluster=px` also deletes the local
+  k3d cluster.
+* Network partitions, synthetic latency injection, and disk-full fault modes are not supported; the
+  harness fault injector provides process kill, signal delivery, and service restart actions only
+  (H09).
+* Direct execution of a JDBC or HBase client on the host machine is excluded by architectural
   design.
 * The Phoenix Query Server (PQS) and the thin JDBC driver are not provisioned by the harness;
-  Pherf's `-t` option is noted only for reference.
-* Workloads exercising vector data types are not covered in this series.
-* MapReduce bulk loading via `CsvBulkLoadTool` is omitted because the MapReduce job client and
+  Pherf's `-t` option is mentioned for reference only.
+* Workloads exercising vector data types are not covered in this curriculum.
+* MapReduce bulk loading via `CsvBulkLoadTool` is not covered because the MapReduce job client and
   cluster configuration inside the container image remain unverified
   ([H08, "Not covered"][h08-mr]).
 
 ## Reference
 
-* Consult [../../README.md](../../README.md) for the harness command reference, operational
-  policy, configuration parameters, host safety guards, exit codes, and verdict severity rules.
-* See [../bundle-format.md][bundle], [../driver-contract.md][driver], [../PLUGINS.md][plugins],
-  and [../backends.md][backends] for the formal harness architectural contracts.
+* Consult [../../README.md](../../README.md) for the harness command reference, operational policy,
+  configuration parameters, host safety guards, exit codes, and verdict severity rules.
+* See [../bundle-format.md][bundle], [../driver-contract.md][driver], [../PLUGINS.md][plugins], and
+  [../backends.md][backends] for the formal harness architectural contracts.
 * See [README.md][pherf-readme], [LATENCY.md][latency], [VERDICT.md][verdict], and
-  [ANALYSIS.md][analysis] for the Pherf subsystem contracts and specifications.
-* Browse the [Pherf HOWTO index][pherf-index] for standalone load generation guides.
+  [ANALYSIS.md][analysis] for the Pherf subsystem contracts.
+* Browse the [Pherf HOWTO index][pherf-index] for standalone load-generation guides.
+* Consult the [README of phoenix-pherf-distributed][module] for the architecture of the Distributed
+  Pherf processes, workload plans, work splitting, REST API, and run bundle layout.
+* Browse the [Distributed Pherf HOWTO index][d-index] for distributed fleet guides.
 
 [bundle]: ../bundle-format.md
 [driver]: ../driver-contract.md
@@ -310,6 +354,12 @@ builds prior to the fixes still exhibit the earlier behavior.
 [latency]: ../../../../phoenix-pherf/LATENCY.md
 [verdict]: ../../../../phoenix-pherf/VERDICT.md
 [analysis]: ../../../../phoenix-pherf/ANALYSIS.md
+[module]: ../../../../phoenix-pherf-distributed/README.md
+[d-index]: ../../../../phoenix-pherf-distributed/docs/howto/README.md
+[d01]: ../../../../phoenix-pherf-distributed/docs/howto/01-standalone-fleet-and-rest-api.md
+[d02]: ../../../../phoenix-pherf-distributed/docs/howto/02-first-fleet-run.md
+[d03]: ../../../../phoenix-pherf-distributed/docs/howto/03-faults-cancel-and-restart.md
+[d04]: ../../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
 
 [h01]: 01-measurement-protocol.md
 [h02]: 02-first-cluster-and-smoke.md
@@ -324,6 +374,8 @@ builds prior to the fixes still exhibit the earlier behavior.
 [h11]: 11-scale-out-capacity-and-skew.md
 [h12]: 12-regression-ab-and-matrices.md
 [h13]: 13-extending-the-harness.md
+[h14]: 14-fleet-through-the-harness.md
+[h15]: 15-fleet-replicates-ab-and-faults.md
 [h08-mr]: 08-ingest-plans-and-index-cost.md#not-covered-mapreduce-bulk-load
 [p01]: ../../../../phoenix-pherf/docs/howto/01-first-pherf-run.md
 [p02]: ../../../../phoenix-pherf/docs/howto/02-scenario-authoring-and-validation.md

@@ -47,16 +47,27 @@ who review performance and overhead claims for data ingestion or secondary index
   [04-pherf-through-the-harness.md](04-pherf-through-the-harness.md).
 * Your container engine provides at least 16 GiB of total memory, allowing the preflight check to
   admit up to 12288 MiB of aggregate container limits.
+* You have `jq` installed on the host for steps 8 and 14, the optional sustained ingest section,
+  and "Reproduce it", all of which parse JSON, along with `curl` for the sustained ingest section.
 
 | Cost | Value |
 |---|---|
-| Wall time | ~25 min: 4 Pherf loads (3 to 4 min), 2 psql runs, YARN, up/down; +20 min sustained |
-| Docker memory | 12032 MiB in validation: 1 RegionServer (8704 MiB) and rendered YARN (3328 MiB) |
-| Disk | Under 1 GiB of disk space within `$PX_OUT` |
-| Files written | `$PX_OUT/howto/08/`, 7 run bundles in `$PX_OUT/runs/`, 1 session in `sessions/` |
+| Wall time | About 25 min total, plus about 20 min more for the optional sustained ingest run. |
+| Docker memory | 12032 MiB in validation: 1 RegionServer (8704 MiB) and rendered YARN (3328 MiB). |
+| Disk | Less than 1 GiB of space under `$PX_OUT`. |
+| Files written | `$PX_OUT/howto/h08/`, 7 bundles in `$PX_OUT/runs/` and 1 session in `sessions/`. |
 
-Although the YARN group remains stopped until step 21, the preflight check still includes its
-configured memory limits in the total allocation budget.
+The 25-minute total encompasses 4 Pherf data loads of 3 to 4 minutes each, 2 psql runs, the YARN
+group startup, cluster bring-up, and teardown. Although the YARN service group remains stopped
+until step 20, the preflight check still counts its container limits toward the memory budget.
+
+Begin every shell session for this guide by running these three setup lines:
+
+```sh
+export PATH="$PWD/dev/harness/bin:$PATH"
+export PX_OUT="${PX_OUT:-$HOME/phoenix-harness}"
+HOWTO="$PX_OUT/howto/h08"; mkdir -p "$HOWTO"
+```
 
 ## Method
 

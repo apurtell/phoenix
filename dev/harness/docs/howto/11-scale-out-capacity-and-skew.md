@@ -273,39 +273,49 @@ sizes also invalidates the comparison.
    regionserver-0 cpu mean ...% over ... samples
    ```
 
-   Bounding the calculation to the open-loop schedule interval excludes the initial load phase.
-   The excerpt above illustrates the output format. The RegionServer must be the limiting resource,
-   exhibiting high processor utilization while client 0 retains headroom. If client 0 approaches
-   its share of host CPU, or if the saturation verdict reports a late dispatcher, stop here because
-   this host cannot demonstrate scale-out for this workload. Select a workload that performs more
-   server-side work per operation, or wait for distributed Pherf (W2), which is forthcoming.
+   Bounding the averaging window to the open-loop schedule interval excludes the initial data load
+   phase. The excerpt above illustrates the output format. For this experiment to be valid, the
+   RegionServer must be the limiting bottleneck, exhibiting high processor utilization while client
+   0 retains spare headroom. If client 0 approaches its share of the host processors, or if the
+   saturation verdict diagnostic identifies a lagging dispatcher, stop here because this host
+   cannot demonstrate horizontal scale-out for this workload. Either select a workload that
+   performs more server-side work per operation, or drive the workload from a fleet of Distributed
+   Pherf agents; see [How to run Pherf on a fleet through the
+   harness](14-fleet-through-the-harness.md) and [How to scale out the load generator and read
+   fleet latency correctly][d04]. Note that on a single machine the fleet agents still share the
+   container engine's processors with the RegionServers, so deploying a local fleet removes the
+   bottleneck of a single client JVM without removing the capacity bound of the host.
 
 ### Change the size of the live cluster
 
-7. Scale the active cluster to 3 RegionServers. Pass `scale` the same `--class`, `--config`, and
-   `-e` arguments used during bring-up; any rendered topology that alters another service instance
-   is rejected with exit 2. The preflight memory check validates the new render before starting
-   containers and fails with exit 3 if it does not fit:
+6. Resize the running cluster to 3 RegionServers. Because `scale` re-renders the deployment from
+   the persisted cluster record with the updated instance count and writes that count back to the
+   record, you do not need to repeat any bring-up flags; any render that modifies another service
+   instance is rejected with exit code 2. The preflight memory check verifies the updated topology
+   before launching containers and aborts with exit code 3 if the deployment exceeds the budget:
 
    ```sh
-   px-cluster --class validation scale regionserver 3; echo "exit $?"
+   px-cluster scale regionserver 3
    px-cluster status regionserver
    ```
 
    ```text
-   exit 0
    role          index  instance_id  state    ready  image_ref  node
    regionserver  0      ...          running  yes    ...
    regionserver  1      ...          running  yes    ...
    regionserver  2      ...          running  yes    ...
    ```
 
-   Only the newly added instances start. Existing regions remain on their current servers until
-   the HBase balancer migrates them, so newly started RegionServers begin with no regions. Because
-   each run in this HOWTO creates its table after the scaling operation, HBase assigns the new
-   regions evenly across all active servers immediately, avoiding any wait for the balancer. If
-   the balancer relocates a region while a run is in progress, that run reports its read skew
-   verdict as `SKIP`.
+   Similarly, `px-pherf scale COUNT` resizes the Distributed Pherf agent pool using the persisted
+   cluster record and blocks until every agent reports IDLE; see [H14][h14].
+
+   During a scale-out operation, only the newly added instances are started. Existing regions
+   remain on their current hosts until the HBase balancer migrates them, meaning that a newly
+   added RegionServer initially hosts no regions. Because each run in this HOWTO creates its target
+   table after the scaling step completes, HBase assigns the new table's regions across all active
+   servers immediately, so the measurement does not depend on waiting for the balancer. If the
+   balancer relocates a region while a run is in progress, that run reports its read skew verdict
+   as `SKIP`.
 
 7. Run the identical rate sweep against the 3-RegionServer topology:
 
@@ -684,13 +694,17 @@ px-cluster down
 
 ## See also
 
-* [06-saturation-knee.md](06-saturation-knee.md): locating the saturation knee of a single cluster,
-  configuring rate ramps and discrete steps, and distinguishing client from cluster bottlenecks.
-* [01-measurement-protocol.md](01-measurement-protocol.md): run classes, sizing contamination
-  rules, and the 24 GiB memory override profile.
-* [08-ingest-plans-and-index-cost.md](08-ingest-plans-and-index-cost.md): salting strategies for
-  write ingest workloads.
-* [VERDICT.md](../../../../phoenix-pherf/VERDICT.md): specification of the read skew check and its
+* [06-saturation-knee.md](06-saturation-knee.md): explains how to locate the saturation knee of a
+  single cluster using rate ramps and steps, and how to distinguish client from cluster
+  bottlenecks.
+* [01-measurement-protocol.md](01-measurement-protocol.md): defines the run classes, sizing
+  contamination rules, and the 24 GiB memory override profile.
+* [08-ingest-plans-and-index-cost.md](08-ingest-plans-and-index-cost.md): covers table salting for
+  ingestion workloads.
+* [VERDICT.md](../../../../phoenix-pherf/VERDICT.md): specifies the read skew health check and its
   operational bounds.
-* [../backends.md](../backends.md): host port mapping and live deployment scaling mechanics.
-* [../../README.md](../../README.md): preflight validation checks and host memory budget rules.
+* [../backends.md](../backends.md): documents host port mappings and live deployment scaling.
+* [../../README.md](../../README.md): describes the preflight checks and host memory budget rules.
+
+[d04]: ../../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
+[h14]: 14-fleet-through-the-harness.md

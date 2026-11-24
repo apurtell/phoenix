@@ -48,8 +48,12 @@ claims, as well as users who plan an SLO for a Phoenix workload.
 |---|---|
 | Wall time | Allow about 25 minutes for the hands-on steps; a soak runs as long as you choose. |
 | Docker memory | The validation class with 1 RegionServer uses 8704 MiB of container limits. |
-| Disk | Each bundle uses a few MiB, and a one-hour soak with interval export adds a few MiB more. |
-| Files written | `$HOWTO/slo_schema.sql`, `slo_closed.xml`, `slo_open.xml`, `slo_poisson.xml`, `slo.properties`, `slo-response`, `slo-response.hgrm`, `slo-service`, `slo-service.hgrm`, 5 bundles |
+| Disk | Each bundle uses a few MiB; a one-hour soak with interval export adds a few MiB. |
+| Files written | Writes 9 files under `$HOWTO` (listed below) and 5 bundles. |
+
+The artifacts written under `$HOWTO` are `slo_schema.sql`, `slo_closed.xml`, `slo_open.xml`,
+`slo_poisson.xml`, `slo.properties`, `slo-response`, `slo-response.hgrm`, `slo-service`, and
+`slo-service.hgrm`.
 
 Begin every shell session for this guide by running these three setup lines:
 
@@ -170,10 +174,9 @@ quiet host as described in [How to plan a trustworthy measurement](01-measuremen
    EOF
    ```
 
-   When `<coGeneration>` is configured, every column value is derived deterministically from the
-   row index and the seed, and point lookups sample only rows that were committed during the load
-   phase. See
-   [How to generate verifiable data with co-generation](../../../../phoenix-pherf/docs/howto/04-co-generation.md).
+   When `<coGeneration>` is configured, each column value is derived as a deterministic function of
+   the row index and the seed, and every point lookup targets only rows that were committed during
+   the load phase. See [How to generate verifiable data with co-generation][p04].
 
 4. Write the open-loop scenario configuration for the same table and query, offering 50 operations
    per second for 30 s across 4 workers with UNIFORM arrivals and the LATE lag policy with no lag
@@ -373,46 +376,33 @@ quiet host as described in [How to plan a trustworthy measurement](01-measuremen
     for 200 s, setting the harness p99 check to the same 50 ms bound.
 
     ```sh
-    RUN_S="$(px-run --keep -c validation -d pherf -e PX_THRESHOLD_STEADY_P99_MS_MAX=50 -- \
-      --scenario "$HOWTO/slo_open.xml" --schema "$HOWTO/slo_schema.sql" \
-      --properties "$HOWTO/slo.properties" -- -runDurationMs 200000)"; echo "exit $?"
+    RUN_S="$(px-run pherf -e PX_THRESHOLD_STEADY_P99_MS_MAX=50 -- "${O[@]}" \
+      --properties "$HOWTO/slo.properties" -- -runDurationMs 200000)"
     grep -E 'tail_latency|steady.query_latency' "$RUN_S/report/verdicts.tsv" | cut -f 1,2,5
-    grep -E '"(operation|count|p50Us|p90Us|p99Us|p999Us)"' \
+    jq -r '.histograms[] | [.operation, .phase, .count, .p50Us, .p90Us, .p99Us, .p999Us] | @tsv' \
       "$RUN_S/drivers/pherf/results_HDR/LATENCY_run.json"
     ```
 
     ```text
-    exit 0
     pherf.health.tail_latency    PASS  all 2 keys within the bounds p99 50 ms, p99.9 200 ms;
-    highest response:slo_open:get p99 10.095 ms, p99.9 11.863 ms
-    steady.query_latency.p99_ms  PASS  the highest p99 is 10.095 ms in steady@pherf;
+    highest response:slo_open:get p99 7.383 ms, p99.9 13.383 ms
+    steady.query_latency.p99_ms  PASS  the highest p99 is 7.383 ms in steady@pherf;
     steady.p99_ms.max=50
-          "operation": "query:slo_open:get",
-          "count": 1500,
-          "p50Us": 2535,
-          "p90Us": 3471,
-          "p99Us": 4723,
-          "p999Us": 10559
-          "operation": "query:slo_open:get",
-          "count": 200,
-          ...
-          "operation": "response:slo_open:get",
-          "count": 1500,
-          "p50Us": 5271,
-          "p90Us": 8171,
-          "p99Us": 10095,
-          "p999Us": 11863
+    query:slo_open:get	steady	10000	2143	3371	5103	10783
+    query:slo_open:get	warmup	200	6159	8567	1172479	1172479
+    response:slo_open:get	steady	10000	3297	5615	7383	13383
     ```
 
-    These values are illustrative. Both checks grade the worst key across the `query`, `scan`,
-    `delete`, `response`, and `operation` categories, so the slower response key governs the
-    result. The output excerpt above was captured from a 30 s run without the duration override:
-    30 s at 50 operations per second yields 1500 samples, which is sufficient for p99 but leaves
-    p99.9 dependent on only one or two observations. Passing `-runDurationMs 200000` extends the
-    window to 200 s and collects 10,000 samples, providing the sample depth required for a p99.9
-    claim. The second `query:` entry with 200 samples represents the `warmup` phase (50 warmup
-    executions across each of the 4 workers). The JSON report exposes the same metric keys recorded
-    in `metrics/aggregate.tsv` (`op@response_slo_open_get` and `pherf.latency.p999_us`).
+    Both checks evaluate the worst key across the `query`, `scan`, `delete`, `response`, and
+    `operation` categories, meaning that the slower response key governs the outcome. Passing the
+    override `-runDurationMs 200000` runs the workload for 200 s at 50 operations per second to
+    collect 10,000 samples, which is sufficient for a p99.9 claim resting on 10 tail observations.
+    A 30 s window would yield only 1500 samples—sufficient for a p99 claim, but leaving p99.9
+    dependent on only one or two observations. The second `query:` entry, containing 200 samples,
+    records the `warmup` phase across 50 warmup executions on each of the 4 workers; its p99 of
+    1.17 s reflects the cold-start overhead that the warmup phase isolates from the steady-state
+    keys. The JSON report exposes the same metric keys that `metrics/aggregate.tsv` records
+    (`op@response_slo_open_get`, `pherf.latency.p999_us`).
 
     Both latency checks constitute `duration` evidence. On a validation-class run, exceeding a
     threshold produces ADVISORY rather than FAIL: Pherf downgrades its own verdict row because the
@@ -441,18 +431,19 @@ quiet host as described in [How to plan a trustworthy measurement](01-measuremen
     query:slo_open:get|warmup
     response:slo_open:get|steady
     "Timestamp","Int_Count","Int_50%","Int_90%","Int_Max","Total_Count","Total_50%","Total_90%",...
-    5.005,181,6.075,8.887,11.863,181,6.075,8.887,11.639,11.863,11.863,11.863
-    10.006,250,5.475,8.671,10.559,431,5.739,8.719,10.703,11.863,11.863,11.863
+    5.006,174,4.627,6.691,15.031,174,4.627,6.691,9.311,15.031,15.031,15.031
+    10.007,250,4.319,6.675,11.991,424,4.487,6.675,7.947,15.031,15.031,15.031
+    15.006,250,3.983,6.503,22.607,674,4.283,6.675,8.783,22.607,22.607,22.607
     ```
 
-    These values are illustrative. Each CSV row represents one export interval, listing its end
-    time in seconds from the start of the log, its interval sample count, p50, p90, and maximum,
-    followed by the cumulative totals up to that interval. Meanwhile, `slo-response.hgrm` contains
-    the full percentile distribution across the entire run. An interval in which the sample count
-    drops while p90 and the maximum spike indicates a transient stall; correlate that timestamp
-    against `logs/gc/` and the daemon instance logs in the bundle. The per-interval counts for a
-    key sum to its total count in the JSON report: in the 30 s run shown in the excerpt, an initial
-    interval of 181, five intervals of 250, and a final interval of 69 sum to 1500.
+    Each CSV row represents one export interval, reporting its end timestamp in seconds from the
+    start of the log, its interval sample count, p50, p90, and maximum, followed by the cumulative
+    totals up to that point. Meanwhile, `slo-response.hgrm` captures the percentile distribution
+    across the entire run. An interval in which the sample count drops while p90 and the maximum
+    spike indicates a transient stall; correlate that timestamp against `logs/gc/` and the daemon
+    instance logs in the bundle. The per-interval counts for a metric key sum to its total count in
+    the JSON report: here across 41 intervals, an initial interval of 174, followed by 39 intervals
+    of 250 and a final interval of 76, sum to 10,000.
 
 14. Repeat the SLO run using POISSON arrivals at the same mean rate with a fixed seed.
 
@@ -468,15 +459,15 @@ quiet host as described in [How to plan a trustworthy measurement](01-measuremen
     ```
 
     ```text
-    uniform 10095 poisson 13551
+    uniform 7383 poisson 10583
     ```
 
-    These illustrative values come from 30 s runs. Because POISSON arrivals cluster in random bursts
-    around the same mean rate—just as independent clients do—short transient queues form and can
-    elevate the response-time tail at an identical average rate. A UNIFORM arrival schedule
-    represents a gentler workload, so always specify the arrival process in every SLO claim. The
-    fixed seed makes the arrival timestamps deterministic so that replicates reproduce the exact
-    same bursts.
+    Because POISSON arrivals cluster in random bursts around the same mean rate—just as independent
+    clients do—short transient queues form and can elevate the response-time tail even at an
+    identical average rate. By contrast, a UNIFORM arrival schedule represents a more benign
+    workload, so always state the arrival process explicitly in every SLO claim. The fixed random
+    seed makes the arrival schedule deterministic so that each replicate reproduces the exact same
+    bursts.
 
 15. Verify that the warmup period was long enough by examining the service time across each interval
     of the steady phase of the SLO run. Inspect the service key rather than the response key, which
@@ -490,29 +481,41 @@ quiet host as described in [How to plan a trustworthy measurement](01-measuremen
     ```
 
     ```text
-    5.005 s  p50 ... ms  p90 ... ms
-    10.006 s  p50 ... ms  p90 ... ms
-    ...
+    5.006 s  p50 3.723 ms  p90 4.923 ms
+    10.007 s  p50 3.267 ms  p90 4.227 ms
+    15.006 s  p50 2.965 ms  p90 4.049 ms
+    20.006 s  p50 2.839 ms  p90 3.809 ms
+    25.005 s  p50 2.637 ms  p90 3.567 ms
+    30.005 s  p50 2.813 ms  p90 3.613 ms
+    35.005 s  p50 2.501 ms  p90 3.349 ms
+    40.006 s  p50 2.431 ms  p90 3.355 ms
     ```
 
-    Because the live verification did not capture output for this step, the excerpt illustrates only
-    the output format. The warmup duration was sufficient if the p50 and p90 latencies of the
-    initial intervals are no higher than those of subsequent intervals. If they trend downward over
-    the first N intervals, the JVM JIT compiler or an internal cache was still warming up during the
-    measured window. In that case, either raise `warmupExecutions` until the warmup spans at least N
+    The warmup duration was sufficient if the p50 and p90 latencies of the initial intervals are no
+    higher than those of subsequent intervals. When they trend downward across the first N
+    intervals, the JVM JIT compiler or an internal cache was still warming up during the measured
+    window. In that case, either raise `warmupExecutions` until the warmup spans at least N
     intervals, or prepend a leading query set with its own distinct query id ahead of the measured
     query set and make no latency claims from that leading set.
 
+    In this run, the warmup period was not long enough: the interval p50 fell from 3.7 ms to 2.4 ms
+    across the first 8 intervals (40 s), whereas later intervals settled between 1.7 and 2.3 ms.
+    Executing 50 warmup iterations per worker absorbed the initial connection establishment and
+    region location lookups (reflected in the 1.17 s warmup p99 from step 12), but did not drive
+    the JIT compiler to steady state. The SLO evaluation in step 12 still passes because those early
+    intervals, while slower, remained well within the threshold bound. To make a formal steady-state
+    latency claim, either exclude the first 40 s or increase the warmup duration accordingly.
+
 ## Read the result
 
-- **The SLO holds** when response p99 and p99.9 remain within their bounds, schedule attainment is
-  at least 90%, and each target percentile has a sufficient sample count. On a validation-class run,
-  a passing result serves as a rehearsal; repeating the same procedure on a measurement-class run
-  with no contamination tag provides authoritative evidence, and running three replicates produces a
-  distribution as described in
-  [How to detect a regression and compare builds, configurations and versions](12-regression-ab-and-matrices.md).
+- **The SLO holds** when the response p99 and p99.9 remain within their bounds, schedule attainment
+  is at least 90%, and each target percentile has a sufficient sample count. On this validation
+  run, a passing result serves as a rehearsal; repeating the same steps on a measurement run with
+  no contamination tag provides authoritative evidence, and running three replicates establishes a
+  distribution (see [How to detect a regression and compare builds, configurations and
+  versions](12-regression-ab-and-matrices.md)).
 - **The SLO fails** when a latency bound is exceeded while schedule attainment is at least 90%.
-  Locate the timestamp of the tail spike in the interval log and consult
+  Inspect the interval log to locate the timestamp of the tail spike, and then consult
   [How to profile a run and find the root cause](10-profiling-and-root-cause.md).
 - **The run is invalid** when schedule attainment falls below 90% or the saturation verdict row
   fails, indicating that the run measured an overload condition. Either lower the offered rate or
@@ -530,14 +533,13 @@ harness code and the live runs from the steps above, although the multi-hour soa
 executed live for this HOWTO.
 
 1. Understand what this soak exercises. Because the workload is strictly read-only against a
-   10,000-row table, this soak tests the read execution path, the heap and garbage collection
-   behavior of each JVM, and daemon log output. It does not exercise data volume growth, memstore
-   flush and compaction debt, region splits, or store-file accumulation, because a read-only
-   workload triggers none of those mechanisms. To run an endurance test of the storage engine, the
-   workload must write continuously throughout the soak at a rate that fills and flushes the
-   memstores many times; see the sustained ingest workload in
-   [How to measure ingest throughput, check query plans and cost a secondary index](08-ingest-plans-and-index-cost.md).
-   Step 4 below monitors store-file and compaction trends in either case.
+   10,000-row table, this soak evaluates the read execution path, the heap and GC behavior of each
+   JVM, and daemon log output. It does not exercise data volume growth, memstore flush and
+   compaction debt, region splits, or store-file accumulation, because a read-only load triggers
+   none of those mechanisms. For an endurance test of the datastore, the workload must write
+   continuously throughout the soak at a rate that fills the memstores many times; see the
+   sustained ingest workload in [How to measure ingest throughput, check query plans and cost a
+   secondary index][h08]. Step 4 monitors the store-file and compaction trends in either case.
 
 2. Plan the workload volume and timeout bounds for a single one-hour soak run. Passing the override
    `-runDurationMs 3600000` scales the stage in `slo_open.xml` to one hour, generating 180,000
@@ -681,10 +683,19 @@ verdicts remain ADVISORY.
 
 ## See also
 
-- [Pherf latency outputs](../../../../phoenix-pherf/LATENCY.md): documents the latency metric keys,
+- [Pherf latency outputs](../../../../phoenix-pherf/LATENCY.md): Documents the latency metric keys,
   schedule telemetry entries, and interval histogram export.
-- [The Pherf health verdict](../../../../phoenix-pherf/VERDICT.md): documents the tail latency,
+- [The Pherf health verdict](../../../../phoenix-pherf/VERDICT.md): Documents the tail latency,
   schedule attainment, and worker saturation checks along with their thresholds.
-- [How to drive an open-loop workload with profiles and operation mixes](../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md)
-- [How to read Pherf results, grade a run and compare replicates](../../../../phoenix-pherf/docs/howto/06-results-verdict-and-analysis.md)
+- [How to drive an open-loop workload with profiles and operation mixes][p03]
+- [How to read Pherf results, grade a run and compare replicates][p06]
+- [How to scale out the load generator and read fleet latency correctly][d04]: Explains how to run
+  the same open-loop workload across multiple agents, producing a single merged histogram per metric
+  key while accounting for agent start skew.
 - [The result bundle, section "The cluster checks"](../bundle-format.md)
+
+[d04]: ../../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
+[h08]: 08-ingest-plans-and-index-cost.md
+[p03]: ../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md
+[p04]: ../../../../phoenix-pherf/docs/howto/04-co-generation.md
+[p06]: ../../../../phoenix-pherf/docs/howto/06-results-verdict-and-analysis.md

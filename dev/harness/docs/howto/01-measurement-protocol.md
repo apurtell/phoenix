@@ -97,25 +97,26 @@ overhead, pass `-e PX_COLLECTORS=none` to both sides of the test.
 Several systemic and environmental factors can perturb latency and throughput measurements even
 when the code under test remains unchanged:
 
-* Concurrent host activity: competing processes such as web browsers, compilation jobs, background
-  file indexers, or a secondary container engine.
-* Container runtime memory management: environments like Docker Desktop may reclaim virtual machine
-  memory after the last running container terminates, forcing the subsequent cluster startup to
-  absorb memory reallocation overhead.
-* Host power management and thermal regulation: system sleep states, battery power-saving modes,
-  and CPU thermal throttling. Although the harness actively inhibits system sleep while a cluster
-  remains online, it cannot prevent hardware thermal throttling.
-* Runtime and cache warmup transients: JVM just-in-time (JIT) compilation, dynamic class loading,
-  initial connection establishment, HBase block cache population, and client-side region location
-  caching. Guide H04 demonstrates how to configure the Pherf warmup phase and the client connection
-  cache.
-* Asynchronous cluster maintenance: background HBase and HDFS activities including memstore
-  flushes, storefile compactions, region splits, and region balancer migrations.
-* JVM garbage collection pauses occurring in either the client driver or the server daemons.
-* Load generator artifacts: a client driver that exhausts its worker thread pool, or a closed-loop
-  generator that blocks on each response before issuing the next request, masks the true queueing
-  latency experienced by an external user. Guide H05 examines this architectural distinction
-  between service time and response time.
+* Concurrent load on the host: competing processes such as a web browser, a build job, a background
+  file indexer, or a second container engine.
+* Container engine memory management: Docker Desktop can reclaim the memory of its virtual machine
+  (VM) after the last container stops, forcing the next cluster startup to pay the reallocation
+  overhead.
+* Host power and thermal state: system sleep states, battery power-saving modes, and thermal
+  throttling. Although the harness holds the host awake while a cluster is up, it cannot prevent a
+  hardware thermal limit.
+* Runtime and cache warmup: just-in-time (JIT) compilation, class loading, establishing the first
+  connection, populating the block cache, and caching region locations in the client. Guide H04
+  demonstrates how to configure the Pherf warmup phase and the connection cache.
+* Asynchronous background work in the cluster: memstore flushes, storefile compactions, region
+  splits, and the region balancer.
+* JVM garbage collection activity in both the client driver and the server daemons.
+* The load generator itself: a client driver that runs out of worker threads, or a closed-loop
+  generator that waits for each response before issuing the next request, hides the true queueing
+  latency that a real user sees. Guide H05 examines the distinction between service time and
+  response time. A single client JVM can also become the throughput bound; a fleet of Distributed
+  Pherf agents splits the offered rate across workers and merges the histograms of every agent into
+  a single aggregate histogram per key (see [D04][d04] and [H14](14-fleet-through-the-harness.md)).
 
 The harness mitigates concurrent host contention through the quiet-host gate and exposes garbage
 collection pauses and host scheduling stalls through its telemetry collectors (H10). Managing the
@@ -556,32 +557,33 @@ written summary.
    `manifest.json` under `run.class`.)
 2. Was the host verified to be quiet, with zero contamination tags recorded? (Confirm that
    `quiet_host.state` is `quiet` and `quiet_host.tags` is empty.)
-3. Are at least 3 independent replicates provided for each side of the comparison?
+3. Are there at least 3 independent replicates provided for each side of the comparison?
 4. Does the bootstrap confidence interval of the percentage difference exclude zero in the
    direction of the performance claim? (Check the `-analyze` output fields `comparisons[].ciLowPct`
    and `ciHighPct`.)
-5. Are the record counts identical across all replicates for deterministic workloads? (Verify the
+5. Are the record counts equal across all replicates of a deterministic workload? (Verify the
    count parity rows in the comparative analysis output.)
-6. Are the component version set, container image IDs (excluding the specific build under test),
-   memory sizing, active telemetry collectors, and random seeds held identical across both sides?
-7. Is every replicate bundle archived, and does `px-bundle validate` pass cleanly on each bundle?
-8. Was a well-formed experimental question, including an explicit numerical threshold, stated prior
-   to executing the runs?
+6. Are the component version set, container image IDs (except for the build under test), memory
+   sizing, active telemetry collectors, and random seeds identical on both sides?
+7. Is every replicate bundle archived, and does `px-bundle validate` pass cleanly on each one?
+8. Was a well-formed experimental question, including an explicit decision threshold, stated before
+   executing the runs?
 9. Do both rate attainment and client saturation checks PASS across every replicate? (Verify
    `pherf.health.attainment` and `pherf.health.saturation` to confirm that the intended load was
    actually offered.)
-10. If the claim concerns end-user latency, is it evaluated using the `response:` metric keys from
-    an open-loop workload? (See H05.)
-11. Does every claimed latency percentile q contain at least 10 / (1 - q) recorded samples (for
+10. Does any end-user latency claim evaluate the `response:` metric keys from an open-loop
+    workload? (See H05.)
+11. Does each claimed latency percentile q contain at least 10 / (1 - q) recorded samples (for
     example, at least 1,000 samples for a p99 claim)?
-12. Was the load generator client confirmed not to be the throughput bottleneck? (Inspect the
-    saturation cause alongside the processor utilization of client 0 relative to the RegionServers,
-    as detailed in H06.)
+12. Was the load generator client confirmed not to be the throughput bound? (Inspect the saturation
+    cause and the processor utilization of client 0 relative to the RegionServers, as covered in
+    H06; for a multi-agent fleet, verify the per-agent workload shares and the merged histograms as
+    described in [D04][d04].)
 13. Is the measured steady evaluation window at least 60 s in duration?
-14. Did a preliminary A/A comparison of the identical build produce zero false regressions? (See
-    H12.)
-15. Is the magnitude of the claimed performance effect at least 10%, matching the minimum detection
-    threshold of `-analyze`?
+14. Did a preliminary A/A baseline comparison of the identical build produce zero false
+    regressions? (See H12.)
+15. Is the claimed performance effect at least 10%, matching the minimum detection threshold of
+    `-analyze`?
 
 Any performance claim that fails item 1 or item 2 must be treated as an exploratory hypothesis
 rather than an authoritative result. Such preliminary evidence can still justify scheduling a
@@ -599,11 +601,18 @@ formal measurement run on a quiet host configured with full measurement sizing.
   time for latency SLO evaluation.
 * [12-regression-ab-and-matrices.md](12-regression-ab-and-matrices.md): Covers multi-replicate
   statistical comparisons and A/B test matrices.
+* [14-fleet-through-the-harness.md](14-fleet-through-the-harness.md): Explains how to drive load
+  from a distributed fleet of agents through the harness.
+* [How to scale out the load generator and read fleet latency correctly][d04]: Examines how to
+  distinguish a client bound from a cluster bound and why fleet analysis requires merged histograms
+  rather than averaged percentiles.
 * [../../README.md](../../README.md): Documents configuration precedence rules, host safety
   guardrails, and verdict severity levels.
-* [../bundle-format.md](../bundle-format.md): Specifies the bundle manifest schema and the metric
-  merge lifecycle.
+* [../bundle-format.md](../bundle-format.md): Specifies the bundle manifest schema and the verdict
+  and metric merge lifecycle.
 * [../../../../phoenix-pherf/ANALYSIS.md](../../../../phoenix-pherf/ANALYSIS.md): Describes the
   statistical methodology used by the comparative analyzer.
 * [../../../../phoenix-pherf/VERDICT.md](../../../../phoenix-pherf/VERDICT.md): Explains the
   noisy-host contamination flag within Pherf verdict evaluation.
+
+[d04]: ../../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md

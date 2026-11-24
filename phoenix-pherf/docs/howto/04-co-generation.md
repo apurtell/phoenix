@@ -52,13 +52,16 @@ consistency.
 * Ensure that the tables `PHERF.HOWTO_COGEN` and `PHERF.HOWTO_CLUSTER` do not contain any data
   that must be preserved.
 
-| Cost | Value |
-|---|---|
-| Wall time | Runs take about 10 min, plus about 5 min to bring up a local harness cluster. |
-| Docker memory | None externally; 8704 MiB limits for a validation harness with 1 RegionServer. |
-| Disk | Runs use under 50 MB across `$HOWTO/work`, `$HOWTO/work-a`, and `$HOWTO/work-b`. |
-| Files written | `$HOWTO` holds scenarios; work directories hold `RESULTS/` and `RESULTS_HDR/`. |
-| Tables written | Uses `PHERF.HOWTO_COGEN` (10,000 rows) and `PHERF.HOWTO_CLUSTER` (5,000 rows). |
+**Cost.**
+
+* Wall time: Approximately 10 min of benchmark runs, plus roughly 5 min if bringing up a local
+  harness cluster.
+* Docker memory: None when running against an external cluster; a local harness validation cluster
+  with 1 RegionServer reserves 8704 MiB of container memory limits.
+* Disk: Less than 50 MB in the working directory.
+* Files written: `$HOWTO` stores the scenario XML files, while `$HOWTO/work`, `$HOWTO/work-a`, and
+  `$HOWTO/work-b` store the generated `RESULTS/` and `RESULTS_HDR/` directories.
+* Tables written: `PHERF.HOWTO_COGEN` (10,000 rows) and `PHERF.HOWTO_CLUSTER` (5,000 rows).
 
 ## Method
 
@@ -103,14 +106,24 @@ no separate command-line option or configuration property:
               walk="MULTIPLICATIVE"/>
 ```
 
-| Attribute | Default | Meaning |
-|---|---|---|
-| `seed` | 0 | This value seeds both column value generation and the reader traversal order. |
-| `offset` | 0 | First process row index (at least 0); global index is offset plus local index. |
-| `blockSize` | 1000 | Rows per commit batch (at least 1); never crosses a `blockSize` multiple. |
-| `clusterLimit` | absent: no clustering | Caps leading primary key values per block (at least 1). |
-| `watermark` | `COMMIT` | Readers see blocks on commit (`COMMIT`) or after load ends (`LOAD`). |
-| `walk` | `MULTIPLICATIVE` | Reads by coprime hash (`MULTIPLICATIVE`) or index (`SEQUENTIAL`). |
+The supported configuration attributes and their default values are as follows:
+
+* `seed` (default 0): Seeds both deterministic column value generation and the reader traversal
+  sequence.
+* `offset` (default 0): Specifies the starting row index for this process and must be at least 0.
+  The global index of any generated row equals this offset plus its local row index.
+* `blockSize` (default 1000): Defines the number of rows in each writer block and must be at least
+  1. A block never straddles an integer multiple of `blockSize`, and each block is committed as a
+  single batch.
+* `clusterLimit` (absent by default, disabling clustering): Must be at least 1 when set, and caps
+  the maximum number of distinct leading primary key values generated within each block.
+* `watermark` (default `COMMIT`): Controls reader visibility during data loading. Under `COMMIT`,
+  a block becomes eligible for reading as soon as its commit completes; under `LOAD`, blocks become
+  visible to readers only after all data-load writer threads finish.
+* `walk` (default `MULTIPLICATIVE`): Determines the order in which readers traverse committed rows.
+  Under `MULTIPLICATIVE`, readers step through the key space in a hashed sequence using a stride
+  coprime to the row count so that a complete pass visits every row exactly once; under
+  `SEQUENTIAL`, readers traverse rows in ascending index order.
 
 If an attribute value cannot be parsed—such as `walk="SEQUENTAIL"`—the run fails immediately with
 an error message that identifies the scenario, the attribute name, and the invalid value.
@@ -667,14 +680,26 @@ process offsets manually.
 
 ## See also
 
-* Consult the "Co-generation" and "SCAN and DELETE operations" sections of
-  [README.md](../../README.md) for the complete reference specification.
-* See [P02](02-scenario-authoring-and-validation.md) for details on the `cogen.*`, `key.coverage`,
-  and `predicate.*` validation rules.
-* See [P03](03-open-loop-profiles-and-mixes.md) to run co-generated read workloads under open-loop
-  arrival rates and operation mixes.
-* See [P06](06-results-verdict-and-analysis.md) for verifying count parity across replicate runs.
-* See [P07](07-extending-pherf.md) to implement a custom generator class supporting
+* [README.md](../../README.md), sections "Co-generation" and "SCAN and DELETE operations": Complete
+  reference specification for deterministic data generation and block-level range operations.
+* [P02](02-scenario-authoring-and-validation.md): Details on the `cogen.*`, `key.coverage`, and
+  `predicate.*` rules enforced by the offline validator.
+* [P03](03-open-loop-profiles-and-mixes.md): Guide to driving co-generated read workloads at a
+  controlled arrival rate with an operation mix.
+* [P06](06-results-verdict-and-analysis.md): Guide to verifying exact count parity across
+  replicate runs.
+* [P07](07-extending-pherf.md): Walkthrough of implementing a custom generator class with
   `valueAt(index, seed)`.
-* See [H07](../../../dev/harness/docs/howto/07-read-what-you-wrote.md) for end-to-end
-  read-what-you-wrote verification under load using the cluster test harness.
+* [H07](../../../dev/harness/docs/howto/07-read-what-you-wrote.md): End-to-end read-what-you-wrote
+  verification under load using the test harness.
+* [D02][d02] and [H14][h14]: Guides to partitioning co-generation across multiple distributed
+  agents. Configuring `<coGeneration offset>` with `${pherf.slot.offset}` and specifying `rows` on
+  the execution step assigns each slot i a disjoint row range [o_i, o_i + n_i) such that the union
+  of all slot ranges spans [0, N). Keep the co-generation seed constant across the fleet and omit
+  slot tokens from primary key columns so that every generated key remains a pure function of its
+  global row index. Note that when `clusterLimit` is enabled, the leading primary key column is
+  derived from the slot's local row index, meaning any subsequent step that reads rows written by an
+  earlier step must execute with the same agent count and slot weights.
+
+[d02]: ../../../phoenix-pherf-distributed/docs/howto/02-first-fleet-run.md
+[h14]: ../../../dev/harness/docs/howto/14-fleet-through-the-harness.md

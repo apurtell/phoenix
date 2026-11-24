@@ -23,6 +23,11 @@ each agent streams its recorded interval histograms back to the controller for a
 communication layer is built exclusively on the standard JDK HTTP server and `java.net` using JSON
 request and response bodies, avoiding any external RPC framework or servlet web container.
 
+## HOWTOs
+
+Step-by-step operational guides for this module, progressing from an initial fleet deployment to
+distributed latency analysis, are available in [docs/howto/README.md](docs/howto/README.md).
+
 ## Processes
 
 | Process | Main class | Role |
@@ -425,31 +430,27 @@ half of that minimum delay plus 1 ms. Both controller and agent use wall clocks,
 process shares the wall clock of its agent host.
 
 The run view exposes the step epoch along with each slot's agent clock offset and delay at the
-epoch, its scheduled `startAtMs`, and its controller-normalized dispatch time (`startedMs` minus
-the offset). The error bound on a slot's dispatch time is half the round-trip delay plus 2 ms to
-account for millisecond clock resolution. Because the estimated offset cancels out when computing
-the spread between a slot's scheduled and actual dispatch times, the offset estimation error
-appears only in the error bounds. Once every slot that received a `start` command has reported its
-dispatch time, the controller computes and logs the step skew, which represents a rigorous upper
-bound on the true start skew across the fleet: the latest dispatch time minus the earliest
-dispatch time, plus the two largest individual error bounds. Any slot whose error bound exceeds
-25 ms (corresponding to a round-trip delay above approximately 46 ms) triggers a warning indicating
-that a 50 ms synchronization bound cannot be proven for that slot. If any slot in a step lacks a
-valid clock sample, no skew value is computed for the step.
+epoch, its scheduled `startAtMs`, and its normalized dispatch time (`startedMs` minus the offset).
+The error bound on a dispatch time equals half the delay plus 2 ms to account for the millisecond
+resolution of the clocks. Because the estimated clock offset cancels out of the spread of the
+dispatch times, the offset error affects only the error bounds. Once every slot that received
+`start` reports a dispatch time, the controller computes and logs the step skew, which represents
+an upper bound on the true start skew: the latest dispatch time minus the earliest dispatch time,
+plus the two largest error bounds. Any slot whose error bound exceeds 25 ms (a delay of 48 ms or
+more) receives a warning that the 50 ms bound is not proven for it. A step containing a slot with
+no clock sample records no skew.
 
-- If a `start` command arrives after its target epoch or a sleeping thread wakes up late, the
-  child opens its start gate immediately. The slot dispatches late and the resulting skew reflects
-  the delay, without aborting or retrying the run. In particular, a `start` reply lost to the 5
-  second read timeout arrives approximately 4 seconds after its scheduled epoch.
-- Open-loop workloads gate the dispatch schedule after all worker threads have completed warmup,
-  whereas closed-loop workloads gate each runner thread individually after its own warmup so that
-  the first thread on every agent starts in sync.
-- Data loads (`-l`) and multi-tenant (`-mt`) workloads do not use a start gate; their slots
-  transition directly from `LAUNCHED` to `DONE` without a `start` command, and the step reports no
-  skew.
-- The synchronization error bound assumes that no host wall clock steps during startup. A step
-  containing two slots whose round-trip delays each exceed approximately 46 ms cannot prove a
-  50 ms skew bound.
+- If a `start` command arrives after its epoch or a thread wakes late, the start gate opens
+  immediately. The slot dispatches late and the computed skew reflects the delay, without aborting
+  or retrying. A `start` reply lost to the 5 second read timeout arrives about 4 seconds after its
+  epoch.
+- An open-loop workload gates its schedule after all workers complete warmup, whereas a closed-loop
+  workload gates each runner thread after its own warmup so that the first thread of each agent is
+  synchronized.
+- Data loads (`-l`) and `-mt` workloads use no start gate; their slots transition directly from
+  `LAUNCHED` to `DONE` with no `start` command, and the step records no skew.
+- The synchronization bound assumes that no wall clock steps during startup. Two slots with
+  round-trip delays of 48 ms or more each cannot prove the 50 ms bound.
 
 ### Telemetry stream
 

@@ -38,17 +38,21 @@ throughput regression, as well as operators who are planning the capacity of a P
 
 **Prerequisites.**
 
-- [How to validate a latency SLO with an open loop, and hold it in a soak](05-latency-slo-and-soak.md):
-  this guide introduces the service and response latency keys and the attainment check.
-- A JDK 11 or later `java` binary installed on the host for step 12, together with the build
-  manifest at `$PX_OUT/build/phoenix/build.tsv`.
+- [How to validate a latency SLO with an open loop, and hold it in a soak][h05]: this guide
+  covers the service and response latency keys and the attainment check.
+- A JDK 11 or later `java` binary installed on the host for step 12, along with the build manifest
+  at `$PX_OUT/build/phoenix/build.tsv`.
+- A `jq` binary available on the host for step 13, which parses the JSON latency report.
 
 | Cost | Value |
 |---|---|
 | Wall time | The procedure takes about 30 minutes across 10 runs of about 2 to 3 minutes each. |
-| Docker memory | The validation class with 1 RegionServer sets 8704 MiB of container limits. |
-| Disk | Legacy detail reports hold one row per operation, using a few hundred MiB at most. |
-| Files written | `$HOWTO/knee_schema.sql`, `step.xml`, `ramp.xml`, `knee.xml`, `pool.xml`, `knee.properties`, `pool.properties`, `ladder.tsv`, `ramp`, `ramp.hgrm`, 10 bundles |
+| Docker memory | The validation class with 1 RegionServer enforces 8704 MiB of container limits. |
+| Disk | Legacy detail reports hold one row for each operation, using a few hundred MiB at most. |
+| Files written | The procedure writes 10 files under `$HOWTO` (listed below) and 10 run bundles. |
+
+The generated files under `$HOWTO` are `knee_schema.sql`, `step.xml`, `ramp.xml`, `knee.xml`,
+`pool.xml`, `knee.properties`, `pool.properties`, `ladder.tsv`, `ramp`, and `ramp.hgrm`.
 
 Begin every shell session for this guide by running these three setup lines:
 
@@ -121,10 +125,13 @@ figure.
 The scheduling lag of an operation is the elapsed time between its intended schedule timestamp and
 the moment a worker thread picks it up for execution.
 
-| Lag policy | What happens to a late operation | Counts | Response tail |
-|---|---|---|---|
-| `LATE` (default) | it runs, and counts as late when `maxLagMs` is set and exceeded | completed = scheduled | complete: the backlog shows as response time |
-| `DROP` (needs `maxLagMs`) | it does not run, and counts as dropped | completed + dropped = scheduled | truncated near `maxLagMs` plus the service time |
+- `LATE` (the default). A late operation still executes, and it is counted as late whenever
+  `maxLagMs` is configured and exceeded. For the operation counts, completed = scheduled. The
+  response latency tail remains complete because the accumulated backlog surfaces directly as
+  response time.
+- `DROP` (which requires `maxLagMs`). A late operation is not executed and is counted as dropped
+  instead. For the operation counts, completed + dropped = scheduled. The response latency tail is
+  truncated near `maxLagMs` plus the service time.
 
 The `DROP` policy bounds the total execution time of an overloaded step, making it ideal for
 sweeping a wide rate ladder. The `LATE` policy exposes the full latency penalty of an overload,
@@ -239,7 +246,10 @@ identical operation counts, causing offline analysis to report a count-parity FA
     done
     ```
 
-7. Execute the linear ramp scenario using the same collection parameters.
+    Because `tee -a` appends to its target file, delete `$HOWTO/ladder.tsv` before re-running the
+    rate ladder.
+
+7. Execute the linear ramp scenario using the same collection configuration.
 
     ```sh
     RUN_RAMP="$(px-run pherf --collect host,container -e PX_COLLECT_INTERVAL_S=2 -- \
@@ -253,13 +263,6 @@ identical operation counts, causing offline analysis to report a count-parity FA
     ```sh
     metric() { px-bundle metrics "$1" "$2" "$3" | cut -f 3; }
     ```
-
-**The excerpts of steps 9 to 14.** The illustrative output excerpts shown in steps 9 through 14 were
-captured from an earlier single-run formulation of this ladder that executed a 2.5 s query set per
-step on a build prior to 63c9dd0ec2. Consequently, the operation counts reflect 2.5 s windows rather
-than 60 s runs, and the schedule anchors identify individual query set positions within that
-combined scenario. The qualitative saturation pattern remains identical, and the next live refresh
-of these HOWTOs will recapture the excerpts using full 60 s steps.
 
 ### Read each step
 
@@ -279,25 +282,23 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
    ```
 
    ```text
-   schedule@ladder.1 scheduled 625 completed 625 dropped 0 queue 1 drift_us 3575
-   schedule@ladder.2 scheduled 1250 completed 1250 dropped 0 queue 2 drift_us 3396
-   schedule@ladder.3 scheduled 2500 completed 2500 dropped 0 queue 2 drift_us 2557
-   schedule@ladder.4 scheduled 5000 completed 5000 dropped 0 queue 8 drift_us 46776
-   schedule@ladder.5 scheduled 10000 completed 10000 dropped 0 queue 8 drift_us 205019
-   schedule@ladder.6 scheduled 10000 completed 10000 dropped 0 queue 8 drift_us 246657
+   rate 250 exit 0 scheduled 15000 completed 15000 dropped 0 queue 5 drift_us 25987
+   rate 500 exit 0 scheduled 30000 completed 30000 dropped 0 queue 8 drift_us 34905
+   rate 1000 exit 0 scheduled 60000 completed 60000 dropped 0 queue 8 drift_us 15766
+   rate 2000 exit 0 scheduled 120000 completed 120000 dropped 0 queue 8 drift_us 27360
+   rate 4000 exit 0 scheduled 240000 completed 239792 dropped 208 queue 8 drift_us 506456
    ```
 
-   This excerpt comes from the earlier ladder of 2.5 s steps, where row 6 corresponds to the ramp.
    The schedule records also expose `pherf.schedule.late` and `pherf.schedule.aborted`, and the
-   accounting identity `scheduled = completed + dropped + aborted` holds across every step. At
-   offered rates of 250, 500, and 1000 operations per second, the workers kept pace easily with a
-   peak queue depth of at most 2. Starting at 2000 operations per second, the dispatch queue
-   saturated at its ceiling of 8, and the maximum drift—representing the worst-case scheduling
-   lag—climbed to 205 ms, showing that the worker threads had become the bottleneck. Because no
-   operation waited longer than the 500 ms cutoff, no requests were dropped, placing the raw system
-   capacity near 4000 operations per second. By contrast, in a separate trial using 3 s steps, the
-   4000 operations per second step completed only 10892 of 12000 operations and dropped 1108,
-   illustrating that a single ladder represents only one sample on a noisy host.
+   accounting identity `scheduled = completed + dropped + aborted` holds across every step. Every
+   step up to 2000 operations per second completed all of its scheduled arrivals with a maximum
+   drift—the worst-case scheduling lag—below 35 ms. Although the dispatch queue reached its
+   capacity bound of 8 starting at 500 operations per second, that peak reflects a transient burst
+   rather than a sustained backlog trend (see step 13). At 4000 operations per second, the maximum
+   drift climbed to 506 ms, exceeding the 500 ms lag limit and causing 208 of the 240,000
+   operations to be dropped. Consequently, the throughput capacity of this client lies between 2000
+   and 4000 operations per second, keeping in mind that a single rate ladder represents only one
+   sample on a noisy host.
 
 10. Compare the service p99 latency against the response p99 latency across every ladder step and
     the ramp.
@@ -312,22 +313,25 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
     ```
 
     ```text
-    r0250 service_p99_us 8695 response_p99_us 10207
-    r0500 service_p99_us 8967 response_p99_us 10015
-    r1000 service_p99_us 5747 response_p99_us 6379
-    r2000 service_p99_us 9511 response_p99_us 47967
-    r4000 service_p99_us 5547 response_p99_us 203391
-    ramp service_p99_us 4519 response_p99_us 247167
+    rate 250 service_p99_us 8059 response_p99_us 11743
+    rate 500 service_p99_us 2711 response_p99_us 2915
+    rate 1000 service_p99_us 2603 response_p99_us 2923
+    rate 2000 service_p99_us 3145 response_p99_us 4791
+    rate 4000 service_p99_us 3267 response_p99_us 467199
+    ramp service_p99_us 1908 response_p99_us 14911
     ```
 
-    In this excerpt from the earlier ladder, where each rate step used a distinct query identifier,
-    the service p99 latency remains between 4 and 10 ms across all steps. Meanwhile, the response
-    p99 latency increases fivefold at 2000 operations per second and twentyfold at 4000 operations
-    per second, proving that the additional delay accumulates inside the client dispatch queue
-    rather than inside the cluster. Evaluated against the 50 ms SLO threshold established in H05,
-    the 2000 operations per second step is the highest rate that remains compliant. Whenever an
-    overloaded step drops operations, its response p99 latency settles near the 500 ms lag limit
-    plus the service time because the `DROP` policy truncates the upper tail of the distribution.
+    Across every run, the service p99 latency remains between 1.9 and 8 ms; because the 250
+    operations per second step executes first against a freshly started cluster, its upper tail
+    includes initial cold-cache misses. Up to 2000 operations per second, the response p99 latency
+    tracks within 2 ms of the service p99 latency, whereas at 4000 operations per second it jumps
+    to 467 ms—roughly 140 times the service p99. That additional delay accumulates inside the
+    client dispatch queue rather than inside the cluster. Evaluated against the 50 ms SLO threshold
+    established in H05, the 2000 operations per second step is the highest compliant rate. Whenever
+    an overloaded step drops operations, its response p99 latency settles near the 500 ms lag limit
+    because the `DROP` policy truncates the upper tail of the distribution. Finally, the continuous
+    ramp reports a response p99 of only 15 ms because it spends roughly one second at each rate
+    level (see step 12).
 
 11. Examine the attainment and saturation verdict rows for each step in the ladder as well as the
     ramp run.
@@ -340,26 +344,25 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
     ```
 
     ```text
-    pherf.health.attainment  PASS  lowest attainment 91.0% (scenario ladder query set 6: 10000
-    of 10000 completed, taken in 2746 ms of a 2500 ms window); minimum 90%
-    pherf.health.saturation  PASS  peak lag 246.657 ms (scenario ladder query set 6), within
-    1000 ms; queue peak 8 of 8, at its bound; in-flight peak 8 of 8: the workers could not keep
-    up; late 0, dropped 0
+    == 20261124T013630Z-bi1g
+    pherf.health.attainment  PASS  lowest attainment 99.9% (scenario step query set 1: 239792
+    of 240000 completed, taken in 60000 ms of a 60000 ms window); minimum 90%
+    pherf.health.saturation  PASS  peak lag 506.456 ms (scenario step query set 1), within 1000
+    ms; queue peak 8 of 8, at its bound; in-flight peak 8 of 8: the workers could not keep up;
+    late 0, dropped 208
     ```
 
-    This excerpt shows the ramp stage from the earlier ladder, with each tab-separated row wrapped
-    for readability. Although both health checks report PASS, the ramp is right on the edge of
-    failure, requiring 2746 ms to drain a 2500 ms schedule window. This illustrates why overly short
-    steps are deceptive: a 91% attainment score passes the threshold while masking a 246 ms backlog
-    that would continue to grow over a longer duration. Furthermore, the saturation check evaluates
-    peak scheduling lag against `pherf.verdict.lag.maxMs` (which defaults to 1000 ms). When the
-    `DROP` policy enforces a tighter lag cutoff such as 500 ms, no surviving operation can ever
-    exceed 1000 ms of lag, allowing the saturation verdict to pass even while operations are being
-    discarded; you must therefore always inspect the `dropped` count and schedule records alongside
-    the verdict. For example, in the earlier 3 s step trial, the attainment check reported
-    `ADVISORY; lowest attainment 82.3% (scenario ladder query set 5: 10892 of 12000 completed, ...)`
-    while the saturation row still passed despite recording `dropped 1108`. The diagnostic detail
-    column of the saturation verdict identifies the immediate mechanism of overload:
+    This excerpt shows the 4000 operations per second step, with each tab-separated verdict row
+    wrapped here for readability. Every verdict row across the ladder and the ramp reports PASS—even
+    for this step, which dropped 208 operations. Because the saturation check evaluates peak
+    scheduling lag against `pherf.verdict.lag.maxMs` (1000 ms), configuring the `DROP` policy with
+    a lower lag limit (500 ms here) keeps the lag of every executed operation near or below that
+    threshold. As a result, the saturation check can pass even while a step is actively dropping
+    requests, so you must always inspect the `dropped` count and the schedule metrics alongside the
+    verdict. For the same reason, the 99.9% attainment score easily clears its 90% minimum. An
+    overly brief step conceals a growing backlog in an analogous way, which is why each step must
+    run long enough for a queue buildup to surface. The diagnostic detail column of the saturation
+    row identifies the immediate mechanism of overload:
 
     - When the dispatch queue reaches its capacity bound, the worker threads could not keep pace
       with arrivals.
@@ -387,19 +390,37 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
     ```
 
     ```text
-    15.005 s  completed/s 844  p90 1.910 ms  max 6.759 ms
-    16.005 s  completed/s 3622  p90 1.665 ms  max 11.055 ms
-    17.005 s  completed/s 4730  p90 218.239 ms  max 230.911 ms
-    18.005 s  completed/s 804  p90 247.295 ms  max 247.935 ms
+    2.005 s  completed/s 210  p90 3.053 ms  max 4.479 ms
+    3.005 s  completed/s 601  p90 3.387 ms  max 10.775 ms
+    ...
+    30.005 s  completed/s 3754  p90 0.984 ms  max 27.007 ms
+    ...
+    51.011 s  completed/s 6187  p90 1.049 ms  max 9.767 ms
+    52.004 s  completed/s 6339  p90 11.175 ms  max 19.647 ms
+    53.005 s  completed/s 6339  p90 7.015 ms  max 17.631 ms
+    54.005 s  completed/s 6653  p90 19.023 ms  max 28.031 ms
+    55.005 s  completed/s 6669  p90 1.066 ms  max 9.591 ms
+    ...
+    61.005 s  completed/s 7369  p90 3.249 ms  max 14.527 ms
+    62.005 s  completed/s 4525  p90 13.959 ms  max 20.143 ms
     ```
 
-    This excerpt reflects the 2.5 s ramp from the earlier ladder, where the opening row covers a
-    partial second and the final row captures the post-window queue drain. The achieved completion
-    rate tracks the rising offered load up to roughly 4700 operations per second, at which point the
-    p90 response latency abruptly spikes from 2 ms to 218 ms within the same one-second slice. That
-    inflection second marks the saturation knee of the ramp, cross-checking the coarse step ladder
-    with much finer rate resolution. Running the full 60 s ramp yields roughly 60 one-second
-    intervals, making the exact second of saturation unmistakable.
+    In this interval log, the opening row covers a partial second at startup and the final row
+    captures the queue drain after the schedule window closes. The completed throughput tracks the
+    rising offered ramp up to roughly 7400 operations per second, while the p90 response latency
+    remains near 1 ms up to about 6200 operations per second. Starting at 52 s—corresponding to an
+    offered rate of roughly 6300 operations per second—individual one-second slices exhibit p90
+    latencies of 7 to 19 ms as the dispatch queue begins to build, marking the saturation knee of
+    the ramp.
+
+    Although the ramp knee at roughly 6300 operations per second lies well above the 4000
+    operations per second flat step that dropped requests, the two measurements do not contradict
+    each other. Because the ramp sweeps through each rate level for only about one second, it
+    identifies the instantaneous rate at which queueing first begins to form. By contrast, a flat
+    60 s step sustains a constant rate long enough to encounter a transient runtime stall—here a
+    506 ms scheduling lag spike—and test whether the client can drain the resulting backlog. Always
+    establish your sustainable throughput claim from the flat steps, and use the continuous ramp to
+    guide where you place the next step.
 
 ### Check the result and find the bound
 
@@ -414,35 +435,35 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
         -v w="$(metric "$r" op@query_step_get pherf.latency.mean_us)" \
         'BEGIN { l = c / 60 * w / 1000000
           printf "%s mean in flight %.2f rho %.2f\n", q, l, l / 8 }'
-      grep -E '"(maxQueueDepth|maxInFlight)"' "$r/drivers/pherf/results_HDR/LATENCY_run.json"
+      jq -r '.schedules[] | "maxQueueDepth \(.maxQueueDepth) maxInFlight \(.maxInFlight)"' \
+        "$r/drivers/pherf/results_HDR/LATENCY_run.json"
     done <"$HOWTO/ladder.tsv"
     ```
 
     ```text
-    r0250 mean in flight 0.99
-    r0500 mean in flight 1.40
-    r1000 mean in flight 1.95
-    r2000 mean in flight 4.57
-    r4000 mean in flight 5.41
-          "maxQueueDepth": 1,
-          "maxInFlight": 4,
+    250 mean in flight 0.45 rho 0.06
+    maxQueueDepth 5 maxInFlight 8
+    500 mean in flight 0.49 rho 0.06
+    maxQueueDepth 8 maxInFlight 8
     ...
+    4000 mean in flight 3.50 rho 0.44
+    maxQueueDepth 8 maxInFlight 8
     ```
 
-    This excerpt comes from the earlier ladder run, which calculated λ over a 2.5 s window and did
-    not print ρ. The mean number of in-flight operations grows with the offered rate because the
-    product λ x W increases whenever requests arrive faster or individual queries take longer to
-    execute. At the lowest step, the mean in-flight count is roughly 1 while the peak reaches 4,
-    demonstrating that an isolated peak above the mean reflects a short burst rather than steady
-    saturation.
+    The intermediate steps at 1000 and 2000 operations per second record a mean of 0.81 and 1.58
+    operations in flight, corresponding to worker utilizations ρ of 0.10 and 0.20. The mean
+    in-flight concurrency rises with the offered rate because the product λ x W increases whenever
+    requests arrive faster or individual queries take longer to complete. At the 250 operations per
+    second step, the mean in-flight count is only 0.45 while the peak reaches 8, confirming that an
+    isolated peak above the mean reflects a short burst rather than steady saturation.
 
-    Applying the Little's law diagnostic criteria from the method section to the 4000 operations per
-    second step reveals a mean of 5.41 operations in flight across 8 workers, corresponding to a
-    worker utilization ρ of only about 0.68. Despite that spare service capacity, step 9 showed that
-    the dispatch queue was pinned at its maximum depth of 8. This discrepancy proves that the worker
-    threads were spending substantial time outside the measured JDBC service window inside client
-    bookkeeping, making the client container the true bottleneck—a conclusion confirmed by the CPU
-    utilization data in step 14.
+    Applying the Little's law diagnostic rule from the method section to the 4000 operations per
+    second step shows a mean of 3.50 operations in flight across 8 workers, yielding a worker
+    utilization ρ of about 0.44. Even with that spare service capacity, step 9 showed that the
+    dispatch queue reached its capacity bound of 8 and scheduling lag climbed to 506 ms. This
+    discrepancy indicates that the worker threads spent substantial time outside the instrumented
+    service window inside the client, proving that the client is the limiting bottleneck—a
+    conclusion confirmed by the processor utilization measurements in step 14.
 
 14. Compare the CPU consumption of client 0 against that of the RegionServer during the 2000 and
     4000 operations per second steps and the ramp, noting that a `cpu_pct` value of 100 corresponds
@@ -465,32 +486,49 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
     ```
 
     ```text
-    client-0 cpu mean 328% over 4 samples
-    regionserver-0 cpu mean 98% over 4 samples
-    host load peak 114%
+    20261124T013447Z-8d1p client-0 cpu mean 179% over 30 samples
+    20261124T013447Z-8d1p regionserver-0 cpu mean 43% over 30 samples
+    host load peak 55%
+    20261124T013630Z-bi1g client-0 cpu mean 272% over 30 samples
+    20261124T013630Z-bi1g regionserver-0 cpu mean 82% over 30 samples
+    host load peak 84%
+    20261124T013818Z-ai1v client-0 cpu mean 264% over 30 samples
+    20261124T013818Z-ai1v regionserver-0 cpu mean 77% over 30 samples
+    host load peak 72%
     ```
 
-    Interpret these resource metrics by combining the saturation cause from step 11 with the
-    following diagnostic matrix:
+    The three output groups correspond to the 2000 and 4000 operations per second steps followed by
+    the continuous ramp.
 
-    | Saturation cause | Client 0 | RegionServers | Bound |
-    |---|---|---|---|
-    | the workers were busy, or the queue is full, with ρ near 1 | moderate | high, or GC pauses in `logs/gc/` | the cluster |
-    | the queue is full with ρ well below 1, or the dispatcher was late | near its share of the host | moderate | the client |
-    | either | Moderate | Moderate; host load nears 100% | The host: client and cluster contend |
+    Evaluate these utilization figures alongside the saturation cause from step 11 using the
+    following criteria:
 
-    In this excerpt from the earlier ladder, which aggregated a single window across its final three
-    stages, client 0 consumed more than three full processor cores while the RegionServer used just
-    under one core, and peak host load exceeded 100%. Consequently, the saturation knee observed in
-    this ladder reflects exhaustion of the client and the shared host rather than the capacity limit
-    of Phoenix.
+    - The bottleneck is **the cluster** when all workers are busy or the dispatch queue is full
+      with ρ approaching 1, client 0 CPU usage remains moderate, and the RegionServers exhibit high
+      CPU utilization or garbage-collection pauses in `logs/gc/`.
+    - The bottleneck is **the client** when the dispatch queue saturates with ρ remaining well
+      below 1 or the dispatcher falls behind schedule, client 0 consumes near its full share of the
+      host, and RegionServer CPU utilization remains moderate.
+    - The bottleneck is **the host**—where the client and the cluster contend for shared
+      processors—under either saturation cause when both client 0 and the RegionServers show
+      moderate utilization while peak host load approaches 100%.
 
-    Because the Docker containers run without CPU quota limits, any container can schedule threads
-    across every logical core available to the engine, and a `host load peak` approaching or
-    exceeding 100% indicates that the physical host itself is saturated. When the load generator and
-    the cluster share a single workstation or laptop, client-bound and host-bound knees are routine;
-    isolating the load generator on dedicated machines eliminates this contention, which upcoming
-    distributed Pherf support (W2) is designed to provide.
+    At 4000 operations per second, client 0 consumed 2.7 processor cores while the RegionServer
+    used only 0.8 cores—more than three times less—and host load peaked at 84%. Consequently, the
+    saturation knee observed in this ladder reflects a client bottleneck approaching the host
+    capacity limit rather than the throughput ceiling of Phoenix.
+
+    Because the containers run without CPU quota limits, each container can schedule threads across
+    every processor available to the container engine, and a `host load peak` approaching 100%
+    indicates that the physical host itself is saturated. When the client and cluster share a
+    single machine, hitting a client-bound or host-bound knee is common on a laptop; running the
+    load generator on dedicated hosts eliminates that contention. Distributed Pherf partitions the
+    offered arrival rate across multiple agent processes and merges their latency histograms; see
+    [How to scale out the load generator and read fleet latency correctly][d04] for distinguishing
+    client-bound and cluster-bound knees with a fleet, and [How to run Pherf on a fleet through the
+    harness][h14] for deploying the fleet tier. When all containers run on a single host, however,
+    the fleet agents still share physical processors with the cluster, meaning that a local fleet
+    removes the bottleneck of a single client JVM without removing the capacity limit of the host.
 
 ### Refine the knee
 
@@ -551,13 +589,12 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
     ```
 
     ```text
-    workers 8 exit 0 pherf.health.attainment	PASS response_p99_us 691711
-    <stage durationMs="3000" rate="3000.0"/>
+    workers 8 exit 0 pherf.health.attainment	PASS response_p99_us 299263
+    <stage durationMs="60000" rate="3000.0"/>
     ```
 
-    This excerpt comes from an earlier 3 s refinement trial. Because the XML result file records the
-    effective stage configuration after applying command-line overrides, a full 60 s run displays
-    `durationMs="60000"`.
+    The XML result file records the effective stage configuration after applying the command-line
+    overrides, confirming a 60 s run at 3000 operations per second.
 
 17. Re-run the exact same 3000 operations per second offered rate while expanding the client pool to
     32 workers.
@@ -567,21 +604,25 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
     ```
 
     ```text
-    workers 32 exit 0 pherf.health.attainment	PASS response_p99_us 138751
-    <stage durationMs="3000" rate="3000.0"/>
+    workers 32 exit 0 pherf.health.attainment	PASS response_p99_us 115583
+    <stage durationMs="60000" rate="3000.0"/>
     ```
 
-    In this excerpt from the same 3 s refinement trial, both the 8-worker and 32-worker runs
-    maintained attainment above the 90% minimum (reaching 95.5% and 100%, respectively), yet both
-    violated the 50 ms response p99 SLO bound, confirming that 3000 operations per second lies above
-    the saturation knee. Quadrupling the worker count to 32 cut the response p99 latency from 692 ms
-    to 139 ms while doubling the service p99 latency from 12 ms to 25 ms, demonstrating that adding
-    client concurrency shifts queueing pressure out of the client dispatcher and into the cluster.
-    In general, if increasing the worker count from 8 to 32 causes an overloaded rate to pass, the
-    client thread count was the limiting bottleneck; if both worker configurations fail at the same
-    rate, the cluster or host is the bottleneck. Always repeat the decisive knee step at least three
-    times and evaluate the replicates using offline comparative analysis; see
-    [How to detect a regression and compare builds, configurations and versions](12-regression-ab-and-matrices.md).
+    Both runs completed all 180,000 of the 180,000 scheduled operations for 100% attainment, yet
+    both violated the 50 ms SLO bound, confirming that 3000 operations per second exceeds the
+    saturation knee for this SLO. Increasing the worker pool to 32 threads reduced the response p99
+    latency from 299 ms to 116 ms and cut the peak scheduling lag from 384 ms to 176 ms, while the
+    service p99 latency doubled from 5.0 ms to 11.2 ms and the service p50 remained flat at
+    0.77 ms, demonstrating that higher client concurrency shifts queueing pressure out of the
+    client and into the cluster. In general, if 32 workers pass at a rate where 8 workers fail, the
+    client worker thread count was the limiting bottleneck rather than the cluster; if both
+    configurations fail at the same rate, the cluster is the bottleneck unless the client itself is
+    processor-bound. Here both configurations fail, but step 14 showed client 0 consuming nearly
+    2.7 processors while the RegionServer used under 1 processor: adding worker threads inside a
+    single client JVM cannot relieve a client CPU bottleneck, whereas scaling out to a fleet of
+    clients can ([D04][d04]). Always repeat the decisive knee step at least three times and compare
+    the replicates using offline analysis; see
+    [How to detect a regression and compare builds, configurations and versions][h12].
 
 ### Detect an exhausted Pherf pool
 
@@ -659,20 +700,20 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
 ## Read the result
 
 - **The knee** is the highest offered rate step that achieves at least 90% attainment, passes the
-  saturation health check, and keeps its response p99 latency within the target SLO bound. In the
-  illustrative ladder, 2000 operations per second is the last compliant step, while the refinement
-  runs in steps 16 and 17 confirm that 3000 operations per second already exceeds the knee. The raw
-  system capacity is the throughput plateau where completed operations level off—roughly 4000
-  operations per second in this trial—but operating near that plateau is unsustainable because tail
-  response latency is dominated by client queueing or truncated by the lag cutoff.
-- **The bound** is identified by correlating the saturation verdict detail with container and host
-  CPU utilization. Whenever the limiting factor is the client container or the shared physical host,
-  it reflects a constraint of the test environment and must be reported as such rather than as the
-  throughput capacity of Phoenix.
-- **Validity.** Because the validation cluster class runs on a shared host, any failed timing
-  verdict is downgraded to ADVISORY. A saturation knee located during a validation run should be
-  treated strictly as a starting hypothesis to be confirmed by a formal measurement-class run with
-  replicates.
+  saturation health check, and maintains a response p99 latency within the target SLO bound. In the
+  captured ladder, 2000 operations per second is the highest compliant step, while the refinement
+  runs in steps 16 and 17 confirm that 3000 operations per second already lies above the knee. The
+  raw throughput capacity is the plateau of the completed operation rate—roughly 4000 operations
+  per second here, where the run completed all but 208 of 240,000 requests—but operating near that
+  ceiling is unsustainable because the response latency tail is dominated by client queueing or
+  truncated by the lag limit.
+- **The bound** is determined by correlating the saturation verdict detail with container and host
+  processor utilization. Whenever the limiting bottleneck is the client or the shared host, it
+  reflects a constraint of the test setup and must be reported as such, never as the capacity of
+  Phoenix.
+- **Validity.** Any failed timing verdict in a validation run is downgraded to ADVISORY, so a
+  saturation knee identified here serves strictly as an initial hypothesis to be confirmed by a
+  formal measurement run with replicates.
 
 ## Reproduce it
 
@@ -702,13 +743,20 @@ of these HOWTOs will recapture the excerpts using full 60 s steps.
 
 ## See also
 
-- [How to plan capacity across 1, 3 and 5 RegionServers and detect hotspots](11-scale-out-capacity-and-skew.md):
-  this guide executes the same rate ladder across larger RegionServer topologies.
-- [How to profile a run and find the root cause](10-profiling-and-root-cause.md), which explains how
-  to inspect what the cluster was doing internally at the saturation knee.
-- [Pherf latency outputs, section "Schedule entries"](../../../../phoenix-pherf/LATENCY.md), which
-  documents the schedule metrics emitted by open-loop runs.
-- [The Pherf health verdict](../../../../phoenix-pherf/VERDICT.md), which specifies the attainment,
-  saturation, and client pool health rules.
-- [How to drive an open-loop workload with profiles and operation mixes](../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md):
-  this guide details the available open-loop launch overrides.
+- [How to plan capacity across 1, 3 and 5 RegionServers and detect hotspots][h11]: executes the
+  same rate ladder across larger RegionServer topologies.
+- [How to profile a run and find the root cause](10-profiling-and-root-cause.md): explains how to
+  inspect what the cluster was doing internally at the saturation knee.
+- [Pherf latency outputs, section "Schedule entries"](../../../../phoenix-pherf/LATENCY.md)
+- [The Pherf health verdict](../../../../phoenix-pherf/VERDICT.md): documents the attainment,
+  saturation, and client pool health checks.
+- [How to drive an open-loop workload with profiles and operation mixes][p03]: details the
+  command-line launch overrides for open-loop stages.
+- [How to scale out the load generator and read fleet latency correctly][d04]
+
+[d04]: ../../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
+[h05]: 05-latency-slo-and-soak.md
+[h11]: 11-scale-out-capacity-and-skew.md
+[h12]: 12-regression-ab-and-matrices.md
+[h14]: 14-fleet-through-the-harness.md
+[p03]: ../../../../phoenix-pherf/docs/howto/03-open-loop-profiles-and-mixes.md

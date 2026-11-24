@@ -51,19 +51,18 @@ new to running Pherf workloads.
   that option B has been verified against the source code but was not executed against a live
   cluster.
 
-| Cost | Value |
-|---|---|
-| Wall time | Compiling the required modules takes approximately 8 min with a warm Maven cache
-  (and longer with a cold cache), while loading the dataset and executing the four runs takes a
-  few additional minutes depending on cluster capacity. |
-| Memory | The Pherf JVM process on the host allocates a maximum heap of up to 3 GiB
-  (`-Xmx3072m`). |
-| Disk | Build artifacts consume approximately 175 MiB of jars under `target/`, and the generated
-  run results require less than 10 MiB. |
-| Files written | The procedure writes `$PX_OUT/howto/pherf-env.sh`, configuration files under
+**Cost.**
+
+- Wall time: compiling the required modules takes approximately 8 min with a warm Maven cache (and
+  longer with a cold cache), while loading the dataset and executing the four runs takes a few
+  additional minutes depending on cluster capacity.
+- Memory: the Pherf JVM process on the host allocates a maximum heap of up to 3 GiB (`-Xmx3072m`).
+- Disk: build artifacts consume approximately 175 MiB of jars in `target/`, and the generated run
+  results require less than 10 MiB.
+- Files written: the procedure writes `$PX_OUT/howto/pherf-env.sh`, configuration files under
   `$HOWTO/conf/` (the schema, scenario, and `pherf.properties`), result artifacts in
   `$HOWTO/work/RESULTS`, `$HOWTO/work/RESULTS_HDR`, and `$HOWTO/sets/`, and the cluster table
-  `PHERF.HOWTO_EVENTS`. |
+  `PHERF.HOWTO_EVENTS`.
 
 The workflow steps that require a live cluster were verified against `Pherf.java` and the unit test
 golden result files rather than executed on a running cluster for this HOWTO; their output samples
@@ -183,15 +182,21 @@ valid.
 3. Generate the `pherf-env.sh` helper script, which defines the `pherf` shell function. This script
    constructs a runtime classpath combining the newly built project jars with dependency jars cached
    in your local Maven repository. The dependency versions correspond to the properties defined in
-   the root `pom.xml` (`bson.version` and `log4j2.version`) and in `phoenix-pherf/pom.xml`
-   (`activation.version`, `jaxb-api.version`, and `jaxb-impl.version`). If your build version or
-   HBase profile differs from the defaults of `5.4.0-SNAPSHOT` and `2.6`, export `PHX_VERSION` and
-   `PHX_HBASE_PROFILE` prior to sourcing the script. Even Pherf's offline modes require every jar on
-   this classpath: omitting the activation jar causes `-validate` to terminate with exit code 1;
-   omitting the JAXB jars aborts execution with
-   `NoClassDefFoundError: javax/xml/bind/JAXBException`; and omitting the Log4j jars leaves SLF4J
-   without a logging backend, causing startup errors and validation refusals to fail silently
-   without printing diagnostic messages.
+   the root `pom.xml` (`bson.version`, `log4j2.version`, and `slf4j.version`) and in
+   `phoenix-pherf/pom.xml` (`activation.version`, `jaxb-api.version`, and `jaxb-impl.version`). The
+   embedded client does not bundle the OpenTelemetry API; instead, it declares the versions aligned
+   with the selected HBase release profile, which the build writes into
+   `phoenix-client-parent/phoenix-client-embedded/target/pom.xml` (version 1.49.0 and semconv
+   1.29.0-alpha for profile 2.6). It also requires a commons-logging API implementation, provided by
+   `jcl-over-slf4j`. Without `jcl-over-slf4j` and the OpenTelemetry jars on the classpath,
+   `-validate` still succeeds, but every JDBC connection attempt fails with `NoClassDefFoundError:
+   org/apache/commons/logging/Log` or `io/opentelemetry/api/trace/Span`
+   even though the run exits with code 0. If your build version or HBase profile differs from
+   `5.4.0-SNAPSHOT` and `2.6`, export `PHX_VERSION` and `PHX_HBASE_PROFILE` before sourcing the
+   script. Even Pherf's offline modes require the remaining jars on this classpath: omitting the
+   activation jar causes `-validate` to exit with code 1; omitting the JAXB jars aborts execution
+   with `NoClassDefFoundError: javax/xml/bind/JAXBException`; and omitting the Log4j jars leaves
+   SLF4J without a logging backend, causing validation refusals to produce no diagnostic message.
 
    ```sh
    mkdir -p "$PX_OUT/howto"
@@ -215,6 +220,12 @@ valid.
    PHERF_CP="$PHERF_CP:$L/log4j-api/2.25.5/log4j-api-2.25.5.jar"
    PHERF_CP="$PHERF_CP:$L/log4j-core/2.25.5/log4j-core-2.25.5.jar"
    PHERF_CP="$PHERF_CP:$L/log4j-slf4j-impl/2.25.5/log4j-slf4j-impl-2.25.5.jar"
+   PHERF_CP="$PHERF_CP:$M2/org/slf4j/jcl-over-slf4j/1.7.36/jcl-over-slf4j-1.7.36.jar"
+   O="$M2/io/opentelemetry"
+   PHERF_CP="$PHERF_CP:$O/opentelemetry-api/1.49.0/opentelemetry-api-1.49.0.jar"
+   PHERF_CP="$PHERF_CP:$O/opentelemetry-context/1.49.0/opentelemetry-context-1.49.0.jar"
+   S="$O/semconv/opentelemetry-semconv/1.29.0-alpha"
+   PHERF_CP="$PHERF_CP:$S/opentelemetry-semconv-1.29.0-alpha.jar"
    for f in $(echo "$PHERF_CP" | tr ':' ' '); do
      [ -f "$f" ] || echo "pherf-env.sh: missing $f" >&2
    done
@@ -577,21 +588,19 @@ valid.
     The configuration properties in `pherf.properties` that most directly govern workload
     measurements are summarized below:
 
-    | Key | Default | Effect |
-    |---|---|---|
-    | `pherf.default.threadpool` | 10 | Sets the size of the closed-loop execution thread pool as
-      well as the capacity of the connection cache. |
-    | `pherf.default.dataloader.threadpool` | 0 | Controls the number of concurrent writer threads
-      used during `-l` data loading, where 0 allocates one thread per available CPU core. |
-    | `pherf.default.dataloader.batchsize` | 1000 | Defines the number of rows buffered into each
-      committed write batch during data loading. |
-    | `pherf.default.results.dir` | `RESULTS` | Specifies the output directory for legacy result
-      files relative to the working directory, while HDR histogram artifacts are written to a
-      sibling directory with `_HDR` appended to this name. |
-    | `pherf.default.hdr.intervalMs` | absent (off) | Configures the reporting interval in
-      milliseconds for the periodic interval histogram log. |
-    | `pherf.verdict.*` | see [VERDICT.md](../../VERDICT.md) | Defines the evaluation thresholds
-      and parameters used to compute the run health verdict. |
+    - `pherf.default.threadpool` (default 10): sets the size of the closed-loop execution thread
+      pool as well as the capacity of the connection cache.
+    - `pherf.default.dataloader.threadpool` (default 0): controls the number of concurrent writer
+      threads used during `-l` data loading, where 0 allocates one thread per available CPU core.
+    - `pherf.default.dataloader.batchsize` (default 1000): defines the number of rows buffered into
+      each committed write batch during data loading.
+    - `pherf.default.results.dir` (default `RESULTS`): specifies the output directory for legacy
+      result files relative to the working directory. The HDR histogram outputs are written to a
+      sibling directory with `_HDR` appended to this name.
+    - `pherf.default.hdr.intervalMs` (absent and off by default): configures the reporting interval
+      for the periodic interval histogram log.
+    - `pherf.verdict.*`: defines the evaluation thresholds and bounds used to compute the run health
+      verdict; see [VERDICT.md](../../VERDICT.md).
 
 16. Organize the replicate artifacts into a structured directory set for offline statistical
     analysis. Each replicate subdirectory stores the HDR latency report alongside the legacy XML
@@ -681,4 +690,8 @@ artifacts remain available for HOWTO 06.
 - [README.md](../../README.md): Provides a comprehensive reference for all command-line options and
   scenario XML elements.
 - [Harness HOWTO 01](../../../dev/harness/docs/howto/01-measurement-protocol.md): Defines the
-  rigorous measurement protocol, including run classes, host isolation, and contamination checks.
+  rigorous measurement protocol, including run classes, quiet host isolation, and contamination
+  checks.
+- [Distributed Pherf HOWTOs](../../../phoenix-pherf-distributed/docs/howto/README.md): Explains how
+  to execute the same scenario across multiple agents coordinated by a single controller to produce
+  one merged latency report.

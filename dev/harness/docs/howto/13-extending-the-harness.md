@@ -197,10 +197,22 @@ driver toolkit:
 * `dv_java` launches a Java main class inside `client-0`.
 * `dv_window` retrieves the bounds of a closed stage window for use during `report`.
 
-When you simply need to run a custom Java class without authoring a new driver script, the built-in
-`java-main` driver accepts `[--cp FILE]... CLASS [ARG...]`. The target class retrieves the cluster
-JDBC URL from the `px.jdbc.url` system property—which enables Phoenix request-level metrics—and
-emits each measurement as a single line on standard output:
+The harness ships with four built-in drivers: `psql`, `pherf`, `java-main`, and
+`pherf-distributed`. Both Pherf drivers share the parsing helpers defined in
+`dev/harness/drivers/lib/pherf.sh`: `pherf_verdict_copy` validates and appends the rows of a Pherf
+verdict file to `verdicts.tsv`, `pherf_latency` records a Pherf latency report, and
+`pherf_profile_names` extracts the workload profiles referenced by a scenario. Any custom driver
+that consumes Pherf outputs should source this shared library rather than duplicating its parsers.
+Unlike the standalone driver, `pherf-distributed` launches no local JVM; instead, it drives the
+REST API of the Distributed Pherf controller through `lib/fleet.sh` by invoking `sb_exec` inside
+`pherf-controller` 0, representing the sole architectural exception to the `client-0` execution
+rule described above. See
+[How to run Pherf on a fleet through the harness](14-fleet-through-the-harness.md) for details.
+
+When you need to execute a custom Java class without writing a new driver, the built-in `java-main`
+driver accepts `[--cp FILE]... CLASS [ARG...]`. The target class retrieves the cluster JDBC URL
+from the `px.jdbc.url` system property, which automatically enables request metrics, and reports
+each measurement by writing a single line to stdout:
 
 ```text
 px-metric <key> <class> <value> <unit>
@@ -632,15 +644,19 @@ the run.
 
 ## See also
 
-* [../PLUGINS.md](../PLUGINS.md): the normative plug-in contract and manifest specification.
-* [../driver-contract.md](../driver-contract.md): the six lifecycle verbs, the describe document
-  schema, and the shared driver toolkit.
-* [../bundle-format.md](../bundle-format.md): cluster health checks and threshold merging rules.
-* [../backends.md](../backends.md): the substrate backend contract used by drivers and hooks.
-* [03-result-bundles-and-automation.md](03-result-bundles-and-automation.md): verdict evaluation
-  and command exit codes.
-* [09-fault-injection-and-recovery.md](09-fault-injection-and-recovery.md): the `disrupt:` suite
-  directive and fault-injection schedules.
-* [Pherf HOWTO 07, extending Pherf][p07]: extension mechanisms in Phoenix Pherf.
+* [../PLUGINS.md](../PLUGINS.md) defines the formal plug-in contract and manifest specification.
+* [../driver-contract.md](../driver-contract.md) specifies the six lifecycle verbs, the describe
+  document schema, and the shared driver toolkit.
+* [../bundle-format.md](../bundle-format.md) documents the cluster health checks and threshold
+  merging rules.
+* [../backends.md](../backends.md) defines the substrate backend contract used by workload drivers
+  and lifecycle hooks.
+* [03-result-bundles-and-automation.md](03-result-bundles-and-automation.md) explains verdict
+  evaluation and command exit codes.
+* [09-fault-injection-and-recovery.md](09-fault-injection-and-recovery.md) covers fault injection
+  and the `disrupt:` suite directive.
+* [Pherf HOWTO 07, extending Pherf][p07] details the extension points available within Pherf.
+* [14-fleet-through-the-harness.md](14-fleet-through-the-harness.md) describes the
+  `pherf-distributed` driver and the distributed load-generation tier.
 
 [p07]: ../../../../phoenix-pherf/docs/howto/07-extending-pherf.md

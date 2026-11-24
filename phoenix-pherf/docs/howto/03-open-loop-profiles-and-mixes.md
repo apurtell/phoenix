@@ -37,26 +37,32 @@ workloads and for Phoenix developers who need to generate load at a known, contr
 **Prerequisites.**
 
 * You need a Phoenix cluster whose ZooKeeper quorum is reachable from your host, along with the
-  build artifacts and the `$PX_OUT/howto/pherf-env.sh` environment script prepared in
-  [P01](01-first-pherf-run.md), step 3. You must also have JDK 17 configured in `JAVA_HOME`.
-* If you do not have an existing cluster, you can start a local harness cluster by following
-  [H02](../../../dev/harness/docs/howto/02-first-cluster-and-smoke.md) and running
-  `px-cluster --class validation up`, then selecting option B in step 2. Because the harness Pherf
-  driver cannot execute an external profile (as explained in step 17), option B executes Pherf
-  directly inside the client container. Option B has been verified against the harness
-  implementation code, although it has not been executed live against a running cluster.
+  compiled build artifacts and the `$PX_OUT/howto/pherf-env.sh` environment script prepared in
+  [P01](01-first-pherf-run.md), step 3, and JDK 17 configured in `JAVA_HOME`.
+* If you do not have an existing cluster, you can provision a local harness cluster as shown in
+  [H02](../../../dev/harness/docs/howto/02-first-cluster-and-smoke.md) by running
+  `px-cluster --class validation up` and selecting option B in step 2. Option B invokes Pherf
+  directly inside the client container so that every step executes as written with its own
+  command-line options. Note that option B has been verified against the harness implementation
+  code, although it was not executed against a live cluster. While the harness Pherf driver also
+  supports scenarios that reference an external profile ([H04][h04]), the driver manages the
+  `-label`, `-l`, and `-q` flags for each verb internally, so this guide uses option B instead.
 * Review [P02](02-scenario-authoring-and-validation.md) for background on the scenario XML format
   and the offline validator.
 * Ensure that the tables `PHERF.REF_RELATIONAL`, `PHERF.HOWTO_MIX`, and `PHERF.HOWTO_LAG` do not
   contain data you need to preserve, because the steps in this guide create and modify them.
 
-| Cost | Value |
-|---|---|
-| Wall time | About 15 min of test runs; add roughly 5 min for a harness bring-up. |
-| Docker memory | none on your own cluster; 8704 MiB of container limits for a harness validation cluster with 1 RegionServer |
-| Disk | Under 50 MB in the working directory. |
-| Files written | `$HOWTO`: the scenarios and profiles of the steps; `$HOWTO/work`: `RESULTS/` and `RESULTS_HDR/` |
-| Tables written | `PHERF.REF_RELATIONAL` (20,000 rows at most), `PHERF.HOWTO_MIX` (10,000), `PHERF.HOWTO_LAG` (5,000) |
+**Cost.**
+
+* Wall time: Approximately 15 min of benchmark executions, plus roughly 5 min if bringing up a
+  local harness cluster.
+* Docker memory: None when targeting an external cluster; a local harness validation cluster with
+  1 RegionServer reserves 8704 MiB of container memory limits.
+* Disk: Less than 50 MB in the working directory.
+* Files written: `$HOWTO` stores the scenario and profile definitions created during the steps,
+  while `$HOWTO/work` holds the generated `RESULTS/` and `RESULTS_HDR/` directories.
+* Tables written: `PHERF.REF_RELATIONAL` (up to 20,000 rows), `PHERF.HOWTO_MIX` (10,000 rows), and
+  `PHERF.HOWTO_LAG` (5,000 rows).
 
 ## Method
 
@@ -396,9 +402,14 @@ The table below summarizes the three reference scenarios and their default smoke
 
 | Scenario | Smoke profile | Arrivals | SELECT / SCAN / DELETE | Block | Rows left of 1,000 |
 |---|---|---|---|---|---|
-| [relational_scenario.xml](../../config/reference/relational_scenario.xml) | 2000 ms at 50/s, mix 70/20/10 | 100 | 70 / 20 / 10 | 50 | 500 |
-| [json_scenario.xml](../../config/reference/json_scenario.xml) | 1000 ms at 20/s, then 1000 ms from 20/s to 60/s, mix 50/30/20 | 60 | 30 / 18 / 12 | 40 | 520 |
-| [bson_scenario.xml](../../config/reference/bson_scenario.xml) | 1500 ms at 40/s, mix 60/20/20 | 60 | 36 / 12 / 12 | 25 | 700 |
+| [relational][ref-rel] | (a) | 100 | 70 / 20 / 10 | 50 | 500 |
+| [json][ref-json] | (b) | 60 | 30 / 18 / 12 | 40 | 520 |
+| [bson][ref-bson] | (c) | 60 | 36 / 12 / 12 | 25 | 700 |
+
+The corresponding smoke profiles configure the following schedules: (a) runs for 2000 ms at a
+steady rate of 50/s with a 70/20/10 operation mix; (b) runs for 1000 ms at 20/s followed by a
+1000 ms linear ramp from 20/s to 60/s with a 50/30/20 operation mix; and (c) runs for 1500 ms at a
+steady rate of 40/s with a 60/20/20 operation mix.
 
 Because a `DELETE` permanently removes rows from the table, the next run with `-l` reloads those
 rows, so pass `-l` to every run that needs to start from a fully populated table. See
@@ -680,12 +691,12 @@ rows, so pass `-l` to every run that needs to start from a fully populated table
     EOF
     ```
 
-    Declaring an inline `mix` alongside an inline `openLoop` element is fully supported. In fact,
-    this inline structure is the only open-loop configuration that the harness Pherf driver can
-    execute directly: because the driver stages only the scenario XML file and schema files into the
-    container, an external profile file placed next to the scenario will not be found when running
-    through the harness driver. See
-    [H04](../../../dev/harness/docs/howto/04-pherf-through-the-harness.md) for details.
+    Declaring an inline `mix` alongside an inline `openLoop` element is valid. The harness Pherf
+    driver supports both inline definitions and external profiles by staging each referenced
+    `querySet profile="..."` file into the container at the same relative path alongside the
+    scenario file. Specifying a profile with an absolute path or a `..` path segment is rejected as
+    a command usage error (exit 2), whereas referencing a profile that is not a readable file
+    records the verdict row `pherf.profile FAIL`. See [H04][h04] for details.
 
 18. Load the 5,000 rows and execute both query sets:
 
@@ -878,15 +889,26 @@ rows, so pass `-l` to every run that needs to start from a fully populated table
 
 ## See also
 
-* [README.md](../../README.md): reference documentation for open loop query sets, workload profiles,
-  launch overrides, and the reference scenarios.
-* [LATENCY.md](../../LATENCY.md): specification of latency keys and schedule report entries.
-* [VERDICT.md](../../VERDICT.md): specification of the attainment and saturation health checks.
-* [P04](04-co-generation.md): explanation of how co-generation guarantees point read hits and binds
-  `SCAN` and `DELETE` predicates to exact row blocks.
-* [P06](06-results-verdict-and-analysis.md): guide to interpreting result files, health verdicts,
-  and multi-replicate analysis.
-* [H05](../../../dev/harness/docs/howto/05-latency-slo-and-soak.md): comparison of service time
-  versus response time during sustained soak testing.
-* [H06](../../../dev/harness/docs/howto/06-saturation-knee.md): methodology for driving rate ramps
-  to identify the saturation knee.
+* [README.md](../../README.md): Reference documentation covering open-loop query sets, workload
+  profiles, launch overrides, and the bundled reference scenarios.
+* [LATENCY.md](../../LATENCY.md): Specification of the latency histogram keys and schedule report
+  entries.
+* [VERDICT.md](../../VERDICT.md): Specification of the attainment and saturation health checks.
+* [P04](04-co-generation.md): Explanation of how co-generation guarantees that every point read
+  locates an existing row and binds `SCAN` and `DELETE` predicates to exact row blocks.
+* [P06](06-results-verdict-and-analysis.md): Guide to interpreting result artifacts, health
+  verdicts, and multi-replicate analysis.
+* [H05](../../../dev/harness/docs/howto/05-latency-slo-and-soak.md): Comparison of service time
+  against end-to-end response time during sustained soak testing.
+* [H06](../../../dev/harness/docs/howto/06-saturation-knee.md): Methodology for driving rate ramps
+  to locate the cluster saturation knee.
+* [D04][d04]: Guide to scaling open-loop workloads across multiple distributed agents. Each slot in
+  the fleet receives a distinct POISSON seed via `${pherf.slot.seed}` so that agents do not
+  dispatch phase-locked arrivals, and the fleet verdict grades attainment against the worst
+  individual schedule rather than the fleet average.
+
+[h04]: ../../../dev/harness/docs/howto/04-pherf-through-the-harness.md
+[d04]: ../../../phoenix-pherf-distributed/docs/howto/04-load-generator-scale-out.md
+[ref-rel]: ../../config/reference/relational_scenario.xml
+[ref-json]: ../../config/reference/json_scenario.xml
+[ref-bson]: ../../config/reference/bson_scenario.xml

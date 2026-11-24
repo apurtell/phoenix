@@ -222,6 +222,17 @@ the Pherf results directory.
 HOWTO H04 reads the latency report through the harness, while P02 and P06 read the validation and
 analysis reports.
 
+The `pherf-distributed` driver writes its artifacts under `drivers/pherf-distributed/`. It copies
+the result bundle of the controller execution verbatim into `controller/` and the result bundle of
+the data-load execution verbatim into `load/`. Within that structure, the aggregated fleet latency
+report resides at `controller/drivers/pherf/results_HDR/LATENCY_run.json`. Consequently, Pherf
+`-analyze` must be pointed at `<bundle>/drivers/pherf-distributed/controller` rather than at the
+root of the harness bundle; if pointed at the root directory, it exits with 1. See
+[H14](14-fleet-through-the-harness.md) for the directory layout,
+[H15](15-fleet-replicates-ab-and-faults.md) for multi-replicate fleet analysis, and
+[the result bundle](../bundle-format.md), section "The other exports", for the complete file
+inventory.
+
 ## Steps
 
 ### Read a bundle
@@ -655,6 +666,10 @@ the `tree` row of the build record alongside the archive.
   replicate bundles as input to `-analyze`.
 * [13-extending-the-harness.md](13-extending-the-harness.md): Covers adding custom checks,
   thresholds, and workload drivers through a plug-in.
+* [14-fleet-through-the-harness.md](14-fleet-through-the-harness.md) and
+  [15-fleet-replicates-ab-and-faults.md](15-fleet-replicates-ab-and-faults.md): Document the
+  bundle structure of the `pherf-distributed` driver and how to run `-analyze` across its
+  controller bundles.
 * [../bundle-format.md](../bundle-format.md): Specifies every file path, column schema, and
   manifest key in a result bundle.
 * [../driver-contract.md](../driver-contract.md): Defines the driver lifecycle verb exit codes.

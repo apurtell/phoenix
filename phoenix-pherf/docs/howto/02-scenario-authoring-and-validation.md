@@ -70,15 +70,29 @@ prior load actually populated the rows required by a query-only run executed wit
 
 **Why each rule protects a measurement.**
 
-| Rule | The defect | What the defect does to a measurement |
-|---|---|---|
-| `xml.unknown-element` | An unknown element. | The parser ignores it, leaving the setting off. |
-| `xml.value` | Enum typo (`arrival="POISON"`). | The parser reads it as absent, using defaults. |
-| `predicate.casing` | `[k2]` for rule `K2`. | `[k2]` stays in SQL; queries fail with no sample. |
-| `openloop.rate` | Open-loop `concurrency="1-2"`. | It needs one worker count as its queue bound. |
-| `openloop.seed` | `arrival="POISSON"` lacks `seed`. | Arrivals vary; replicates do not compare. |
-| `key.coverage` | `K2 = [K1]` filter. | Reads bind wrong keys, find no row, and time empty reads. |
-| `cogen.offsets` | `[0, 1000)`, `[500, 1500)` on a table. | Overwrites skew row counts and reads. |
+The following list describes each validation rule, the configuration defect it targets, and how that
+defect corrupts a benchmark measurement:
+
+- `xml.unknown-element`: Detects an XML element that this version of Pherf does not recognize.
+  Because the parser silently ignores unrecognized elements, a configuration setting that appears to
+  be enabled actually remains off.
+- `xml.value`: Detects a misspelled enumeration value, such as `arrival="POISON"`. The parser
+  treats the unrecognized value as absent and falls back to the default behavior.
+- `predicate.casing`: Detects a placeholder such as `[k2]` whose corresponding column rule is
+  defined as `K2`. At runtime, Pherf leaves `[k2]` unresolved in the SQL statement, causing every
+  query execution to fail without recording a latency sample.
+- `openloop.rate`: Detects an open-loop workload configured with a concurrency range such as
+  `concurrency="1-2"`. An open-loop scheduler requires a single fixed worker count, which also
+  defines the capacity bound of its internal dispatch queue.
+- `openloop.seed`: Detects an open-loop schedule configured with `arrival="POISSON"` but no
+  `seed`. Without a fixed seed, the generated arrival timestamps vary across replicate runs, making
+  replicates incomparable.
+- `key.coverage`: Detects a mismatched predicate such as `K2 = [K1]`. During execution, the read
+  query binds the value of the wrong column, fails to match any existing row, and measures an empty
+  lookup instead of a row retrieval.
+- `cogen.offsets`: Detects two scenarios writing overlapping row ranges, such as `[0, 1000)` and
+  `[500, 1500)`, into a single table. The concurrent writers overwrite each other's keys,
+  invalidating both the table row counts and the subsequent read workload.
 
 The complete catalog of rule ids appears in the Validation section of [README.md](../../README.md).
 Because rule ids remain stable across releases, automated tooling can match against them reliably.
@@ -240,15 +254,19 @@ applies those options using the exact same resolution logic as a live run.
    path. Semantic model rules report the scenario name, the query set index, and the query index,
    using 1-based numbering. The complete diagnostic messages emitted for each rule are as follows:
 
-   | Rule | Message |
-   |---|---|
-   | `xml.unknown-element` | element `<thinkTime>` is not a child of `<scenario>` in the Pherf model, so the parser ignores it and its content |
-   | `xml.value` | the value 'POISON' is not one of UNIFORM, POISSON, so the parser reads it as absent |
-   | `predicate.casing` | placeholder [k2] has no rule, and rule K2 differs only in case, so the run leaves [k2] in the statement |
-   | `openloop.rate` | openLoop of querySet 1 of scenario orders: concurrency is not one integer of at least 1: 1-2 |
-   | `openloop.seed` | openLoop of querySet 1 of scenario orders: arrival POISSON requires a seed |
-   | `key.coverage` | column K2 is compared with placeholder [K1], but the decoder binds [K1] to the value of K1 of the drawn row |
-   | `cogen.offsets` | rows [500, 1500) overlap rows [0, 1000) of scenario orders on table PHERF.HOWTO_ORDERS, so the writers write the same keys |
+   - `xml.unknown-element`: element `<thinkTime>` is not a child of `<scenario>` in the Pherf
+     model, so the parser ignores it and its content
+   - `xml.value`: the value 'POISON' is not one of UNIFORM, POISSON, so the parser reads it as
+     absent
+   - `predicate.casing`: placeholder [k2] has no rule, and rule K2 differs only in case, so the
+     run leaves [k2] in the statement
+   - `openloop.rate`: openLoop of querySet 1 of scenario orders: concurrency is not one integer
+     of at least 1: 1-2
+   - `openloop.seed`: openLoop of querySet 1 of scenario orders: arrival POISSON requires a seed
+   - `key.coverage`: column K2 is compared with placeholder [K1], but the decoder binds [K1] to
+     the value of K1 of the drawn row
+   - `cogen.offsets`: rows [500, 1500) overlap rows [0, 1000) of scenario orders on table
+     PHERF.HOWTO_ORDERS, so the writers write the same keys
 
 6. Inspect the process exit code returned by Pherf when a defect is present. An exit code of 65
    (EX_DATAERR) indicates that at least one validation rule failed.
@@ -366,10 +384,12 @@ applies those options using the exact same resolution logic as a live run.
     report; instead, it records a single INFO log entry (`The scenario files pass the validation`),
     and the benchmark execution proceeds directly using the data models parsed during validation.
 
-11. Verify that the pre-run gate validates the scenario files exactly as written on disk. Runtime
-    launch overrides (`-threadCount`, `-runDurationMs`, and `-targetRate`) are applied only after
-    the validation gate completes, meaning that passing `-threadCount 2` on the command line does
-    not mask or repair an invalid concurrency range declared on an open loop.
+11. Verify that the pre-run gate validates the scenario files exactly as written on disk, whereas
+    invoking `-validate` with launch overrides evaluates both the unmodified files and the
+    overridden models. Because runtime launch overrides (`-threadCount`, `-runDurationMs`,
+    `-targetRate`) are applied only after the pre-run gate completes, passing `-threadCount 2`
+    does not repair an invalid concurrency range declared on an open loop, and the execution
+    rejects the file:
 
     ```sh
     pherf -q -z nohost.invalid -threadCount 2 -disableSchemaApply -label range \
@@ -385,9 +405,66 @@ applies those options using the exact same resolution logic as a live run.
     Validation: 1 error(s) in 1 file(s). Report: RESULTS/VALIDATION_range.json
     ```
 
-12. Verify that the validator applies `-rowCountOverride` in the same manner as a benchmark run.
-    When overridden to 400 rows, scenario `orders` writes the range `[0, 400)` and `ordersB` writes
-    `[500, 900)`, eliminating the key-range overlap between the two scenarios.
+    Next, run offline validation with the same launch overrides. When launch overrides are
+    supplied, `-validate` first evaluates all rules against the scenario files as written—matching
+    the behavior of the pre-run gate—and then evaluates the rules a second time against the data
+    models after applying the overrides. Any finding produced by both passes is deduplicated and
+    reported once, ensuring that a clean `-validate` pass guarantees a clean pre-run gate.
+
+    ```sh
+    pherf -validate -q -threadCount 2 -disableSchemaApply -label range-v \
+      -scenarioFile "$HOWTO/d-range.xml" 2>"$HOWTO/range-v.log"
+    echo "exit=$?"
+    ```
+
+    Captured output (with the long line truncated at `...`):
+
+    ```text
+    openloop.rate $HOWTO/d-range.xml scenario orders querySet 1: openLoop of querySet 1 of ...
+    Validation: 1 error(s) in 1 file(s). Report: RESULTS/VALIDATION_range-v.json
+    exit=65
+    ```
+
+    This finding originates from the first pass against the unmodified file on disk. Once
+    `-threadCount 2` is applied, the in-memory data models have a single integer worker count, so
+    the second validation pass does not flag the rule.
+
+    Conversely, a launch override can introduce a semantic defect that is not present in the static
+    scenario files. Create a closed-loop variant of the valid baseline scenario by stripping its
+    `openLoop` and `mix` elements, and then override its concurrency to 2000 threads against its
+    1000-row dataset:
+
+    ```sh
+    sed -e '/<openLoop/,/<\/openLoop>/d' -e '/<mix>/,/<\/mix>/d' "$HOWTO/orders.xml" \
+      > "$HOWTO/closed.xml"
+    pherf -validate -disableSchemaApply -label closed -scenarioFile "$HOWTO/closed.xml" \
+      2>/dev/null
+    pherf -validate -q -threadCount 2000 -disableSchemaApply -label walk \
+      -scenarioFile "$HOWTO/closed.xml" 2>/dev/null
+    echo "exit=$?"
+    ```
+
+    Captured output (with long lines truncated at `...`):
+
+    ```text
+    Validation: 0 error(s) in 1 file(s). Report: RESULTS/VALIDATION_closed.json
+    cogen.walk $HOWTO/closed.xml scenario orders querySet 1: SELECT: worker 1999 of 2000 has ...
+    cogen.walk $HOWTO/closed.xml scenario orders querySet 1: SCAN: worker 1999 of 2000 has ...
+    Validation: 2 error(s) in 1 file(s). Report: RESULTS/VALIDATION_walk.json
+    exit=65
+    ```
+
+    Because the scenario file is valid as written, both standalone validation and the pre-run gate
+    accept it; the pre-run gate cannot detect a defect that arises only after launch overrides are
+    applied. Only running `-validate` with the exact launch overrides intended for execution exposes
+    this error, so you should always validate using the full set of runtime overrides. Distributed
+    Pherf enforces this automatically across a fleet: every agent validates its assigned share of
+    the execution plan, and a validation finding on any agent terminates the entire fleet run with
+    status `ABORTED` before any workload launches ([D01][d01]).
+
+12. Verify that the validator applies `-rowCountOverride` using the same resolution logic as a live
+    run. When overridden to 400 rows, scenario `orders` populates the range `[0, 400)` while
+    `ordersB` populates `[500, 900)`, eliminating the key-range overlap between the two scenarios.
 
     ```sh
     pherf -validate -rowCountOverride 400 -disableSchemaApply -label over \
@@ -515,10 +592,12 @@ rm -rf "$HOWTO"
 
 - [README.md](../../README.md), Validation section: Reference documentation covering every
   validation rule id and the pre-run gate behavior.
-- [HOWTO 03](03-open-loop-profiles-and-mixes.md): Detailed guide to open-loop workloads, profiles,
-  and operation mixes validated by the `openloop.*` and `xml.profile` rules.
+- [HOWTO 03](03-open-loop-profiles-and-mixes.md): Detailed guide to open-loop workloads, external
+  profiles, and operation mixes validated by the `openloop.*` and `xml.profile` rules.
 - [HOWTO 04](04-co-generation.md): Detailed guide to deterministic co-generation validated by the
   `cogen.*`, `key.coverage`, and `predicate.*` rules.
 - [Harness HOWTO 04](../../../dev/harness/docs/howto/04-pherf-through-the-harness.md): Guide to
-  invoking the pre-run validation gate through the test harness, where a gate failure produces the
-  summary row `pherf.gate FAIL`.
+  executing the pre-run validation gate through the test harness, where a gate failure produces the
+  verdict row `pherf.gate FAIL`.
+
+[d01]: ../../../phoenix-pherf-distributed/docs/howto/01-standalone-fleet-and-rest-api.md

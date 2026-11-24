@@ -59,15 +59,15 @@ HOWTO="$PX_OUT/howto/h07"; mkdir -p "$HOWTO"
 ## Method
 
 **Co-generation.** When a scenario includes a `<coGeneration>` element, every generated column
-value is a pure function of the row index, the column generation rule, and the seed. Writers
-claim disjoint blocks of row indexes, where each block corresponds to a single commit, and a
-reader selects only row indexes that a writer has already committed. A SCAN or DELETE operation
-selects one aligned block and binds its two range bounds to the leading-key values of the first
-and last rows of that block, ensuring that the predicate matches the exact rows belonging to
-that block. Because DELETE operations consume blocks in sequential index order and read
-operations skip blocks that have already been deleted, every operation and row count for the
-entire run is deterministically determined by the scenario definition. See
-[How to generate verifiable data with co-generation](../../../../phoenix-pherf/docs/howto/04-co-generation.md)
+value is a pure function of the row index, the column generation rule, and the seed. Writers claim
+disjoint blocks of row indexes where each block corresponds to a single commit, and a reader draws
+only row indexes that a writer has already committed. A SCAN or DELETE operation targets one
+aligned block and binds its two range bounds to the leading-key values of the first and last rows
+of that block, ensuring that the predicate matches the exact rows belonging to that block. Because
+DELETE operations consume blocks in sequential index order and read operations skip blocks that
+have already been deleted, every operation and row count for the run is deterministically fixed by
+the scenario definition. See
+[How to generate verifiable data with co-generation][p04]
 for the configuration settings.
 
 **The expected counts.** The scenario loads N = 1000 rows in blocks of B = 50 rows. The open-loop
@@ -210,16 +210,16 @@ verdicts remain authoritative on any host and across every run class.
    EOF
    ```
 
-   The operation mix is declared inline alongside the inline `<openLoop>` element to keep the
-   scenario in a single file; an external `profile="..."` file placed next to the scenario also
-   works because the pherf driver stages it. Both the SCAN and DELETE statements reference the
-   `[K1]` range placeholder twice, binding the first occurrence to the lower bound and the second
-   occurrence to the upper bound. Setting `watermark="COMMIT"` ensures that a reader observes a
-   block only after its commit completes, and `walk="MULTIPLICATIVE"` traverses the committed rows
-   in a hashed order that reads each row once per pass. To validate this scenario file before a
-   run, follow
-   [How to author a scenario and validate it offline](../../../../phoenix-pherf/docs/howto/02-scenario-authoring-and-validation.md);
-   the pre-run validation gate of Pherf enforces the same rules automatically during `prepare`.
+   The operation mix is declared inline alongside the inline `<openLoop>` element so that the
+   entire scenario resides in a single file; an external `profile="..."` file placed next to the
+   scenario also works because the pherf driver stages it automatically. Both the SCAN and DELETE
+   statements reference the `[K1]` range placeholder twice, binding the first occurrence to the
+   lower bound and the second to the upper bound. Setting `watermark="COMMIT"` ensures that a
+   reader observes a block only after its commit completes, while `walk="MULTIPLICATIVE"` traverses
+   the committed rows in a hashed order that visits each row once per pass. To validate this
+   scenario file offline before executing a run, follow
+   [How to author a scenario and validate it offline][p02];
+   the pre-run validation gate of Pherf enforces the same rules during `prepare`.
 
 3. Run the workload scenario.
 
@@ -338,12 +338,10 @@ verdicts remain authoritative on any host and across every run class.
 
 ### Under concurrent load
 
-Read-your-writes consistency defects typically surface under multi-worker concurrency and
-sustained load pressure. Whereas the scheduled proof above runs one worker at 25 operations per
-second, this concurrent proof runs 16 workers at 1000 operations per second for 60 s using only
-point lookups and range scans so that no read can race against a concurrent delete. These steps
-have been verified against the implementation code, although the live verification pass of these
-HOWTO documents did not execute them.
+Read-your-writes consistency defects typically surface under multi-worker concurrency and sustained
+load pressure. Whereas the scheduled proof above runs a single worker at 25 operations per second,
+this concurrent proof drives 16 workers at 1000 operations per second for 60 s using only point
+lookups and range scans so that no read can race against a concurrent delete.
 
 To determine the expected counts, the scenario loads N = 10,000 rows in blocks of B = 50 rows,
 and the open-loop schedule generates A = 60,000 arrivals. Because the 70/30 mix has a cycle
@@ -406,25 +404,47 @@ the end of the run.
     rangeScan runs 18000 rows 900000 min 50 max 50
     ```
 
-    The output excerpt displays the expected values for a passing run. A minimum count of 0 for
-    the lookup query indicates a read that missed a committed row under load, while a scan
-    minimum below 50 rows indicates a key range that lost rows. You can also inspect the
-    operation counts and schedule counters by running the command from step 4 against `$RUN_L`,
-    which must report 60,000 scheduled and completed arrivals along with 0 dropped and 0 aborted
-    arrivals.
+    The observed counts match the expected values exactly. A minimum row count of 0 for the point
+    lookup indicates a read that missed a committed row under load, whereas a scan returning fewer
+    than 50 rows indicates a key range that lost rows. Inspecting the operation counts and schedule
+    metrics by running the command from step 4 against `$RUN_L` confirms 60,000 scheduled and
+    completed arrivals with 0 dropped and 0 aborted operations:
+
+    ```text
+    op@query_rwyl_lookup	pherf.operations	42000
+    op@response_rwyl_lookup	pherf.operations	42000
+    op@response_rwyl_rangeScan	pherf.operations	18000
+    op@scan_rwyl_rangeScan	pherf.operations	18000
+    schedule@rwyl.1	pherf.schedule.scheduled	60000
+    schedule@rwyl.1	pherf.schedule.completed	60000
+    schedule@rwyl.1	pherf.schedule.dropped	0
+    schedule@rwyl.1	pherf.schedule.aborted	0
+    ```
+
+    As in step 7, the scenario omits a warmup phase, so initial cold-start overhead produces a peak
+    scheduling lag of 1.4 s and a response p99 latency of 1.4 s, causing the saturation and
+    tail-latency verdict rows to report ADVISORY. Because both checks belong to the `duration`
+    class, they do not affect the correctness proof.
 
 11. Verify the total row count of the table using the psql driver.
 
     ```sh
     echo 'SELECT COUNT(*) FROM PX_HOWTO.RWYL;' >"$HOWTO/count-load.sql"
-    RUN_LC="$(px-run --keep -c validation -d psql -- "$HOWTO/count-load.sql")"; echo "exit $?"
+    RUN_LC="$(px-run psql -- "$HOWTO/count-load.sql")"
     cat "$RUN_LC/drivers/psql/out/run-1.out"
     ```
 
-    The resulting row count must equal 10,000. To verify the same guarantee under fault
-    conditions, add the fault kill specification from
-    [How to inject faults and measure recovery](09-fault-injection-and-recovery.md) to step 9
-    when running on the cluster topology defined in that HOWTO.
+    ```text
+                                    COUNT(1)
+    ----------------------------------------
+                                       10000
+    Time: 0.064 sec(s)
+    ```
+
+    The resulting row count must equal 10,000. To verify the same correctness guarantee across a
+    server fault, add the kill disruption specification from
+    [How to inject faults and measure recovery](09-fault-injection-and-recovery.md) to step 9 on
+    the cluster topology defined in that HOWTO.
 
 ## Read the result
 
@@ -451,25 +471,25 @@ correctness failure in the build, regardless of the host environment.
 
 To scale up the workload with deletes enabled, increase the arrival rate and stage duration
 together with the initial row count: because delete operations remove 10 x B rows for every 100
-arrivals, the total row count must remain strictly greater than deletes x B. When running
-multiple load generators against a single table, assign each generator process a distinct
-`offset` attribute; see
-[How to generate verifiable data with co-generation](../../../../phoenix-pherf/docs/howto/04-co-generation.md).
+arrivals, the total row count must remain strictly above deletes x B. When driving a single table
+from multiple load-generator processes, assign each process a distinct `offset`; see
+[How to generate verifiable data with co-generation][p04]. The Distributed Pherf tier automatically
+assigns each agent a contiguous, disjoint key range: `fleet-rww.suite` in [H14][h14] executes this
+proof across 2 agents configured with offsets 0 and 2000.
 
 ## Reproduce it
 
-- The seed 8070, the offset, the block size, the cluster limit, the row count, and the column
+- The co-generation seed 8070, offset, block size, cluster limit, row count, and column generation
   rules deterministically fix every generated value. Because `rwyw.xml` defines the complete
   workload, archive it alongside the run bundles.
-- Using UNIFORM arrivals at a fixed rate together with an exact mix cycle deterministically
+- Combining UNIFORM arrivals at a fixed rate with an exact operation mix cycle deterministically
   fixes the execution order of the operations.
-- Within each bundle, `cluster/topology.env` and `cluster/images.tsv` record the exact component
-  version set and container image. Archive `$RUN`, `$RUN_COUNT`, `$RUN_L`, and `$RUN_LC`, and
-  use `px-bundle validate --run "$RUN"` to verify an archived copy.
-- Repeated replicates of each run must produce identical operation counts and row counts. The
-  offline analysis pipeline verifies this exact parity automatically for co-generated scenarios;
-  see
-  [How to detect a regression and compare builds, configurations and versions](12-regression-ab-and-matrices.md).
+- Within each bundle, `cluster/topology.env` and `cluster/images.tsv` record the component version
+  set and container image. Archive `$RUN`, `$RUN_COUNT`, `$RUN_L`, and `$RUN_LC`, and run
+  `px-bundle validate "$RUN"` to confirm the integrity of any archived bundle copy.
+- Replicates of each run must produce identical operation and row counts. The offline analysis
+  pipeline verifies this exact parity for any co-generated scenario; see [How to detect a
+  regression and compare builds, configurations and versions][h12].
 
 ## Clean up
 
@@ -486,8 +506,17 @@ multiple load generators against a single table, assign each generator process a
 
 ## See also
 
-- [README of Pherf, sections "Co-generation" and "SCAN and DELETE operations"](../../../../phoenix-pherf/README.md)
-- [How to cover Phoenix types and multi-tenant workloads](../../../../phoenix-pherf/docs/howto/05-types-and-multi-tenant.md)
-- [How to inject faults and measure recovery](09-fault-injection-and-recovery.md): Applies this
-  same correctness proof across a RegionServer fault kill.
+- [README of Pherf, sections "Co-generation" and "SCAN and DELETE operations"][pherf-readme]
+- [How to cover Phoenix types and multi-tenant workloads][p05]
+- [How to run Pherf on a fleet through the harness][h14], section "Read what you wrote across
+  agents": executes the same correctness proof across 2 agents, each assigned its own slot offset.
+- [How to inject faults and measure recovery](09-fault-injection-and-recovery.md): executes the
+  same correctness proof across a RegionServer kill.
 - [The driver contract, sections "psql" and "pherf"](../driver-contract.md)
+
+[h12]: 12-regression-ab-and-matrices.md
+[h14]: 14-fleet-through-the-harness.md
+[p02]: ../../../../phoenix-pherf/docs/howto/02-scenario-authoring-and-validation.md
+[p04]: ../../../../phoenix-pherf/docs/howto/04-co-generation.md
+[p05]: ../../../../phoenix-pherf/docs/howto/05-types-and-multi-tenant.md
+[pherf-readme]: ../../../../phoenix-pherf/README.md
