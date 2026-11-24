@@ -1402,12 +1402,17 @@ disrupt_sweep() {
 # Host safety and lifecycle guards
 # ---------------------------------------------------------------------------
 
-# Any non-quiet result that still permits the workload to proceed—including when the check is turned
-# off—sets CONTAMINATION and records a contamination row.
-## @description  Runs the px-tool quiet-host check before starting the workload.
+# Any other result that still permits the workload to start—including when the check is turned
+# off—marks the run as contaminated.
+## @description  Executes the px-tool quiet-host check (or the dedicated-node check on Kubernetes)
+##               and records every output row except the closing result row.
 ## @return       Exits 0 to proceed, or returns the px-tool status (2 usage, 4 busy, 5 unmeasured).
 quiet_check() {
   local rows status=0 state detail
+  if [ "$PX_BACKEND" = k8s ]; then
+    dedicated_check
+    return
+  fi
   rows="$("$PX_HOME/bin/px-tool" quiet-host || exit "$?")" || status=$?
   record_rows "quiet$PX_TAB" "$(printf '%s\n' "$rows" | grep -v "^result$PX_TAB" || true)"
   state="$(px_tsv_get quiet_host "$rows")" || state=""
@@ -1419,6 +1424,32 @@ quiet_check() {
   *) detail="the host was ${state:-not measured}" ;;
   esac
   contaminate quiet-host "$detail"
+}
+
+# Only a target declaring PX_K8S_DEDICATED_NODES=1 produces authoritative time verdicts; an
+# undeclared target either refuses the run or marks it as contaminated.
+## @description  Evaluates the quiet-host check for a Kubernetes target.
+## @return       Exits 0 to proceed, or 2 on undeclared required isolation or an invalid value.
+dedicated_check() {
+  case "${PX_K8S_DEDICATED_NODES:-0}" in
+  1)
+    record_row quiet quiet_host dedicated 0 0 ""
+    return 0
+    ;;
+  0) ;;
+  *)
+    px_error "PX_K8S_DEDICATED_NODES='$PX_K8S_DEDICATED_NODES' must be 0 or 1"
+    return "$PX_EXIT_USAGE"
+    ;;
+  esac
+  if px_is_true "${PX_REQUIRE_QUIET_HOST:-0}"; then
+    record_row quiet quiet_host refused 0 0 ""
+    px_error "the run requires a quiet host, and the target declares no dedicated nodes:" \
+      "set PX_K8S_DEDICATED_NODES=1 in the target file, or PX_REQUIRE_QUIET_HOST=0"
+    return "$PX_EXIT_USAGE"
+  fi
+  record_row quiet quiet_host undeclared 0 0 ""
+  contaminate dedicated-node "the target declares no dedicated nodes"
 }
 
 ## @description  Appends a contamination cause (cause, detail...) to the comma-separated

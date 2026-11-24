@@ -16,12 +16,21 @@
 # This template defines the common pod specification shared across all workloads. It runs a single
 # container named px under an unprivileged user identity with all capabilities dropped, and
 # configures a dedicated DNS search domain for each headless Service to resolve the bare name of
-# any peer.
+# any peer. Target placement rules (affinity, node selector, and tolerations) and pull secrets
+# apply uniformly to every pod. Local images are never pulled, whereas images from a remote
+# registry are pulled by digest.
 
 restartPolicy: ${PX_M_RESTART}
 automountServiceAccountToken: false
 enableServiceLinks: false
 terminationGracePeriodSeconds: ${PX_M_GRACE}
+${PX_M_AFFINITY}
+nodeSelector:
+${PX_M_NODE_SELECTOR}
+tolerations:
+${PX_M_TOLERATIONS}
+imagePullSecrets:
+${PX_M_PULL_SECRETS}
 securityContext:
   runAsNonRoot: true
   runAsUser: ${PX_M_UID}
@@ -35,7 +44,7 @@ ${PX_M_SEARCHES}
 containers:
   - name: px
     image: "${PX_M_IMAGE}"
-    imagePullPolicy: Never
+    imagePullPolicy: ${PX_M_PULL_POLICY}
     securityContext:
       runAsNonRoot: true
       runAsUser: ${PX_M_UID}

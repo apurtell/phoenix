@@ -312,7 +312,7 @@ timeout bounds, and all other resolved configuration parameters for the active r
 | `PX_RUN_ID` | The unique run identifier, formatted as `<YYYYMMDDTHHMMSSZ>-<4 characters>`. |
 | `PX_RUN_DIR` | The run bundle directory, located at `$PX_OUT/runs/<run-id>`. |
 | `PX_RUN_CLASS` | Either `validation` or `measurement`; every real run is assigned one. |
-| `PX_CONTAMINATION` | Host contamination causes, such as `quiet-host`; empty on a quiet host. |
+| `PX_CONTAMINATION` | Causes such as `quiet-host` or `dedicated-node`; empty on a quiet host. |
 | `PX_BACKEND` | The bound substrate backend identifier passed to `sb_load`. |
 | `PX_SCOPE_ID` | The cluster scope, opaque to a driver, or empty when the run has no cluster. |
 | `PX_DRIVER_NAME` | The canonical name of the driver. |

@@ -17,7 +17,7 @@
 # Defines the substrate contract by declaring what a backend must provide, binding a single
 # backend, and verifying that the binding is complete.
 #
-# Every layer above this file interacts with the substrate exclusively through these 31 sb_*
+# Every layer above this file interacts with the substrate exclusively through these 32 sb_*
 # functions. Consequently, a driver, a check, a plug-in hook, a health monitor, a collector, and
 # the operator commands execute unchanged across every backend, and no component above this layer
 # depends on a container runtime. This file itself does not reference any specific runtime.
@@ -212,12 +212,12 @@ EOF
 # ---------------------------------------------------------------------------
 # The function set
 # ---------------------------------------------------------------------------
-# The substrate contract consists of 31 required functions: sb_load refuses a backend that does not
+# The substrate contract consists of 32 required functions: sb_load refuses a backend that does not
 # define each one. A backend that cannot serve a function on its substrate must still define it and
 # return 5 so that the caller records a skip. Every function that operates on a cluster takes the
-# scope id returned by sb_scope_create as its first argument. The three image functions
-# sb_image_build, sb_image_present, and sb_image_base_digest operate on the host rather than on a
-# cluster, so they take no scope id.
+# scope id returned by sb_scope_create as its first argument. The four image functions
+# sb_image_build, sb_image_present, sb_image_base_digest, and sb_image_push operate on the host
+# rather than on a cluster, so they take no scope id.
 
 SB_REQUIRED_FUNCTIONS="sb_backend_id
 sb_version_info
@@ -249,7 +249,8 @@ sb_endpoint_release
 sb_image_ref
 sb_image_build
 sb_image_present
-sb_image_base_digest"
+sb_image_base_digest
+sb_image_push"
 
 ## @description  Outputs the list of all substrate contract function names.
 ## @return       Writes one function name per line to stdout and exits 0.
@@ -908,15 +909,9 @@ sb_scope_gated() {
 ## @param        SCOPE: The new scope id to admit and record.
 ## @return       Exits 0 when the new record is written, or 1 if the gate refuses or writing fails.
 sb_record_gate() {
-  local backend=${1:-} scope=${2:-} dir path name others=""
-  dir="$(sb_state_dir "$backend")" || return "$SB_EXIT_FAIL"
+  local backend=${1:-} scope=${2:-} path others
   if ! px_is_true "${PX_FORCE:-0}"; then
-    for path in "$dir"/scope-*.tsv; do
-      [ -f "$path" ] || continue
-      name="$(sb_row_get scope "$(cat "$path")")" || continue
-      [ "$name" != "$scope" ] || continue
-      others="$others $name"
-    done
+    others="$(sb_record_scopes "$backend" "$scope")" || return "$SB_EXIT_FAIL"
     if [ -n "$others" ]; then
       px_error "another scope is recorded on this host:$others. Tear it down first," \
         "or set PX_FORCE=1 when the record is stale."
@@ -932,6 +927,19 @@ sb_record_gate() {
   rm -f "$path"
   sb_record_set "$backend" "$scope" scope "$scope" || return "$SB_EXIT_FAIL"
   sb_record_set "$backend" "$scope" created_at "$(px_timestamp)" || return "$SB_EXIT_FAIL"
+}
+
+## @description  Reports every recorded scope id for BACKEND except an optional EXCEPT scope.
+## @return       Writes each scope id preceded by a space, or nothing if none exist; exits 0, or 2
+##               when the output policy refuses the state directory.
+sb_record_scopes() {
+  local dir path name
+  dir="$(px_state_dir)" || return $?
+  for path in "$dir/${1:-}"/scope-*.tsv; do
+    [ -f "$path" ] || continue
+    name="$(sb_row_get scope "$(cat "$path")")" || continue
+    [ "$name" = "${2:-}" ] || printf ' %s' "$name"
+  done
 }
 
 ## @description  Reports the label namespace prefix that scopes every substrate object.
@@ -988,10 +996,38 @@ sb_version_at_least() {
   return 1
 }
 
-## @description  Emits one phase TSV row for a compound operation with elapsed time since START_MS.
-## @param        PHASE: The phase name, such as drain, stop, start, ready, or rebalance.
-## @param        status: The phase outcome word: ok, fail, or skip.
-## @param        START_MS: Phase start timestamp in epoch milliseconds; defaults to 0.
+# Compares VERSION against the major.minor version floor stored in the variable named by NAME, such
+# as PX_K3D_MIN_VERSION from docker/versions.env.
+## @description  Tests VERSION against the major.minor floor stored in the variable NAME.
+## @return       Exits 0 when VERSION meets the floor, 1 when it is lower, or 2 when either value
+##               contains no version number.
+sb_version_floor() {
+  local floor=${!2:-}
+  case "$floor" in
+  [0-9]*.[0-9]*) sb_version_at_least "${1:-}" "${floor%%.*}" "${floor#*.}" ;;
+  *) return "$SB_EXIT_USAGE" ;;
+  esac
+}
+
+# Defines the lowercase grammar for a registry address, consisting of a host, an optional port, and
+# an optional path. Because the container engine interprets a leading component without a dot, a
+# port, or the name localhost as a Docker Hub namespace, accepting such a value would direct a push
+# to a public registry; the host validation rule therefore rejects it.
+SB_REGISTRY_RE='^[a-z0-9]([-a-z0-9.]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([-a-z0-9._]*[a-z0-9])?)*$'
+
+## @description  Validates a registry value against SB_REGISTRY_RE and the explicit host rule.
+## @return       Exits 0 when the value names an explicit registry host, or 1 otherwise.
+sb_registry_check() {
+  local host=${1:-}
+  host=${host%%/*}
+  [[ ${1:-} =~ $SB_REGISTRY_RE ]] || return "$SB_EXIT_FAIL"
+  case "$host" in
+  *.* | *:* | localhost) return 0 ;;
+  esac
+  return "$SB_EXIT_FAIL"
+}
+
+## @description  Emits one phase row for a compound operation (PHASE, ok|fail|skip, and START_MS).
 ## @return       Writes one phase TSV row to stdout and exits 0.
 sb_phase_row() {
   px_tsv_row "${1:-}" "${2:-}" "$(($(px_epoch_ms) - ${3:-0}))"

@@ -144,11 +144,60 @@ ck_wrapper() {
   fi
 }
 
-## @description  Evaluates the restart subject from abort rows and diff rows marked unplanned or
-##               vanished.
+## @description  Reads the previous container log for each instance (role/index words) into
+##               logs/instance/<role>-<index>.previous.log for the verdict detail.
+## @return       Writes one note per instance prefixed with "; " to stdout and returns exit 0.
+ck_previous_logs() {
+  local key role index file status
+  [ -n "${PX_SCOPE_ID:-}" ] || return 0
+  mkdir -p "$CK_RUN/logs/instance" || return 0
+  for key in ${1:-}; do
+    role=${key%/*} index=${key#*/}
+    file="logs/instance/$role-$index.previous.log"
+    status=0
+    sb_logs "$PX_SCOPE_ID" "$role" "$index" - 1 >"$CK_RUN/$file" 2>/dev/null || status=$?
+    if [ "$status" = 0 ]; then
+      printf '; the previous log of %s is %s' "$key" "$file"
+    else
+      rm -f "$CK_RUN/$file"
+      printf '; no previous log of %s, exit %s' "$key" "$status"
+    fi
+  done
+}
+
+## @description  Reports each instance not named by an anomaly row (keys) whose live restart count
+##               rose above its post-run or pre-run snapshot count.
+## @return       Writes "role/index before after" lines to stdout and returns exit 0.
+ck_restart_live() {
+  local rows named=" ${1:-}" live role index count base status=0
+  [ -z "$CK_INV_GAP" ] || return 0
+  rows="$(pb_record_rows restart "$CK_REC")"
+  [ -n "$rows" ] || return 0
+  live="$(sb_restart_count "$PX_SCOPE_ID" 2>/dev/null || exit "$?")" || status=$?
+  [ "$status" = 0 ] || return 0
+  # Each restart record row contains phase, role, index, and count. Because the post-run snapshot
+  # count already reflects every planned action executed during the run, any subsequent increase
+  # represents an unplanned restart. Any instance without a pre-run snapshot row is newly created.
+  while IFS="$PX_TAB" read -r role index count; do
+    [ -n "$role" ] && [[ $count =~ $PX_RE_INT ]] || continue
+    case "$named" in
+    *" $role/$index "*) continue ;;
+    esac
+    base="$(printf '%s\n' "$rows" | awk -F '\t' -v r="$role" -v i="$index" '
+      $2 == r && $3 == i { b[$1] = $4 }
+      END { if ("post" in b) print b["post"]; else if ("pre" in b) print b["pre"] }')"
+    [[ $base =~ $PX_RE_INT ]] || continue
+    [ "$count" -le "$base" ] || printf '%s/%s %s %s\n' "$role" "$index" "$base" "$count"
+  done <<EOF
+$live
+EOF
+}
+
+## @description  Evaluates the restart subject from diff rows marked unplanned or vanished, abort
+##               rows, and live restart counts exceeding the snapshots.
 ## @return       Returns exit 0.
 ck_restart() {
-  local diffs aborts result count list known unknown sev
+  local diffs aborts result count list known unknown sev keys live key before after
   diffs="$(pb_record_rows diff "$CK_REC")"
   aborts="$(pb_record_rows abort "$CK_REC")"
   # Each diff row contains role, index, before, after, verdict, pre_state, and post_state. An
@@ -175,10 +224,23 @@ ck_restart() {
     } END { printf "%d\t%s\n", n, list }')"
   count="$(px_tsv_field 1 "$result")"
   list="$(px_tsv_field 2 "$result")"
+  keys="$(pb_anomaly_rows "$CK_REC" | awk -F "$PB_US" 'NR > 1 { printf "%s/%s ", $1, $2 }')"
+  live="$(ck_restart_live "$keys")"
+  while read -r key before after; do
+    [ -n "$key" ] || continue
+    count=$((count + 1))
+    keys="$keys$key "
+    list="$list $key (restart count $before to $after after the post-run snapshot)"
+  done <<EOF
+$live
+EOF
   [ -z "$list" ] || list=":$list"
   [ "$unknown" = 0 ] || list="$list; $unknown instances unreadable after the run"
   sev=PASS
-  ck_over "$count" "$CK_VALUE" && sev=ERROR
+  if ck_over "$count" "$CK_VALUE"; then
+    sev=ERROR
+    list="$list$(ck_previous_logs "$keys")"
+  fi
   sx_verdict_row cluster.restart "$sev" count "$count instances changed with no planned" \
     "action$list; restart.unplanned.max=$CK_VALUE"
 }
@@ -256,7 +318,7 @@ EOF
   esac
   if ck_over "$count" "$kill_max"; then
     sx_verdict_row cluster.oom ERROR count "$count out-of-memory kills:$kill_list;" \
-      "peaks:$peaks; oom.kills.max=$kill_max"
+      "peaks:$peaks; oom.kills.max=$kill_max$(ck_previous_logs "$kill_list")"
   elif [ -n "$peak_pct" ] && ck_over "$peak_pct" "$peak_max"; then
     sx_verdict_row cluster.oom FAIL count "$peak_who peaked at $peak_pct% of its limit;" \
       "peaks:$peaks; oom.peak_pct.max=$peak_max"

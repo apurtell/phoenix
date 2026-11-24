@@ -79,6 +79,7 @@ runs/<run-id>/
   logs/px-collect.log           the stderr of px-collect start and stop under px-run  optional
   logs/collect.log              the remote tool output and the sampler log         optional
   logs/instance/<role>-<index>.log  the daemon log of each instance
+  logs/instance/<role>-<index>.previous.log  the previous container, Kubernetes  optional
   logs/gc/<role>-<index>.log    the garbage-collection log of each JVM instance     optional
   plugins/<id>/                 the output of each plug-in, its hooks.tsv           optional
   plugins/<id>/manifest.tsv     the output manifest of a plug-in                    optional
@@ -175,7 +176,7 @@ row type permits superseding entries, readers retain the final row of that type.
 | `term` | role index reason exit_code signal finished_at | evidence of an unplanned state change |
 | `oom` | role index oom evidence | out-of-memory evidence of an unplanned instance change |
 | `quiet` | kind, followed by the fields for that kind below | results of the quiet-host check |
-| `contamination` | cause detail | `quiet-host` or `sizing`, marking time evidence as not valid |
+| `contamination` | cause detail | `quiet-host`, `sizing`, or `dedicated-node`: no time evidence |
 | `monitor` | phase dir | records the run directory of the background health monitor |
 | `disrupt` | ordinal kind when action role index argument state | the final row for each counts |
 | `action` | ts_ms action role index argument state exit_code | one injected disruption action |
@@ -186,19 +187,24 @@ row type permits superseding entries, readers retain the final row of that type.
 | `skip` | phase subject reason | a skipped step and its reason, including a missed disruption |
 | `result` | exit_code name anomaly | the final row; a record lacking this row was interrupted |
 
-A `quiet` row has the form `sample ts_ms load_pct threshold_pct` or `result state samples waited_s
-load_pct`. A `diff` verdict is `unchanged`, `planned`, `unplanned`, `vanished` or `unknown`. A
-`quiet` result state is `quiet`, `contaminated`, `refused`, `unmeasured`, or `off`. A `disrupt`
-kind is either `offset`, with `when` expressed in seconds after the `run` verb starts, or `phase`,
-naming a lifecycle milestone. A `disrupt` state is `pending`, `ok`, `skip`, `fail`, or `missed`.
-The value `missed` indicates an anchor that began and ended before `px-run` observed it open, so the
-disruption never fired; a corresponding `skip` row also identifies it. A `recover` state is `ok`,
-`timeout`, or `fail`, and recovered_ms remains empty unless the state is `ok`. A `sample` phase is
-either `pre` or `post` for the boundary snapshots around the workload, or `monitor` for a continuous
-sample collected by the health monitor from the start of the run onward. The `plugins` context row
-lists the identifiers of the enabled plug-ins separated by spaces. The fields of the `instance`,
-`sample`, `term`, `oom`, and `phase` rows follow the schemas defined in `docs/backends.md`, section
-"Schemas".
+Each `quiet` entry takes the form `sample ts_ms load_pct threshold_pct` or `quiet_host state samples
+waited_s load_pct`: the rows of `px-tool quiet-host` without its closing `result` row. A `diff`
+verdict is one of `unchanged`, `planned`, `unplanned`, `vanished`, or `unknown`. The `quiet_host`
+state is `quiet`, `contaminated`, `refused`, `unmeasured`, or `off`; on
+Kubernetes, where the dedicated-node check runs in place of the quiet-host check, the state is
+`dedicated` (the target declares `PX_K8S_DEDICATED_NODES=1`, so the time evidence counts),
+`undeclared` (no declaration, recording the `dedicated-node` contamination), or `refused` (no
+declaration on a run that requires a quiet host, which stops before prepare with exit code 2). A
+`disrupt` kind is either `offset`, with `when` expressed in seconds after the `run` verb starts, or
+`phase`, naming a lifecycle milestone. A `disrupt` state is `pending`, `ok`, `skip`, `fail`, or
+`missed`. The value `missed` indicates an anchor that began and ended before `px-run` observed it
+open, so the disruption never fired; a corresponding `skip` row also identifies it. A `recover`
+state is `ok`, `timeout`, or `fail`, and recovered_ms remains empty unless the state is `ok`. A
+`sample` phase is either `pre` or `post` for the boundary snapshots around the workload, or
+`monitor` for a continuous sample collected by the health monitor from the start of the run onward.
+The `plugins` context row lists the identifiers of the enabled plug-ins separated by spaces. The
+fields of the `instance`, `sample`, `term`, `oom`, and `phase` rows follow the schemas defined in
+`docs/backends.md`, section "Schemas".
 
 ## stages.tsv
 
@@ -528,7 +534,13 @@ empty string, and an unknown numeric value is represented as `null`.
   ],
   "artifacts": [
     { "path": "run-record.tsv", "status": "present", "required": true, "reason": "" }
-  ]
+  ],
+  "kubernetes": {
+    "api_version": "v1.31.4+k3s1",
+    "placement": [ { "role": "regionserver", "index": 0, "pod": "regionserver-0",
+      "node": "k3d-px-agent-0" } ],
+    "registry_digests": [ { "image_ref": "phoenix-harness:local", "digest": "sha256:..." } ]
+  }
 }
 ```
 
@@ -546,6 +558,7 @@ empty string, and an unknown numeric value is represented as `null`.
 | `steady` | `stages.tsv`, `metrics/aggregate.tsv` | each steady-state window and its metrics |
 | `disruptions` | `disrupt` and `recover` rows | each disruption and its recovery outcome |
 | `artifacts` | `pb_artifact_rows` | the complete file inventory of the bundle |
+| `kubernetes` | `version`, `instance` pre rows, `cluster/images.tsv` | for a Kubernetes run only |
 
 The field `run.started_ms` records the timestamp of the first milestone of `px-run`, while
 `run.ended_ms` records the timestamp at which the manifest is written, and `run.result` holds the
@@ -553,6 +566,13 @@ merged run outcome computed by `px-report`. The field `quiet_host.state` reflect
 `quiet` result row, defaulting to `unknown`, while `quiet_host.tags` lists all contamination
 causes; an empty array indicates that the time evidence of the run is clean. Each entry in
 `artifacts` carries a status of `present`, `missing`, `skipped`, or `unavailable`.
+
+**The kubernetes member.** This member is included only for runs on the Kubernetes backend, leaving
+a Compose manifest byte-for-byte unchanged. The `api_version` field holds the `api_server` value
+from the pre-run version rows, and `placement` records the pod and node for each instance in the
+pre-run snapshot. The `registry_digests` array lists each image reference from `cluster/images.tsv`
+once together with the trailing `sha256` digest of its image ID, capturing the digest resolved by
+the nodes—the registry digest for a pulled image or the content digest for an imported one.
 
 **The anomaly.** The `anomaly` member is `null` whenever no instance changed state without a
 planned action, which corresponds exactly to the `result` row of `run-record.tsv` recording the
@@ -669,7 +689,12 @@ finished bundle exists. The validator enforces the following rules:
    entry in `images` includes an `image_id`, and each entry in `tables` includes an
    `update_cache_frequency`. In addition, `anomaly` is either `null` or an object containing
    `aborted`, `abort_ms`, and at least one entry in `instances`, where each entry carries every
-   member shown in the schema example above.
+   member shown in the schema example above. A bundle for the `k8s` backend with a scope also
+   includes `kubernetes.api_version` as a non-empty string, `kubernetes.placement` as a non-empty
+   array in which every entry names its node, and `kubernetes.registry_digests` as a non-empty
+   array in which every digest matches `sha256:<64 hex>`, emitting one validation row each for
+   `kubernetes.api_version`, `kubernetes.placement`, and `kubernetes.registry_digests`, whereas a
+   Compose bundle emits none of these rows.
 6. `steady` contains at least one entry with a `steady@` anchor and a closed time window. Each
    entry names its anchor and holds integer `start_ms` and `end_ms` timestamps such that the end
    does not precede the start, and the validator explicitly names the defect if an entry has no
@@ -811,8 +836,8 @@ source `check:cluster`.
 | Check | Evidence | Over the threshold | Class |
 |---|---|---|---|
 | `cluster.wrapper` | `verb` rows with timed_out set or an exit code above 128 | `FAIL` | none |
-| `cluster.restart` | `diff` rows `unplanned` or `vanished`, plus `abort` rows | `ERROR` | count |
-| `cluster.oom` | `oom`, `sb_oom_killed`, and `sample` peaks | kill `ERROR`, peak `FAIL` | count |
+| `cluster.restart` | `diff` `unplanned` and `vanished`, `abort`, live counts | `ERROR` | count |
+| `cluster.oom` | `oom`, `sb_oom_killed`, all `sample` peaks | kill `ERROR`, peak `FAIL` | count |
 | `cluster.log` | `sb_logs` output since run start | errors `FAIL`, warnings `ADVISORY` | count |
 | `cluster.gc` | the GC log of each JVM instance retrieved via `sb_copy_out` | `FAIL` | duration |
 | `cluster.recovery` | `disrupt`, `action`, `recover` rows | `FAIL`, and `fail` or `missed` | none |
@@ -822,27 +847,35 @@ Any subject lacking applicable evidence emits a `SKIP` verdict stating the reaso
 cluster, no disruption, or no GC log. The `cluster.recovery` subject emits `FAIL` for any
 disruption whose state is `fail` (a failed fault injection) or `missed`, and it emits `SKIP` only
 when no disruption entry is `ok`, `fail`, or `missed`, since entries that are `skip` or never fired
-prove nothing. The log subject saves each daemon log in `logs/instance/`, and the GC subject saves
-each GC log in `logs/gc/`. When a planned action covered an instance, the log subject still
-preserves its log file but excludes its lines from the counts. It also excludes any line logged by
-any instance during a disruption's recovery window—from the injection timestamp to the recovery
-timestamp of the `recover` row, with 2 s of slack at each end—because an intentional fault
-expectedly causes peer instances to log errors, such as a DataNode whose write pipeline from a
-killed RegionServer breaks. Each line's timestamp is taken from its leading UTC date and time. Lines
-logged after the recovery window are counted as usual, and `cluster.post_recovery` verifies any
-faults that remain. Because the instances belonging to the `pherf` group in `cluster/services.tsv`
-(the controller and agents of the Distributed Pherf tier) act as the load generator rather than
-cluster daemons, the log subject preserves their logs without counting any of their lines and notes
-them in the verdict detail as `load generator, kept and not counted`, while the restart, OOM, and
-container checks continue to monitor them. Furthermore, the log subject excludes known benign server
-log lines matching an entry in the allowlist `suites/log-allow.txt`, and the verdict detail reports
-each matched entry, such as `1 allowed: hbase-dispatcher-delayqueue`. Each allowlist entry specifies
-a unique `id`, the log `level`, the exact `logger` name as formatted by the container image layout
-(the final two components of the class name immediately following the thread name), an awk regular
-expression `message` matched against the text following `<logger>: `, a per-instance `max` count of
-at least 1, an inclusive `release` version range for `hbase` or `hadoop`, and a `reason` with a
-supporting reference. An entry permits at most `max` matching lines within the log of a single
-instance; any subsequent matching lines are counted as ordinary log lines and noted in the detail as
+prove nothing. The `cluster.restart` subject also compares the live `sb_restart_count` of each
+instance against its count from the post-run snapshot (or from the pre-run snapshot if the post-run
+count is absent); any increase after the snapshots that is not already covered by an anomaly row is
+counted and reported as "restart count A to B after the post-run snapshot". For each instance
+counted by `cluster.restart` or `cluster.oom`, the check retrieves the previous container log via
+`sb_logs ... previous=1` into `logs/instance/<role>-<index>.previous.log` and records that file in
+the verdict detail, or records "no previous log of <role>/<index>, exit N" when the backend retains
+no previous log (exit code 5 on Compose, or 6 when no previous container exists). The log subject
+saves each daemon log in `logs/instance/`, and the GC subject saves each GC log in `logs/gc/`. When
+a planned action covered an instance, the log subject still preserves its log file but excludes its
+lines from the counts. It also excludes any line logged by any instance during a disruption's
+recovery window—from the injection timestamp to the recovery timestamp of the `recover` row, with
+2 s of slack at each end—because an intentional fault expectedly causes peer instances to log
+errors, such as a DataNode whose write pipeline from a killed RegionServer breaks. Each line's
+timestamp is taken from its leading UTC date and time. Lines logged after the recovery window are
+counted as usual, and `cluster.post_recovery` verifies any faults that remain. Because the
+instances belonging to the `pherf` group in `cluster/services.tsv` (the controller and agents of
+the Distributed Pherf tier) act as the load generator rather than cluster daemons, the log subject
+preserves their logs without counting any of their lines and notes them in the verdict detail as
+`load generator, kept and not counted`, while the restart, OOM, and container checks continue to
+monitor them. Furthermore, the log subject excludes known benign server log lines matching an entry
+in the allowlist `suites/log-allow.txt`, and the verdict detail reports each matched entry, such as
+`1 allowed: hbase-dispatcher-delayqueue`. Each allowlist entry specifies a unique `id`, the log
+`level`, the exact `logger` name as formatted by the container image layout (the final two
+components of the class name immediately following the thread name), an awk regular expression
+`message` matched against the text following `<logger>: `, a per-instance `max` count of at least
+1, an inclusive `release` version range for `hbase` or `hadoop`, and a `reason` with a supporting
+reference. An entry permits at most `max` matching lines within the log of a single instance; any
+subsequent matching lines are counted as ordinary log lines and noted in the detail as
 `over the max of the allow list, counted: <id>`, because a benign message that repeats excessively
 can indicate a genuine fault. An entry applies only when the active release recorded in
 `cluster/topology.env` (`PX_DIST_HBASE_VERSION` or `PX_DIST_HADOOP_VERSION`) falls within its

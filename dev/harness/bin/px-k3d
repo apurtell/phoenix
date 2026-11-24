@@ -14,35 +14,376 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Front end for provisioning and tearing down the small, version-pinned k3s cluster through k3d to
-# verify the Kubernetes backend. Because round K2 implements the cluster lifecycle behavior and its
-# command-line options, this entry point responds to --help and rejects every other invocation with
-# the unsupported exit code.
+# Manages the local Kubernetes cluster used to validate the Kubernetes backend: a small,
+# digest-pinned k3s cluster that k3d runs inside the host container engine. This command is the
+# only caller of k3d in the repository. The harness never provisions any other Kubernetes cluster,
+# because the Kubernetes backend operates exclusively on existing clusters and node pools.
+#
+# Five design rules govern this script:
+#   1. k3d is invoked from a single function, pxd_call, using an absolute path stored in an
+#      unexported private variable.
+#   2. A state directory record tracks every cluster provisioned by this command. Both delete and
+#      import verify this record before invoking k3d so that delete never removes an externally
+#      managed cluster; check executes prior to create without requiring a record, and targeting a
+#      remote context never invokes k3d.
+#   3. Only one cluster is permitted per host: create refuses to run alongside a Compose cluster,
+#      alongside another state record (unless PX_FORCE=1 marks it stale), or alongside an existing
+#      cluster of the same name. Conversely, px-cluster up on Compose refuses to run when a record
+#      from this command exists. A failed create removes any cluster left behind by k3d, which is
+#      safe because the gate already verified that no cluster with that name existed beforehand.
+#   4. Every host port exposed by the cluster binds to 127.0.0.1, and the active context in the
+#      operator's kubeconfig is never modified.
+#   5. Container images are loaded directly into the node cache via import; no registry is created
+#      and no image is pushed.
+# The engine memory figure reported by check is queried through the Compose backend, which this
+# command loads solely to produce that row.
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/common.sh
 . "$SELF/../lib/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
+. "$SELF/../lib/backend/contract.sh"
 
 set -euo pipefail
 
-## @description  Prints the command-line usage summary and supported options.
-## @return       Writes the help text to stdout and exits with status 0.
-usage() {
-  cat <<'EOF'
-Usage: px-k3d [-h|--help]
+# Host port bindings for the cluster, covering the API server and, in the validation topology,
+# the HTTP port of the service load balancer. Both ports bind exclusively to 127.0.0.1.
+PXD_API_PORT=127.0.0.1:6550
+PXD_LB_PORT=127.0.0.1:8081:80@loadbalancer
+# Regular expression enforcing that the k3s image pin specifies an immutable digest reference.
+PXD_PIN_RE='k3s(:[^@]+)?@sha256:[0-9a-f]{64}$'
 
-Creates and removes the local cluster that proofs the Kubernetes backend.
-Round K2 implements it.
+# Holds the resolved absolute path to the k3d executable. It remains unexported so child processes
+# cannot access k3d through it, and invoking an absolute path bypasses the trap function in
+# lib/common.sh.
+_PXD_K3D=""
 
-Exit codes: 0 help, 2 usage, 5 unsupported until round K2.
+PXD_CLASS=""
+PXD_AGENTS=""
+PXD_CONTEXT=""
+PXD_CLUSTER=""
+PXD_LABEL=""
+PXD_IMAGES=()
+
+px_cli_spec <<'EOF'
+about Manages the local k3d cluster that proves the Kubernetes backend.
+about The cluster is named by its kubeconfig context, PX_K8S_CONTEXT, k3d-px by
++ default (k8s/env/k3d.env), which k3d names k3d-<cluster>. Each --config file
++ reads before k8s/env/k3d.env.
+shared --class
+sub create
+about create the cluster from the pinned k3s image
++ PX_K3S_IMAGE
+about measurement: one server, no agent, Traefik and the service load balancer
++ disabled. validation (the default): one server and N agents (0 to 9, default 2),
++ Traefik disabled, the load balancer on 127.0.0.1:8081. The API server binds
++ 127.0.0.1:6550, and the current context of the kubeconfig does not change.
+opt --agents N PXD_AGENTS | the agent count of the validation shape, 0 to 9
+sub delete
+about delete the cluster that create recorded, after the
++ deployment on it came down
+opt --label KEY=VALUE PXD_LABEL | the cluster to delete by its label:
++ k3d.cluster=NAME
+sub import [IMAGE...]
+about import local images into the node cache,
++ PX_IMAGE_TAG by default and PX_PHERF_IMAGE_TAG
++ with PX_PHERF=1
+sub check
+about report k3d, its version and the memory of the engine
+about check runs before create, so it needs no cluster.
+output check rows: check, status and detail, then result, ok or fail, the code
++ and host.
+exits 1 also means that k3d failed or is absent or that the engine did not answer, 2
++ a pin without a digest, 3 a gate or a version floor refused, 4 a wait expired,
++ 6 no cluster of px-k3d on the context for delete and import, or a context that
++ is no context of k3d.
+example px-k3d create --class validation --agents 1
+example px-k3d import -e PX_K8S_CONTEXT=k3d-px
 EOF
+
+## @description  Resolves _PXD_K3D once by searching PATH, then Homebrew and standard system paths.
+## @return       Returns 0 when _PXD_K3D holds an absolute path, or 1 if no k3d binary is found.
+pxd_resolve() {
+  local candidate found=""
+  [ -z "$_PXD_K3D" ] || return 0
+  # Using type -P searches only PATH directories and never resolves to the shell trap function.
+  found="$(type -P k3d 2>/dev/null)" || found=""
+  if [ -z "$found" ]; then
+    for candidate in /opt/homebrew/bin/k3d /usr/local/bin/k3d /usr/bin/k3d; do
+      if [ -x "$candidate" ]; then
+        found=$candidate
+        break
+      fi
+    done
+  fi
+  if [ -z "$found" ]; then
+    px_error "no k3d found: install k3d for a local cluster"
+    return "$PX_EXIT_FAIL"
+  fi
+  case "$found" in
+  /*) ;;
+  *) found="$PWD/$found" ;;
+  esac
+  _PXD_K3D=$found
 }
 
-case "${1:-}" in
--h | --help)
-  usage
-  exit 0
+## @description  Executes the single k3d invocation entry point with (TIMEOUT_S, ARG...).
+## @return       Returns the k3d exit code, 124 on timeout expiry, 137 on KILL after grace, or 1
+##               if k3d cannot be resolved.
+pxd_call() {
+  local timeout=$1
+  shift
+  pxd_resolve || return "$PX_EXIT_FAIL"
+  px_debug "k3d call: $*"
+  px_timeout "$timeout" "$_PXD_K3D" "$@"
+}
+
+## @description  Extracts and reports the k3d version string from its version command output.
+## @return       Writes the version (e.g., v5.7.4) to stdout and returns 0, or 1 if unavailable.
+pxd_version() {
+  local text
+  text="$(pxd_call 30 version)" || return "$PX_EXIT_FAIL"
+  text="$(printf '%s\n' "$text" | sed -n 's/^k3d version \(v*[0-9][0-9.]*\).*/\1/p' |
+    sed -n 1p)"
+  [ -n "$text" ] || return "$PX_EXIT_FAIL"
+  printf '%s\n' "$text"
+}
+
+## @description  Resolves the state record file path for the cluster associated with the context.
+## @return       Writes the path to stdout and returns 0, 2, or 1 as returned by sb_record_path.
+pxd_record() { sb_record_path px-k3d scope "$PXD_CONTEXT"; }
+
+## @description  Checks whether k3d currently lists the cluster named by PXD_CLUSTER.
+## @return       Returns 0 if listed, 6 if absent, or 1 if k3d fails to respond.
+pxd_listed() {
+  local list
+  list="$(pxd_call 60 cluster list --no-headers 2>/dev/null)" || return "$PX_EXIT_FAIL"
+  printf '%s\n' "$list" | awk -v n="$PXD_CLUSTER" '$1 == n { f = 1 } END { exit !f }' ||
+    return "$PX_EXIT_NO_OBJECT"
+}
+
+# Rejects creation if a Compose cluster is recorded, the k3d version is below the minimum floor, a
+# k3d cluster of the same name already exists, or another px-k3d record is present.
+## @description  Enforces the single-cluster host gate and records the new cluster scope.
+## @return       Returns 0 when the record is written, 3 on any gate refusal, or 1 if k3d fails to
+##               respond.
+pxd_gate() {
+  local others version status=0
+  others="$(sb_record_scopes compose)" || return "$PX_EXIT_FAIL"
+  if [ -n "$others" ]; then
+    px_error "a Compose cluster is recorded on this host:$others. The host runs one" \
+      "cluster: run px-cluster down first"
+    return "$PX_EXIT_ANOMALY"
+  fi
+  version="$(pxd_version)" || {
+    px_error "k3d did not report its version"
+    return "$PX_EXIT_FAIL"
+  }
+  if ! sb_version_floor "$version" PX_K3D_MIN_VERSION; then
+    px_error "k3d $version is below the floor ${PX_K3D_MIN_VERSION:-unset} of PX_K3D_MIN_VERSION"
+    return "$PX_EXIT_ANOMALY"
+  fi
+  pxd_listed || status=$?
+  case "$status" in
+  0)
+    px_error "a k3d cluster $PXD_CLUSTER exists already, and the host runs one cluster"
+    return "$PX_EXIT_ANOMALY"
+    ;;
+  "$PX_EXIT_NO_OBJECT") ;;
+  *)
+    px_error "k3d did not list its clusters"
+    return "$PX_EXIT_FAIL"
+    ;;
+  esac
+  sb_record_gate px-k3d "$PXD_CONTEXT" || return "$PX_EXIT_ANOMALY"
+}
+
+# Measurement class provisions a single flat node, whereas validation class provisions one server
+# and N agents.
+## @description  Creates the k3d cluster configured for the topology of the requested run class.
+## @return       Returns 0 on success, 1 on k3d failure, 2 on usage or unpinned image digest error,
+##               3 on gate refusal, or 4 on timeout expiry.
+pxd_create() {
+  local timeout status=0
+  local -a args=()
+  if ! [[ ${PX_K3S_IMAGE:-} =~ $PXD_PIN_RE ]]; then
+    px_die "$PX_EXIT_USAGE" "PX_K3S_IMAGE='${PX_K3S_IMAGE:-}' names no digest: pin the k3s" \
+      "image as rancher/k3s:<tag>@sha256:<64 hex> in versions.env"
+  fi
+  px_run_class_require "$PXD_CLASS"
+  case "$PXD_CLASS" in
+  measurement)
+    [ "${PXD_AGENTS:-0}" = 0 ] ||
+      px_die "$PX_EXIT_USAGE" "the measurement shape is one node: --agents must be 0"
+    PXD_AGENTS=0
+    # Measurement uses a single flat node with both the ingress controller and service load
+    # balancer disabled alongside the deployment.
+    args=(--k3s-arg '--disable=traefik@server:*' --k3s-arg '--disable=servicelb@server:*')
+    ;;
+  validation)
+    PXD_AGENTS=${PXD_AGENTS:-2}
+    [[ $PXD_AGENTS =~ ^[0-9]$ ]] || px_die "$PX_EXIT_USAGE" "--agents is 0 to 9, got '$PXD_AGENTS'"
+    args=(--k3s-arg '--disable=traefik@server:*' -p "$PXD_LB_PORT")
+    ;;
+  esac
+  timeout="$(sb_seconds PX_TIMEOUT_PROVISION 900)"
+  args=(cluster create "$PXD_CLUSTER" --image "$PX_K3S_IMAGE" --servers 1 --agents
+    "$PXD_AGENTS" --api-port "$PXD_API_PORT" "${args[@]}" --kubeconfig-update-default
+    --kubeconfig-switch-context=false --wait --timeout "${timeout}s")
+  px_plan create k3d "${args[@]}" && return 0
+  sb_scope_gated k3d pxd_gate "$PXD_CONTEXT" || status=$?
+  [ "$status" = 0 ] || exit "$status"
+  pxd_call $((timeout + 60)) "${args[@]}" >&2 || status=$?
+  if [ "$status" != 0 ]; then
+    # Clean up any partially created cluster that k3d may have left behind after a failure or kill.
+    if pxd_listed && ! pxd_call "$(sb_seconds PX_TIMEOUT_TEARDOWN 300)" cluster delete \
+      "$PXD_CLUSTER" >&2; then
+      px_error "k3d left the cluster $PXD_CLUSTER, and its delete failed: the record stays," \
+        "so px-k3d delete can remove it"
+      exit "$PX_EXIT_FAIL"
+    fi
+    sb_record_drop px-k3d "$PXD_CONTEXT" scope
+    sb_expired "$status" && px_die "$PX_EXIT_TIMEOUT" "the create of $PXD_CLUSTER expired"
+    px_die "$PX_EXIT_FAIL" "k3d could not create the cluster $PXD_CLUSTER"
+  fi
+  px_info "created the $PXD_CLASS cluster $PXD_CLUSTER, context $PXD_CONTEXT, with" \
+    "$PXD_AGENTS agents"
+}
+
+## @description  Verifies that a state record exists for the target context before proceeding.
+## @return       Returns 0 if the record exists, or exits with 6 if absent, or 2 or 1 from
+##               sb_record_path.
+pxd_need_record() {
+  local path
+  path="$(pxd_record)" || exit $?
+  [ -f "$path" ] || px_die "$PX_EXIT_NO_OBJECT" "no cluster of px-k3d on context $PXD_CONTEXT"
+}
+
+## @description  Deletes the recorded cluster once no Kubernetes backend scope references it.
+## @return       Returns 0 on success, 1 on k3d failure, 3 if a deployment is active on it, 4 if
+##               the delete timed out, or 6 if no px-k3d cluster is recorded for the context.
+pxd_delete() {
+  local names name status=0 timeout
+  pxd_need_record
+  names="$(sb_record_scopes k8s)" || exit $?
+  for name in $names; do
+    case "$name" in
+    "$PXD_CONTEXT"/*)
+      px_die "$PX_EXIT_ANOMALY" "the scope $name is up on context $PXD_CONTEXT: run" \
+        "px-cluster down first"
+      ;;
+    esac
+  done
+  timeout="$(sb_seconds PX_TIMEOUT_TEARDOWN 300)"
+  px_plan delete k3d cluster delete "$PXD_CLUSTER" && return 0
+  pxd_call "$timeout" cluster delete "$PXD_CLUSTER" >&2 || status=$?
+  if [ "$status" != 0 ]; then
+    sb_expired "$status" && px_die "$PX_EXIT_TIMEOUT" "the delete of $PXD_CLUSTER expired"
+    px_die "$PX_EXIT_FAIL" "k3d could not delete the cluster $PXD_CLUSTER"
+  fi
+  sb_record_drop px-k3d "$PXD_CONTEXT" scope
+  px_info "deleted the cluster $PXD_CLUSTER of context $PXD_CONTEXT"
+}
+
+# When no explicit IMAGE arguments are supplied, import loads every image tag required by the
+# active configuration: the primary harness image, plus the pherf image when the tier is enabled.
+## @description  Imports local images into the recorded cluster's node cache in individual calls.
+## @return       Returns 0 on success, 1 on k3d failure, 2 if an image is not a local tag, 4 if an
+##               import timed out, or 6 if no px-k3d cluster is recorded for the context.
+pxd_import() {
+  local image timeout status
+  pxd_need_record
+  if [ "${#PXD_IMAGES[@]}" = 0 ]; then
+    PXD_IMAGES=("$PX_IMAGE_TAG")
+    ! px_is_true "${PX_PHERF:-0}" || PXD_IMAGES+=("$PX_PHERF_IMAGE_TAG")
+  fi
+  for image in "${PXD_IMAGES[@]}"; do
+    sb_image_tag_local "$image" ||
+      px_die "$PX_EXIT_USAGE" "the image '$image' is not a local repository:tag"
+  done
+  timeout="$(sb_seconds PX_TIMEOUT_PROVISION 900)"
+  for image in "${PXD_IMAGES[@]}"; do
+    px_plan import k3d image import -c "$PXD_CLUSTER" "$image" && continue
+    status=0
+    pxd_call "$timeout" image import -c "$PXD_CLUSTER" "$image" >&2 || status=$?
+    if [ "$status" != 0 ]; then
+      sb_expired "$status" && px_die "$PX_EXIT_TIMEOUT" "the import of $image expired"
+      px_die "$PX_EXIT_FAIL" "k3d could not import $image into $PXD_CLUSTER"
+    fi
+  done
+}
+
+## @description  Checks the k3d binary, its version against the minimum floor, and engine memory.
+## @return       Writes check TSV rows and returns 0, 1 if k3d is absent or the engine did not
+##               respond, or 3 when any check row fails.
+pxd_check_rows() {
+  local version floor=${PX_K3D_MIN_VERSION:-unset} rows scope failed=0 row
+  if ! pxd_resolve; then
+    px_tsv_row k3d_binary fail "no k3d on this host"
+    return "$PX_EXIT_FAIL"
+  fi
+  px_tsv_row k3d_binary ok "$_PXD_K3D"
+  if ! version="$(pxd_version)"; then
+    px_tsv_row k3d_version fail "k3d did not report its version"
+    return "$PX_EXIT_FAIL"
+  fi
+  if sb_version_floor "$version" PX_K3D_MIN_VERSION; then
+    px_tsv_row k3d_version ok "k3d $version, floor $floor"
+  else
+    px_tsv_row k3d_version fail "k3d $version is below the floor $floor"
+    failed=1
+  fi
+  # Because the cluster runs inside the host container engine, its available memory budget is the
+  # total memory of that engine as reported by the Compose backend.
+  sb_load compose
+  if ! scope="$(PX_DRY_RUN=1 sb_scope_create "${PX_CLUSTER_ID:-default}" 2>/dev/null)"; then
+    px_tsv_row engine_memory fail "cannot name a scope to ask the engine"
+    return "$PX_EXIT_FAIL"
+  fi
+  rows="$(sb_preflight "$scope" 2>/dev/null)" || true
+  row="$(printf '%s\n' "$rows" | awk -F '\t' '$1 == "engine_memory" && $2 == "ok"')"
+  if [ -z "$row" ]; then
+    px_tsv_row engine_memory fail "the container engine reported no memory total"
+    return "$PX_EXIT_FAIL"
+  fi
+  printf '%s\n' "$row"
+  [ "$failed" = 0 ] || return "$PX_EXIT_ANOMALY"
+}
+
+## @description  Executes the px-k3d check suite and closes the output stream with a result row.
+## @return       Exits with 0 on success, 1 if k3d is absent or the container engine does not
+##               respond, or 3 when any check fails.
+pxd_check() {
+  local code=0
+  pxd_check_rows || code=$?
+  px_result_close "$code" host || exit "$?"
+}
+
+px_cli_parse "$@"
+PXD_IMAGES=(${PX_CLI_ARGS[@]+"${PX_CLI_ARGS[@]}"})
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"} "$PX_HOME/k8s/env/k3d.env"
+PXD_CONTEXT=${PX_K8S_CONTEXT:-}
+# A label selector identifies the target cluster in place of the context. Because k3d labels the
+# containers of cluster NAME with k3d.cluster=NAME, that is the only key this command accepts.
+if [ -n "${PXD_LABEL:-}" ]; then
+  case "$PXD_LABEL" in
+  k3d.cluster=?*) PXD_CONTEXT="k3d-${PXD_LABEL#k3d.cluster=}" ;;
+  *) px_die "$PX_EXIT_USAGE" "unsupported label $PXD_LABEL: use k3d.cluster=NAME" ;;
+  esac
+fi
+[ -n "$PXD_CONTEXT" ] || px_die "$PX_EXIT_USAGE" "name the context with -e PX_K8S_CONTEXT=NAME"
+case "$PXD_CONTEXT" in
+k3d-?*) PXD_CLUSTER=${PXD_CONTEXT#k3d-} ;;
+*)
+  # A context pointing to another cluster, such as a remote target, never belongs to this command;
+  # only create rejects it as a usage error while other subcommands report no managed object.
+  [ "$PX_CLI_SUB" != create ] ||
+    px_die "$PX_EXIT_USAGE" "the context '$PXD_CONTEXT' is no context of k3d: k3d-<cluster>"
+  px_die "$PX_EXIT_NO_OBJECT" "no cluster of px-k3d on context $PXD_CONTEXT"
   ;;
--*) px_usage_error "unknown option: $1" ;;
 esac
-px_die "$PX_EXIT_UNSUPPORTED" "px-k3d arrives with round K2"
+[[ $PXD_CLUSTER =~ $SB_CLUSTER_RE ]] ||
+  px_die "$PX_EXIT_USAGE" "the cluster name '$PXD_CLUSTER' of context $PXD_CONTEXT is invalid"
+PXD_CLASS=${PX_RUN_CLASS:-validation}
+
+"pxd_$PX_CLI_SUB"

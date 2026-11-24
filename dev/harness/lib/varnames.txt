@@ -246,3 +246,16 @@ PX_K8S_VOLUME_GIB        # the size of the claim of each stateful role, GiB
 PX_K8S_CPU_MILLI_PER_GIB # the CPU of a container in millicores per GiB of its memory limit
 PX_K8S_MAX_PAUSE_S       # the longest JVM pause, seconds, that the liveness probe tolerates
 PX_K8S_CLUSTER_DOMAIN    # the DNS domain of the cluster, default cluster.local
+PX_K8S_TARGET            # the target file of a cluster, outside the repository: stage 2a
+PX_K8S_REGISTRY          # the registry of a remote cluster: images by digest, the push target
+PX_K8S_PULL_SECRET       # the pull secret that the operator prepared in the namespace
+PX_K8S_NODE_SELECTOR     # key=value[,key=value]: the nodeSelector of every pod
+PX_K8S_TOLERATIONS       # key[=value]:Effect[,...]: the tolerations of every pod
+PX_K8S_DEDICATED_NODES   # 1 declares dedicated nodes, so time verdicts can be authoritative
+PX_K8S_MESH              # 1 adds the mesh overlay: the namespace label and the pod annotations
+PX_K8S_MESH_CORE         # 1 injects the core daemons too; 0 keeps them out of the mesh
+PX_K8S_IMAGE_DIGESTS     # ref=sha256:<hex>[,...]: the digests that px-cluster push promoted
+PX_K3S_ALLOWANCE_MIB     # the memory of the k3s control plane, which a local budget deducts
+PX_K3S_IMAGE             # the k3s image of px-k3d, pinned by digest
+PX_KUBECTL_MIN_VERSION   # the oldest kubectl client that the harness supports, major.minor
+PX_K3D_MIN_VERSION       # the oldest k3d that px-k3d supports, major.minor

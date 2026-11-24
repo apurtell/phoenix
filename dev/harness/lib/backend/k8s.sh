@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # This module provides the Kubernetes backend implementation for the substrate contract. It
-# fulfills all 31 sb_* contract functions using kubectl and serves as the sole module in this
+# fulfills all 32 sb_* contract functions using kubectl and serves as the sole module in this
 # repository permitted to invoke kubectl.
 #
 # Five fundamental Kubernetes characteristics govern the design of this backend:
@@ -153,9 +153,11 @@ px_k8s_resolve() {
   px_debug "kubectl: $_PXK_KUBECTL"
 }
 
-## @description  Executes kubectl (TIMEOUT_S or - for no bound, ARG...) against the loaded target.
-## @return       Returns the kubectl exit code, 124 on timeout expiry, 137 on SIGKILL after the
-##               grace period, or 1 if kubectl cannot be resolved or no target is loaded.
+# Serves as the single kubectl invocation point; passing bg as the timeout replaces the calling
+# subshell with kubectl without running inherited exit hooks.
+## @description  Executes kubectl (TIMEOUT_S, - for no bound, or bg, ARG...) on the loaded target.
+## @return       Returns the kubectl exit status, 124 on timeout expiry, 137 on SIGKILL, or 1 if
+##               kubectl cannot be resolved or no target is loaded.
 px_k8s_call() {
   local timeout=${1:-} status=0
   shift || true
@@ -166,6 +168,13 @@ px_k8s_call() {
   fi
   px_debug "kubectl call: $*"
   set -- "$_PXK_KUBECTL" --context "$PXK_CONTEXT" --namespace "$PXK_NAMESPACE" "$@"
+  if [ "$timeout" = bg ]; then
+    # Because a tunnel outlives the command that opens it, the subshell running this mode replaces
+    # itself with kubectl so that its PID becomes the tunnel PID and no exit hooks inherited from
+    # the caller execute within it.
+    trap - EXIT INT TERM
+    exec "$@"
+  fi
   if [ "$timeout" = "-" ]; then
     command "$@" || status=$?
   else
@@ -571,14 +580,111 @@ sb_version_info() {
   return 0
 }
 
-# Validates the target environment for a scope: the kubectl binary, API server reachability and
-# minimum version, caller RBAC permissions, and aggregate allocatable node memory and CPU.
+# Fails if another harness namespace exists on the target or if the scope's own namespace already
+# contains workloads, while accepting an empty labeled namespace as one prepared by the operator.
+## @description  Evaluates and reports the target deployment preflight check row.
+## @return       Writes check TSV rows to stdout; exits with 0 when no check fails, or 3 if a check
+##               fails.
+px_k8s_preflight_deployment() {
+  local others label status=0 left
+  others="$(px_k8s_other_namespaces)" || {
+    px_tsv_row deployment_absent fail "kubectl did not list the namespaces of the harness"
+    return "$SB_EXIT_ANOMALY"
+  }
+  if [ -n "$others" ]; then
+    px_tsv_row deployment_absent fail \
+      "a harness deployment is already on context $PXK_CONTEXT, namespace:$others"
+    return "$SB_EXIT_ANOMALY"
+  fi
+  status=0
+  label="$(px_k8s_namespace_label)" || status=$?
+  case "$status" in
+  "$SB_EXIT_NO_OBJECT")
+    px_tsv_row deployment_absent ok "no harness deployment on context $PXK_CONTEXT"
+    return 0
+    ;;
+  0) ;;
+  *)
+    px_tsv_row deployment_absent fail "kubectl did not read the namespace $PXK_NAMESPACE"
+    return "$SB_EXIT_ANOMALY"
+    ;;
+  esac
+  if [ "$label" != "$PXK_CLUSTER" ]; then
+    px_tsv_row deployment_absent fail "the namespace $PXK_NAMESPACE carries no label\
+ $(sb_label_prefix).cluster=$PXK_CLUSTER, so another owner holds it"
+    return "$SB_EXIT_ANOMALY"
+  fi
+  left="$(px_k8s_call 30 get statefulsets,jobs,pods -l "$(px_k8s_selector)" -o name)" || {
+    px_tsv_row deployment_absent fail "kubectl did not list the workloads of $PXK_NAMESPACE"
+    return "$SB_EXIT_ANOMALY"
+  }
+  if [ -n "$left" ]; then
+    px_tsv_row deployment_absent fail \
+      "the namespace $PXK_NAMESPACE holds a harness deployment: $(px_tsv_clean "$left")"
+    return "$SB_EXIT_ANOMALY"
+  fi
+  px_tsv_row deployment_absent ok \
+    "the namespace $PXK_NAMESPACE holds no workload: the operator prepared it"
+}
+
+# Emits one quota:<class> row for each ResourceQuota and resource defined in the scope's own
+# namespace, normalizing the hard and used figures into bytes, millicores, or items.
+## @description  Reports namespace ResourceQuota limits and current usage as preflight check rows.
+## @return       Writes check TSV rows to stdout and exits with 0.
+px_k8s_preflight_quotas() {
+  local fmt key out line name field hard used class value i
+  local -a resources=(requests.memory limits.memory memory requests.cpu limits.cpu cpu pods
+    persistentvolumeclaims requests.storage)
+  local -a fields=()
+  # Format one output line per quota containing the quota name followed by the hard and used values
+  # for each resource in the order listed in resources.
+  fmt='{range .items[*]}{.metadata.name}'
+  for key in "${resources[@]}"; do
+    fmt="$fmt|{.status.hard.${key//./\\.}}|{.status.used.${key//./\\.}}"
+  done
+  out="$(px_k8s_call 30 get resourcequota -o "jsonpath=$fmt{\"\\n\"}{end}")" || out=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS='|' read -r -a fields <<<"$line|"
+    name=${fields[0]}
+    i=0
+    for key in "${resources[@]}"; do
+      hard=${fields[$((2 * i + 1))]:-}
+      used=${fields[$((2 * i + 2))]:-}
+      i=$((i + 1))
+      [ -n "$hard" ] || continue
+      case "$key" in
+      requests.storage) class=storage value=px_k8s_bytes ;;
+      *memory) class=memory value=px_k8s_bytes ;;
+      *cpu) class=cpu value=px_k8s_millicores ;;
+      pods) class=pods value="" ;;
+      *) class=claims value="" ;;
+      esac
+      field=$hard
+      if [ -n "$value" ]; then
+        hard="$("$value" "$hard")"
+        used="$("$value" "${used:-0}")"
+      fi
+      [[ $hard =~ $PX_RE_INT ]] || hard=0
+      [[ ${used:-0} =~ $PX_RE_INT ]] || used=0
+      px_tsv_row "quota:$class" ok "$hard hard, ${used:-0} used, quota $name $key ($field)"
+    done
+  done <<EOF
+$out
+EOF
+}
+
+# Executes the target portion of preflight validation: the kubectl binary and its version, API
+# server reachability and version, caller permissions, target deployment state, the configured
+# StorageClass, the pull secret, the nodes selected by PX_K8S_NODE_SELECTOR, and namespace quotas.
 ## @description  Runs target preflight checks against the cluster and namespace of a scope.
-## @param        scope_id: the scope identifier whose target cluster and namespace are validated
-## @return       Writes preflight check TSV rows to stdout; exits with 0 when all checks pass, 3 if
-##               any check fails, or 2 on invalid arguments.
+## @param        scope_id: the scope identifier whose target the checks inspect
+## @return       Writes check TSV rows to stdout; exits with 0 when no check fails, 3 if any check
+##               fails, or 2 on usage error.
 sb_preflight() {
-  local scope=${1:-} text server failed=0 verb nodes memory=0 cpus=0 mem cpu status=0
+  local scope=${1:-} text server client failed=0 verb nodes memory=0 cpus=0 largest=0 mem cpu
+  local status=0 found bytes
+  local -a select=()
   px_k8s_scope_load "$scope" || return $?
   if px_k8s_resolve; then
     px_tsv_row engine_binary ok "$_PXK_KUBECTL"
@@ -592,6 +698,7 @@ sb_preflight() {
   # or authorization rejection from an unreachable server.
   text="$(px_k8s_call 30 version -o json 2>&1)" || status=$?
   server="$(px_k8s_version_of serverVersion "$text")"
+  client="$(px_k8s_version_of clientVersion "$text")"
   if [ -z "$server" ]; then
     text="$(printf '%s\n' "$text" | grep -v '^[[:space:]{}"]' | sed -n '/./{p;q;}')"
     case "$text" in
@@ -601,8 +708,8 @@ sb_preflight() {
         "the client is not authorised on context $PXK_CONTEXT: $(px_tsv_clean "$text")"
       ;;
     *)
-      px_tsv_row engine_responsive fail "the API server of context $PXK_CONTEXT did not" \
-        "answer a version request: $(px_tsv_clean "${text:-no text}")"
+      px_tsv_row engine_responsive fail "the API server of context $PXK_CONTEXT did not\
+ answer a version request: $(px_tsv_clean "${text:-no text}")"
       ;;
     esac
     return "$SB_EXIT_ANOMALY"
@@ -615,6 +722,13 @@ sb_preflight() {
       "API server $server is below the floor $PX_K8S_API_FLOOR_MAJOR.$PX_K8S_API_FLOOR_MINOR"
     failed=1
   fi
+  if sb_version_floor "${client:-none}" PX_KUBECTL_MIN_VERSION; then
+    px_tsv_row client_version ok "kubectl $client, floor $PX_KUBECTL_MIN_VERSION"
+  else
+    px_tsv_row client_version fail \
+      "kubectl ${client:-unknown} is below the floor ${PX_KUBECTL_MIN_VERSION:-unset}"
+    failed=1
+  fi
   for verb in statefulsets.apps pods/exec; do
     text="$(px_k8s_call 30 auth can-i create "$verb" 2>/dev/null)" || text=""
     if [ "$text" != yes ]; then
@@ -624,23 +738,57 @@ sb_preflight() {
     fi
   done
   [ "$failed" = 1 ] || px_tsv_row engine_credentials ok "the client may create the workloads"
+  px_k8s_preflight_deployment || failed=1
+  if [ -z "${PX_K8S_STORAGE_CLASS:-}" ]; then
+    px_tsv_row storage_class fail "PX_K8S_STORAGE_CLASS is unset: a target file names it"
+    failed=1
+  else
+    found="$(px_k8s_call 30 get storageclass "$PX_K8S_STORAGE_CLASS" --ignore-not-found \
+      -o name 2>/dev/null)" || found=""
+    if [ -n "$found" ]; then
+      px_tsv_row storage_class ok "the StorageClass $PX_K8S_STORAGE_CLASS exists"
+    else
+      px_tsv_row storage_class fail \
+        "context $PXK_CONTEXT has no StorageClass $PX_K8S_STORAGE_CLASS"
+      failed=1
+    fi
+  fi
+  if [ -n "${PX_K8S_PULL_SECRET:-}" ]; then
+    # Query only the secret name so that the harness never reads secret payload data.
+    found="$(px_k8s_call 30 get secret "$PX_K8S_PULL_SECRET" --ignore-not-found -o name \
+      2>/dev/null)" || found=""
+    if [ -n "$found" ]; then
+      px_tsv_row pull_secret ok "the pull secret $PX_K8S_PULL_SECRET is in $PXK_NAMESPACE"
+    else
+      px_tsv_row pull_secret fail "no pull secret $PX_K8S_PULL_SECRET in $PXK_NAMESPACE:\
+ prepare the namespace with the secret"
+      failed=1
+    fi
+  fi
+  [ -z "${PX_K8S_NODE_SELECTOR:-}" ] || select=(-l "$PX_K8S_NODE_SELECTOR")
   nodes='jsonpath={range .items[*]}{.status.allocatable.memory}|'
   nodes="$nodes"'{.status.allocatable.cpu}{"\n"}{end}'
-  nodes="$(px_k8s_call 30 get nodes -o "$nodes")" || nodes=""
+  nodes="$(px_k8s_call 30 get nodes ${select[@]+"${select[@]}"} -o "$nodes")" || nodes=""
   while IFS='|' read -r mem cpu; do
     [ -n "$mem" ] || continue
-    memory=$((memory + $(px_k8s_bytes "$mem")))
+    bytes="$(px_k8s_bytes "$mem")"
+    memory=$((memory + bytes))
+    [ "$bytes" -le "$largest" ] || largest=$bytes
     cpus=$((cpus + $(px_k8s_millicores "$cpu")))
   done <<EOF
 $nodes
 EOF
   if [ "$memory" -gt 0 ]; then
-    px_tsv_row engine_memory ok "$memory bytes allocatable on the nodes"
-    px_tsv_row engine_cpus ok "$((cpus / 1000)) processors allocatable on the nodes"
+    px_tsv_row engine_memory ok "$memory bytes allocatable on the selected nodes"
+    px_tsv_row engine_cpus ok \
+      "$cpus millicores ($((cpus / 1000)) processors) allocatable on the selected nodes"
+    px_tsv_row node_memory ok "$largest bytes allocatable on the largest selected node"
   else
-    px_tsv_row engine_memory warn "the nodes reported no allocatable memory"
-    px_tsv_row engine_cpus warn "the nodes reported no allocatable processors"
+    px_tsv_row engine_memory warn "the selected nodes reported no allocatable memory"
+    px_tsv_row engine_cpus warn "the selected nodes reported no allocatable processors"
+    px_tsv_row node_memory warn "the selected nodes reported no allocatable memory"
   fi
+  px_k8s_preflight_quotas
   px_tsv_row port_availability ok "no pod publishes a port on a host"
   [ "$failed" = 0 ] || return "$SB_EXIT_ANOMALY"
 }
@@ -657,6 +805,30 @@ EOF
 # lacks this scope's cluster label. Similarly, scope deletion removes a namespace only if it bears
 # the expected cluster label, ensuring the harness never adopts or destroys a namespace belonging to
 # another owner.
+#
+# A namespace that already exists with the expected cluster label before the admission gate runs is
+# treated as one prepared by the operator, for example to pre-install a pull secret for a remote
+# registry. The local scope record persists that ownership. Because the harness deletes only
+# namespaces that it created itself, scope deletion preserves an operator-prepared namespace and its
+# secret. Furthermore, because the cluster label alone does not identify who created a namespace,
+# scope deletion also retains the namespace whenever no local record names the harness as its owner.
+# During bring-up, provisioning skips applying the Namespace manifest to an operator-owned namespace
+# so that the harness does not alter any of its labels.
+
+# Any namespace carrying the harness cluster label represents a harness deployment on the target.
+## @description  Lists all harness namespaces on the target other than the loaded scope's namespace.
+## @return       Writes each namespace name preceded by a space (or nothing if none); exits with 0,
+##               or 1 if kubectl fails to respond.
+px_k8s_other_namespaces() {
+  local names name
+  names="$(px_k8s_call 30 get namespaces -l "$(sb_label_prefix).cluster" \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')" || return "$SB_EXIT_FAIL"
+  while IFS= read -r name; do
+    [ -z "$name" ] || [ "$name" = "$PXK_NAMESPACE" ] || printf ' %s' "$name"
+  done <<EOF
+$names
+EOF
+}
 
 ## @description  Reads the harness cluster label value from the namespace of the loaded scope.
 ## @return       Writes the label value (or empty if unlabeled) to stdout; exits with 0 if the
@@ -671,29 +843,23 @@ px_k8s_namespace_label() {
   printf '%s\n' "${out#*|}"
 }
 
-# Rejects concurrent harness namespaces on the target cluster, pre-existing namespaces owned by
-# others, and conflicting local scope records before recording SCOPE.
-## @description  Enforces the single-deployment admission gate and initializes the record for SCOPE.
-## @return       Exits with 0 when the scope record is written, or 1 if the gate rejects or fails.
+# Rejects concurrent harness namespaces on the target, pre-existing namespaces owned by others, and
+# conflicting local scope records before recording SCOPE and its namespace owner.
+## @description  Enforces the single-deployment admission gate and records SCOPE and its owner.
+## @return       Exits with 0 when the scope record is written, or 1 if the gate rejects or a step
+##               fails.
 px_k8s_scope_gate() {
-  local scope=$1 names name others="" label="" status=0
-  names="$(px_k8s_call 30 get namespaces -l "$(sb_label_prefix).cluster" \
-    -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')" || status=$?
+  local scope=$1 others="" label="" status=0 owner=operator previous
+  others="$(px_k8s_other_namespaces)" || status=$?
   [ "$status" != 0 ] || label="$(px_k8s_namespace_label)" || status=$?
   case "$status" in
   0) ;;
-  "$SB_EXIT_NO_OBJECT") label=$PXK_CLUSTER ;;
+  "$SB_EXIT_NO_OBJECT") label=$PXK_CLUSTER owner=harness ;;
   *)
     px_error "the API server of context $PXK_CONTEXT did not answer, so the gate cannot run"
     return "$SB_EXIT_FAIL"
     ;;
   esac
-  while IFS= read -r name; do
-    [ -n "$name" ] && [ "$name" != "$PXK_NAMESPACE" ] || continue
-    others="$others $name"
-  done <<EOF
-$names
-EOF
   if [ -n "$others" ]; then
     px_error "a harness deployment is already on context $PXK_CONTEXT, namespace:$others." \
       "Tear it down first, because the harness runs one deployment per target."
@@ -705,7 +871,12 @@ EOF
       "not take it over. Name another cluster, or set PX_PROJECT_PREFIX."
     return "$SB_EXIT_FAIL"
   fi
+  # When a forced gate replaces the state record for a namespace that the harness originally
+  # created, preserve the prior ownership so the namespace remains recorded as harness-owned.
+  previous="$(sb_record_get k8s "$scope" namespace_owner || true)"
+  [ -z "$previous" ] || owner=$previous
   sb_record_gate k8s "$scope" || return "$SB_EXIT_FAIL"
+  sb_record_set k8s "$scope" namespace_owner "$owner" || return "$SB_EXIT_FAIL"
   sb_record_drop k8s "$scope" pods
   PXK_DEPLOY_DIR="" PXK_STARTED=" "
 }
@@ -763,29 +934,51 @@ sb_scope_exists() {
   return "$SB_EXIT_NO_OBJECT"
 }
 
-# Deletes the scope namespace (and all resources remaining within it) along with the local state
-# record. Any namespace lacking this scope's cluster label is left untouched, and setting PX_KEEP
-# preserves the namespace on the cluster.
-## @description  Deletes the deployment scope namespace and removes its local state records.
+# Deletes the scope's ConfigMaps and Services when the namespace was not created by the harness or
+# has no recorded owner, leaving the namespace itself intact.
+## @description  Removes harness-owned ConfigMaps and Services from a retained scope namespace.
+## @return       Exits with 0 when no matching objects remain, or 1 otherwise.
+px_k8s_delete_owned() {
+  local timeout=${1:-} selector left
+  selector="$(px_k8s_selector)"
+  px_k8s_call "$timeout" delete configmaps,services -l "$selector" --ignore-not-found \
+    --wait=true "--timeout=${timeout}s" >&2 || return "$SB_EXIT_FAIL"
+  left="$(px_k8s_call 60 get configmaps,services -l "$selector" -o name)" ||
+    return "$SB_EXIT_FAIL"
+  if [ -n "$left" ]; then
+    px_error "objects of $PXK_SCOPE remain: $(px_tsv_clean "$left")"
+    return "$SB_EXIT_FAIL"
+  fi
+  px_info "the namespace $PXK_NAMESPACE stays: no record shows that the harness made it"
+}
+
+# Deletes the namespace and all objects within it when the local record names the harness as its
+# creator, or deletes only the scope's objects when the namespace was prepared by the operator or
+# has no recorded owner. Preserves the entire namespace when PX_KEEP is set or when the namespace
+# lacks the scope's cluster label, and always removes the local state records.
+## @description  Deletes a deployment scope or its in-namespace objects and removes local records.
 ## @param        scope_id: the scope identifier returned by sb_scope_create
-## @return       Exits with 0 on success, 1 if the namespace persists, carries a foreign label, or
-##               kubectl fails to respond, or 2 on invalid arguments.
+## @return       Exits with 0, 1 if the namespace or a scope object remains, the namespace carries
+##               another label, or kubectl fails to respond, or 2 on usage error.
 sb_scope_delete() {
-  local scope=${1:-} timeout label failed=0 status=0
+  local scope=${1:-} timeout label failed=0 status=0 owner
   px_k8s_scope_load "$scope" || return $?
   if sb_dry_run "delete the scope $scope"; then
     return 0
   fi
+  owner="$(sb_record_get k8s "$scope" namespace_owner || true)"
   if px_is_keep; then
     px_info "PX_KEEP is set, the namespace $PXK_NAMESPACE and its claims stay"
   else
     label="$(px_k8s_namespace_label)" || status=$?
+    timeout="$(sb_seconds PX_TIMEOUT_TEARDOWN 300)"
     if [ "$status" = 0 ] && [ "$label" != "$PXK_CLUSTER" ]; then
       px_error "the namespace $PXK_NAMESPACE does not carry the label" \
         "$(sb_label_prefix).cluster=$PXK_CLUSTER (it carries '$label'), so it stays"
       failed=1
+    elif [ "$status" = 0 ] && [ "$owner" != harness ]; then
+      px_k8s_delete_owned "$timeout" || failed=1
     elif [ "$status" = 0 ]; then
-      timeout="$(sb_seconds PX_TIMEOUT_TEARDOWN 300)"
       px_k8s_call "$timeout" delete namespace "$PXK_NAMESPACE" --ignore-not-found \
         --wait=true "--timeout=${timeout}s" >&2 || failed=1
       status=0
@@ -1037,7 +1230,7 @@ EOF
 ## @return       Writes instance TSV rows; exits with 0, 1 on dry-run, apply, or kubectl failure, 2
 ##               on usage or invalid directory, 3 if an instance terminated, or 4 on timeout.
 sb_provision() {
-  local scope=${1:-} dir=${2:-} timeout=${3:-} cluster="" file rows line bad="" status=0
+  local scope=${1:-} dir=${2:-} timeout=${3:-} cluster="" file rows line bad="" status=0 owner
   local -a files=()
   if [ -z "$dir" ]; then
     px_error "sb_provision needs a scope and a rendered deployment directory"
@@ -1056,8 +1249,14 @@ sb_provision() {
       "cluster $PXK_CLUSTER: render it for this cluster"
     return "$SB_EXIT_USAGE"
   fi
+  owner="$(sb_record_get k8s "$scope" namespace_owner || true)"
   for file in "$dir"/manifests/*.yaml; do
-    [ -f "$file" ] && files+=("$file")
+    [ -f "$file" ] || continue
+    # Because the admission gate already verified the cluster label on an operator-prepared
+    # namespace, skip the Namespace manifest so the harness does not modify an object owned by
+    # another party.
+    [ "$owner" != operator ] || [ "${file##*/}" != 00-namespace.yaml ] || continue
+    files+=("$file")
   done
   if [ "${#files[@]}" = 0 ]; then
     px_error "the deployment in $dir holds no manifest"
@@ -1845,21 +2044,45 @@ sb_termination_reason() {
   fi
 }
 
-## @description  Reports whether an instance was OOM-killed based on current and prior terminations.
+# Determines whether an instance suffered an out-of-memory kill by checking its current and prior
+# container termination states first, and then inspecting namespace events for the pod carrying an
+# OOMKilling or OOMKilled reason or a message containing OOMKilled.
+## @description  Reports whether an instance was OOM-killed from termination state or pod events.
 ## @param        scope_id: the scope identifier returned by sb_scope_create
 ## @param        role: the target role name
 ## @param        index: the zero-based instance index
 ## @return       Writes one oom TSV row to stdout; exits with 0, 1 if kubectl fails to respond, 2 on
-##               invalid arguments, or 6 if the instance does not exist.
+##               usage error, or 6 if the instance does not exist.
 sb_oom_killed() {
+  local events reason message
   px_k8s_instance "${1:-}" "${2:-}" "${3:-}" || return $?
   if [ "$PXK_P_TERM_REASON" = OOMKilled ]; then
     px_tsv_row yes "the container terminated OOMKilled, exit code ${PXK_P_CODE:-137}"
+    return 0
   elif [ "$PXK_P_LAST_REASON" = OOMKilled ]; then
     px_tsv_row yes "the last container terminated OOMKilled, exit code ${PXK_P_LAST_CODE:-137}"
-  else
-    px_tsv_row no "no termination reason is OOMKilled, restart count $PXK_P_RESTARTS"
+    return 0
   fi
+  # When a node-level OOM kill targets a descendant process rather than PID 1 of the container, no
+  # container termination reason is recorded; instead, the kubelet emits a pod event that can be
+  # queried for that single pod via a field selector.
+  events="$(px_k8s_call 30 get events --field-selector "involvedObject.name=$PXK_P_NAME" \
+    -o 'jsonpath={range .items[*]}{.reason}|{.message}{"\n"}{end}')" || {
+    px_error "kubectl did not list the events of $PXK_P_NAME"
+    return "$SB_EXIT_FAIL"
+  }
+  while IFS='|' read -r reason message; do
+    case "$reason|$message" in
+    OOMKilling\|* | OOMKilled\|* | *\|*OOMKilled*)
+      px_tsv_row yes "a namespace event $reason names pod $PXK_P_NAME:" \
+        "$(px_tsv_clean "$message")"
+      return 0
+      ;;
+    esac
+  done <<EOF
+$events
+EOF
+  px_tsv_row no "no termination reason or event is OOMKilled, restart count $PXK_P_RESTARTS"
 }
 
 # Queries the Kubernetes metrics API for current CPU and memory usage across all running instances.
@@ -1902,10 +2125,14 @@ EOF
 # ---------------------------------------------------------------------------
 # 13. Service endpoints and container images
 # ---------------------------------------------------------------------------
-# Every pod binds the base port of each port family directly on its own pod IP address, and its
-# headless Service assigns it the in-cluster DNS record <pod>.<role>.<namespace>.svc. Consequently,
-# any service endpoint resolves to that DNS name paired with the base port from the rendered port
-# map, requiring no dynamic port forwarding or resource release.
+# Every pod binds the base port of each port family directly on its own pod address, and no Service
+# exposes ports outside the cluster. Consequently, the host can reach an instance port only through
+# a local tunnel established by running kubectl port-forward on 127.0.0.1 to the base port of the
+# target pod. A tunnel starts when a caller queries an endpoint, outlives that invocation, and
+# terminates when the endpoint is released or the scope is torn down. Its state record under the
+# state directory persists the tunnel PID, the allocated local port, and the pod UID, ensuring that
+# an active tunnel to the same pod is reused while a tunnel to a pod replaced by its controller is
+# restarted.
 
 ## @description  Looks up the base port for ROLE and port family NAME from the rendered port map.
 ## @return       Writes the port number to stdout and exits with 0, or 6 if the port is not defined.
@@ -1922,19 +2149,50 @@ px_k8s_port_value() {
   printf '%s\n' "$value"
 }
 
-## @description  Constructs the in-cluster headless Service DNS name for an instance (POD ROLE).
-## @return       Writes <pod>.<role>.<namespace>.svc to stdout and exits with 0.
-px_k8s_fqdn() { printf '%s.%s.%s.svc\n' "${1:-}" "${2:-}" "$PXK_NAMESPACE"; }
+# Verifies the process command line because a recorded PID may be reassigned to an unrelated
+# process after the tunnel exits, such as after a host restart.
+## @description  Tests whether the specified process ID (PID) is running a kubectl port-forward.
+## @return       Exits with 0 when the process is a live port-forward, or 1 otherwise.
+px_k8s_tunnel_live() {
+  local args
+  [[ ${1:-} =~ $PX_RE_INT ]] || return "$SB_EXIT_FAIL"
+  args="$(ps -p "$1" -o args= 2>/dev/null)" || return "$SB_EXIT_FAIL"
+  case "$args" in
+  *port-forward*) return 0 ;;
+  esac
+  return "$SB_EXIT_FAIL"
+}
 
-## @description  Reports the in-cluster DNS address and port number for a named port of an instance.
+# Signals the recorded PID only if its command line still belongs to a port-forward process.
+## @description  Terminates the tunnel for a record file (PATH) and removes its record and log.
+## @return       Exits with 0.
+px_k8s_tunnel_stop() {
+  local record=$1 pid=""
+  [ ! -f "$record" ] || IFS="$PX_TAB" read -r pid _ <"$record" || true
+  if px_k8s_tunnel_live "$pid"; then
+    px_kill_tree "$pid" || px_warn "the tunnel $pid did not stop"
+  fi
+  rm -f "$record" "$record.log"
+}
+
+## @description  Tests whether a new tunnel (PID, LOG) has logged its local port or terminated.
+## @return       Exits with 0 once the tunnel has settled, or 1 while startup is still in progress.
+px_k8s_tunnel_settled() {
+  grep -q '^Forwarding from 127\.0\.0\.1:[0-9]' "$2" 2>/dev/null || ! kill -s 0 "$1" 2>/dev/null
+}
+
+# Reuses an active loopback tunnel when one already targets the current pod UID, or starts a new
+# background tunnel that persists until released or torn down and outputs 127.0.0.1 and the local
+# port. Exits with status 6 for an unknown instance, an unknown port, or a role without a Service.
+## @description  Opens or reuses a local loopback tunnel to a named port of a running instance.
 ## @param        scope_id: the scope identifier returned by sb_scope_create
 ## @param        role: a role backed by a headless Service
 ## @param        index: the zero-based instance index
-## @param        port_name: a logical port family name from the port map (for example, rpc)
-## @return       Writes one endpoint TSV row to stdout; exits with 0, 1 if kubectl fails to respond,
-##               2 on usage error, or 6 for an unknown instance, unknown port, or serviceless role.
+## @param        port_name: a port family name from the port map (for example, rpc)
+## @return       Writes one endpoint TSV row; exits with 0, 1 if kubectl fails, the pod is not
+##               running, or the tunnel ends, 2 on usage, 4 on 30 s timeout, or 6 if not found.
 sb_endpoint() {
-  local scope=${1:-} role=${2:-} index=${3:-} port=${4:-} value
+  local scope=${1:-} role=${2:-} index=${3:-} port=${4:-} value record pid="" lport="" uid="" rc=0
   if [ -z "$port" ]; then
     px_error "sb_endpoint needs a scope, a role, an index and a port name"
     return "$SB_EXIT_USAGE"
@@ -1942,7 +2200,7 @@ sb_endpoint() {
   px_k8s_instance "$scope" "$role" "$index" || return $?
   case "$role" in
   setup | client | tooling)
-    px_error "the role $role has no Service, so it has no address in the cluster"
+    px_error "the role $role has no Service, so it has no port to forward"
     return "$SB_EXIT_NO_OBJECT"
     ;;
   esac
@@ -1950,24 +2208,81 @@ sb_endpoint() {
     px_error "the port map of the render holds no port $port for $role"
     return "$SB_EXIT_NO_OBJECT"
   fi
-  px_tsv_row "$(px_k8s_fqdn "$PXK_P_NAME" "$role")" "$value"
+  if [ "$PXK_P_STATE" != running ]; then
+    px_error "instance $role/$index is $PXK_P_STATE, so no tunnel can reach it"
+    return "$SB_EXIT_FAIL"
+  fi
+  record="$(sb_record_path k8s tunnel "$scope|$role|$index|$port")" || return "$SB_EXIT_FAIL"
+  if [ -f "$record" ]; then
+    IFS="$PX_TAB" read -r pid lport uid _ <"$record" || true
+    # Reusing a tunnel requires that the recorded pod UID matches the current pod, the recorded PID
+    # is still an active port-forward process, and the tunnel log confirms the recorded local port.
+    if [ "$uid" = "$PXK_P_UID" ] && px_k8s_tunnel_live "$pid" &&
+      grep -q "^Forwarding from 127\.0\.0\.1:$lport " "$record.log" 2>/dev/null; then
+      px_tsv_row 127.0.0.1 "$lport"
+      return 0
+    fi
+    px_k8s_tunnel_stop "$record"
+  fi
+  # Detach all standard streams so that invoking this function inside a command substitution returns
+  # without waiting for the background tunnel to close, while letting kubectl allocate a free local
+  # port.
+  (px_k8s_call bg port-forward --address 127.0.0.1 "pod/$PXK_P_NAME" ":$value") \
+    </dev/null >"$record.log" 2>&1 &
+  pid=$!
+  px_wait_until 30 0.2 px_k8s_tunnel_settled "$pid" "$record.log" || true
+  lport="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$record.log" |
+    sed -n 1p)"
+  if ! kill -s 0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    px_error "the tunnel to $role/$index port $port ended:" \
+      "$(px_tsv_clean "$(cat "$record.log" 2>/dev/null)")"
+    rc=$SB_EXIT_FAIL
+  elif [ -z "$lport" ]; then
+    px_kill_tree "$pid" || true
+    px_error "the tunnel to $role/$index port $port did not open in 30s"
+    rc=$SB_EXIT_TIMEOUT
+  fi
+  if [ "$rc" != 0 ]; then
+    rm -f "$record.log"
+    return "$rc"
+  fi
+  if ! px_tsv_row "$pid" "$lport" "$PXK_P_UID" "$scope" >"$record"; then
+    px_k8s_tunnel_stop "$record"
+    return "$SB_EXIT_FAIL"
+  fi
+  px_tsv_row 127.0.0.1 "$lport"
 }
 
-# In-cluster DNS endpoints require no allocated host state, so releasing an endpoint is a no-op once
-# arguments are validated.
-## @description  Releases a previously discovered instance endpoint.
+## @description  Stops the tunnel for a single endpoint, or all tunnels in the scope when given all.
 ## @param        scope_id: a valid scope identifier for this backend
-## @param        role: the role name (unused)
-## @param        index: the zero-based instance index (unused)
+## @param        role: the target role name (ignored when port_name is all)
+## @param        index: the zero-based instance index (ignored when port_name is all)
 ## @param        port_name: a port name or all (required)
-## @return       Exits with 0 for a valid scope identifier of this backend, or 2 on usage error.
+## @return       Exits with 0 for a valid scope id (even if no tunnel exists), 1 if the state
+##               directory cannot be accessed, or 2 on usage error.
 sb_endpoint_release() {
-  if [ -z "${4:-}" ]; then
+  local scope=${1:-} port=${4:-} record dir owner
+  if [ -z "$port" ]; then
     px_error "sb_endpoint_release needs a scope, a role, an index and a port name or all"
     return "$SB_EXIT_USAGE"
   fi
-  px_k8s_scope_load "${1:-}" || return $?
-  px_debug "nothing to release: an endpoint of $1 is an address in the cluster"
+  px_k8s_scope_load "$scope" || return $?
+  if [ "$port" != all ]; then
+    record="$(sb_record_path k8s tunnel "$scope|${2:-}|${3:-}|$port")" ||
+      return "$SB_EXIT_FAIL"
+    px_k8s_tunnel_stop "$record"
+    return 0
+  fi
+  dir="$(sb_state_dir k8s)" || return "$SB_EXIT_FAIL"
+  for record in "$dir"/tunnel-*.tsv; do
+    [ -f "$record" ] || continue
+    owner=""
+    IFS="$PX_TAB" read -r _ _ _ owner _ <"$record" || true
+    [ "$owner" = "$scope" ] || continue
+    px_k8s_tunnel_stop "$record"
+  done
+  return 0
 }
 
 ## @description  Reports the configured image reference and resolved image ID for one instance.
@@ -1993,16 +2308,17 @@ sb_image_build() {
   return "$SB_EXIT_UNSUPPORTED"
 }
 
-# Verifies that every container image referenced by the rendered deployment manifests is cached on
-# every node of the PX_K8S_CONTEXT cluster, which is required because all pods run with
-# imagePullPolicy set to Never. Writes one image TSV row per distinct image, leaving the resolved
-# image column empty when an image is missing from one or more nodes.
-## @description  Verifies that every image in a rendered deployment is cached on every cluster node.
-## @param        deployment_dir: path to the rendered deployment directory containing manifests/
-## @return       Writes one image TSV row per image; exits with 0 if all are present, 1 on kubectl
-##               failure, 2 on usage or missing manifests or context, or 6 if any image is absent.
+# Verifies that every local image referenced by the rendered manifests is cached on every node of
+# the PX_K8S_CONTEXT cluster, which is required because local images use imagePullPolicy Never. Any
+# image referenced by digest counts as present with its digest as the image ID because the kubelet
+# pulls it on demand and a pull failure aborts the readiness barrier. Writes one image TSV row per
+# image, leaving the image ID column empty when an image is missing from any node.
+## @description  Verifies that all images in a rendered deployment are available to cluster nodes.
+## @param        deployment_dir: the rendered deployment directory containing manifests/
+## @return       Writes one image TSV row per image; exits with 0 if all are present, 1 if kubectl
+##               fails, 2 on usage or missing manifests or context, or 6 if any image is absent.
 sb_image_present() {
-  local dir=${1:-} ref nodes node names found missing=0 cluster fmt
+  local dir=${1:-} ref refs nodes="" node names found missing=0 cluster fmt
   if [ -z "$dir" ] || [ ! -d "$dir/manifests" ]; then
     px_error "sb_image_present needs a deployment directory that holds manifests/"
     return "$SB_EXIT_USAGE"
@@ -2010,14 +2326,25 @@ sb_image_present() {
   cluster="$(sed -n 's/^PX_CLUSTER_ID=//p' "$dir/topology.env" 2>/dev/null)"
   px_k8s_target_load "${PX_K8S_CONTEXT:-}" "$(sb_project_prefix)-${cluster:-default}" ||
     return $?
-  fmt='jsonpath={range .items[*]}{.metadata.name}|'
-  fmt="$fmt"'{range .status.images[*]}{.names[*]} {end}{"\n"}{end}'
-  nodes="$(px_k8s_call 30 get nodes -o "$fmt")" || {
-    px_error "the API server of context $PXK_CONTEXT did not list its nodes"
-    return "$SB_EXIT_FAIL"
-  }
+  refs="$(cat "$dir"/manifests/*.yaml "$dir"/groups/*/*.yaml 2>/dev/null |
+    sed -n 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' |
+    LC_ALL=C sort -u)"
+  if printf '%s\n' "$refs" | grep -v '@sha256:' | grep -q .; then
+    fmt='jsonpath={range .items[*]}{.metadata.name}|'
+    fmt="$fmt"'{range .status.images[*]}{.names[*]} {end}{"\n"}{end}'
+    nodes="$(px_k8s_call 30 get nodes -o "$fmt")" || {
+      px_error "the API server of context $PXK_CONTEXT did not list its nodes"
+      return "$SB_EXIT_FAIL"
+    }
+  fi
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
+    case "$ref" in
+    *@sha256:*)
+      px_tsv_row "$ref" "${ref##*@}"
+      continue
+      ;;
+    esac
     # An image is considered present only if every cluster node holds it; found retains the matched
     # image name from the final node inspected so it can be reported in the output row.
     found=""
@@ -2041,11 +2368,21 @@ EOF
     [ -n "$found" ] || missing=1
     px_tsv_row "$ref" "$found"
   done <<LIST
-$(cat "$dir"/manifests/*.yaml "$dir"/groups/*/*.yaml 2>/dev/null |
-    sed -n 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' |
-    LC_ALL=C sort -u)
+$refs
 LIST
   [ "$missing" = 0 ] || return "$SB_EXIT_NO_OBJECT"
+}
+
+# Container images are pushed from the local engine via the Compose backend rather than by the
+# Kubernetes backend.
+## @description  Rejects image push requests as unsupported on the Kubernetes backend.
+## @param        image_id: local image digest sha256:<64 hex> (unused)
+## @param        target_ref: destination image reference <registry>/<repository>:<tag> (unused)
+## @return       Exits with 5.
+sb_image_push() {
+  px_error "the Kubernetes backend pushes no image: px-cluster push pushes it with the" \
+    "compose backend"
+  return "$SB_EXIT_UNSUPPORTED"
 }
 
 # Base image digests are resolved by the Compose backend during image builds rather than by the

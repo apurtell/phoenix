@@ -2253,3 +2253,58 @@ LIST
   fi
   px_tsv_row "$ref" "$digest"
 }
+
+# Push a local image, identified by its image ID, to a target registry reference and report the
+# manifest digest assigned by the registry. This operation neither builds an image nor logs into the
+# registry, relying instead on the operator's credential store to authenticate the push.
+## @description  Push a local image by ID to a registry reference and report its registry digest.
+## @param        image_id: local image ID formatted as sha256:<64 hex>
+## @param        target_ref: target <registry>/<repository>:<tag> reference without a digest
+## @return       Write one image TSV row (target_ref and registry digest) and exit 0, 1 on no engine
+##               answer, push failure, or missing digest, 2 on usage, or 6 if no local image has ID.
+sb_image_push() {
+  local id=${1:-} target=${2:-} found timeout status=0 line digest=""
+  if ! [[ $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    px_error "sb_image_push needs an image id sha256:<64 hex>, got '$id'"
+    return "$SB_EXIT_USAGE"
+  fi
+  if ! [[ $target =~ ^[a-z0-9][a-z0-9.:-]*/[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]
+  then
+    px_error "sb_image_push needs a target <registry>/<repository>:<tag>, got '$target'"
+    return "$SB_EXIT_USAGE"
+  fi
+  if sb_dry_run "push of $id to $target"; then
+    return 0
+  fi
+  found="$(px_compose_engine 60 image inspect --format '{{.Id}}' "$id" 2>/dev/null)" || found=""
+  if [ "$found" != "$id" ]; then
+    px_error "no local image has the id $id"
+    return "$SB_EXIT_NO_OBJECT"
+  fi
+  if ! px_compose_engine 60 tag "$id" "$target" >&2; then
+    px_error "the engine could not tag $id as $target"
+    return "$SB_EXIT_FAIL"
+  fi
+  timeout="$(sb_seconds PX_TIMEOUT_PROVISION 900)"
+  px_compose_engine "$timeout" push "$target" >&2 || status=$?
+  if [ "$status" != 0 ]; then
+    sb_expired "$status" && px_error "the push of $target expired after ${timeout}s"
+    px_error "the engine could not push $target"
+    return "$SB_EXIT_FAIL"
+  fi
+  # The container engine records the manifest digest assigned by the registry in RepoDigests, with
+  # one entry for each repository associated with the image.
+  while IFS= read -r line; do
+    case "$line" in
+    "${target%:*}@sha256:"*) digest=${line#*@} ;;
+    esac
+  done <<EOF_DIGESTS
+$(px_compose_engine 60 image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+    "$target" 2>/dev/null || true)
+EOF_DIGESTS
+  if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    px_error "the registry gave no digest for $target"
+    return "$SB_EXIT_FAIL"
+  fi
+  px_tsv_row "$target" "$digest"
+}

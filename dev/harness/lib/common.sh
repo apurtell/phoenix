@@ -1480,6 +1480,7 @@ px_run_dir() {
 #   0. Command-line options, recorded by px_cli_parse before the configuration loader runs.
 #   1. The inherited process environment.
 #   2. Explicit configuration files named on the command line.
+#      2a. The target file named by PX_K8S_TARGET.
 #      2b. The cluster record at $PX_OUT/$PX_STATE_DIR/cluster-<ID>.env written by px-cluster up.
 #   3. Local environment overrides in <layout>/env/local.env.
 #      3a. Enabled plug-ins (the sizing and JVM lines of each plugin.env).
@@ -1508,9 +1509,21 @@ px_run_dir() {
 # Environment files may contain only KEY=VALUE assignments, comments, and blank lines. The loader
 # parses each file as literal data without sourcing it or performing shell expansion, preventing
 # configuration files from executing arbitrary commands.
+#
+# The cluster record persists the flattened configuration values captured during cluster bring-up
+# from the command line, any --config files, and the target file, together with PX_BACKEND and
+# PX_RUN_CLASS. Subsequent commands operating against that cluster inherit those settings without
+# having to repeat them, while any explicit override supplied by the later command still takes
+# precedence. Variables specific to a single invocation or used to locate the record itself are
+# never persisted in the cluster record.
 
 PX_CONFIG_ORIGINS=""
 PX_CONFIG_STRICT=0
+PX_CONFIG_TARGET=""
+PX_CONFIG_RECORD=""
+PX_CONFIG_RECORD_SKIP="PX_VERBOSE PX_DRY_RUN PX_STRICT_CONFIG PX_KEEP PX_SCOPE_ID"
+PX_CONFIG_RECORD_SKIP="$PX_CONFIG_RECORD_SKIP PX_DEPLOYMENT_DIR PX_OUT PX_STATE_DIR PX_CLUSTER_ID"
+PX_CONFIG_RECORD_SKIP="$PX_CONFIG_RECORD_SKIP PX_FORCE PX_LOG_FILE"
 PX_VARNAMES=""
 PX_VARNAMES_PREFIXES=""
 PX_VARNAMES_PRIVATE=""
@@ -1725,6 +1738,8 @@ px_config_load() {
     px_config_parse_file "$file" "$file" ||
       px_die "$PX_EXIT_NO_OBJECT" "configuration file not found: $file"
   done
+  px_config_target
+  px_config_cluster "$record"
   env_dir="${PX_ENV_DIR:-$PX_HOME/$PX_DEPLOY_SUBDIR/env}"
   px_config_set PX_ENV_DIR "$env_dir" derived
   px_config_parse_file "${PX_LOCAL_ENV:-$env_dir/local.env}" local || true
@@ -1765,6 +1780,15 @@ px_config_load() {
     "${PX_VERSIONS_LOCAL_ENV:-$PX_HOME/$PX_DEPLOY_SUBDIR/versions.local.env}" \
     versions-local || true
   px_config_load_ports "${PX_DEPLOYMENT_DIR:-}"
+  # Because a target file defines the target cluster during stage 2a, any PX_K8S_TARGET assignment
+  # supplied by a lower-precedence stage arrives too late and must be rejected. The sole exception
+  # is the cluster record, which already embeds the flattened target file values from bring-up.
+  if [ -n "${PX_K8S_TARGET:-}" ] && [ -z "$PX_CONFIG_TARGET" ] &&
+    [ "$(px_config_origin PX_K8S_TARGET || true)" != cluster ]; then
+    px_die "$PX_EXIT_USAGE" "PX_K8S_TARGET comes from the stage" \
+      "$(px_config_origin PX_K8S_TARGET || true), which loads after the target stage:" \
+      "set it with -e, in the environment or in a --config file"
+  fi
   px_versions_resolve
   # Because strict variable validation must be active before stage 1 runs, enabling PX_STRICT_CONFIG
   # inside a configuration file arrives too late and is rejected rather than silently ignored.
@@ -1777,6 +1801,111 @@ px_config_load() {
       px_die "$?" "the output policy refuses PX_LOG_FILE '$PX_LOG_FILE'"
   fi
   return 0
+}
+
+# Loads the cluster target file named by PX_K8S_TARGET (which must reside outside the working tree)
+# and records its resolved path in PX_CONFIG_TARGET, or leaves PX_CONFIG_TARGET empty when unset.
+## @description  Loads stage 2a cluster target assignments from the file named by PX_K8S_TARGET.
+## @return       Exits 0 on success, 6 if the file is absent or unresolvable, or 2 if the path lies
+##               inside the working tree or contains a refused line.
+px_config_target() {
+  local path=${PX_K8S_TARGET:-}
+  PX_CONFIG_TARGET=""
+  [ -n "$path" ] || return 0
+  # A target file records the environment-specific details of a cluster (its context, registry,
+  # and secrets), which must never be committed inside the repository.
+  [ -f "$path" ] || px_die "$PX_EXIT_NO_OBJECT" "the target file of PX_K8S_TARGET is absent: $path"
+  path="$(px_realpath "$path")" || px_die "$PX_EXIT_NO_OBJECT" "cannot resolve the target $path"
+  if [ -n "$PX_TREE_ROOT" ] && px_path_within "$path" "$PX_TREE_ROOT"; then
+    px_die "$PX_EXIT_USAGE" "the target file $path is inside the working tree $PX_TREE_ROOT:" \
+      "a target file holds the facts of one cluster and stays outside the repository"
+  fi
+  px_config_parse_file "$path" target
+  PX_CONFIG_TARGET=$path
+}
+
+# Parses the target file into local variables against a cleared origin table so that settings from
+# earlier stages cannot mask values assigned in the file. Callers invoke this helper inside a
+# command substitution so that any rejected line terminates only that child subshell.
+## @description  Inspects an environment file (file, name...) and prints the value assigned to each.
+## @return       Writes one line per variable (empty if unset) and exits 0, or returns 6 if the
+##               file does not exist.
+px_config_peek() {
+  local file=$1 name PX_CONFIG_ORIGINS="" PX_CONFIG_STRICT=0 PX_VERBOSE=0
+  shift
+  [ -f "$file" ] || return "$PX_EXIT_NO_OBJECT"
+  local "$@"
+  px_config_parse_file "$file" peek >/dev/null 2>&1 || true
+  for name in "$@"; do
+    printf '%s\n' "${!name:-}"
+  done
+}
+
+# The cluster record path depends exclusively on PX_OUT, PX_STATE_DIR, and PX_CLUSTER_ID. Whenever
+# an earlier stage leaves any of these variables unset, the helper peeks at local.env (the stage
+# where PX_OUT is configured) before falling back to the built-in defaults. Resolving this path
+# creates no files or directories, ensuring that dry runs and the config subcommand leave the
+# filesystem untouched.
+## @description  Resolves the cluster record file path corresponding to PX_CLUSTER_ID.
+## @return       Writes the path to stdout and exits 0, or writes nothing if the cluster identifier
+##               or output root cannot form a valid record path.
+px_config_record_path() {
+  local out=${PX_OUT:-} dir=${PX_STATE_DIR:-} id=${PX_CLUSTER_ID:-} local_env line
+  local -a values=()
+  local_env="${PX_LOCAL_ENV:-${PX_ENV_DIR:-$PX_HOME/$PX_DEPLOY_SUBDIR/env}/local.env}"
+  if { [ -z "$out" ] || [ -z "$dir" ] || [ -z "$id" ]; } && [ -f "$local_env" ]; then
+    while IFS= read -r line; do
+      values+=("$line")
+    done <<EOF
+$(px_config_peek "$local_env" PX_OUT PX_STATE_DIR PX_CLUSTER_ID)
+EOF
+    out=${out:-${values[0]:-}}
+    dir=${dir:-${values[1]:-}}
+    id=${id:-${values[2]:-}}
+  fi
+  out=${out:-${HOME:+$HOME/phoenix-harness}}
+  dir=${dir:-state}
+  id=${id:-default}
+  # Validate the cluster identifier against the SB_CLUSTER_RE grammar from the substrate contract,
+  # which is not sourced by this foundation library.
+  [[ $id =~ ^[a-z0-9][a-z0-9_-]*$ ]] || return 0
+  case "$out" in
+  /*) ;;
+  *) return 0 ;;
+  esac
+  case "$dir" in
+  /*) ;;
+  *) dir="$out/$dir" ;;
+  esac
+  printf '%s/cluster-%s.env\n' "$dir" "$id"
+}
+
+# Because cluster names are unique across all backends sharing an output root, any PX_BACKEND value
+# selected by an earlier stage that conflicts with the recorded backend is rejected rather than
+# treated as a distinct cluster. Unless reading is disabled via the read parameter, the existing
+# record is loaded as stage 2b under the cluster origin.
+## @description  Resolves PX_CONFIG_RECORD and optionally loads the cluster record as stage 2b.
+## @return       Exits 0 on success, or exits 2 if the active backend conflicts with the record or
+##               the record file contains a rejected line.
+px_config_cluster() {
+  local read=${1:-1} recorded="" origin
+  PX_CONFIG_RECORD="$(px_config_record_path)"
+  [ "$read" = 1 ] && [ -n "$PX_CONFIG_RECORD" ] && [ -f "$PX_CONFIG_RECORD" ] || return 0
+  recorded="$(px_config_peek "$PX_CONFIG_RECORD" PX_BACKEND)"
+  if [ -n "$recorded" ] && [ -n "${PX_BACKEND:-}" ] && [ "$recorded" != "$PX_BACKEND" ]; then
+    # Identify the configuration stage that supplied the conflicting PX_BACKEND value—whether a
+    # command-line option, the process environment, or a configuration file—in the error message.
+    origin="$(px_config_origin PX_BACKEND || true)"
+    case "$origin" in
+    cli) origin="the command line" ;;
+    environment) origin="the environment" ;;
+    esac
+    px_die "$PX_EXIT_USAGE" "cluster ${PX_CLUSTER_ID:-default} is recorded on the $recorded" \
+      "backend in $PX_CONFIG_RECORD, and PX_BACKEND='$PX_BACKEND' comes from $origin: a" \
+      "cluster name is unique across backends, so drop that setting or name another cluster" \
+      "with --cluster"
+  fi
+  px_config_parse_file "$PX_CONFIG_RECORD" cluster
 }
 
 # Loads PX_PORT_MAP_ENV when set, or falls back to ports.generated.env inside the supplied
@@ -3135,9 +3264,11 @@ px_runtime_blocked() {
     "- use the substrate contract in lib/backend/contract.sh"
 }
 
-## @description  Defines a shell trap function for each container runtime and Kubernetes CLI tool.
+## @description  Defines a shell trap function for each container runtime, Kubernetes CLI tool, and
+##               registry client.
 ## @return       Each generated trap function exits 2.
 _px_names="docker docker-compose podman nerdctl kubectl k3d helm crictl" # px-allow-docker: traps
+_px_names="$_px_names skopeo crane regctl oras" # px-allow-docker: registry clients
 for _px_t in $_px_names; do
   eval "$_px_t() { px_runtime_blocked $_px_t \"\$@\"; }"
 done

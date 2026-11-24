@@ -14,7 +14,9 @@
 # limitations under the License.
 
 # Defines the one-shot setup Job that executes the HDFS format followed by the bootstrap probe.
-# Because the job never retries, any execution failure remains visible as a failed pod.
+# Because the job never retries, any execution failure remains visible as a failed pod. Its pod
+# explicitly opts out of service-mesh sidecar injection in every render because a long-running
+# sidecar that does not terminate would prevent the Job from completing.
 
 apiVersion: batch/v1
 kind: Job
@@ -27,9 +29,10 @@ spec:
   backoffLimit: 0
   template:
     metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
       labels:
 ${PX_M_POD_LABELS}
     spec:
       hostname: ${PX_M_HOSTNAME}
-${PX_M_AFFINITY}
 ${PX_M_POD_SPEC}

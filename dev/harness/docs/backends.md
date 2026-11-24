@@ -20,7 +20,7 @@ limitations under the License.
 The substrate contract serves as the sole interface between the test harness and the underlying
 container execution environment. This contract is declared in `lib/backend/contract.sh` and
 implemented in `lib/backend/<name>.sh`, with one implementation file dedicated to each backend.
-Because every layer above the contract interacts exclusively through its 31 `sb_*` functions,
+Because every layer above the contract interacts exclusively through its 32 `sb_*` functions,
 drivers, checks, plug-in hooks, health monitors, collectors, and operator commands execute without
 modification across all backends, and no component above the contract requires a container runtime.
 
@@ -34,10 +34,13 @@ directory layout, network model, service labels, port map, and runtime boundary 
   and verifies the completeness of that binding. In addition, it manages the two state records
   shared across all commands: the scope record and the planned-action record.
 * `compose.sh` implements the Docker Compose backend and is the only file in the repository
-  permitted to invoke a container runtime directly.
+  permitted to invoke a container runtime directly. Through `sb_image_push`, it is also the sole
+  component that writes to a container registry.
 * `k8s.sh` implements the Kubernetes backend and is the only file in the repository permitted to
   invoke `kubectl` directly. Its dedicated section at the end of this document details its
   architectural mapping and backend-specific differences.
+* `bin/px-k3d` is not a backend implementation; it manages the local k3d cluster and is the only
+  file permitted to invoke `k3d`.
 
 ## Binding a backend
 
@@ -57,7 +60,7 @@ that commands that merely print configuration never touch a backend implementati
 | `sb_load [backend]` | Binds a single backend; defaults to `${PX_BACKEND:-compose}`. |
 | `sb_bound_backend` | Outputs the bound backend name on stdout, or returns 6 if none is bound. |
 | `sb_verify_backend` | Lists missing function names on stdout; returns 0 if complete, 1 if not. |
-| `sb_contract_functions` | Emits the 31 contract function names, one per line. |
+| `sb_contract_functions` | Emits the 32 contract function names, one per line. |
 
 If given an invalid or unknown backend name, `sb_load` terminates the process with exit code 2 and
 reports the implementation file path it attempted to locate. It terminates the process with exit
@@ -525,7 +528,7 @@ without the tier produces an output identical to deployments prior to the introd
 The shelldoc on each `sb_*` function in `lib/backend/contract.sh` and `lib/backend/compose.sh`
 serves as the definitive function reference: its `## @param` lines specify the arguments, and its
 `## @return` line specifies the stdout schema and all possible exit codes. `sb_load` rejects any
-backend that omits any of the 31 contract functions. Callers always record exit code 5 as a skipped
+backend that omits any of the 32 contract functions. Callers always record exit code 5 as a skipped
 operation rather than a failure. The behavioral rules below apply across all contract functions.
 
 Every function that operates on a cluster takes the scope identifier returned by `sb_scope_create`
@@ -586,23 +589,39 @@ instances in a stopped state without starting them.
 without pushing to any registry, rejecting any image tag that includes a registry hostname or a
 digest. The container engine builds for the host architecture; arm64 is the primary architecture
 while amd64 is supported on a best-effort basis, which the staging step notes in its
-output when executing on an amd64 host.
+output when executing on an amd64 host. `sb_image_push image_id target_ref` pushes a single local
+image, identified by its image ID `sha256:<64 hex>`, to `<registry>/<repository>:<tag>` and emits
+one image row containing the target reference and the registry-assigned digest (returning exit code
+1 on a failed push or missing digest, 2 on invalid usage, and 6 when no local image matches the ID).
+It performs no image build, never logs in to a registry (relying instead on the operator's
+credential store to authenticate the push), and serves as the sole container runtime `push`
+operation in the repository. Only `px-cluster push` invokes it, and the Kubernetes backend
+returns exit code 5.
 
 ## The runtime boundary
 
-**Only a backend implementation may invoke a container runtime or a Kubernetes tool, and each
-backend may invoke only its own.** The eight restricted tool binaries are `docker`,
-`docker-compose`, `podman`, `nerdctl`, `kubectl`, `k3d`, `helm`, and `crictl`, and the four engine
-variables are `PX_DOCKER_BIN`, `_PXC_ENGINE`, `PX_KUBECTL_BIN`, and `_PXK_KUBECTL`. Each backend is
-assigned a distinct token class:
+**Only a designated owner may invoke a container runtime, a Kubernetes tool, or a registry, and each
+owner may invoke only its own.** The twelve restricted tool binaries are `docker`, `docker-compose`,
+`podman`, `nerdctl`, `kubectl`, `k3d`, `helm`, `crictl`, and the registry clients `skopeo`, `crane`,
+`regctl`, and `oras`, while the engine variables are `PX_DOCKER_BIN`, `_PXC_ENGINE`,
+`PX_KUBECTL_BIN`, `_PXK_KUBECTL`, and `_PXD_K3D`. Each owner is assigned a distinct token class:
 
 | File | May name |
 |---|---|
 | `lib/backend/compose.sh` | The container runtimes alongside `PX_DOCKER_BIN` and `_PXC_ENGINE`. |
 | `lib/backend/k8s.sh` | `kubectl` alongside `PX_KUBECTL_BIN` and `_PXK_KUBECTL`. |
+| `bin/px-k3d` | `k3d` alongside `_PXD_K3D`. |
 
 No other file in the repository may reference any of these tokens, except for the self-test suite
-that generates the mock executables.
+that generates the mock executables. Furthermore, no file may reference a standalone registry client
+or `helm`, as the container runtime push inside `sb_image_push` is the sole mechanism that writes to
+a registry. The static scan also enforces three additional invariants across all executable code
+lines in the repository tree: only `bin/px-k3d` may contain `cluster create` (ensuring
+`lib/backend/k8s.sh` never creates a cluster), the container runtime `push` command may appear
+exclusively within `sb_image_push`, and no line may log in to a registry or create a Kubernetes
+secret. `px-k3d` invokes `k3d` through the resolved absolute path stored in its private variable
+`_PXD_K3D`—just as each backend invokes its own underlying tool—while `px-cluster` and
+`scripts/preflight-k8s.sh` interact with `k3d` exclusively by invoking a subcommand of `px-k3d`.
 
 The Compose backend resolves the container engine binary once per process and stores its absolute
 filesystem path in `_PXC_ENGINE`, a private shell variable that is never exported. Only Docker is
@@ -631,17 +650,17 @@ all three:
 1. **Static scan.** `test/run-tests.sh` enumerates every file in the harness that can be executed,
    sourced, or rendered into executable form—including every file with a shell shebang, every file
    under `bin/`, and all `*.sh`, `*.env`, `*.tmpl`, and `*.suite` files. It scans each file for the
-   eight tool names and the four engine variables, ignoring comment lines as well as lines annotated
-   with the inline waiver `# px-allow-docker: <reason>`. Any unwaived match outside the allowlist
-   fails the test suite and reports the offending file path, line number, and line text. The
-   allowlist is maintained inside the test script with one entry per path specifying its permitted
-   token class and a mandatory reason. A match inside an allowlisted backend passes only when the
-   token belongs to that backend's token class, and the scan for bypass forms likewise restricts
-   each backend to its own token class. A **stale** allowlist entry also fails the test: an
-   allowlisted path that no longer exists or no longer contains a token of its assigned class must
-   be removed rather than left behind to grow into a loophole. Markdown documentation is excluded
-   from the scan, allowing this document to name the tools directly.
-2. **Runtime trap.** `lib/common.sh` defines each of the eight tool names as a shell function that
+   twelve tool names and the five engine variables, ignoring comment lines as well as lines
+   annotated with the inline waiver `# px-allow-docker: <reason>`. Any unwaived match outside the
+   allowlist fails the test suite and reports the offending file path, line number, and line text.
+   The allowlist is maintained inside the test script with one entry per path specifying its
+   permitted token class and a mandatory reason. A match inside an allowlisted backend passes only
+   when the token belongs to that backend's token class, and the scan for bypass forms below
+   likewise restricts each backend to its own token class. A **stale** allowlist entry also fails
+   the test: an allowlisted path that no longer exists or no longer contains a token of its assigned
+   class must be removed rather than left behind to grow into a loophole. Markdown documentation is
+   excluded from the scan, allowing this document to name the tools directly.
+2. **Runtime trap.** `lib/common.sh` defines each of the twelve tool names as a shell function that
    immediately exits with code 2, reporting the attempted argument list and a diagnostic message
    naming the substrate contract. Because every `px-*` process sources `lib/common.sh`, every
    driver, check, hook, and collector executing within such a process inherits the trap—including
@@ -653,17 +672,20 @@ all three:
    append its argument list to an audit log before responding from a fixture state file. Alongside
    it, the test writes a stateful fake `kubectl`—which logs every invocation first, rejects any call
    lacking `--context` and `--namespace`, and models pods, StatefulSets, claims, namespaces, the
-   `OnDelete` strategy, and the restart of a killed container—together with mock executables for
-   `k3d`, `helm`, and `crictl` that append their binary name and argument list to the same log. Any
-   call to these tools resolved through `PATH` reaches its fake and populates the log. The negative
-   control exercises every entry point that must never touch a container runtime or Kubernetes tool
-   and asserts that the log remains empty. A simulated hostile driver reads `PX_DOCKER_BIN` and
-   invokes `command "$PX_DOCKER_BIN" ps`, verifying that the variable is empty and the log remains
-   empty; on the Kubernetes backend, a second hostile driver performs the same check against
-   `PX_KUBECTL_BIN`, and exercising each backend reaches only that backend's designated tool. The
-   positive control then executes a real backend call and asserts that the log is **not** empty and
-   contains the expected scope label selector, because an empty log alone would prove nothing and
-   could merely indicate a broken shim or a `PATH` change that never took effect.
+   `OnDelete` strategy, the restart of a killed container, and target cluster properties—a stateful
+   fake `k3d` that tracks its clusters and imported images, a simulated registry inside the fake
+   container runtime that records each push and rejects any login attempt, and mock executables for
+   `helm`, `crictl`, and the four registry clients that append their binary name and argument list
+   to the same log. Any call to these tools resolved through `PATH` must reach its fake executable
+   and populate the log. The negative control exercises every entry point that must never touch a
+   container runtime or Kubernetes tool and asserts that the log remains empty. A simulated hostile
+   driver reads `PX_DOCKER_BIN` and invokes `command "$PX_DOCKER_BIN" ps`, verifying that the
+   variable is empty and the log remains empty; on the Kubernetes backend, a second hostile driver
+   performs the same check against `PX_KUBECTL_BIN`, and exercising each backend reaches only that
+   backend's designated tool. The positive control then executes a real backend call and asserts
+   that the log is **not** empty and contains the expected scope label selector, because an empty
+   log alone would prove nothing and could merely indicate a broken shim or a `PATH` change that
+   never took effect.
 
 Any requirement for a new file to access the container runtime directly is an architectural design
 question rather than a routine allowlist addition. The image build pipeline illustrates this
@@ -716,24 +738,30 @@ Compose.
 
 ## Kubernetes backend
 
-`lib/backend/k8s.sh` implements the exact same 31 contract functions, output schemas, and exit codes
+`lib/backend/k8s.sh` implements the exact same 32 contract functions, output schemas, and exit codes
 on a Kubernetes cluster without introducing any custom substrate verbs of its own. Everything
 earlier in this document is normative for the Kubernetes backend except where this section
 explicitly specifies a difference, and it is the sole file in the repository permitted to invoke
-`kubectl`. Milestone K1 delivers the backend implementation and its manifest generator verified
-against a fake `kubectl`; milestone K2 adds cluster preflight checks, endpoint tunnels, cluster
-target files, image promotion, the mesh overlay, and `px-k3d`; and milestones K3 and K4 validate the
-implementation on a live k3d cluster.
+`kubectl`. The backend operates on existing clusters and node pools: it never creates a cluster, and
+only `bin/px-k3d` creates a local k3d cluster. Milestone K1 delivered the backend implementation and
+its manifest generator verified against a fake `kubectl`; milestone K2 added cluster preflight
+checks, endpoint tunnels, cluster target files, image promotion, the mesh overlay, and `px-k3d`; and
+milestones K3 and K4 validate the implementation on a live k3d cluster.
 
 ### Binding and selection
 
-Passing `--backend k8s` to `px-cluster` or `px-run`, passing `-e PX_BACKEND=k8s`, or setting
+Passing `--backend k8s` to `px-cluster` and `px-run`, passing `-e PX_BACKEND=k8s`, or setting
 `PX_BACKEND=k8s` in `env/local.env` selects the Kubernetes backend before the configuration loader
 runs. The loader then ingests `k8s/env/k8s.env` after the run-class configuration and before
 `docker/env/defaults.env`, ensuring that explicit operator overrides and run-class settings take
-precedence. Cluster target files and `k8s/env/k3d.env` are supplied via `--config` and therefore
-override `k8s/env/k8s.env`. Drivers, checks, hooks, and collectors inherit `PX_BACKEND` and
-`PX_SCOPE_ID` from `px-run` and bind the backend via `sb_load "$PX_BACKEND"` without modification.
+precedence. Immediately prior to `k8s.env`, under the `backend:px-k3d` origin, the loader ingests
+`k8s/env/k3d.env` for the local `px-k3d` cluster unless `PX_K8S_TARGET` designates another cluster,
+making the local cluster the default target. A cluster target file (described below) is evaluated
+immediately after any `--config` files and therefore overrides both backend default files. Once the
+cluster is provisioned, the cluster record persists `PX_BACKEND=k8s` so that subsequent commands do
+not need to pass `--backend`. Drivers, checks, hooks, and collectors inherit `PX_BACKEND` and
+`PX_SCOPE_ID` from `px-run` and bind the
+backend via `sb_load "$PX_BACKEND"` without modification.
 
 | Name | Default | Meaning |
 |---|---|---|
@@ -744,6 +772,8 @@ override `k8s/env/k8s.env`. Drivers, checks, hooks, and collectors inherit `PX_B
 | `PX_K8S_MAX_PAUSE_S` | 120 | The maximum JVM pause duration that the liveness probe tolerates. |
 | `PX_K8S_CLUSTER_DOMAIN` | `cluster.local` | The internal DNS domain of the Kubernetes cluster. |
 | `PX_KUBECTL_BIN` | the `PATH` | The `kubectl` binary path, kept private like `PX_DOCKER_BIN`. |
+| `PX_KUBECTL_MIN_VERSION` | 1.28 | The minimum `kubectl` version, set in `docker/versions.env`. |
+| `PX_K8S_DEDICATED_NODES`, `PX_K8S_MESH`, `PX_K8S_MESH_CORE` | 0 | See the target files section. |
 
 The backend never relies on the implicit current context of the local kubeconfig. Whenever a
 Kubernetes context is required, an empty `PX_K8S_CONTEXT` causes the operation to fail with exit
@@ -765,13 +795,29 @@ belonging to another harness cluster (enforcing a single deployment per target c
 namespace matching the target scope name already exists without the scope's matching cluster label,
 or if a local state record already exists for another scope on the host unless `PX_FORCE=1` is set.
 It records the scope metadata in `$(px_state_dir)/k8s/scope-<id>.tsv` via the record helpers in
-`contract.sh`, storing the deployment directory path alongside the list of role groups started by
-test steps, while the scope's container restart table resides alongside it in `pods-<id>.tsv`.
-During provisioning, `sb_provision` applies the namespace manifest first. Because applying a
-namespace manifest would otherwise adopt an existing namespace, checking the cluster label up front
-prevents the harness from hijacking and subsequently deleting a namespace owned by another user or
-system. For the same reason, `sb_scope_exists` considers a namespace present only when it carries
-the expected cluster label for that scope.
+`contract.sh`, storing the deployment directory path, the list of role groups started by test steps,
+and `namespace_owner`, while the scope's container restart table resides alongside it in
+`pods-<id>.tsv`. During provisioning, `sb_provision` applies the namespace manifest first. Because
+applying a namespace manifest would otherwise adopt an existing namespace, checking the cluster
+label up front prevents the harness from hijacking and subsequently deleting a namespace owned by
+another user or system. For the same reason, `sb_scope_exists` considers a namespace present only
+when it carries the expected cluster label for that scope.
+
+**The prepared namespace.** Because a remote image pull secret resides inside the target namespace
+and the harness never creates a secret, the operator of a remote target cluster prepares the
+namespace in advance by creating `<PX_PROJECT_PREFIX>-<cluster>` with the label
+`px.harness.cluster=<cluster>` and installing the pull secret within it. A namespace that already
+exists with the matching cluster label when the scope gate runs is recorded with
+`namespace_owner operator`, whereas a namespace created by the initial manifest application is
+recorded with `namespace_owner harness`. The harness deletes only resources that it created:
+`sb_scope_delete` deletes the namespace itself only when the scope record specifies
+`namespace_owner harness`. For any other namespace—whether prepared by the operator or lacking a
+local scope record (since the cluster label alone does not indicate who created the namespace)—the
+function deletes the scope's ConfigMaps and Services by label, verifies that none remain, and
+preserves the namespace along with its pull secret. During bring-up, the backend does not apply
+`00-namespace.yaml` to an operator-prepared namespace so that none of its existing labels are
+modified; consequently, when `PX_K8S_MESH=1` is enabled, the operator must also configure the mesh
+injection label on that namespace.
 
 The Kubernetes backend reuses the exact same label keys as the Compose backend—`px.harness.cluster`,
 `.role`, `.index`, `.group`, `.start`, and `.drain`—all of which are valid Kubernetes label names.
@@ -783,9 +829,11 @@ specifies both `--context` and `--namespace`, even when querying cluster-scoped 
 `kubectl` ignores the namespace flag. Every command that selects harness resources includes the
 label selector `-l px.harness.cluster=<cluster>`, including queries listing pods, StatefulSets,
 Jobs, persistent volume claims, or namespaces, label-based deletions, and `top`. Commands that act
-on a single named object—such as `exec POD`, `logs POD`, `cp`, `delete pod NAME`, or
-`delete namespace NAME`—are scoped by the target namespace. Only read-only queries inspecting
-cluster-wide target properties omit a label selector: `version`, `auth can-i`, and `get nodes`.
+on a single named object—such as `exec POD`, `logs POD`, `cp`, `port-forward pod/POD`,
+`delete pod NAME`, or `delete namespace NAME`—are scoped by the target namespace. Only read-only
+queries inspecting target cluster properties omit a label selector: `version`, `auth can-i`,
+`get nodes`, `get storageclass NAME`, `get secret NAME` (retrieving only the secret name, never its
+data payload), `get resourcequota`, and `get events` for a single pod.
 
 ### The deployment directory
 
@@ -806,6 +854,9 @@ deploy-k8s/<cluster>/
   topology.env          the topology record of the shared writer
   ports.generated.env   PX_PORT_<ROLE>_<FAMILY>=<base>, with no index
   services.tsv          the columns and the rows of the Compose generator
+  requests.tsv          kind name replicas cpu_milli mem_mib claims claim_gib, one row per
+                        workload document, which scripts/preflight-k8s.sh sums
+  render.env            the settings of a px-cluster render or push, which up DIR records
   manifests/            applied by sb_provision in name order
     00-namespace.yaml   the namespace, with the cluster label
     10-env.yaml         ConfigMap px-env: topology.env and the port map
@@ -820,17 +871,19 @@ deploy-k8s/<cluster>/
 ```
 
 The generator produces every manifest by expanding the template files under `k8s/templates`. Both
-document skeletons and repeated list elements are represented as templates, and the generator simply
-selects, repeats, indents, and concatenates the expanded text, rendering any empty list as `[]`.
-Each template may reference only the variables explicitly bound for it by the generator.
-`pxg_expand` rejects any unbound or empty `${PX_*}` placeholder—as well as any `${` sequence that
-does not form a valid placeholder—with exit code 2, reporting the offending template path and line
-number. Next, `pxg_validate` scans the written files and fails with exit code 1 across both
-generators if any unexpanded `$` character remains. The two ConfigMaps containing raw configuration
-templates are appended after this validation pass because those templates intentionally preserve
-`${PX_*}` placeholders for container startup: each file is embedded as an explicitly indented YAML
-literal block so the pod receives its exact bytes, and the container's `render.sh` script serves as
-their fail-closed validator at startup.
+document skeletons and repeated elements are represented as templates, and the generator simply
+selects, repeats, indents, and concatenates the expanded text, rendering any empty list as `[]` and
+any empty map as `{}`. Cluster target files and run-class configurations modify only the bound
+variable values; the template files and the overlays under `k8s/overlays` are strictly read-only
+and are never modified in place. Each template may reference only the variables explicitly bound for
+it by the generator. `pxg_expand` rejects any unbound or empty `${PX_*}` placeholder—as well as any
+`${` sequence that does not form a valid placeholder—with exit code 2, reporting the offending
+template path and line number. Next, `pxg_validate` scans the written files and fails with exit code
+1 across both generators if any unexpanded `$` character remains. The two ConfigMaps containing raw
+configuration templates are appended after this validation pass because those templates
+intentionally preserve `${PX_*}` placeholders for container startup: each file is embedded as an
+explicitly indented YAML literal block so the pod receives its exact bytes, and the container's
+`render.sh` script serves as their fail-closed validator at startup.
 
 The container image is identical to the image used on Compose and requires no modifications. At
 startup, each pod renders its own service configuration from the `px-conf` ConfigMap mounted
@@ -850,20 +903,30 @@ backend-specific branching.
 * The setup role is deployed as the Job `setup-0`, configured with `restartPolicy: Never`,
   `backoffLimit: 0`, the persistent volume claim `data-namenode-0` mounted at `/data`, and a
   required pod affinity rule co-locating it on the same node as the NameNode pod because that
-  volume claim binds to a single node.
+  volume claim binds to a single node. Its pod template always carries
+  `sidecar.istio.io/inject: "false"` across every render because an injected sidecar container that
+  does not terminate would prevent the Job from completing.
 * The `client` and `tooling` roles are deployed as standalone Pods named `client-0` and `tooling-0`
   with `restartPolicy: Never`.
 * Each StatefulSet pod derives `PX_HOSTNAME` from its pod name and `PX_INSTANCE_INDEX` from the
-  `apps.kubernetes.io/pod-index` label via the Downward API, whereas the setup Job and standalone
-  Pods define literal values. All remaining environment variables match those of the corresponding
-  Compose service. In milestone K1, the setup Job does not run a monitor heartbeat.
+  `apps.kubernetes.io/pod-index` label, whereas the setup Job and standalone Pods define literal
+  values. All remaining environment variables match those of the corresponding Compose service. The
+  setup Job does not read a monitor heartbeat file: a pod cannot read a host file without a
+  `hostPath` volume—which the `restricted` security profile forbids and a remote cluster node cannot
+  serve—and `px-cluster up` aborts any bring-up whose health monitor fails to start.
 * Every pod disables service account token mounting (`automountServiceAccountToken: false`) and
   service environment variable injection (`enableServiceLinks: false`), sets
   `terminationGracePeriodSeconds` to `PX_TIMEOUT_STOP`, and enforces `runAsNonRoot` using the host
   UID and GID that built the container image (rejecting UID or GID 0), alongside `fsGroup` and
   `seccompProfile: RuntimeDefault`. Within each pod, the primary container `px` sets
   `allowPrivilegeEscalation: false` and drops all Linux capabilities, satisfying the Kubernetes
-  `restricted` Pod Security Standard profile. In addition, `imagePullPolicy` is set to `Never`.
+  `restricted` Pod Security Standard profile. Local images use `imagePullPolicy: Never`, whereas
+  remote images are referenced by immutable digest with `IfNotPresent`.
+* For node placement, DataNode and RegionServer pods prefer nodes that do not already host a pod of
+  the same role (`preferredDuringSchedulingIgnoredDuringExecution` with weight 100 on
+  `kubernetes.io/hostname`), which is a no-op on a single-node cluster. Every pod specification
+  includes the target cluster's `nodeSelector`, `tolerations`, and `imagePullSecrets`, rendering
+  `{}` and `[]` when none are configured.
 * Resource requests are set equal to resource limits so that every pod is assigned to the
   Guaranteed QoS class. Memory limits, heap sizes, and direct memory allocations match the role's
   Compose values; because Compose does not specify CPU limits, each container's CPU allocation is
@@ -888,11 +951,21 @@ with a DNS search domain `<role>.<namespace>.svc.<PX_K8S_CLUSTER_DOMAIN>` for ea
 Service. Supporting more than six DNS search domains alongside the pod-index label requires at
 least Kubernetes 1.28, which `sb_preflight` enforces as the minimum cluster version.
 
-In milestone K1, `sb_endpoint` returns the cluster-internal FQDN `<pod>.<role>.<namespace>.svc`
-together with the family's base port, which resolves inside the cluster, while `sb_endpoint_release`
-is a no-op that returns exit code 0; milestone K2 adds host-side loopback port-forward tunnels
-(RQ-287). Roles that do not have a Service—specifically `setup`, `client`, and `tooling`—expose no
-endpoints and cause `sb_endpoint` to return exit code 6.
+From the host, the operator and harness commands access a pod exclusively through a port-forward
+tunnel bound to the loopback interface. When a caller requests an endpoint, `sb_endpoint` launches a
+detached `kubectl port-forward --address 127.0.0.1 pod/<pod> :<base port>` process, recording its
+log alongside a state record in the state directory (`tunnel-<scope>_<role>_<index>_<port>.tsv`,
+containing the process ID, local port, pod UID, and scope). The function waits up to 30 s for the
+tunnel to emit its `Forwarding from 127.0.0.1:<port>` line and then outputs `127.0.0.1` together
+with that dynamically allocated local port (returning exit code 4 if the readiness line does not
+appear within the timeout, or exit code 1 if the process terminates early or the pod is not
+running). Subsequent calls reuse an active tunnel targeting the same pod; if the controller replaces
+the pod, the old tunnel terminates and the next call establishes a new one. `sb_endpoint_release`
+terminates a single tunnel—or all tunnels belonging to the scope when passed `all`, which teardown
+performs as its initial step. Because the detached tunnel holds no open file descriptors inherited
+from its caller, `px-cluster endpoint` returns immediately while the tunnel continues running in the
+background. Roles that do not have a Service—specifically `setup`, `client`, and `tooling`—expose no
+endpoints and return exit code 6.
 
 ### Probes
 
@@ -997,33 +1070,260 @@ deleted pods are retained in the table. `sb_termination_reason current` reports 
 active termination state—or its last termination state while the container is waiting in backoff to
 restart—whereas `previous` inspects the prior termination state and returns exit code 6 if none
 exists. A Kubernetes termination reason of `OOMKilled` maps to `oom`, and an evicted pod maps to
-`evicted`; `sb_oom_killed` inspects both current and previous states for these conditions.
-`sb_sample_resources` queries `kubectl top --containers` for the `px` container; because the
-Kubernetes Metrics API does not expose network or block I/O counters, those four schema columns are
-emitted as empty fields (denoting unknown values rather than 0), and an unavailable Metrics API
-causes the function to return exit code 5. Milestone K2 extends `px-run` and the cluster health
-checks to inspect prior container terminations and pod events (RQ-288, RQ-300).
+`evicted`. `sb_oom_killed` inspects both current and previous states and then checks the pod's
+events (`get events
+--field-selector involvedObject.name=<pod>`): a reason `OOMKilling` or `OOMKilled`, or a message
+containing `OOMKilled`, indicates an out-of-memory kill. `sb_sample_resources` runs `kubectl top
+--containers` for the container `px`; because the Kubernetes Metrics API does not expose network or
+block I/O counters, those four schema columns are emitted as empty fields (denoting unknown values
+rather than 0), and an unavailable Metrics API causes the function to return exit code 5. While a
+workload runs, px-run aborts the run with exit code 3 if any instance's restart count increases or a
+container terminates unexpectedly. In addition, the cluster health checks compare live restart
+counts against the run's snapshots and capture the previous container log of every instance that
+restarted or suffered an out-of-memory kill into `logs/instance/<role>-<index>.previous.log`.
 
 ### Images
 
 `sb_image_ref` outputs the image reference declared in the pod specification alongside the resolved
-image identifier reported by the container status. Because pods never pull images remotely,
-`sb_image_present` verifies that every node in the cluster already holds every image required by the
-rendered deployment, matching node image names even when the container runtime prefixes them with a
-registry hostname. Both `sb_image_build` and `sb_image_base_digest` return exit code 5 on the
-Kubernetes backend: container images are built locally through the Compose backend, and milestone K2
-handles loading and promoting those images into the target Kubernetes cluster.
+image identifier reported by the container status. For local image references, `sb_image_present`
+verifies that every node in the cluster already holds every local image required by the rendered
+deployment—because pods using local tags never pull images remotely—matching node image names even
+when the container runtime prefixes them with a registry hostname. An image referenced by immutable
+digest is always treated as present with the digest itself serving as its image ID: the kubelet
+pulls the image from the registry on demand, and any pull failure surfaces as `ErrImagePull`, which
+aborts the readiness barrier with exit code 3. `sb_image_build`, `sb_image_base_digest`, and
+`sb_image_push` all return exit code 5 on the Kubernetes backend: container images are built and
+pushed through the Compose backend, while `px-k3d import` loads local images into a local k3d
+cluster.
 
-### What K1 leaves to later rounds
+### The preflight
 
-Live cluster bring-up requires `scripts/preflight-k8s.sh`, which is introduced in milestone K2;
-until that script is present, `px-cluster up`, `scale`, and on-demand group starts triggered by a
-test suite halt with exit code 5 via `px_preflight_script` in `lib/common.sh` before modifying the
-target cluster. Every other `px-cluster` subcommand operates on a Kubernetes scope in K1. Milestone
-K2 also introduces host loopback tunnels, cluster target configuration files supporting node
-placement and image pull secrets, image promotion via `scripts/push-images.sh` with immutable digest
-references, the mesh fault-injection overlay, `px-k3d`, and the setup Job monitor heartbeat.
-Milestone K3 then validates against a live k3d cluster the runtime behaviors that a fake cannot
-prove: DNS search domain resolution, the pod-index label, probe timing behavior, the shared
-persistent volume claim mounted by the setup Job, `kubectl cp`, resource metrics sampling, and
-drain-aware restarts.
+`scripts/preflight-k8s.sh` implements the preflight check for the Kubernetes backend, invoked by
+`px-cluster up`, `scale`, and role-group starts via `px_preflight_script`. It accepts the same
+command-line options and returns the same exit codes as `scripts/preflight.sh` (0 when the
+deployment fits, 1 when the cluster fails to respond or a required metric cannot be measured, 2 on
+invalid usage, 3 when a preflight check rejects the target, and 5 when the client is rejected) and
+shares the common helper library `lib/preflight.sh`. During the fast phase, it emits the check rows
+returned by `sb_preflight`:
+
+| Row | Fails when |
+|---|---|
+| `engine_binary`, `engine_responsive`, `engine_version` | No client, no reply, or API below 1.28. |
+| `client_version` | The `kubectl` client is below `PX_KUBECTL_MIN_VERSION`, naming both versions. |
+| `engine_credentials` | The client lacks permission to create StatefulSets or exec into pods. |
+| `deployment_absent` | Another harness namespace is on the target, or workloads are in its own. |
+| `storage_class` | `PX_K8S_STORAGE_CLASS` is unset, or the named StorageClass does not exist. |
+| `pull_secret` | `PX_K8S_PULL_SECRET` is set, and no such secret exists in the namespace. |
+| `engine_memory`, `engine_cpus`, `node_memory` | Never; reports the selected nodes' figures. |
+| `quota:<class>` | Never; reports the hard limit and usage of each ResourceQuota and resource. |
+
+The capacity figures report the total allocatable memory and CPU millicores across the nodes
+matching `PX_K8S_NODE_SELECTOR`, along with the allocatable memory of the single largest selected
+node; each quota row reports a single ResourceQuota object and one of the tracked resources
+(memory, cpu, pods, claims, or storage).
+
+When `px-k3d check` recognizes the target context, the fast phase appends its `k3d_binary` and
+`k3d_version` rows (rejecting a version below `PX_K3D_MIN_VERSION` with exit code 3 and reporting
+both versions). Any `k3d-*` context that was not created by `px-k3d` fails the `k3d_cluster` row
+with exit code 3: because every node in a k3d cluster reports the entire memory of the underlying
+container engine as allocatable, only the host-level budget enforced by `k3d_memory_fit` prevents a
+multi-node k3d deployment from exceeding actual host memory. The memory phase sums `requests.tsv`
+across all workloads—including on-demand role groups—and emits `memory_fit` (comparing total memory
+requests against `engine_memory`), `pod_fit` (comparing the largest single pod against
+`node_memory`), `cpu_fit` (comparing total CPU requests against `engine_cpus`;
+`PX_PREFLIGHT_MIN_CPUS` does not apply because container CPU requests are explicit), one
+`quota_fit:<class>` row for each quota row (comparing total demand against the hard limit minus
+current usage, or against the full hard limit when rechecking a running deployment with
+`--phase memory`), `k3d_memory_fit` for a cluster managed by `px-k3d` (comparing demand against the
+engine memory reported by `px-k3d check` minus the 4 GiB host headroom and minus
+`PX_K3S_ALLOWANCE_MIB`, or failing with exit code 2 if a local target lacks that variable), and
+`disk_free`. Every fit row formats its detail as `<demand> against <limit>: <what>`, and a failing
+`memory_fit` check also lists the individual resource requests of each workload.
+
+### Target files
+
+A cluster target file describes the environment and placement parameters of a single external
+Kubernetes cluster. The operator specifies the file path via `PX_K8S_TARGET`—either using `-e` or in
+the shell environment—so every harness command accepts it without requiring a dedicated command-line
+flag. The configuration loader ingests the target file in its own dedicated precedence stage
+immediately after `--config` files and before `env/local.env`; consequently, command-line overrides,
+environment variables, and `--config` files take precedence over the target file, while the target
+file takes precedence over `local.env`, plug-in defaults, the run-class configuration, `k8s.env`,
+and the base defaults. Specifying a path located inside the repository working tree fails with exit
+code 2 because target files contain cluster-specific environment details and must reside outside the
+repository; a non-existent target file fails with exit code 6; and defining `PX_K8S_TARGET` only
+inside `local.env` or a lower-precedence stage fails with exit code 2, except when loaded from the
+cluster record, which stores the flattened settings of the target file used during bring-up. The
+repository ships no target files: `k8s/env` contains only `k8s.env` and `k3d.env`, where `k3d.env`
+serves as the backend default that an external target file replaces.
+
+| Key | Required | Grammar | Reaches |
+|---|---|---|---|
+| `PX_K8S_TARGET` | | A path outside the working tree | The loader stage that reads this file. |
+| `PX_K8S_CONTEXT` | yes | No whitespace and no `\|` | `--context` on every call and the scope ID. |
+| `PX_CLUSTER_ID` | no | A valid DNS label segment | The target namespace `<prefix>-<cluster>`. |
+| `PX_PROJECT_PREFIX` | no | A valid DNS label part | The target namespace `<prefix>-<cluster>`. |
+| `PX_K8S_STORAGE_CLASS` | yes | A valid DNS name | `storageClassName` and `get storageclass`. |
+| `PX_K8S_REGISTRY` | remote | `host[:port][/path]`, see below | Every image and the push target. |
+| `PX_K8S_PULL_SECRET` | no | A valid DNS name | `imagePullSecrets` on every pod, `get secret`. |
+| `PX_K8S_NODE_SELECTOR` | no | `key=value[,key=value]` | `nodeSelector` and `get nodes -l`. |
+| `PX_K8S_TOLERATIONS` | no | `key[=value]:Effect[,...]` | `tolerations` on every pod. |
+| `PX_K8S_DEDICATED_NODES` | no, 0 | 0 or 1 | The quiet-host state of a run, described below. |
+| `PX_K8S_MESH` | no, 0 | 0 or 1 | The service mesh overlay. |
+| `PX_K8S_MESH_CORE` | no, 0 | 0 or 1 | Enrolls the core pods of the overlay in the mesh. |
+
+Each toleration effect must be `NoSchedule`, `PreferNoSchedule`, or `NoExecute`; specifying
+`key=value` matches a taint carrying that exact value (`operator: Equal`), whereas specifying `key`
+alone matches any value for that taint key (`operator: Exists`). Any setting that violates its
+declared grammar fails with exit code 2 and reports the offending key name. Any other `PX_*`
+variable in a target file is processed as ordinary harness configuration. For example:
+
+```sh
+# ~/targets/perf-east.env, outside the repository
+PX_K8S_CONTEXT=perf-east
+PX_K8S_STORAGE_CLASS=gp3
+PX_K8S_REGISTRY=registry.example.com/phoenix-harness
+PX_K8S_PULL_SECRET=harness-pull
+PX_K8S_NODE_SELECTOR=pool=phoenix-perf
+PX_K8S_TOLERATIONS=dedicated=phoenix:NoSchedule
+PX_K8S_DEDICATED_NODES=1
+```
+
+### Remote images and promotion
+
+When `PX_K8S_REGISTRY` is configured, manifest rendering rewrites every container image reference to
+an immutable digest of the form `<registry>/<repository>@sha256:<digest>` with pull policy
+`IfNotPresent`, resolving digests exclusively from `PX_K8S_IMAGE_DIGESTS` (formatted as
+comma-separated `<local ref>=sha256:<64 hex>` entries). Attempting a remote render without a
+resolved digest for `PX_IMAGE_TAG` fails with exit code 2 and directs the operator to
+`px-cluster push BUNDLE`:
+
+```sh
+px-cluster push "$PX_OUT/runs/<run-id>" --class measurement \
+  -e PX_K8S_TARGET="$HOME/targets/perf-east.env"
+px-cluster --backend k8s -e PX_K8S_TARGET="$HOME/targets/perf-east.env" up DIR
+```
+
+`px-cluster push` promotes the exact container images verified in a passing validation run. It
+requires a run bundle that passes `px-bundle validate` with `run.class` set to validation and
+`run.result` set to PASS (failing with exit code 1 otherwise, or exit code 6 if the bundle path does
+not exist), and whose recorded image references are local tags each mapped to a single `sha256`
+digest. For each image, it invokes `sb_image_push` on the Compose backend to push the image by its
+ID to `<PX_K8S_REGISTRY>/<repository>:<tag>`, verifies that the digest returned by the registry
+matches the digest recorded in the bundle (failing with exit code 1 without rendering if they
+differ), renders the target deployment manifests with `PX_K8S_IMAGE_DIGESTS` into
+`$PX_OUT/deploy-k8s/push-<run id>`, and writes that directory path to stdout while logging an INFO
+line to stderr for each pushed image. Because neither the push operation nor its manifest render
+consults a cluster record, an active local cluster neither alters the promoted render nor has its
+own deployment directory modified; `render.env` inside the rendered directory persists the
+resolved digests so that subsequent scaling operations on the promoted cluster require no
+repeated digest settings. The command never logs in to a registry, builds an image, invokes
+`kubectl`, or creates a Kubernetes secret. The `PX_K8S_REGISTRY` value must be lowercase, and its
+hostname component must contain a `.`, include a port, or be `localhost`; any other value is
+rejected with exit code 2 during both manifest rendering and `px-cluster push` before any push is
+attempted, because the container engine interprets a single-word prefix such as
+`apurtell` as a user namespace on the public Docker Hub registry.
+
+Image promotion requires the container engine to use the containerd image store. Under the
+containerd store, the local image ID is the digest of the image manifest stored by the registry, so
+the local and registry digests match. Under the classic overlay2 image store, the local image ID is
+the digest of the image configuration JSON, which never matches a registry manifest digest and
+causes every promotion attempt to fail with exit code 1. Milestone K3 validates this image store
+behavior on a live environment (owner question 2).
+
+### The mesh overlay
+
+When `PX_K8S_MESH=1` is enabled, the manifest generator applies the mesh overlay from
+`k8s/overlays/mesh` after rendering the base manifests: the namespace receives the label
+`istio-injection: "enabled"`, and every pod in the core group (all cluster daemons alongside the
+client and tooling pods) receives the annotation `sidecar.istio.io/inject: "false"`, or `"true"`
+when `PX_K8S_MESH_CORE=1` is also set. Because a namespace with injection enabled injects a sidecar
+into any pod lacking an explicit annotation, setting `"false"` explicitly keeps the core cluster
+pods outside the mesh by default, while the setup Job unconditionally retains its opt-out
+annotation. Because the overlay modifies nothing else, a mesh-enabled render differs from a flat
+render solely by those added metadata lines. Both flags default to 0 in `k8s.env`, so renders
+without explicit mesh settings remain flat across both run classes, whereas a validation target that
+sets `PX_K8S_MESH=1` activates the overlay. The mesh role group for the Distributed Pherf tier,
+whose pods join the mesh automatically without an explicit opt-in annotation, is deferred to
+milestone K5.
+
+### The local cluster: px-k3d
+
+`bin/px-k3d` creates, imports images into, checks, and deletes the local k3d cluster associated with
+the target context, which defaults to `k3d-px` (defined in `k8s/env/k3d.env` and loaded after
+operator configuration files and prior to the cluster record); the k3d cluster name is derived by
+stripping the `k3d-` prefix from the context name. The command invokes `k3d` through the resolved
+absolute binary path stored in `_PXD_K3D`, discovered by searching `PATH` followed by
+`/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bin`.
+
+* `create [--class validation|measurement] [--agents N]` rejects with exit code 2 any `PX_K3S_IMAGE`
+  pin that does not match `k3s(:<tag>)?@sha256:<64 hex>` (in `docker/versions.env`), and rejects
+  with exit code 3 an existing Compose cluster record on the host, a k3d version below
+  `PX_K3D_MIN_VERSION`, an existing k3d cluster with the target name, or another local `px-k3d`
+  state record (unless `PX_FORCE=1` marks that record as stale). If cluster creation fails or times
+  out, the command deletes any partial cluster left behind by k3d—which the pre-creation gate
+  confirmed did not exist beforehand—and removes the state record; if that cleanup deletion also
+  fails, the state record is retained so a subsequent `px-k3d delete` can remove it. The command
+  invokes `k3d
+  cluster create px --image <pin> --servers 1 --agents <N> --api-port 127.0.0.1:6550 --k3s-arg
+  --disable=traefik@server:* ... --kubeconfig-update-default --kubeconfig-switch-context=false
+  --wait --timeout <s>`. The measurement topology uses 0 agents, disables the service load balancer
+  (`--k3s-arg --disable=servicelb@server:*`), and publishes no host port mappings; the validation
+  topology uses N agents (0 to 9, defaulting to 2), retains the service load balancer, and maps
+  `127.0.0.1:8081:80@loadbalancer`. Every published port binds exclusively to 127.0.0.1, and the
+  active context in the operator's kubeconfig remains unchanged.
+* `import [IMAGE...]` executes `k3d image import -c px <image>` once for each specified local image
+  tag, defaulting to `PX_IMAGE_TAG`. No container registry is created and no image is pushed.
+* `check` emits the `k3d_binary`, `k3d_version`, and `engine_memory` check rows, obtaining the
+  Compose backend's engine memory figure, which `px-k3d` binds exclusively for that row.
+* `delete` fails with exit code 3 if an active Kubernetes scope is still recorded for the target
+  context; otherwise, it deletes the k3d cluster and removes its state record.
+
+The state record `$(px_state_dir)/k3d/scope-<context>.tsv` (storing the scope and created_at fields)
+tracks every cluster created by `px-k3d`. Every subcommand other than `create` inspects this record
+before making any tool call: if no record exists for the target context—including when targeting a
+remote cluster—the command immediately returns exit code 6 without invoking `k3d`, ensuring `px-k3d`
+never deletes a cluster owned by someone else. The single-cluster-per-host invariant is enforced in
+both directions: `px-k3d create` refuses to run when a Compose scope record is present, and
+`px-cluster up` on the Compose backend fails with exit code 1 when a `px-k3d` state record is
+present. The command returns exit code 0 on success, 1 if k3d fails or is not installed, 2 on
+invalid usage or an image pin lacking a digest, 3 when a pre-creation gate or version floor check
+rejects the operation, 4 when a wait operation expires, and 6 when no `px-k3d` cluster is recorded
+for the context.
+
+### Dedicated nodes and the end of a measurement
+
+Because the CPU load on the operator's local workstation does not reflect the load on Kubernetes
+worker nodes, px-run replaces the local quiet-host check with a dedicated-node check when running on
+the Kubernetes backend. Setting `PX_K8S_DEDICATED_NODES=1` records the quiet state as `dedicated`
+without flagging run contamination, allowing measurement runs to produce authoritative timing
+verdicts. A target cluster without that setting is rejected with exit code 2 prior to the prepare
+phase whenever the run requires a quiet host (`PX_REQUIRE_QUIET_HOST`, which defaults to 1 in the
+measurement class); when a quiet host is not required, the run records the quiet state as
+`undeclared` and marks the bundle with `dedicated-node` contamination, downgrading timing verdicts
+to ADVISORY while preserving the full severity of count-based verdicts. `k3d.env` sets
+`PX_REQUIRE_QUIET_HOST=0`, meaning that a measurement run executed against a local k3d cluster
+evaluates count parity only. Both the workstation sleep inhibitor and the cluster health monitor
+operate on Kubernetes just as they do on Compose.
+
+Test runs leave the cluster running upon completion. On Kubernetes, `px-cluster down` deletes the
+harness namespace created by `px-cluster up` regardless of the run class while leaving the
+underlying Kubernetes cluster intact for reuse, because the cluster itself was provisioned by
+`px-k3d create`. Tearing down an additional cluster requires the operator to target it explicitly by
+label: invoking `px-cluster down --label k3d.cluster=px` deletes the harness namespace and then
+delegates to `px-k3d delete` to remove the local k3d cluster `px`. If px-k3d has no record of that
+cluster, the deletion step returns exit code 6 and leaves all other resources untouched.
+
+### What K3 and later prove live
+
+Milestone K3 installs k3d and validates on a live cluster the runtime behaviors that a simulated
+fake cannot prove: the pinned k3s image digest, the `--k3s-arg` node filters and loopback bindings
+of `--api-port` and `-p`, the actual memory footprint of k3s relative to `PX_K3S_ALLOWANCE_MIB`,
+the resolved image ID following an image import, live port-forward tunnel creation and termination
+upon pod restart, the event reasons emitted by a genuine out-of-memory kill, DNS search domain
+resolution, the pod-index label, probe timing behavior, the shared persistent volume claim mounted
+by the setup Job, `kubectl cp`, resource metrics sampling, and drain-aware restarts. Milestone K4
+then validates behavioral parity with Compose along with full measurement run teardown; milestone K5
+validates the Distributed Pherf tier and its mesh role group; milestone K6 validates service mesh
+integration and image promotion against a live registry; and milestone K7 validates node placement,
+resource quotas, and operator-prepared namespaces on dedicated hardware.

@@ -24,7 +24,7 @@
 # pipeline, any configuration rejected by one is rejected by the other with an identical diagnostic
 # message, and both generators produce identical service tables for the same configuration.
 #
-# Five design rules govern this generator:
+# Six design rules govern this generator:
 #   1. It only writes local files and never invokes kubectl.
 #   2. It fails closed: pxg_require rejects unset variable names, pxg_expand rejects template
 #      placeholders that lack a value, and pxg_validate rejects any rendered file in which an
@@ -40,6 +40,8 @@
 #      no backend-specific branching.
 #   5. Every pod binds to the base port of each port family. Because every pod receives its own
 #      network address, no port offset is required to keep multiple instances apart.
+#   6. A target configuration file and the run class modify bound configuration values only; the
+#      templates and overlays are strictly read-only and are never written.
 #
 # This generator does not yet render the Distributed Pherf tier. Enabling PX_PHERF=1 therefore
 # halts the render with exit code 2, and that tier must be rendered with the Compose backend.
@@ -55,8 +57,10 @@ set -euo pipefail
 # the generator is permitted to overwrite.
 PXG_MARKER="# Rendered by manifests.gen.sh. Render again instead of editing."
 
-# This directory holds the YAML templates for manifest documents and their repeated items.
+# These directories hold the YAML templates for manifest documents, their repeated items, and the
+# optional manifest overlays.
 PXK_TEMPLATES="$SELF/templates"
+PXK_OVERLAYS="$SELF/overlays"
 # This directory holds the container image configuration templates packaged into the px-conf
 # ConfigMap.
 PXK_CONF_DIR="$PX_HOME/$PX_DEPLOY_SUBDIR/image/conf"
@@ -80,6 +84,11 @@ PXK_PODS="client tooling"
 # StorageClass name, and the cluster domain.
 PXK_LABEL_RE='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
 PXK_SUBDOMAIN_RE='^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+# These regular expressions enforce the grammar for a node label key, a node label value, and a
+# container image digest, while sb_registry_check enforces the grammar for an image registry.
+PXK_LABEL_KEY_RE='^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$'
+PXK_LABEL_VALUE_RE='^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$'
+PXK_DIGEST_RE='^sha256:[0-9a-f]{64}$'
 
 # These variables hold the computed state accumulated during a single render pass.
 PXK_NAMESPACE=""
@@ -90,6 +99,13 @@ PXK_PORTS=""
 PXK_EAGER_FILES=""
 PXK_GROUP_FILES=""
 PXK_CHECKED=()
+# These variables store the container image reference and pull policy for every pod alongside the
+# target placement constraints, each remaining an empty string when the target configures none.
+PXK_IMAGE=""
+PXK_PULL_POLICY=""
+PXK_NODE_SELECTOR=""
+PXK_TOLERATIONS=""
+PXK_PULL_SECRETS=""
 
 ## @description  Prints the command-line usage instructions and exit code summary.
 ## @return       Writes the usage text to stdout and returns exit code 0.
@@ -132,25 +148,30 @@ PX_PHERF=1, or a target directory that is not a rendered deployment; 6 a
 EOF
 }
 
-## @description  Expands a template from k8s/templates (name, columns, NAME=VALUE...) and indents
-##               each output line by the requested column count.
+## @description  Expands a template file (path, columns, NAME=VALUE...) and indents each output
+##               line by the specified column count.
 ## @return       Writes the text to stdout and exits 0, or exits 2 on a placeholder with no value.
-pxk_t() {
-  local name=$1 pad text
+pxk_tf() {
+  local file=$1 pad text
   printf -v pad '%*s' "$2" ''
   shift 2
-  text="$(pxg_expand "$PXK_TEMPLATES/$name.yaml.tmpl" "$@")" || exit $?
+  text="$(pxg_expand "$file" "$@")" || exit $?
   printf '%s\n' "$text" | sed "s/^/$pad/"
 }
 
-## @description  Formats a YAML list (columns, items) indented by the given column count, or emits
-##               an indented empty list [] when no items are present.
+## @description  Expands a named template from k8s/templates (name, columns, NAME=VALUE...) by
+##               delegating to pxk_tf.
+## @return       Writes the text to stdout and exits 0, or exits 2 on a placeholder with no value.
+pxk_t() { pxk_tf "$PXK_TEMPLATES/$1.yaml.tmpl" "${@:2}"; }
+
+## @description  Formats a YAML collection (columns, items, empty form) indented by the column
+##               count, or emits the empty form ([] by default) when no items are present.
 ## @return       Writes the formatted text without its trailing newline to stdout and exits 0.
 pxk_list() {
   local pad
   if [ -z "${2:-}" ]; then
     printf -v pad '%*s' "$1" ''
-    printf '%s[]' "$pad"
+    printf '%s%s' "$pad" "${3:-[]}"
     return 0
   fi
   printf '%s' "${2%"$PX_NL"}"
@@ -193,6 +214,94 @@ pxk_port_protocol() {
   esac
 }
 
+## @description  Resolves the promoted digest for a local image reference (ref) from the
+##               comma-separated ref=sha256:<hex> pairs in PX_K8S_IMAGE_DIGESTS.
+## @return       Writes the digest and exits 0, exits 6 if absent, or exits 2 on a malformed pair.
+pxk_digest_of() {
+  local pair pairs=()
+  IFS=, read -r -a pairs <<<"${PX_K8S_IMAGE_DIGESTS:-}"
+  for pair in ${pairs[@]+"${pairs[@]}"}; do
+    if [ "${pair%=*}" = "$pair" ] || ! [[ ${pair##*=} =~ $PXK_DIGEST_RE ]]; then
+      px_die "$PX_EXIT_USAGE" "PX_K8S_IMAGE_DIGESTS holds '$pair', not ref=sha256:<64 hex>"
+    fi
+    if [ "${pair%=*}" = "$1" ]; then
+      printf '%s\n' "${pair##*=}"
+      return 0
+    fi
+  done
+  return "$PX_EXIT_NO_OBJECT"
+}
+
+# Local renders use the local image tag with a Never pull policy, whereas remote targets resolve the
+# image by digest in PX_K8S_REGISTRY and pull it whenever a node lacks the image.
+## @description  Configures the container image reference and pull policy applied to every pod.
+## @return       Exits 0, or exits 2 on a rejected registry or a remote render missing a digest.
+pxk_image_source() {
+  local digest
+  PXK_IMAGE=$PX_IMAGE_TAG PXK_PULL_POLICY=Never
+  [ -n "${PX_K8S_REGISTRY:-}" ] || return 0
+  if ! sb_registry_check "$PX_K8S_REGISTRY"; then
+    px_die "$PX_EXIT_USAGE" "PX_K8S_REGISTRY='$PX_K8S_REGISTRY' must be host[:port][/path] in" \
+      "lower case, its host with a dot or a port, or localhost"
+  fi
+  # Because a mutable registry tag can move whereas a content digest is immutable, remote pod
+  # manifests pin the exact digest recorded by a passing validation bundle.
+  if ! digest="$(pxk_digest_of "$PX_IMAGE_TAG")"; then
+    px_die "$PX_EXIT_USAGE" "a remote render references images by digest, and" \
+      "PX_K8S_IMAGE_DIGESTS names none for $PX_IMAGE_TAG: render it with" \
+      "scripts/push-images.sh"
+  fi
+  PXK_IMAGE="$PX_K8S_REGISTRY/${PX_IMAGE_TAG%%:*}@$digest"
+  PXK_PULL_POLICY=IfNotPresent
+}
+
+## @description  Configures the target placement settings for every pod, including the node
+##               selector, tolerations, and image pull secret.
+## @return       Exits 0, or exits 2 if any value violates its grammar, naming the offending key.
+pxk_placement() {
+  local item key value effect items=()
+  PXK_NODE_SELECTOR="" PXK_TOLERATIONS="" PXK_PULL_SECRETS=""
+  IFS=, read -r -a items <<<"${PX_K8S_NODE_SELECTOR:-}"
+  for item in ${items[@]+"${items[@]}"}; do
+    key=${item%%=*} value=${item#*=}
+    if [ "$key" = "$item" ] || ! [[ $key =~ $PXK_LABEL_KEY_RE ]] ||
+      ! [[ $value =~ $PXK_LABEL_VALUE_RE ]]; then
+      px_die "$PX_EXIT_USAGE" "PX_K8S_NODE_SELECTOR holds '$item', not key=value of a label"
+    fi
+    PXK_NODE_SELECTOR="$PXK_NODE_SELECTOR$(pxk_pairs 2 "$item")$PX_NL"
+  done
+  items=()
+  IFS=, read -r -a items <<<"${PX_K8S_TOLERATIONS:-}"
+  for item in ${items[@]+"${items[@]}"}; do
+    effect=${item##*:} key=${item%:*} value=""
+    if [ "$key" != "${key%%=*}" ]; then
+      value=${key#*=} key=${key%%=*}
+    fi
+    case "$effect" in
+    NoSchedule | PreferNoSchedule | NoExecute) ;;
+    *) effect="" ;;
+    esac
+    if [ "$item" = "${item%:*}" ] || [ -z "$effect" ] || ! [[ $key =~ $PXK_LABEL_KEY_RE ]] ||
+      { [ -n "$value" ] && ! [[ $value =~ $PXK_LABEL_VALUE_RE ]]; }; then
+      px_die "$PX_EXIT_USAGE" "PX_K8S_TOLERATIONS holds '$item', not key[=value]:Effect with" \
+        "the effect NoSchedule, PreferNoSchedule or NoExecute"
+    fi
+    if [ -n "$value" ]; then
+      item="$(pxk_t toleration-equal 2 "PX_M_KEY=$key" "PX_M_VALUE=$value" \
+        "PX_M_EFFECT=$effect")" || exit $?
+    else
+      item="$(pxk_t toleration-exists 2 "PX_M_KEY=$key" "PX_M_EFFECT=$effect")" || exit $?
+    fi
+    PXK_TOLERATIONS="$PXK_TOLERATIONS$item$PX_NL"
+  done
+  if [ -n "${PX_K8S_PULL_SECRET:-}" ]; then
+    if ! [[ $PX_K8S_PULL_SECRET =~ $PXK_SUBDOMAIN_RE ]]; then
+      px_die "$PX_EXIT_USAGE" "PX_K8S_PULL_SECRET='$PX_K8S_PULL_SECRET' must be a DNS name"
+    fi
+    PXK_PULL_SECRETS="$(pxk_t pull-secret 2 "PX_M_NAME=$PX_K8S_PULL_SECRET")$PX_NL" || exit $?
+  fi
+}
+
 ## @description  Validates the Kubernetes backend configuration variables and initializes the
 ##               derived PXK_* state variables.
 ## @return       Exits 0, or exits 2 on an unset or refused value or when the host user is root.
@@ -225,6 +334,10 @@ pxk_configure() {
     px_die "$PX_EXIT_USAGE" "the image runs as the user that builds it, and that user is" \
       "root or has no number here (uid '$PXK_UID'): build and render as another user"
   fi
+  pxg_check_switch PX_K8S_MESH
+  pxg_check_switch PX_K8S_MESH_CORE
+  pxk_image_source
+  pxk_placement
 }
 
 ## @description  Determines whether a role requires a headless Service, which applies to every
@@ -299,13 +412,28 @@ pxk_env() {
   done
 }
 
-# The workload kind is statefulset, job, or pod, which determines the restart policy, liveness
-# probes, and volume bindings of the rendered pod specification.
+# Co-locates the setup Job on the node holding the NameNode persistent volume claim and spreads
+# DataNode and RegionServer pods across distinct cluster nodes.
+## @description  Renders the pod affinity block for a role and workload kind (role, kind).
+## @return       Writes the text to stdout and exits 0, or exits 2 on a placeholder with no value.
+pxk_affinity() {
+  if [ "$2" = job ]; then
+    pxk_t affinity-namenode 0 "PX_M_SELECTOR=$(pxk_labels 12 namenode)"
+    return 0
+  fi
+  case "$1" in
+  datanode | regionserver) pxk_t affinity-spread 0 "PX_M_SELECTOR=$(pxk_labels 14 "$1")" ;;
+  *) pxk_t affinity-none 0 ;;
+  esac
+}
+
+# The workload kind (statefulset, job, or pod) governs the restart policy, liveness probes, volume
+# bindings, and placement rules of the rendered pod specification.
 ## @description  Renders the pod specification for a role (role, kind, columns), including its
-##               container, resource limits, probes, volume mounts, and volumes.
+##               container, resources, probes, volume mounts, volumes, and placement constraints.
 ## @return       Writes the text to stdout and exits 0, or exits 2 on a placeholder with no value.
 pxk_pod_spec() {
-  local role=$1 kind=$2 columns=$3 key var mem restart=Never probes="" env ports
+  local role=$1 kind=$2 columns=$3 key var mem restart=Never probes="" env ports affinity
   local mounts="" volumes=""
   key="$(pxg_role "$role" key)"
   var="PX_${key}_MEM_MIB"
@@ -347,11 +475,15 @@ pxk_pod_spec() {
         PX_M_CLAIM=data-namenode-0)$PX_NL"
     fi
   fi
+  affinity="$(pxk_affinity "$role" "$kind")" || exit $?
   pxk_t pod-spec "$columns" "PX_M_RESTART=$restart" "PX_M_GRACE=$PX_TIMEOUT_STOP" \
+    "PX_M_AFFINITY=$affinity" "PX_M_NODE_SELECTOR=$(pxk_list 2 "$PXK_NODE_SELECTOR" '{}')" \
+    "PX_M_TOLERATIONS=$(pxk_list 2 "$PXK_TOLERATIONS")" \
+    "PX_M_PULL_SECRETS=$(pxk_list 2 "$PXK_PULL_SECRETS")" \
     "PX_M_UID=$PXK_UID" "PX_M_GID=$PXK_GID" "PX_M_SEARCHES=$(pxk_list 4 "$PXK_SEARCHES")" \
-    "PX_M_IMAGE=$PX_IMAGE_TAG" "PX_M_ENV=$env" "PX_M_PORTS=$ports" "PX_M_MEM=$mem" \
-    "PX_M_CPU=$(pxk_cpu "$mem")" "PX_M_PROBES=$probes" "PX_M_MOUNTS=$(pxk_list 6 "$mounts")" \
-    "PX_M_VOLUMES=$(pxk_list 2 "$volumes")"
+    "PX_M_IMAGE=$PXK_IMAGE" "PX_M_PULL_POLICY=$PXK_PULL_POLICY" "PX_M_ENV=$env" \
+    "PX_M_PORTS=$ports" "PX_M_MEM=$mem" "PX_M_CPU=$(pxk_cpu "$mem")" "PX_M_PROBES=$probes" \
+    "PX_M_MOUNTS=$(pxk_list 6 "$mounts")" "PX_M_VOLUMES=$(pxk_list 2 "$volumes")"
 }
 
 # Pods managed by a Job or standalone Pod carry an explicit index label, whereas StatefulSet pods
@@ -394,13 +526,11 @@ pxk_statefulset() {
 ##               node that holds the NameNode persistent volume claim.
 ## @return       Writes to stdout and exits 0, or exits 2 on a placeholder with no value.
 pxk_job() {
-  local affinity spec
-  affinity="$(pxk_t affinity-namenode 6 "PX_M_SELECTOR=$(pxk_labels 12 namenode)")" || exit $?
+  local spec
   spec="$(pxk_pod_spec setup job 6)" || exit $?
   pxk_t job 0 PX_M_NAME=setup-0 "PX_M_NAMESPACE=$PXK_NAMESPACE" PX_M_HOSTNAME=setup-0 \
     "PX_M_LABELS=$(pxk_pod_labels 4 setup job)" \
-    "PX_M_POD_LABELS=$(pxk_pod_labels 8 setup job)" "PX_M_AFFINITY=$affinity" \
-    "PX_M_POD_SPEC=$spec"
+    "PX_M_POD_LABELS=$(pxk_pod_labels 8 setup job)" "PX_M_POD_SPEC=$spec"
 }
 
 ## @description  Renders the standalone Pod document for a non-daemon role (role), such as client
@@ -520,8 +650,37 @@ pxk_copy_dir() {
   pxk_copy_data "$1" "$2" "${names[@]}"
 }
 
-## @description  Writes the topology record and the port map into the staging directory.
-## @return       Returns exit code 0, or exits 1 when a file cannot be written.
+# Emits one tab-separated row per workload containing its kind, name, replica count, per-pod CPU in
+# millicores, per-pod memory in MiB, persistent volume claim count, and claim size in GiB.
+## @description  Renders the resource request summary rows for every generated workload document.
+## @return       Writes the rows to stdout and exits 0.
+pxk_requests() {
+  local file role count key var mem kind name claims gib
+  while read -r file role count; do
+    [ -n "$file" ] || continue
+    key="$(pxg_role "$role" key)"
+    var="PX_${key}_MEM_MIB"
+    mem=${!var}
+    claims=0 gib=0
+    case "$role" in
+    setup) kind=Job name=setup-0 count=1 ;;
+    client | tooling) kind=Pod name="$role-0" count=1 ;;
+    *)
+      kind=StatefulSet name=$role
+      if [ -n "$(pxg_volume_of "$role" 0)" ]; then
+        claims=1 gib=$PX_K8S_VOLUME_GIB
+      fi
+      ;;
+    esac
+    px_tsv_row "$kind" "$name" "$count" "$(pxk_cpu "$mem")" "$mem" "$claims" "$gib"
+  done <<EOF
+$PXK_EAGER_FILES$PXK_GROUP_FILES
+EOF
+}
+
+## @description  Writes the topology record, the port map, the service table, and the resource
+##               request table into the staging directory.
+## @return       Exits 0, or exits 1 when a file cannot be written.
 pxk_write_records() {
   local staging=$1
   pxg_write_file "$staging/topology.env" "$(pxg_topology_text)$PX_NL"
@@ -534,6 +693,43 @@ pxk_write_records() {
   } >"$staging/ports.generated.env" || px_die "$PX_EXIT_FAIL" "cannot write the port map"
   pxg_write_file "$staging/services.tsv" \
     "# service role index group start mem_limit_mib heap_mib direct_mib jdk$PX_NL$PXG_TSV"
+  # Because scripts/preflight-k8s.sh aggregates cluster resource requests directly from this table,
+  # it does not need to parse any rendered YAML manifest.
+  pxg_write_file "$staging/requests.tsv" \
+    "# kind name replicas cpu_milli mem_mib claims claim_gib$PX_NL$(pxk_requests)$PX_NL"
+}
+
+# Matches documents by kind and inserts the block immediately after the matching target line key.
+## @description  Inserts a text block into a manifest file (path, kind, text, key) after each line
+##               matching the specified document kind and line key.
+## @return       Exits 0, or exits 1 when the file cannot be written.
+pxk_insert() {
+  if ! PXK_BLOCK="$3" awk -v kind="$2" -v key="$4" '
+    /^---$/ { k = "" } /^kind: / { k = $2 }
+    { print } k == kind && $0 == key { print ENVIRON["PXK_BLOCK"] }' "$1" >"$1.new" ||
+    ! mv -f "$1.new" "$1"; then
+    px_die "$PX_EXIT_FAIL" "cannot write $1"
+  fi
+}
+
+# Adds the service-mesh injection label to the namespace and annotates each core workload pod to opt
+# out of the mesh unless PX_K8S_MESH_CORE is set to 1.
+## @description  Applies the mesh overlay to the staged manifest documents (staging directory).
+## @return       Exits 0, exits 1 if a file cannot be written, or exits 2 on a placeholder with no
+##               value.
+pxk_mesh_overlay() {
+  local staging=$1 file inject=false label pod set
+  [ "$PX_K8S_MESH_CORE" = 0 ] || inject=true
+  label="$(pxk_tf "$PXK_OVERLAYS/mesh/namespace.yaml.tmpl" 4)" || exit $?
+  pxk_insert "$staging/manifests/00-namespace.yaml" Namespace "$label" '  labels:'
+  set="$(pxk_tf "$PXK_OVERLAYS/mesh/pod.yaml.tmpl" 6 "PX_M_INJECT=$inject")" || exit $?
+  pod="$(pxk_tf "$PXK_OVERLAYS/mesh/pod.yaml.tmpl" 2 "PX_M_INJECT=$inject")" || exit $?
+  for file in "$staging"/manifests/2?-*.yaml "$staging"/groups/*/2?-*.yaml \
+    "$staging"/manifests/4?-*.yaml; do
+    [ -f "$file" ] || continue
+    pxk_insert "$file" StatefulSet "$set" '    metadata:'
+    pxk_insert "$file" Pod "$pod" 'metadata:'
+  done
 }
 
 ## @description  Writes a rendered document (path below the staging directory, text) after the
@@ -576,10 +772,12 @@ pxk_write() {
 $list
 EOF
   done
-  pxg_validate "$staging" topology.env ports.generated.env services.tsv "${PXK_CHECKED[@]}"
+  [ "$PX_K8S_MESH" = 0 ] || pxk_mesh_overlay "$staging"
+  pxg_validate "$staging" topology.env ports.generated.env services.tsv requests.tsv \
+    "${PXK_CHECKED[@]}"
   # The runtime configuration templates intentionally retain ${PX_*} placeholders for in-pod
   # expansion. Because each pod's render.sh performs fail-closed validation on those templates at
-  # container startup, they are appended verbatim byte for byte after host-side validation runs.
+  # container startup, they are copied verbatim byte for byte after host-side validation completes.
   pxk_copy_dir "$staging/manifests/11-conf.yaml" "$PXK_CONF_DIR"
   if [ -n "$PXG_OVERLAY_HOST" ]; then
     pxk_copy_dir "$staging/manifests/12-conf-overlay.yaml" "$staging/conf-overlay"

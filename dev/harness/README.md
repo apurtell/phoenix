@@ -34,8 +34,19 @@ The Kubernetes backend applies static manifests using `kubectl` without relying 
 operator, or custom resource. Running `px-cluster render --backend k8s` produces these manifests
 in `$PX_OUT/deploy-k8s/<cluster>` from the same role table, value
 checks, and configuration templates used by the Compose render, and the pods execute the same
-container image. Cluster bring-up depends on the Kubernetes cluster preflight and `px-k3d`, which
-are added in K2; until then, `px-cluster up` exits with code 5 on that backend.
+container image. Prior to cluster bring-up, `scripts/preflight-k8s.sh` validates the target cluster:
+it verifies the API and client versions, confirms that no other harness deployment is present,
+checks the StorageClass and the pull secret, and evaluates the resource requests of the rendered
+deployment against both the allocatable nodes and any active ResourceQuotas. The host communicates
+with a pod exclusively through a `kubectl port-forward` tunnel bound to 127.0.0.1. An external
+cluster is defined by a target file located outside the repository and referenced via
+`PX_K8S_TARGET`, which specifies its context, namespace, registry, pull secret, StorageClass, node
+selector, tolerations, dedicated nodes, and mesh overlay. When no target file is specified, the
+Kubernetes backend defaults to the local k3d cluster defined in `k8s/env/k3d.env`. The
+`px-cluster push BUNDLE` command
+promotes the image digests recorded in a passing validation bundle to the target cluster's registry,
+while `px-k3d` provisions the local k3d cluster used for measurement or validation runs. The harness
+creates no other Kubernetes cluster.
 
 Three additional documents specify the interfaces layered above the contract.
 `docs/driver-contract.md` defines the six lifecycle verbs of a driver, their exit codes, the
@@ -132,19 +143,55 @@ by the command, because no runtime output is ever written inside the repository 
 | `px-cluster` | Manages the cluster lifecycle: build, up, scale, faults, down, matrix, and push. |
 | `px-suite` | Executes a declarative suite file: dependencies, boundaries, filters, and dry run. |
 | `px-run` | Executes one test: one run directory, one driver, snapshots, disruptions, exit code. |
-| `px-tool` | Enforces host safeguards: the health monitor and the quiet-host check. |
-| `px-collect` | Collects host and container samples to CSV and jHiccup with its idle control JVM. |
-| `px-profile` | Runs async-profiler sessions, cpu and alloc, against the target JVMs. |
-| `px-jfr` | Captures Java Flight Recorder recordings of the target JVMs. |
-| `px-trace-count` | Reads Phoenix trace counters of every RegionServer, before and after the run. |
-| `px-bundle` | Writes and validates the result bundle produced by a run. |
-| `px-report` | Merges verdict streams into a single run verdict and a single exit code. |
+| `px-tool` | Enforces host guards: the health monitor and the quiet-host check. |
+| `px-collect` | Gathers profiles, recordings, counters, and samples manually: start, stop, list. |
+| `px-bundle` | Generates, validates, and queries the metrics of a result bundle. |
+| `px-report` | Aggregates a bundle's verdict streams into a single verdict and exit code. |
 | `px-pherf` | Manages the Distributed Pherf tier: start, stop, status, and run of a suite on it. |
-| `px-k3d` | Manages the local k3d cluster for the Kubernetes backend proofs; implemented in K2. |
+| `px-k3d` | Manages the Kubernetes backend's local k3d cluster: create, import, check, delete. |
 
-Every command responds to `--help` with exit code 0 and rejects any unrecognized flag with exit
-code 2. Commands scheduled for implementation in a later round exit with code 5 on any other
-invocation.
+Every command responds to `--help` with exit code 0 and rejects any unknown flag with exit code 2.
+
+**Command-line grammar.** All harness commands share a uniform invocation syntax:
+
+```text
+px-NAME [option...] [SUBCOMMAND] [OPERAND...] [option...] [-- ARGUMENT...]
+```
+
+Options may appear at any position before `--`, while any arguments following `--` are forwarded to
+either the workload driver (`px-run`) or the target command (`px-cluster exec`).
+Every option provides a single long form. Only `-h`, `-v`, `-n`, and `-e` provide short forms, and
+they carry identical semantics across every command. Every command and internal script accepts the
+shared options, and any command that binds a cluster also accepts the cluster selectors:
+
+```text
+  -h, --help                print this help on stdout and exit 0
+  -v, --verbose             log debug detail on stderr
+  -n, --dry-run             print the plan on stdout and change nothing
+  -e, --set NAME=VALUE      set one configuration value (repeatable)
+      --config FILE         read one more configuration file (repeatable; earlier is stronger)
+      --strict              refuse a PX_* name that lib/varnames.txt does not declare
+      --cluster ID          the harness cluster, default "default"
+      --class NAME          validation or measurement, default the class of the cluster record,
+                            else PX_RUN_CLASS
+      --backend NAME        compose or k8s, default the backend of the cluster record, else compose
+```
+
+Within a single command line, the earliest occurrence of a setting takes precedence, matching the
+precedence rule enforced across configuration stages; consequently,
+`-e PX_RUN_CLASS=measurement --class validation` resolves to the measurement class. Any command-line
+parsing error terminates with exit code 2 and emits one of these fixed diagnostic messages:
+`unknown option X`, `unknown subcommand X: use A, B or C`, `name a subcommand: A, B or C`,
+`X needs a value`, `unexpected argument X`, `SUB needs WORDS`, or `X does not apply to SUB`. When
+invoked with `-n`, a command emits one `plan STEP ARGV` row to stdout for each mutating step it
+would perform, while `px-run` and `px-suite` print their execution plans; read-only subcommands,
+such as `px-cluster status` or `px-cluster config`, execute without modification. The final stderr
+line of a failing command reports its exit code, for example
+`ERROR px-cluster: status ends (exit 6, no such object)`, while `px-run` and `px-suite` conclude
+with their summary line, which likewise records the exit code. Helper commands invoked by a
+harness command, such as the preflight check or the deployment generator, emit their error
+diagnostics without appending an exit line of their own, ensuring that a single exit line closes
+the stream.
 
 **Output conventions.** Every standard output stream is formatted as TSV. Any stream of checks or
 verdicts concludes with a single `result STATUS CODE OBJECT` summary row reporting the outcome in
@@ -265,11 +312,13 @@ $PX_OUT/
     compose/                    the Compose backend: its scope records and its
                                 host lock
     k8s/                        the Kubernetes backend: its scope records, its
-                                restart tables and its lock
+                                restart tables, its tunnel records and its lock
+    k3d/                        the records of the clusters that px-k3d created
   deploy/<cluster>/    the rendered deployment directory: compose.yaml,
-                       ports.generated.env, topology.env, services.tsv
+                       ports.generated.env, topology.env, services.tsv, render.env
   deploy-k8s/<cluster>/  the rendered Kubernetes deployment: manifests/, groups/,
-                       ports.generated.env, topology.env, services.tsv
+                       ports.generated.env, topology.env, services.tsv, requests.tsv,
+                       render.env; push-<run id>/ is the render of px-cluster push
   dist/                the verified distributions, and pins.env, the pins that trust on
                        first use recorded
   build/phoenix/       the record and the log of the local Phoenix build: build.tsv holds
@@ -330,14 +379,20 @@ following order, and **the first stage that defines a variable takes precedence*
 
 | # | Stage | Origin | Default location |
 |---|---|---|---|
-| 1 | Process environment | `env` | Exported `PX_*` variables |
+| 0 | Command line | `cli` | `-e`, `--class`, `--backend`, `--cluster`, and option targets |
+| 1 | Process environment | `environment` | Exported `PX_*` environment variables |
 | 2 | Command-line configuration files | the file path | `--config FILE` |
+| 2a | Cluster target file | `target` | `PX_K8S_TARGET`, outside the tree |
+| 2b | Cluster record | `cluster` | `$PX_OUT/$PX_STATE_DIR/cluster-<cluster>.env` |
 | 3 | Local environment overrides | `local` | `docker/env/local.env` |
+| 3a | Enabled plug-ins | `plugin:<id>` | Sizing and JVM settings from each `plugin.env` |
 | 4 | Run class defaults | `class:<name>` | `docker/env/class-<class>.env` |
+| 4a | Backend defaults | `backend:px-k3d`, `backend:k8s` | `k8s/env/k3d.env`, `k8s/env/k8s.env` |
 | 5 | Baseline defaults | `defaults` | `docker/env/defaults.env` (mandatory) |
 | 6 | Component version definitions | `versions` | `docker/versions.env` |
 | 7 | Local version overrides | `versions-local` | `docker/versions.local.env` |
 | 8 | Generated port map | `ports` | `<deployment directory>/ports.generated.env` |
+| | Derived values | `derived` | Version selections, `PX_ENV_DIR`, and command defaults |
 
 Because a later stage never overwrites a value set by an earlier one, an explicit override always
 supersedes lower-priority defaults. The local version overrides file holds operator-declared pins,
@@ -354,7 +409,36 @@ to the baseline defaults, it must be specified on the command line, in the envir
 Operators also use `local.env` to configure `PX_DOCKER_BIN` when the Docker CLI resides outside the
 paths searched by the backend, as well as `PX_KUBECTL_BIN` for `kubectl`. Every `px-*` process reads
 this file directly, and neither value is exported to child processes. When `PX_BACKEND=k8s` is set,
-the loader evaluates `k8s/env/k8s.env` after the run class and before the baseline defaults.
+the loader evaluates `k8s/env/k8s.env` after the run-class configuration and before the baseline
+defaults, and immediately prior to that file it loads `k8s/env/k3d.env`—the local cluster profile
+for `px-k3d`—unless `PX_K8S_TARGET` designates an external cluster. Any cluster target file
+referenced by `PX_K8S_TARGET` is evaluated immediately after `--config` files and must reside
+outside the repository working tree.
+
+**The cluster record.** Once the cluster scope is created, `px-cluster up` writes the cluster
+record at `$PX_OUT/$PX_STATE_DIR/cluster-<cluster>.env`. This record captures every setting
+supplied to the bring-up via the command line, `--config` files, and the target file, flattened
+into literal `NAME='VALUE'` assignments so that subsequent edits to external configuration files
+cannot alter the active cluster configuration, alongside `PX_BACKEND` and `PX_RUN_CLASS`
+irrespective of their origin. Per-invocation flags and path-locating settings are omitted.
+The record never holds `PX_VERBOSE`, `PX_DRY_RUN`, `PX_STRICT_CONFIG`, `PX_KEEP`, `PX_SCOPE_ID`,
+`PX_DEPLOYMENT_DIR`, `PX_OUT`, `PX_STATE_DIR`, `PX_CLUSTER_ID`, `PX_FORCE` and `PX_LOG_FILE`. All
+subsequent commands targeting the cluster load this record at stage 2b, eliminating the need to
+repeat `--class`, `--backend`, `-e`, or `--config` after bring-up while still allowing explicit
+overrides from higher-precedence stages to win; `px-cluster
+config` shows the origin `cluster` for each recorded value. When an earlier stage leaves `PX_OUT`,
+`PX_STATE_DIR`, or `PX_CLUSTER_ID` unset, the loader resolves them from `local.env` first to locate
+the cluster record. Because cluster names are unique across backends, specifying a `PX_BACKEND` that
+conflicts with the recorded backend terminates with exit code 2 and reports the origin of the
+conflicting `PX_BACKEND` setting. Both `px-cluster render` and `px-cluster push` write their
+render-time settings in the same format to `render.env` inside the deployment directory, and
+`px-cluster up DIR` appends those settings to the cluster record at a lower precedence than its
+own command-line settings so that a cluster provisioned from a pre-rendered directory scales using
+its original render parameters. Running `px-cluster scale` updates the replica count in the record,
+`px-cluster down` deletes the record, and `down --keep` preserves it. Invoking `px-cluster up`
+against a cluster that is already running fails with exit code 2. A cluster record whose underlying
+scope no longer exists is treated as stale: `up` rejects it unless `PX_FORCE=1` is set, whereas
+`px-cluster down` removes it.
 
 Because the generated port map is a runtime artifact, stage 8 loads it from the rendered deployment
 directory beneath `$PX_OUT` and never from the source tree; setting `PX_PORT_MAP_ENV` redirects this
@@ -687,10 +771,11 @@ The self-test suite in `test/run-tests.sh` executes without a container runtime,
 a Maven build, allowing it to run both on a developer laptop and inside the pre-commit container. It
 emits TAP-formatted output lines and exits with code 1 if any assertion fails. Among its
 architectural guarantees, the suite verifies across three independent enforcement layers that no
-component outside the two backends invokes a container runtime or a Kubernetes tool, and that each
-backend invokes only its own toolchain: a static source scan paired with a reasoned allowlist that
-also fails on stale entries, a runtime trap that forces any stray invocation to exit with code 2,
-and a fake runtime shim exercised against a negative control, a hostile driver, and a positive
-control. The design of these three layers is documented in `docs/backends.md`. Against the same fake
-runtime, the suite exercises every substrate contract function and every `px-cluster` subcommand,
-and its final test group proves that no command added any path beneath the root of the working tree.
+component outside the two backends and `px-k3d` invokes a container runtime, a Kubernetes tool, or a
+registry client, and that each of them invokes only its own toolchain: a static source scan paired
+with a reasoned allowlist that also fails on stale entries, a runtime trap that forces any stray
+invocation to exit with code 2, and a fake runtime shim exercised against a negative control, a
+hostile driver, and a positive control. The design of these three layers is documented in
+`docs/backends.md`. Against the same fake runtime, the suite exercises every substrate contract
+function and every `px-cluster` subcommand, and its final test group proves that no command added
+any path beneath the root of the working tree.

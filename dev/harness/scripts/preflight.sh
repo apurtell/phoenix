@@ -52,31 +52,17 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/../lib/common.sh"
 # shellcheck source=SCRIPTDIR/../lib/backend/contract.sh
 . "$SELF/../lib/backend/contract.sh"
+# shellcheck source=SCRIPTDIR/../lib/preflight.sh
+. "$SELF/../lib/preflight.sh"
 
 set -euo pipefail
 
 # Do not enable px_trap_enable here because command substitutions in this script intentionally
 # return non-zero exit codes during normal evaluation.
 
-# Fixed host memory headroom reserved by the engine outside all container memory limits. This
-# reservation is an architectural design constant rather than a user-configurable setting.
-PF_HEADROOM_BYTES=4294967296
-PF_MIB=1048576
-PF_GIB=1073741824
-
-PF_PHASE=""
-PF_DIR=""
-PF_CONFIG_FILES=()
-PF_REFUSED=0
-PF_REASON=""
-PF_UNMEASURED=0
-PF_SB_DONE=0
-PF_SB_ROWS=""
-PF_SB_STATUS=0
-
-# Service attributes parsed from the scanned deployment are stored in parallel indexed arrays to
-# maintain compatibility with bash 3.2, which lacks associative arrays. The count array records the
-# number of container instances per service.
+# Parsed service attributes from the scanned deployment are stored in parallel indexed arrays to
+# maintain compatibility with bash 3.2, which does not support associative arrays. The count array
+# records the number of instances for each service.
 PF_S_NAME=()
 PF_S_ROLE=()
 PF_S_GROUP=()
@@ -102,32 +88,9 @@ exits 1 also means that the engine did not answer or a figure could not be measu
 example preflight.sh --phase fast
 EOF
 
-## @description  Emits one check row (name, status, detail...) and records a status 3 refusal on
-##               the first failed row.
-## @return       Writes one TSV row to stdout and exits with status 0.
-pf_check() {
-  local name=$1 status=$2
-  shift 2
-  if [ "$status" = fail ] && [ "$PF_REFUSED" = 0 ]; then
-    PF_REFUSED=$PX_EXIT_ANOMALY
-    PF_REASON="$name: $*"
-  fi
-  px_tsv_row "$name" "$status" "$(px_tsv_clean "$*")"
-}
-
-## @description  Emits a fail row (name, detail...) for a figure that could not be measured, which
-##               causes the script to exit with status 1 rather than 3.
-## @return       Writes one TSV row to stdout and exits with status 0.
-pf_unmeasured() {
-  local name=$1
-  shift
-  PF_UNMEASURED=1
-  px_tsv_row "$name" fail "$(px_tsv_clean "$*")"
-}
-
-## @description  Parses a Compose memory size (number[.fraction][k|m|g|t][i][b], base 1024) into a
-##               byte count.
-## @return       Writes the bytes to stdout and exits with 0, or 1 for a size outside the grammar.
+## @description  Converts a Compose memory size (number[.fraction][k|m|g|t][i][b], base 1024) into
+##               a byte count.
+## @return       Writes the byte count to stdout and exits with 0, or 1 when outside the grammar.
 pf_bytes() {
   local value=$1 whole frac unit mult=1 bytes scale re
   re='^([0-9]+)(\.([0-9]{1,6}))?[[:space:]]?([kKmMgGtT]?)[iI]?[bB]?$'
@@ -149,22 +112,9 @@ pf_bytes() {
   printf '%s\n' "$bytes"
 }
 
-## @description  Formats a byte count as whole MiB, rounded down.
-## @return       Writes the formatted figure to stdout and exits with status 0.
-pf_mib() { printf '%s MiB\n' "$(($1 / PF_MIB))"; }
-
-## @description  Formats a byte count in MiB rounded down alongside GiB rounded to two decimal
-##               places.
-## @return       Writes the formatted figure to stdout and exits with status 0.
-pf_size() {
-  local hundredths=$((($1 * 100 + PF_GIB / 2) / PF_GIB))
-  printf '%s MiB (%s.%02d GiB)\n' "$(($1 / PF_MIB))" "$((hundredths / 100))" \
-    "$((hundredths % 100))"
-}
-
-## @description  Strips enclosing quotes or any trailing comment from a YAML scalar held in the
+## @description  Strips enclosing quotes or any trailing comment from the YAML scalar stored in the
 ##               named variable.
-## @return       Updates the named variable in place without writing to stdout, and exits with 0.
+## @return       Stores the result in that variable without writing to stdout, and exits with 0.
 pf_scalar() {
   local __pf_value=${!1}
   case "$__pf_value" in
@@ -267,125 +217,10 @@ pf_scan() {
   done <"$file"
 }
 
-# Resolves the rendered deployment directory by checking --deployment, PX_DEPLOYMENT_DIR, the
-# active deployment record written by px-cluster up, and finally the default output path.
-## @description  Resolves the target deployment directory in precedence order.
-## @return       Writes the directory path to stdout. Exits with 0, 2 when the root is refused, or
-##               1 on failure.
-pf_deploy_dir() {
-  local root record recorded=""
-  if [ -n "${PF_DIR:-${PX_DEPLOYMENT_DIR:-}}" ]; then
-    printf '%s\n' "${PF_DIR:-$PX_DEPLOYMENT_DIR}"
-    return 0
-  fi
-  record="$(sb_deployment_record 2>/dev/null)" && [ -f "$record" ] &&
-    { IFS= read -r recorded <"$record" || true; }
-  if [ -n "$recorded" ]; then
-    printf '%s\n' "$recorded"
-    return 0
-  fi
-  root="$(px_out_root)" || return $?
-  printf '%s/deploy/%s\n' "$root" "${PX_CLUSTER_ID:-default}"
-}
-
-# Executes sb_preflight at most once and caches its output rows in PF_SB_ROWS, operating against
-# either the existing recorded scope or a synthesized dry-run scope.
-## @description  Invokes sb_preflight once into PF_SB_ROWS on the recorded or dry-run scope.
-## @return       Exits with 0, with 2 or 1 when no backend binds or no scope can be named, or with
-##               2 on an invalid backend call.
-pf_backend() {
-  local scope="" status=0
-  [ "$PF_SB_DONE" = 0 ] || return 0
-  PF_SB_DONE=1
-  sb_load "${PX_BACKEND:-compose}"
-  scope="$(sb_scope_resolve)" || status=$?
-  if [ "$status" = "$PX_EXIT_NO_OBJECT" ]; then
-    status=0
-    scope="$(PX_DRY_RUN=1 sb_scope_create "${PX_CLUSTER_ID:-default}" 2>/dev/null)" ||
-      status=$?
-  fi
-  if [ "$status" = 0 ] && [ -z "$scope" ]; then
-    status=$PX_EXIT_FAIL
-  fi
-  if [ "$status" != 0 ]; then
-    px_die "$status" "cannot name a scope for cluster ${PX_CLUSTER_ID:-default} to ask the backend"
-  fi
-  PF_SB_ROWS="$(sb_preflight "$scope")" || PF_SB_STATUS=$?
-  if [ "$PF_SB_STATUS" = "$PX_EXIT_USAGE" ]; then
-    px_die "$PX_EXIT_USAGE" "the backend preflight refused its arguments"
-  fi
-}
-
-# Emits the backend preflight rows unchanged and assigns the refusal exit code from the first
-# failed row: 1 when the engine does not answer, or 5 when it refuses the client.
-## @description  Executes the fast preflight phase by streaming the backend preflight rows.
-## @return       Writes check rows to stdout and exits with 0, or exits with 2 or 1 as pf_backend
-##               does.
-pf_phase_fast() {
-  local row status_col name_col detail_col status name counted=0
-  if px_is_dry_run; then
-    pf_check preflight warn "dry run, the backend preflight was not called"
-    return 0
-  fi
-  pf_backend
-  status_col="$(sb_schema_index check status)"
-  name_col="$(sb_schema_index check check)"
-  detail_col="$(sb_schema_index check detail)"
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    printf '%s\n' "$row"
-    status="$(px_tsv_field "$status_col" "$row")" || status=""
-    [ "$status" = fail ] || continue
-    counted=1
-    [ "$PF_REFUSED" = 0 ] || continue
-    name="$(px_tsv_field "$name_col" "$row")" || name=""
-    # Callers branch on the resulting exit code: an unresponsive engine may recover on retry, a
-    # refused client requires operator intervention, and a host refusal requires either a smaller
-    # deployment or a freed port.
-    case "$name" in
-    engine_binary | engine_responsive) PF_REFUSED=$PX_EXIT_FAIL ;;
-    engine_credentials) PF_REFUSED=$PX_EXIT_UNSUPPORTED ;;
-    *) PF_REFUSED=$PX_EXIT_ANOMALY ;;
-    esac
-    PF_REASON="$name: $(px_tsv_field "$detail_col" "$row" || true)"
-  done <<EOF
-$PF_SB_ROWS
-EOF
-  if [ "$PF_SB_STATUS" != 0 ] && [ "$counted" = 0 ]; then
-    pf_check preflight fail \
-      "the backend preflight reported $(sb_exit_name "$PF_SB_STATUS") and no failed row"
-  fi
-}
-
-# Reads the leading numeric value from the ok row matching the requested backend check name, such
-# as engine_memory or engine_cpus.
-## @description  Extracts one engine figure from the named ok row of the backend preflight output.
-## @return       Writes the number to stdout and exits with 0, or exits with 6 when the backend
-##               reported none.
-pf_engine_figure() {
-  local row name_col status_col detail_col detail
-  name_col="$(sb_schema_index check check)"
-  status_col="$(sb_schema_index check status)"
-  detail_col="$(sb_schema_index check detail)"
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    [ "$(px_tsv_field "$name_col" "$row")" = "${1:-}" ] || continue
-    [ "$(px_tsv_field "$status_col" "$row")" = ok ] || continue
-    detail="$(px_tsv_field "$detail_col" "$row")" || continue
-    detail=${detail%%[!0-9]*}
-    [ -n "$detail" ] || continue
-    printf '%s\n' "$detail"
-    return 0
-  done <<EOF
-$PF_SB_ROWS
-EOF
-  return "$PX_EXIT_NO_OBJECT"
-}
-
-# Evaluates container memory limits against engine capacity, verifies that each service heap stays
-# below its container limit, and reports available disk space and the host processor count.
-## @description  Executes the memory phase covering limits, heap bounds, free disk, and processors.
-## @return       Writes check rows to stdout and refusal diagnostics to stderr. Exits with 0, or
+# Evaluates container memory limits, service heap bounds, available disk space, and processor
+# counts for the memory verification phase.
+## @description  Executes the memory phase across limits, heap bounds, free disk, and processors.
+## @return       Writes check rows to stdout and refusal messages to stderr. Exits with 0, or exits
 ##               with 2 or 1 when pf_scan, pf_backend, or pf_disk terminates the process.
 pf_phase_memory() {
   local dir file at n mem bytes heap total=0 roles=() role_total=() role_count=()
@@ -475,7 +310,7 @@ pf_phase_memory() {
       pf_unmeasured memory_fit "the backend reported no engine memory total, so the" \
         "limits of $(pf_size "$total") cannot be checked"
     else
-      budget=$((engine - PF_HEADROOM_BYTES))
+      budget="$(pf_budget "$engine")"
       line="the budget $(pf_size "$budget") is the engine $(pf_size "$engine")"
       line="$line less the headroom $(pf_size "$PF_HEADROOM_BYTES")"
       if [ "$total" -gt "$budget" ]; then
@@ -500,30 +335,9 @@ pf_phase_memory() {
   pf_cpus
 }
 
-# Measures free disk space under the output root on the host from field 4 of line 2 of df -Pk and
-# compares it against PX_PREFLIGHT_MIN_DISK_MIB.
-## @description  Verifies free host disk space under the output root against the minimum threshold.
-## @return       Writes one check row to stdout and exits with 0, or exits with 2 or 1 as
-##               px_out_root does.
-pf_disk() {
-  local root kib="" need
-  root="$(px_out_root)" || exit $?
-  need="$(px_int_setting PX_PREFLIGHT_MIN_DISK_MIB 4096 0)" || exit $?
-  read -r _ _ _ kib _ <<<"$(df -Pk "$root" 2>/dev/null | sed -n 2p)" || kib=""
-  if ! [[ $kib =~ $PX_RE_INT ]]; then
-    pf_check disk_free warn "the free disk under $root on the host is unknown"
-  elif [ $((kib / 1024)) -lt "$need" ]; then
-    pf_check disk_free fail "disk: $(pf_size $((kib * 1024))) free under $root on the host," \
-      "below the $need MiB that the deployment requires"
-  else
-    pf_check disk_free ok "$(pf_size $((kib * 1024))) free under $root on the host," \
-      "$need MiB required"
-  fi
-}
-
 # Compares PX_PREFLIGHT_MIN_CPUS against the lesser of the host and engine processor counts, or
-# against the host count alone when the engine reports no processor figure.
-## @description  Verifies that the available processor count meets PX_PREFLIGHT_MIN_CPUS.
+# against the host processor count alone when the engine reports no count.
+## @description  Verifies that the available processor count satisfies PX_PREFLIGHT_MIN_CPUS.
 ## @return       Writes one check row to stdout and exits with 0, or exits with 2 when the
 ##               configured requirement is malformed.
 pf_cpus() {
@@ -545,52 +359,28 @@ pf_cpus() {
   fi
 }
 
-while [ $# -gt 0 ]; do
-  px_cli_common "$1" || case "$1" in
-  --phase)
-    px_cli_need_value "$@"
-    case "$2" in
-    fast | memory) PF_PHASE=$2 ;;
-    *) px_usage_error "--phase is fast or memory, got '$2'" ;;
-    esac
-    shift
-    ;;
-  --deployment) px_cli_need_value "$@" && PF_DIR="$2" && shift ;;
-  --config) px_cli_need_value "$@" && PF_CONFIG_FILES+=("$2") && shift ;;
-  -*) px_usage_error "unknown option: $1" ;;
-  *) px_usage_error "unexpected argument: $1" ;;
-  esac
-  shift
-done
+pf_cli "$@"
 
 px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 # Configuring a component version outside the range supported by its compatibility module is
 # treated as a usage error regardless of the host resources available.
 px_versions_check
 
-# Load the port map from a deployment directory specified on the command line here, because the
-# initial configuration loader only knew PX_DEPLOYMENT_DIR. Because the port map is the weakest
-# configuration stage, loading it late preserves the established precedence order.
-PF_DEPLOY="$(pf_deploy_dir)" || exit $?
+# Load the port map from any deployment directory specified on the command line here, because the
+# configuration loader only knew PX_DEPLOYMENT_DIR. Because the port map is the weakest precedence
+# stage, loading it at this point preserves the configuration precedence order.
+PF_DEPLOY="$(pf_deploy_dir deploy)" || exit $?
 if [ -d "$PF_DEPLOY" ]; then
   px_config_load_ports "$PF_DEPLOY"
 fi
 
-if [ -z "$PF_PHASE" ] || [ "$PF_PHASE" = fast ]; then
+if pf_phase_wanted fast; then
   pf_phase_fast
 fi
-# Because the memory phase is the slower check, any refusal in the fast phase ends the preflight
-# immediately so that an absent engine or a busy port is reported at once.
-if [ "$PF_REFUSED" = 0 ] && { [ -z "$PF_PHASE" ] || [ "$PF_PHASE" = memory ]; }; then
+# Because the memory phase is slower, any refusal during the fast phase terminates the preflight
+# early so that an absent engine or a busy port is reported immediately.
+if pf_phase_wanted memory; then
   pf_phase_memory
 fi
 
-if [ "$PF_REFUSED" != 0 ]; then
-  px_error "the preflight refused the deployment: $PF_REASON"
-  exit "$PF_REFUSED"
-fi
-if [ "$PF_UNMEASURED" != 0 ]; then
-  px_error "the preflight could not measure a figure, see the failed rows"
-  exit "$PX_EXIT_FAIL"
-fi
-exit 0
+pf_finish

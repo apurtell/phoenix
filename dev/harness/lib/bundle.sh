@@ -1114,6 +1114,46 @@ EOF
   pb_manifest_stages "$dir"
   pb_manifest_disruptions "$dir"
   pb_manifest_artifacts "$dir"
+  # Only a Kubernetes run includes this member so that a Compose manifest retains its exact bytes.
+  [ "$backend" != k8s ] || pb_manifest_kubernetes "$dir"
+  px_json_close
+}
+
+## @description  Emits the kubernetes member for a bundle (bundle), recording the API server
+##               version, each pod's node, and each image reference digest resolved by the nodes.
+## @return       Exits 0.
+pb_manifest_kubernetes() {
+  local rec="$1/run-record.tsv" role index pod node ref digest
+  px_json_open kubernetes
+  px_json_str api_version "$(pb_record_rows version "$rec" |
+    awk -F '\t' '$1 == "pre" && $2 == "api_server" { v = $3 } END { print v }')"
+  px_json_arr placement
+  while IFS="$PB_US" read -r role index pod node; do
+    [ -n "$role" ] || continue
+    px_json_open
+    px_json_str role "$role"
+    pb_json_num_or_null index "$index"
+    px_json_str pod "$pod"
+    px_json_str node "$node"
+    px_json_close
+  done <<EOF
+$(pb_record_rows instance "$rec" | awk -F '\t' -v us="$PB_US" '$1 == "pre" {
+    print $2 us $3 us $4 us $8 }')
+EOF
+  px_json_close
+  px_json_arr registry_digests
+  while IFS="$PB_US" read -r ref digest; do
+    [ -n "$ref" ] || continue
+    px_json_open
+    px_json_str image_ref "$ref"
+    px_json_str digest "$digest"
+    px_json_close
+  done <<EOF
+$(awk -F '\t' -v us="$PB_US" 'NR > 1 && $3 != "" {
+    d = $4; if (match(d, /sha256:[0-9a-f]+$/)) d = substr(d, RSTART); else d = ""
+    if (!seen[$3 us d]++) print $3 us d }' "$1/cluster/images.tsv" 2>/dev/null || true)
+EOF
+  px_json_close
   px_json_close
 }
 

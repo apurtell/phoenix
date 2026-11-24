@@ -88,295 +88,198 @@ set -euo pipefail
 # validated separately against SB_CLUSTER_RE from the substrate contract.
 PC_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 
-# Authoritative set of supported subcommands. A single list drives both membership validation and
-# command dispatch, ensuring that no new subcommand can be routed without being registered here.
-PC_SUBCOMMANDS="build render up down status ready config logs exec scale group kill signal
-restart endpoint matrix"
-
 # Holds the scope identifier of an in-progress cluster bring-up so the exit hook can tear it down.
 PC_UP_SCOPE=""
-PC_ARGS=()
-# Additional configuration files supplied via --config, which each version set in a matrix run reads
-# after its own version set file.
-PC_FILES=()
+# Holds the scratch render directory created by up -n so that the exit hook can remove it.
+PC_PLAN_DIR=""
+# Tracks the configuration files of the active matrix version set and whether its cluster is up so
+# that the exit hook can tear that cluster down on early termination.
+PC_MATRIX_FILES=()
+PC_MATRIX_UP=0
+# Destination variables populated by px_cli_parse when parsing subcommand-specific options.
+PC_TIMEOUT=""
+PC_WAIT=1
+PC_DOWN_LABEL=""
+PC_SINCE="-"
+PC_PREVIOUS=0
+PC_FOLLOW=0
+PC_MODE=hard
+PC_RELEASE=0
+PC_RENDER_OUT=""
+PC_TREE=""
 
-## @description  Prints top-level invocation usage text, which px_usage_error displays on a global
-##               usage error.
-## @return       Writes the usage text to stdout and exits with 0.
-usage() {
-  cat <<'EOF'
-Usage: px-cluster [global option...] <subcommand> [argument...]
-
-Provisions, inspects and removes one harness cluster through the substrate
-contract. It selects a backend and calls that backend's implementation.
-
-Global options. They come before the subcommand.
-  -h, --help             print this text and exit 0
-  -v, --verbose          report debug detail on stderr
-  -n, --dry-run          report the planned contract calls and change nothing
-      --keep             keep data and state for a diagnosis
-      --strict           refuse a name that lib/varnames.txt does not declare
-      --backend NAME     backend to bind: compose, the default, or k8s
-      --cluster ID       cluster name, default from the configuration
-      --class NAME       run class, validation or measurement: it selects the
-                         defaults of env/class-NAME.env
-      --config FILE      extra configuration file, strongest file stage,
-                         repeatable
-  -e, --set NAME=VALUE   set one configuration value, repeatable
-
-Subcommands.
-  build                  build the Phoenix jars and the image of the configuration
-  render [OPTION...]     render the deployment directory of the run class
-  up [DIR]               preflight and provision a deployment, then wait for
-                         ready. With no DIR it renders the run class first
-  down                   tear the cluster down and remove its scope
-  status                 report the instance inventory and role group state
-  ready                  wait for readiness
-  config                 report the resolved configuration and each origin
-  logs ROLE INDEX        stream the log of one instance
-  exec ROLE INDEX -- CMD run one command in an instance
-  scale ROLE COUNT       change the instance count of one scaled role
-  group ACTION GROUP     start, stop or report one role group
-  kill ROLE INDEX        terminate one instance abruptly
-  signal ROLE INDEX SIG  deliver one signal to an instance
-  restart ROLE INDEX     drain, restart and rebalance one instance
-  endpoint ROLE INDEX P  report the host address of one named port
-  matrix SUITE FILE...   run SUITE against each version set FILE: build, stage,
-                         up, run and down for each one
-
-Run 'px-cluster <subcommand> --help' for the options of that subcommand.
-
-Exit codes: 0 ok, 1 failure, 2 usage, 3 cluster anomaly, 4 timeout,
-5 unsupported, 6 no such object. The exec subcommand passes the status of
-its command through.
+px_cli_spec <<'EOF'
+about Provisions, inspects and removes one harness cluster through the substrate
++ contract.
+about It selects a backend and calls that backend's implementation. px-cluster up
++ writes the cluster record $PX_OUT/state/cluster-<cluster>.env, and every later
++ command on the cluster takes its configuration from it.
+shared --cluster --class --backend
+sub build
+about build the Phoenix jars and the images of the
++ configuration
+about Builds the Phoenix jars of the tree, jHiccup when PX_DIST_ARTIFACTS lists it,
++ and the image PX_IMAGE_TAG on the local engine; PX_PHERF=1 also builds
++ phoenix-pherf-distributed and the image PX_PHERF_IMAGE_TAG. With --backend k8s
++ on a px-k3d context it then imports the images into the cluster; another
++ context needs px-cluster push.
+opt --tree DIR PC_TREE | the source tree, default the tree that holds the
++ harness
+example px-cluster build -e PX_PHERF=1
+sub render
+about render the deployment directory of the run class
+about Renders the deployment directory of the cluster from the run class and the
++ configuration, by default into $PX_OUT/deploy/<cluster>, and writes its path.
++ Its file render.env holds the settings of the render, which px-cluster up DIR
++ adds to the cluster record. It calls the generator of the backend and makes no
++ backend call. It refuses to replace the deployment directory of a cluster that
++ is up, exit 2. With --backend k8s the generator is k8s/manifests.gen.sh, and the
++ default directory is $PX_OUT/deploy-k8s/<cluster>. -n prints the service table
++ and writes no file.
+opt --out DIR PC_RENDER_OUT | the deployment directory under $PX_OUT
+example px-cluster render --class validation -e PX_RS_COUNT=3
+sub up [DIR]
+about preflight and provision a deployment, then wait for
++ ready
+about DIR is the rendered deployment directory, default PX_DEPLOYMENT_DIR. With
++ neither, a run class (--class or PX_RUN_CLASS) renders the deployment first, so
++ a class and a topology file (--config FILE) are enough. A cluster that is up
++ refuses the bring-up, exit 2: run px-cluster down first. So does a record whose
++ scope is gone, unless PX_FORCE=1 marks it stale. Another cluster on the host
++ refuses it, exit 3. The host preflight runs before the cluster is created: a
++ deployment that the engine cannot hold is refused with the arithmetic, exit 3.
++ A backend without a preflight script refuses the bring-up, exit 5.
+about The image PX_IMAGE_TAG must exist first; px-cluster build makes it. An image
++ that the host does not hold refuses the bring-up before the preflight, exit 6,
++ with the build command. Provisioning is bounded by PX_TIMEOUT_PROVISION.
+about -n runs the whole read-only preflight: it renders into a scratch directory,
++ checks the record, the host, the image, the engine memory and the ports, and
++ prints the plan rows, the check rows and the result row: ok or fail, the code
++ and the cluster. It exits with the code the bring-up would give.
+about up writes the cluster record. While the cluster is up, a sleep inhibitor
++ holds the host awake and the health monitor (px-tool monitor) samples its
++ memory; px-cluster down stops both. A start that fails or is interrupted tears
++ the cluster down, unless --keep is given. A preflight exits 1 when the engine
++ does not answer and 5 when it refuses the client.
+opt --timeout SECONDS PC_TIMEOUT | readiness timeout, default PX_TIMEOUT_READY
+opt --no-wait - PC_WAIT=0 | create the instances and do not wait for readiness
+opt --keep - PX_KEEP=1 | keep a failed bring-up for a diagnosis
+example px-cluster up --class validation -e PX_PHERF=1
+sub down
+about tear the cluster down, remove its scope and record
+about With nothing recorded it exits 0. Down removes only what the cluster owns.
++ --label names one more cluster to tear down by its label; px-k3d delete
++ --label lists the labels it takes. Down first stops any collection that is
++ still recorded, also with --keep.
+opt --keep - PX_KEEP=1 | keep the data, the state, the scope and the record
++ for a diagnosis
+opt --label KEY=VALUE PC_DOWN_LABEL | also tear down the cluster with this label
+sub status [ROLE [INDEX]]
+about report the instance inventory
+about ROLE and INDEX narrow the inventory to one role or one instance. px-cluster
++ group status GROUP reports one role group.
+sub ready [ROLE...]
+about wait for readiness
+about With no role it waits for every instance in the scope.
+opt --timeout SECONDS PC_TIMEOUT | readiness timeout, default PX_TIMEOUT_READY
+exits 3 also means that an instance terminated while waiting.
+sub config [PATTERN...]
+about report the resolved configuration and each origin
+about Each PATTERN is a shell glob on the name; several select every name that one
++ of them matches. A value from the cluster record has the origin cluster.
+output one row per resolved value: name, value and origin, sorted by name. It
++ makes no backend call.
+exits 6 also means that no name matches a PATTERN.
+example px-cluster config 'PX_RS_*' PX_RUN_CLASS
+sub logs ROLE INDEX
+about stream the log of one instance
+opt --since SECONDS PC_SINCE | report only the last SECONDS seconds
+opt --previous - PC_PREVIOUS=1 | read the log of the instance before an unplanned
++ restart
+opt --follow - PC_FOLLOW=1 | keep the stream open
+sub exec ROLE INDEX
+rest -- COMMAND [ARGUMENT...]
+about run one command in an instance
+opt --timeout SECONDS PC_TIMEOUT | command timeout, default PX_TIMEOUT_EXEC
+exits The status of the command passes through. 124 means that the timeout expired,
++ 125 that the command could not start, 126 not executable, 127 not found.
+example px-cluster exec regionserver 0 -- jstack 1
+sub scale ROLE COUNT
+about change the instance count of one scaled role
+about COUNT is 1 to 9, the parity limit both backends keep. The deployment of the
++ cluster is rendered again from the cluster record with the new count, only the
++ instances that the count adds or removes start or stop, and the record keeps
++ the new count. A render that changes another instance is refused, exit 2: a
++ setting of the command differs from the record. The memory check runs on the
++ new render first, exit 3.
+opt --timeout SECONDS PC_TIMEOUT | scale timeout, default PX_TIMEOUT_SCALE
+sub group start|stop|status GROUP
+about start, stop or report one role group
+about start starts a stopped group and waits for its readiness, stop stops every
++ instance of the group and keeps its state, and status reports running against
++ desired. A start runs the memory check again before it starts anything.
+opt --timeout SECONDS PC_TIMEOUT | group timeout, default PX_TIMEOUT_GROUP
+sub kill ROLE INDEX
+about terminate one instance abruptly
+about The action is recorded as planned, so px-run does not read it as an unplanned
++ change.
+opt --mode MODE PC_MODE | hard (the default) stops the process with no
++ graceful shutdown and keeps the instance; delete
++ removes the instance object
+sub signal ROLE INDEX SIGNAL
+about deliver one signal to an instance
+about SIGNAL is a name, for example QUIT for a thread dump, STOP and CONT for a pause,
++ TERM for a graceful shutdown. KILL and TERM go to the instance; each other
++ signal goes to its daemon JVM, and a STOP that does not stop the JVM is a
++ failure. The action is recorded as planned.
+sub restart ROLE INDEX
+about drain, restart and rebalance one instance
+about Drains the hosted regions, restarts the instance, waits for readiness and
++ rebalances. An exited instance starts with no drain, no stop and no rebalance.
++ The drain is bounded by PX_TIMEOUT_DRAIN. The action is recorded as planned.
+opt --timeout SECONDS PC_TIMEOUT | readiness timeout, default PX_TIMEOUT_READY
+example px-cluster restart regionserver 0 -e PX_TIMEOUT_DRAIN=900
+sub endpoint ROLE INDEX PORT
+about report the host address of one named port
+about The host is the loopback interface. On Kubernetes the port is the local end
++ of a port-forward tunnel to the pod, which runs until the release or the
++ teardown, and a second call reuses a live tunnel.
+output one row: host and port, tab separated.
+opt --release - PC_RELEASE=1 | release this endpoint, and stop its tunnel
+sub matrix SUITE FILE...
+about run SUITE against each version set FILE: build,
++ up, run and down
+about Runs the suite SUITE against each version set in order. A version set is a
++ configuration FILE that selects the HBase profile, the HBase and the Hadoop
++ release and the JDKs, for example PX_PHOENIX_HBASE_PROFILE,
++ PX_DIST_HBASE_VERSION, PX_DIST_HADOOP_VERSION and PX_<ROLE>_JDK. For each set it
++ runs px-cluster build, brings the cluster up, runs px-suite and brings the
++ cluster down, also after a failure or an interrupt. A set reads its FILE before
++ each --config FILE of this command. A set that fails does not stop the next
++ one.
+output one row per set: set, file, profile, HBase, Hadoop, JDKs, session, last
++ step and exit code. The rows are also in $PX_OUT/matrix/<id>/matrix.tsv, and
++ the session record of each set names its version set. The last row is result,
++ the worst severity of the sets, the exit code and the matrix directory.
+exits 0 when every set passed, else the exit code of the first set that did not.
+sub push BUNDLE
+about promote the images of a passing validation bundle
++ to the registry of the target, then render the
++ target deployment with their digests
+about BUNDLE is a path or a run id under $PX_OUT/runs of a run of the class
++ validation with the result PASS; it must lie under PX_OUT. PX_K8S_TARGET names
++ the target file, which sets PX_K8S_REGISTRY. The render takes the class as up
++ does, and it needs one; it reads no cluster record. push builds nothing, never
++ logs in and creates no secret.
+output the rendered deployment directory, $PX_OUT/deploy-k8s/push-<run id>.
++ Each pushed image is an INFO line on stderr: its registry reference and its
++ digest.
+exits 1 also means that the bundle is refused, failed or not of the validation
++ class, that a push failed, that the registry gave another digest or that the
++ render failed, 2 no registry or a refused one in the target, or a bundle
++ outside PX_OUT, 6 no bundle, or no local image has a digest of the bundle.
+example px-cluster push BUNDLE --class validation -e PX_K8S_TARGET=FILE
 EOF
-}
-
-## @description  Prints the invocation syntax and option reference for a single subcommand.
-## @return       Writes the usage text to stdout and exits with 0.
-pc_sub_usage() {
-  case "${1:-}" in
-  build) cat <<'EOF'
-Usage: px-cluster [--config FILE] [-e NAME=VALUE] build
-  Builds the image PX_IMAGE_TAG: scripts/build-phoenix.sh builds the
-  Phoenix jars of this tree, scripts/build-jhiccup.sh builds jHiccup when
-  PX_DIST_ARTIFACTS lists jhiccup, then scripts/stage-artifacts.sh stages
-  the pinned distributions and the tools and builds the image through the
-  backend. Each step reads the configuration files and values of this
-  command.
-EOF
-    ;;
-  render) cat <<'EOF'
-Usage: px-cluster [--class NAME] [--config FILE] render [OPTION...]
-  Renders the deployment directory of the cluster from the run class and
-  the configuration, by default into $PX_OUT/deploy/<cluster>, and writes
-  its path. It calls the generator of the backend and passes each OPTION
-  on: -e NAME=VALUE (for example -e PX_RS_COUNT=3), --out DIR, --check and
-  the others that the generator lists. It makes no backend call. It refuses
-  to replace the deployment directory of a cluster that is up, exit 2.
-  With --backend k8s the generator is k8s/manifests.gen.sh, and the default
-  directory is $PX_OUT/deploy-k8s/<cluster>.
-EOF
-    ;;
-  up) cat <<'EOF'
-Usage: px-cluster up [--timeout S] [--ready-timeout S] [--no-wait] [DIR]
-  DIR is the rendered deployment directory, default PX_DEPLOYMENT_DIR. With
-  neither, a run class (--class or PX_RUN_CLASS) renders the deployment
-  first, so a class and a topology file (--config FILE) are enough. A
-  cluster of the same name that is up refuses that render, exit 2.
-  The host preflight runs before the cluster is created: a deployment that
-  the engine cannot hold is refused with the arithmetic, exit 3. A backend
-  without a preflight script refuses the bring-up, exit 5.
-  The image PX_IMAGE_TAG must exist first: scripts/build-phoenix.sh builds
-  the Phoenix jars, scripts/build-jhiccup.sh builds jHiccup, then
-  scripts/stage-artifacts.sh builds the image, and px-cluster build runs
-  them. An image that the host does not hold refuses
-  the bring-up before the preflight, exit 2, with those two commands.
-  --timeout S        provision timeout, default PX_TIMEOUT_PROVISION
-  --ready-timeout S  readiness timeout, default PX_TIMEOUT_READY
-  --no-wait          create the instances and do not wait for readiness
-  While the cluster is up, a sleep inhibitor holds the host awake and the
-  health monitor (px-tool monitor) samples its memory; px-cluster down
-  stops both. A start that fails or is interrupted tears the cluster down,
-  unless PX_TEARDOWN is 0 or --keep is given. A preflight exits 1 when the
-  engine does not answer and 5 when it refuses the client.
-EOF
-    ;;
-  down) cat <<'EOF'
-Usage: px-cluster down [--keep]
-  --keep  keep the data, the state and the scope for a diagnosis
-EOF
-    ;;
-  status) cat <<'EOF'
-Usage: px-cluster status [--group NAME] [ROLE [INDEX]]
-  ROLE and INDEX narrow the inventory to one role or one instance.
-  --group NAME  also report this role group, repeatable. A group name comes
-                from the rendered deployment.
-EOF
-    ;;
-  ready) cat <<'EOF'
-Usage: px-cluster ready [--timeout S] [ROLE...]
-  With no role it waits for every instance in the scope.
-  --timeout S  readiness timeout, default PX_TIMEOUT_READY
-  Exit 0 all ready, 3 an instance terminated while waiting, 4 timeout.
-EOF
-    ;;
-  config) cat <<'EOF'
-Usage: px-cluster config
-  Writes one row per resolved value: name, value and origin, tab separated,
-  sorted by name. It makes no backend call.
-EOF
-    ;;
-  logs) cat <<'EOF'
-Usage: px-cluster logs ROLE INDEX [--since S] [--previous] [-f|--follow]
-  --since S   report only the last S seconds
-  --previous  read the log of the instance before an unplanned restart
-  --follow    keep the stream open
-EOF
-    ;;
-  exec) cat <<'EOF'
-Usage: px-cluster exec ROLE INDEX [--timeout S] -- COMMAND [ARGUMENT...]
-  --timeout S  command timeout, default PX_TIMEOUT_EXEC
-  The status of the command passes through. 124 means the timeout expired,
-  125 the command could not start, 126 not executable, 127 not found.
-EOF
-    ;;
-  scale) cat <<'EOF'
-Usage: px-cluster [--class NAME] [--config FILE] scale ROLE COUNT [--timeout S]
-  COUNT is 1 to 9, the parity limit both backends keep. The deployment of
-  the cluster is rendered again with the new count, and only the instances
-  that the count adds or removes start or stop. Give the --class, --config
-  and -e values of the bring-up: a render that changes another instance is
-  refused, exit 2. The memory check runs on the new render first, exit 3.
-  --timeout S  scale timeout, default PX_TIMEOUT_SCALE
-EOF
-    ;;
-  group) cat <<'EOF'
-Usage: px-cluster group <start|stop|status> GROUP [--timeout S]
-  start   start a stopped group and wait for its readiness
-  stop    stop every instance of the group and keep its state
-  status  report running against desired
-  --timeout S  group timeout, default PX_TIMEOUT_GROUP
-  A start re-runs the memory check before it starts anything.
-EOF
-    ;;
-  kill) cat <<'EOF'
-Usage: px-cluster kill ROLE INDEX [--mode hard|delete]
-  hard    stop the process with no graceful shutdown, keep the instance
-  delete  remove the instance object, default hard
-  The action is recorded as planned, so px-run does not read it as an
-  unplanned change.
-EOF
-    ;;
-  signal) cat <<'EOF'
-Usage: px-cluster signal ROLE INDEX SIGNAL
-  SIGNAL is a name, for example QUIT for a thread dump, STOP and CONT for a
-  pause, TERM for a graceful shutdown. KILL and TERM go to the instance; each
-  other signal goes to its daemon JVM, and a STOP that does not stop the JVM
-  is a failure. The action is recorded as planned.
-EOF
-    ;;
-  restart) cat <<'EOF'
-Usage: px-cluster restart ROLE INDEX [--drain-timeout S] [--ready-timeout S]
-  Drains the hosted regions, restarts the instance, waits for readiness and
-  rebalances. An exited instance starts with no drain, no stop and no
-  rebalance. The action is recorded as planned.
-  --drain-timeout S  drain timeout, default PX_TIMEOUT_DRAIN
-  --ready-timeout S  readiness timeout, default PX_TIMEOUT_READY
-EOF
-    ;;
-  endpoint) cat <<'EOF'
-Usage: px-cluster endpoint ROLE INDEX PORT_NAME [--release]
-  Writes one row: host and port, tab separated. On Compose the host is on
-  the loopback interface. On Kubernetes it is the DNS name of the pod in the
-  cluster, <pod>.<role>.<namespace>.svc, with the base port of the family.
-  --release  release this endpoint instead of discovering it
-EOF
-    ;;
-  matrix) cat <<'EOF'
-Usage: px-cluster [--class NAME] [--config FILE] matrix SUITE FILE...
-  Runs the suite SUITE against each version set in order. A version set is a
-  configuration FILE that selects the HBase profile, the HBase and the Hadoop
-  release and the JDKs, for example PX_PHOENIX_HBASE_PROFILE,
-  PX_DIST_HBASE_VERSION, PX_DIST_HADOOP_VERSION and PX_<ROLE>_JDK. For each
-  set it runs scripts/build-phoenix.sh and scripts/stage-artifacts.sh,
-  brings the cluster up, runs px-suite and brings the cluster down. A set
-  reads its FILE before each --config FILE of this command. A set that fails
-  does not stop the next one.
-  Writes one row per set: set, file, profile, HBase, Hadoop, JDKs, session,
-  last step and exit code. The rows are also in $PX_OUT/matrix/<id>/matrix.tsv,
-  and the session record of each set names its version set.
-  Exit 0 when every set passed, else the exit code of the first set that did
-  not, 2 usage, 6 no such FILE.
-EOF
-    ;;
-  *) usage ;;
-  esac
-}
-
-## @description  Reports a usage error for a specific subcommand, prints its usage text, and
-##               terminates the process.
-## @return       Writes the error and usage text to stderr and exits with 2.
-pc_sub_usage_error() {
-  local sub=$1
-  shift
-  px_error "$*"
-  pc_sub_usage "$sub" >&2
-  exit "$PX_EXIT_USAGE"
-}
-
-## @description  Checks whether a given word is a recognized subcommand of this utility.
-## @return       Exits with 0 when the word is a valid subcommand, or 1 otherwise.
-pc_is_subcommand() {
-  local name
-  for name in $PC_SUBCOMMANDS; do
-    if [ "$name" = "${1:-}" ]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Parses subcommand options (name, spec, argument...) into local variables in the caller's scope and
-# collects remaining positional arguments into PC_ARGS. Each specification token takes the form
-# --opt=var for value options or --flag=var=value for boolean flags.
-## @description  Parses subcommand options into caller local variables and positional words into
-##               PC_ARGS.
-## @return       Exits with 0, or exits with 2 on an unknown option or a missing option value.
-pc_opts() {
-  local _sub=$1 _spec=$2 _word _rest _found
-  shift 2
-  PC_ARGS=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --)
-      shift
-      PC_ARGS+=("$@")
-      break
-      ;;
-    -*)
-      _found=0
-      for _word in $_spec; do
-        [ "${_word%%=*}" = "$1" ] || continue
-        _found=1
-        _rest=${_word#*=}
-        case "$_rest" in
-        *=*) printf -v "${_rest%%=*}" '%s' "${_rest#*=}" ;;
-        *)
-          [ $# -ge 2 ] || pc_sub_usage_error "$_sub" "$1 needs a value"
-          printf -v "$_rest" '%s' "$2"
-          shift
-          ;;
-        esac
-        break
-      done
-      [ "$_found" = 1 ] || pc_sub_usage_error "$_sub" "unknown option $1"
-      ;;
-    *) PC_ARGS+=("$1") ;;
-    esac
-    shift
-  done
-}
 
 # Validates that an operator-supplied role, group, port, or signal name is a plain token. Enforcing
 # a narrow grammar keeps any identifier that reaches a label or a file path predictable.
@@ -1057,13 +960,18 @@ pc_up() {
   # deployment directory is supplied as a positional argument, load its port map explicitly here.
   px_config_load_ports "$dir"
   if px_is_dry_run; then
-    pc_up_plan "$dir" "$timeout" "$ready"
-    return 0
+    if [ -n "$PC_PLAN_DIR" ]; then
+      pc_up_plan "<render>" "$timeout" "$ready"
+    else
+      pc_up_plan "$dir" "$timeout" "$ready"
+    fi
+    pc_up_checks "$dir"
   fi
   # Verify required container images before running host preflight checks: no preflight check can
   # compensate for a missing image, and rejecting a deployment that exceeds host capacity before
   # creating any instances is far cheaper than letting the container engine thrash.
-  pc_image_check "$dir"
+  pc_up_gate pc_check_host
+  pc_up_gate pc_check_image "$dir"
   pc_preflight "$dir"
   scope="$(sb_scope_create "$PX_CLUSTER_ID")" || status=$?
   if [ "$status" != 0 ]; then
@@ -1170,20 +1078,51 @@ pc_down() {
   pc_teardown "$scope" "$keep" || exit $?
   if [ "$keep" = 0 ]; then
     px_info "cluster $PX_CLUSTER_ID is down"
+    pc_down_label
   fi
 }
 
-# Displays the cluster instance inventory along with the state of any requested role groups. Because
-# group names are defined by the rendered deployment, the operator explicitly names each group to
-# inspect.
-## @description  Reports the instance inventory and the state of each named role group.
-## @return       Exits 0, 2 on usage, or 6 when the specified role, index, group, or scope does not
-##               exist.
+# Validates the target label before down modifies any state by delegating validation to a dry-run
+# invocation of px-k3d, which owns the label namespace for local clusters. Because --keep retains
+# cluster data for diagnostic inspection and the labeled cluster hosts that data, combining the two
+# options is rejected.
+## @description  Validates the down --label option (keep flag) before down modifies any state.
+## @return       Exits with 0, or 2 if px-k3d rejects the label or --label is used with --keep.
+pc_label_check() {
+  local status=0
+  [ -n "$PC_DOWN_LABEL" ] || return 0
+  [ "$1" = 0 ] || px_die "$PX_EXIT_USAGE" "--label deletes the data that --keep keeps: use one"
+  px_with_private "$PX_HOME/bin/px-k3d" -n delete --label "$PC_DOWN_LABEL" >/dev/null ||
+    status=$?
+  [ "$status" != "$PX_EXIT_USAGE" ] || exit "$PX_EXIT_USAGE"
+}
+
+# By default, down removes only the resources owned by the cluster itself (D1). An unowned cluster
+# is removed only when the operator explicitly targets it by label, delegating deletion of the
+# labeled cluster to px-k3d.
+## @description  Tears down the cluster identified by down --label, when specified.
+## @return       Exits with 0 on success, or exits with 1 if cluster deletion fails.
+pc_down_label() {
+  local status=0
+  [ -n "$PC_DOWN_LABEL" ] || return 0
+  if px_is_dry_run; then
+    px_plan delete px-k3d delete --label "$PC_DOWN_LABEL"
+    return 0
+  fi
+  px_with_private "$PX_HOME/bin/px-k3d" delete --label "$PC_DOWN_LABEL" >&2 || status=$?
+  case "$status" in
+  0 | "$PX_EXIT_NO_OBJECT") ;;
+  *)
+    px_warn "px-k3d delete --label $PC_DOWN_LABEL reported $(sb_exit_name "$status")"
+    exit "$PX_EXIT_FAIL"
+    ;;
+  esac
+}
+
+## @description  Reports the instance inventory for the cluster, a single role, or one instance.
+## @return       Exits 0, 2 on usage, or 6 if the specified role, index, or scope does not exist.
 pc_status() {
-  local group role="" index="" scope rows grows="" row status=0
-  for group in ${PC_GROUPS[@]+"${PC_GROUPS[@]}"}; do
-    pc_require_name "group" "$group"
-  done
+  local role="" index="" scope rows status=0
   role=${1:-}
   index=${2:-}
   if [ -n "$role" ]; then

@@ -228,6 +228,43 @@ v_anomaly() {
   fi
 }
 
+# Validates a field across every element of a manifest array (ROW, ARRAY, FIELD, REGEX, FAULT,
+# PASS), recording a failed check row if the array is absent or empty or if any element's field
+# does not match the regular expression.
+## @description  Validates a field against a regular expression across each element of an array.
+## @return       Returns exit code 0.
+v_each() {
+  local count=0 index=0 bad=""
+  ! v_is "$2" array || count="$(v_get "$2")"
+  while [ "$index" -lt "$count" ]; do
+    [[ $(v_get "$2/$index/$3") =~ $4 ]] || bad="$bad $index"
+    index=$((index + 1))
+  done
+  if [ "$count" = 0 ] || [ -n "$bad" ]; then
+    v_row "$1" fail "$5:$bad"
+  else
+    v_row "$1" ok "$count $6"
+  fi
+}
+
+# For a Kubernetes bundle with an active scope, validates the kubernetes manifest member by checking
+# the API version, the node assignment of every pod, and the sha256 digest of every image reference.
+## @description  Validates the kubernetes manifest member for a scoped Kubernetes result bundle.
+## @return       Returns exit code 0.
+v_kubernetes() {
+  [ "$(v_get /run/backend)" = k8s ] && [ -n "$(v_get /run/scope)" ] || return 0
+  if v_is /kubernetes/api_version string && [ -n "$(v_get /kubernetes/api_version)" ]; then
+    v_row kubernetes.api_version ok "kubernetes.api_version $(v_get /kubernetes/api_version)"
+  else
+    v_row kubernetes.api_version fail "kubernetes.api_version is absent or empty"
+  fi
+  v_each kubernetes.placement /kubernetes/placement node . \
+    "kubernetes.placement is absent, empty or has a pod with no node" "pods, each with its node"
+  v_each kubernetes.registry_digests /kubernetes/registry_digests digest '^sha256:[0-9a-f]{64}$' \
+    "kubernetes.registry_digests is absent, empty or has an entry with no sha256 digest" \
+    "image references, each with its digest"
+}
+
 # Steady-state validation enforces requirement G5 by verifying that the manifest records at least
 # one closed steady@ entry and that each of the five steady-state metric values falls inside the
 # window of its anchor.
@@ -455,6 +492,7 @@ bundle_validate() {
   if v_manifest; then
     v_identity
     v_types
+    v_kubernetes
     v_steady
     v_members /disruptions disruptions mttr_seconds ""
     v_members /stages stages end_ms number
