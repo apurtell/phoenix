@@ -35,8 +35,9 @@ directory layout, network model, service labels, port map, and runtime boundary 
   shared across all commands: the scope record and the planned-action record.
 * `compose.sh` implements the Docker Compose backend and is the only file in the repository
   permitted to invoke a container runtime directly.
-* The Kubernetes backend has not yet been implemented. Its section at the end of this document
-  presents the planned architectural mapping, which milestones K1 and K2 will complete.
+* `k8s.sh` implements the Kubernetes backend and is the only file in the repository permitted to
+  invoke `kubectl` directly. Its dedicated section at the end of this document details its
+  architectural mapping and backend-specific differences.
 
 ## Binding a backend
 
@@ -296,13 +297,16 @@ disruption. Each entry is stored as a TSV row with fields `ts_ms action role ind
 ## The deployment directory
 
 The rendered deployment directory forms the sole integration boundary between a manifest generator
-and the Compose backend. `sb_provision` accepts the path to this directory, and the backend records
-both the directory path and the compose file path inside its own scope record so that subsequent
-processes can reach the same deployment. Because the backend reads exclusively the artifacts listed
-in this section and nothing else—with scaling operations also reading `services.tsv`—a hand-written
-test deployment provisions identically to a generated one when it conforms to these rules, including
-the memory limit requirement described below. Treated as run output, the deployment directory is
-rendered beneath `$PX_OUT` by the generator. This section is normative for the generator.
+and the Compose backend, and this section defines the directory layout produced by the Compose
+generator. The Kubernetes backend consumes the directory layout produced by its own generator, which
+is defined in the "Kubernetes backend" section. `sb_provision` accepts the path to this directory,
+and the backend records both the directory path and the compose file path inside its own scope
+record so that subsequent processes can reach the same deployment. Because the backend reads
+exclusively the artifacts listed in this section and nothing else—with scaling operations also
+reading `services.tsv`—a hand-written test deployment provisions identically to a generated one when
+it conforms to these rules, including the memory limit requirement described below. Treated as run
+output, the deployment directory is rendered beneath `$PX_OUT` by the generator. This section is
+normative for the generator.
 
 The generator for the Compose backend is `docker/compose.gen.sh`, invoked by `px-cluster render`.
 It exclusively writes files to the deployment directory, and the backend reads no file that is not
@@ -525,9 +529,10 @@ backend that omits any of the 31 contract functions. Callers always record exit 
 operation rather than a failure. The behavioral rules below apply across all contract functions.
 
 Every function that operates on a cluster takes the scope identifier returned by `sb_scope_create`
-as its first argument. Missing or malformed arguments result in exit code 2, as does passing a
-scope identifier that does not belong to the active backend—for Compose, any identifier lacking the
-`<PX_PROJECT_PREFIX>-` prefix.
+as its first argument. Missing or malformed arguments result in exit code 2, as does passing a scope
+identifier that does not belong to the active backend: on Compose, any identifier lacking the
+`<PX_PROJECT_PREFIX>-` prefix; on Kubernetes, any identifier lacking a `<context>/` prefix or
+specifying a namespace outside `<PX_PROJECT_PREFIX>-`.
 
 All timeout parameters are optional. When a timeout argument is omitted or empty, the function uses
 the corresponding configured default listed below; when supplied, it must be a positive integer
@@ -585,10 +590,19 @@ output when executing on an amd64 host.
 
 ## The runtime boundary
 
-**Only a backend implementation may invoke a container runtime or a Kubernetes tool.** In the
-current repository, `lib/backend/compose.sh` is the sole file permitted to reference any of the
-eight tool binaries `docker`, `docker-compose`, `podman`, `nerdctl`, `kubectl`, `k3d`, `helm`, and
-`crictl`, or either of the engine variables `PX_DOCKER_BIN` and `_PXC_ENGINE`.
+**Only a backend implementation may invoke a container runtime or a Kubernetes tool, and each
+backend may invoke only its own.** The eight restricted tool binaries are `docker`,
+`docker-compose`, `podman`, `nerdctl`, `kubectl`, `k3d`, `helm`, and `crictl`, and the four engine
+variables are `PX_DOCKER_BIN`, `_PXC_ENGINE`, `PX_KUBECTL_BIN`, and `_PXK_KUBECTL`. Each backend is
+assigned a distinct token class:
+
+| File | May name |
+|---|---|
+| `lib/backend/compose.sh` | The container runtimes alongside `PX_DOCKER_BIN` and `_PXC_ENGINE`. |
+| `lib/backend/k8s.sh` | `kubectl` alongside `PX_KUBECTL_BIN` and `_PXK_KUBECTL`. |
+
+No other file in the repository may reference any of these tokens, except for the self-test suite
+that generates the mock executables.
 
 The Compose backend resolves the container engine binary once per process and stores its absolute
 filesystem path in `_PXC_ENGINE`, a private shell variable that is never exported. Only Docker is
@@ -603,9 +617,11 @@ discover the engine binary through it.
 
 Every runtime invocation inside the backend funnels through a single function, `px_compose_call`,
 which executes the resolved absolute path either via the `command` shell builtin or under
-`px_timeout`. Because an absolute path containing slashes can never resolve to a shell function,
-this single call site bypasses the runtime trap described below while any unqualified tool
-invocation is caught.
+`px_timeout`. Because an absolute path can never resolve to a shell function, this single call site
+bypasses the runtime trap described below while any other invocation form is caught. The Kubernetes
+backend applies the exact same mechanism to `kubectl`: `PX_KUBECTL_BIN` is declared private and
+scrubbed from the environment when the backend loads, and `px_k8s_call` executes the resolved
+absolute path stored in `_PXK_KUBECTL`.
 
 This isolation boundary is not merely a coding convention; it is the architectural invariant that
 makes supporting a second backend possible. Consequently, the harness self-test suite enforces the
@@ -615,14 +631,16 @@ all three:
 1. **Static scan.** `test/run-tests.sh` enumerates every file in the harness that can be executed,
    sourced, or rendered into executable form—including every file with a shell shebang, every file
    under `bin/`, and all `*.sh`, `*.env`, `*.tmpl`, and `*.suite` files. It scans each file for the
-   eight prohibited tool names and the three engine variables, ignoring comment lines as well as
-   lines annotated with the inline waiver `# px-allow-docker: <reason>`. Any unwaived match outside
-   the allowlist fails the test suite and reports the offending file path, line number, and line
-   text. The allowlist is maintained inside the test script with one entry per path and a mandatory
-   reason, and **stale** allowlist entries also fail the test: an allowlisted path that no longer
-   exists or no longer contains a restricted token is removed rather than left behind to grow into a
-   loophole. Markdown documentation is excluded from the scan, allowing this document to name the
-   tools directly.
+   eight tool names and the four engine variables, ignoring comment lines as well as lines annotated
+   with the inline waiver `# px-allow-docker: <reason>`. Any unwaived match outside the allowlist
+   fails the test suite and reports the offending file path, line number, and line text. The
+   allowlist is maintained inside the test script with one entry per path specifying its permitted
+   token class and a mandatory reason. A match inside an allowlisted backend passes only when the
+   token belongs to that backend's token class, and the scan for bypass forms likewise restricts
+   each backend to its own token class. A **stale** allowlist entry also fails the test: an
+   allowlisted path that no longer exists or no longer contains a token of its assigned class must
+   be removed rather than left behind to grow into a loophole. Markdown documentation is excluded
+   from the scan, allowing this document to name the tools directly.
 2. **Runtime trap.** `lib/common.sh` defines each of the eight tool names as a shell function that
    immediately exits with code 2, reporting the attempted argument list and a diagnostic message
    naming the substrate contract. Because every `px-*` process sources `lib/common.sh`, every
@@ -633,12 +651,16 @@ all three:
 3. **Fake runtime shim.** The test suite writes a mock `docker` executable into a temporary
    directory, prepends that directory to `PATH`, points `PX_DOCKER_BIN` at the shim, and has it
    append its argument list to an audit log before responding from a fixture state file. Alongside
-   it, the test writes mock executables for `kubectl`, `k3d`, `helm`, and `crictl` that append
-   their binary name and argument list to the same log, ensuring that any `PATH`-resolved call to
-   those tools reaches its fake and populates the log. A negative control exercises every entry
-   point that must never touch a container runtime or Kubernetes tool and asserts that the log
-   remains empty; in addition, a simulated hostile driver reads `PX_DOCKER_BIN` and invokes
-   `command "$PX_DOCKER_BIN" ps`, verifying that the variable is empty and the log remains empty. A
+   it, the test writes a stateful fake `kubectl`—which logs every invocation first, rejects any call
+   lacking `--context` and `--namespace`, and models pods, StatefulSets, claims, namespaces, the
+   `OnDelete` strategy, and the restart of a killed container—together with mock executables for
+   `k3d`, `helm`, and `crictl` that append their binary name and argument list to the same log. Any
+   call to these tools resolved through `PATH` reaches its fake and populates the log. The negative
+   control exercises every entry point that must never touch a container runtime or Kubernetes tool
+   and asserts that the log remains empty. A simulated hostile driver reads `PX_DOCKER_BIN` and
+   invokes `command "$PX_DOCKER_BIN" ps`, verifying that the variable is empty and the log remains
+   empty; on the Kubernetes backend, a second hostile driver performs the same check against
+   `PX_KUBECTL_BIN`, and exercising each backend reaches only that backend's designated tool. The
    positive control then executes a real backend call and asserts that the log is **not** empty and
    contains the expected scope label selector, because an empty log alone would prove nothing and
    could merely indicate a broken shim or a `PATH` change that never took effect.
@@ -652,19 +674,20 @@ unchanged.
 ## Rules a backend author must honour
 
 * **Perform no runtime work when sourced.** `sb_load` sources the backend file before any operator
-  intent exists, and the self-test suite verifies that the runtime log remains empty after a bare
+  intent exists, and the self-test suite asserts that the runtime log remains empty after a bare
   `sb_load`. A backend file must only define functions and execute nothing when sourced.
 * **Invoke the underlying runtime through a single call site**, using an absolute binary path stored
-  in an unexported private variable, and annotate that call site with the inline waiver comment and
-  its justification.
+  in an unexported private variable, and register the backend file in the self-test allowlist under
+  its assigned token class.
 * **Emit TSV rows strictly in the declared schema field order** using `px_tsv_row`, sanitize
   free-form message text with `px_tsv_clean`, and represent missing values as empty columns rather
   than omitting columns.
-* **Validate mode arguments with `sb_valid_value`** and return exit code 2 on failure; never forward
-  an unvalidated mode value to the underlying substrate.
+* **Validate mode arguments with `sb_value_arg`**, which checks the value via `sb_valid_value` and
+  returns exit code 2 on failure; never forward an unvalidated mode value to the underlying
+  substrate.
 * **Define every contract function, and return exit code 5 for any operation the substrate cannot
   support**, writing the reason to stderr. Callers record exit code 5 as a clean skip, whereas an
-  undefined function causes an unrecoverable failure.
+  unhandled crash cannot be recovered from by a caller.
 * **Return exit code 6 for an unknown scope, role, index, or port name, and return exit code 1 when
   the runtime fails to respond.** Resource absence must not be conflated with runtime failure, and
   an unresponsive runtime must not be reported as resource absence.
@@ -678,7 +701,13 @@ unchanged.
   from it.
 * **Use the shared helper functions** in `lib/common.sh` and `contract.sh` for logging, timeouts,
   retries, temporary directories, platform differences, scope resolution, and planned-action
-  tracking; reimplementing any of these utilities introduces duplicate behavior to debug.
+  tracking. In addition, `contract.sh` provides shared helpers for parsing timeout arguments, flags,
+  the arguments to `sb_exec`, `sb_logs`, `sb_copy_in`, `sb_copy_out`, and `sb_signal`, poll
+  intervals, role selections, dry-run mode, and version floors; for managing backend scope records
+  and the record-validation half of scope gating (`sb_record_*`, `sb_record_gate`, and
+  `sb_scope_gated`); and for handling restart phase rows, region-mover phases, the region-mover
+  command template, and the JVM signal delivery script. Reimplementing any of these utilities in a
+  backend introduces duplicate behavior to debug.
 
 A new backend implementation is considered complete when `sb_verify_backend` produces no missing
 function names, the self-test contract suite confirms that every required contract function is
@@ -687,31 +716,314 @@ Compose.
 
 ## Kubernetes backend
 
-**Status: not yet implemented. Milestone K1 implements the core backend, and milestone K2
-implements its preflight checks, safety controls, and image promotion paths.** Milestone K1 adds the
-specification sections covering binding, scope management, manifest generation, readiness probes,
-command execution and file copy, and scaling; milestone K2 adds the sections covering fault
-injection, failure evidence, endpoints, images, preflight checks, and k3d proofing. Everything
-earlier in this document is normative for the Kubernetes backend: it implements the exact same 31
-contract functions, output schemas, and exit codes without introducing any custom substrate verbs of
-its own.
+`lib/backend/k8s.sh` implements the exact same 31 contract functions, output schemas, and exit codes
+on a Kubernetes cluster without introducing any custom substrate verbs of its own. Everything
+earlier in this document is normative for the Kubernetes backend except where this section
+explicitly specifies a difference, and it is the sole file in the repository permitted to invoke
+`kubectl`. Milestone K1 delivers the backend implementation and its manifest generator verified
+against a fake `kubectl`; milestone K2 adds cluster preflight checks, endpoint tunnels, cluster
+target files, image promotion, the mesh overlay, and `px-k3d`; and milestones K3 and K4 validate the
+implementation on a live k3d cluster.
 
-The planned architectural mapping from the design document serves as the baseline design rather than
-an immutable commitment:
+### Binding and selection
+
+Passing `--backend k8s` to `px-cluster` or `px-run`, passing `-e PX_BACKEND=k8s`, or setting
+`PX_BACKEND=k8s` in `env/local.env` selects the Kubernetes backend before the configuration loader
+runs. The loader then ingests `k8s/env/k8s.env` after the run-class configuration and before
+`docker/env/defaults.env`, ensuring that explicit operator overrides and run-class settings take
+precedence. Cluster target files and `k8s/env/k3d.env` are supplied via `--config` and therefore
+override `k8s/env/k8s.env`. Drivers, checks, hooks, and collectors inherit `PX_BACKEND` and
+`PX_SCOPE_ID` from `px-run` and bind the backend via `sb_load "$PX_BACKEND"` without modification.
+
+| Name | Default | Meaning |
+|---|---|---|
+| `PX_K8S_CONTEXT` | none | The target kubeconfig context; `k3d.env` sets this to `k3d-px`. |
+| `PX_K8S_STORAGE_CLASS` | none | The StorageClass for every claim; `k3d.env` sets `local-path`. |
+| `PX_K8S_VOLUME_GIB` | 10 | The persistent volume claim size in GiB for each stateful role. |
+| `PX_K8S_CPU_MILLI_PER_GIB` | 250 | The container CPU allocation per GiB of its memory limit. |
+| `PX_K8S_MAX_PAUSE_S` | 120 | The maximum JVM pause duration that the liveness probe tolerates. |
+| `PX_K8S_CLUSTER_DOMAIN` | `cluster.local` | The internal DNS domain of the Kubernetes cluster. |
+| `PX_KUBECTL_BIN` | the `PATH` | The `kubectl` binary path, kept private like `PX_DOCKER_BIN`. |
+
+The backend never relies on the implicit current context of the local kubeconfig. Whenever a
+Kubernetes context is required, an empty `PX_K8S_CONTEXT` causes the operation to fail with exit
+code 2, preventing a test run from accidentally targeting whichever cluster happens to be active in
+the operator's shell.
+
+### Scope, labels and the call site
+
+A Kubernetes scope identifier has the form `<context>/<namespace>`, where the namespace is
+`<PX_PROJECT_PREFIX>-<cluster>`, such as `k3d-px/px-default`. Because the namespace is parsed as the
+substring following the final `/`, context names that contain a `/` parse cleanly, whereas any scope
+identifier lacking a `/` (such as a Compose scope identifier) is rejected with exit code 2. Because
+the cluster name forms part of a Kubernetes namespace name, any cluster name containing `_`—although
+permitted in general by `SB_CLUSTER_RE`—is rejected with exit code 2 during both `sb_scope_create`
+and manifest rendering.
+
+`sb_scope_create` fails with exit code 1 if the target cluster already contains a namespace
+belonging to another harness cluster (enforcing a single deployment per target cluster), if a
+namespace matching the target scope name already exists without the scope's matching cluster label,
+or if a local state record already exists for another scope on the host unless `PX_FORCE=1` is set.
+It records the scope metadata in `$(px_state_dir)/k8s/scope-<id>.tsv` via the record helpers in
+`contract.sh`, storing the deployment directory path alongside the list of role groups started by
+test steps, while the scope's container restart table resides alongside it in `pods-<id>.tsv`.
+During provisioning, `sb_provision` applies the namespace manifest first. Because applying a
+namespace manifest would otherwise adopt an existing namespace, checking the cluster label up front
+prevents the harness from hijacking and subsequently deleting a namespace owned by another user or
+system. For the same reason, `sb_scope_exists` considers a namespace present only when it carries
+the expected cluster label for that scope.
+
+The Kubernetes backend reuses the exact same label keys as the Compose backend—`px.harness.cluster`,
+`.role`, `.index`, `.group`, `.start`, and `.drain`—all of which are valid Kubernetes label names.
+Every rendered resource, including the namespace itself, carries the cluster label.
+
+All `kubectl` invocations pass through a single function, `px_k8s_call`, using the resolved
+absolute binary path stored in the private variable `_PXK_KUBECTL`. Every invocation explicitly
+specifies both `--context` and `--namespace`, even when querying cluster-scoped resources for which
+`kubectl` ignores the namespace flag. Every command that selects harness resources includes the
+label selector `-l px.harness.cluster=<cluster>`, including queries listing pods, StatefulSets,
+Jobs, persistent volume claims, or namespaces, label-based deletions, and `top`. Commands that act
+on a single named object—such as `exec POD`, `logs POD`, `cp`, `delete pod NAME`, or
+`delete namespace NAME`—are scoped by the target namespace. Only read-only queries inspecting
+cluster-wide target properties omit a label selector: `version`, `auth can-i`, and `get nodes`.
+
+### The deployment directory
+
+The Kubernetes deployment directory is rendered by `k8s/manifests.gen.sh`, which is invoked via
+`px-cluster --backend k8s render`. It accepts the same command-line options and returns the same
+exit codes as `docker/compose.gen.sh`, sharing the common deployment generation library
+`lib/deploy.sh`—including the role table, all configuration value checks, plug-in render hooks, the
+topology record writer, artifact staging, and the fail-closed template validator. Consequently, a
+given configuration produces identical `services.tsv` rows across both backends, and any invalid
+setting rejected by one generator is rejected by the other with the exact same diagnostic message.
+Setting `PX_PHERF=1` fails with exit code 2 because Kubernetes support for the Distributed Pherf
+tier is deferred to milestone K5. By default, manifests are rendered into
+`$PX_OUT/deploy-k8s/<cluster>` so that Compose and Kubernetes renders for the same cluster name
+never overwrite one another.
 
 ```text
-scope            <context>/<namespace>, the namespace carries the harness label
-provision        apply the rendered manifests after a client-side dry run
-                 StatefulSets with OnDelete, Jobs for one-shot work
-wait_ready       pod readiness, where the probe delegates to the same healthcheck script
-exec, logs, cp   the pod's named container, with --previous for previous logs
-scale            statefulset replicas; an ordinal keeps an index aligned with Compose
-group stop/start replicas to zero and back, which keeps the volume claims bound
-kill             hard is a kill against pid 1; delete removes the pod, and OnDelete
-                 recreates it only at the harness's direction
-restart_drain    region-mover unload, delete the pod, wait for the replacement, load
-evidence         restart counts, terminated reason and exit code, pod events; the
-                 API already distinguishes an out-of-memory kill from an error
-endpoint         a loopback-bound port-forward whose pid is recorded in the state dir
-image_ref        the spec reference plus the resolved digest, which promotion reads
+deploy-k8s/<cluster>/
+  topology.env          the topology record of the shared writer
+  ports.generated.env   PX_PORT_<ROLE>_<FAMILY>=<base>, with no index
+  services.tsv          the columns and the rows of the Compose generator
+  manifests/            applied by sb_provision in name order
+    00-namespace.yaml   the namespace, with the cluster label
+    10-env.yaml         ConfigMap px-env: topology.env and the port map
+    11-conf.yaml        ConfigMap px-conf: the bytes of docker/image/conf/*.tmpl
+    12-conf-overlay.yaml  ConfigMap px-conf-overlay, with a conf-overlay plug-in
+    2N-<role>.yaml      the headless Service and the StatefulSet of a cluster role,
+                        N its position in the role table
+    30-setup.yaml       the setup Job
+    40-client.yaml  41-tooling.yaml   the standalone Pods
+  groups/<group>/       the files of an on-demand group, applied by sb_group_start
+  conf-overlay/  plugins/<id>/        the plug-in records, as on Compose
 ```
+
+The generator produces every manifest by expanding the template files under `k8s/templates`. Both
+document skeletons and repeated list elements are represented as templates, and the generator simply
+selects, repeats, indents, and concatenates the expanded text, rendering any empty list as `[]`.
+Each template may reference only the variables explicitly bound for it by the generator.
+`pxg_expand` rejects any unbound or empty `${PX_*}` placeholder—as well as any `${` sequence that
+does not form a valid placeholder—with exit code 2, reporting the offending template path and line
+number. Next, `pxg_validate` scans the written files and fails with exit code 1 across both
+generators if any unexpanded `$` character remains. The two ConfigMaps containing raw configuration
+templates are appended after this validation pass because those templates intentionally preserve
+`${PX_*}` placeholders for container startup: each file is embedded as an explicitly indented YAML
+literal block so the pod receives its exact bytes, and the container's `render.sh` script serves as
+their fail-closed validator at startup.
+
+The container image is identical to the image used on Compose and requires no modifications. At
+startup, each pod renders its own service configuration from the `px-conf` ConfigMap mounted
+read-only at `/opt/px/conf` together with the environment variables imported from `px-env`,
+executing the exact same entrypoint and `render.sh` script. The container entrypoint contains no
+backend-specific branching.
+
+### Workloads
+
+* Each cluster daemon role is deployed as a StatefulSet named after the role, configured with
+  `serviceName` set to the role name, `replicas` set to the role's instance count,
+  `podManagementPolicy: Parallel` (because the container entrypoint coordinates startup ordering,
+  just as on Compose), `updateStrategy` set to `OnDelete`, and persistent volume claim retention
+  configured with `whenDeleted:
+  Retain`, `whenScaled: Delete`. Updating a rendered manifest never automatically replaces a
+  running pod; pods are replaced only when explicitly deleted.
+* The setup role is deployed as the Job `setup-0`, configured with `restartPolicy: Never`,
+  `backoffLimit: 0`, the persistent volume claim `data-namenode-0` mounted at `/data`, and a
+  required pod affinity rule co-locating it on the same node as the NameNode pod because that
+  volume claim binds to a single node.
+* The `client` and `tooling` roles are deployed as standalone Pods named `client-0` and `tooling-0`
+  with `restartPolicy: Never`.
+* Each StatefulSet pod derives `PX_HOSTNAME` from its pod name and `PX_INSTANCE_INDEX` from the
+  `apps.kubernetes.io/pod-index` label via the Downward API, whereas the setup Job and standalone
+  Pods define literal values. All remaining environment variables match those of the corresponding
+  Compose service. In milestone K1, the setup Job does not run a monitor heartbeat.
+* Every pod disables service account token mounting (`automountServiceAccountToken: false`) and
+  service environment variable injection (`enableServiceLinks: false`), sets
+  `terminationGracePeriodSeconds` to `PX_TIMEOUT_STOP`, and enforces `runAsNonRoot` using the host
+  UID and GID that built the container image (rejecting UID or GID 0), alongside `fsGroup` and
+  `seccompProfile: RuntimeDefault`. Within each pod, the primary container `px` sets
+  `allowPrivilegeEscalation: false` and drops all Linux capabilities, satisfying the Kubernetes
+  `restricted` Pod Security Standard profile. In addition, `imagePullPolicy` is set to `Never`.
+* Resource requests are set equal to resource limits so that every pod is assigned to the
+  Guaranteed QoS class. Memory limits, heap sizes, and direct memory allocations match the role's
+  Compose values; because Compose does not specify CPU limits, each container's CPU allocation is
+  computed as `ceil(memory MiB * PX_K8S_CPU_MILLI_PER_GIB / 1024)` millicores.
+* Persistent volume claims for `zookeeper`, `namenode`, `secondarynamenode`, and `datanode` are
+  provisioned through `volumeClaimTemplates` backed by `PX_K8S_STORAGE_CLASS` at `PX_K8S_VOLUME_GIB`
+  GiB per claim; attempting to render manifests without a configured StorageClass fails with exit
+  code 2. Furthermore, `/var/lib/px/logs` is mounted as an `emptyDir` volume so that a daemon's
+  garbage-collection log survives container restarts within the same pod.
+
+### Network, ports and DNS
+
+Because every pod receives its own dedicated IP address, each role instance binds directly to the
+base port of each port family, and `ports.generated.env` contains only unindexed port variables.
+Each cluster daemon role is fronted by a headless Service configured with `clusterIP:
+None`, `publishNotReadyAddresses: true`, where every declared port carries a protocol-prefixed
+name and a matching `appProtocol` (`http-` for web, shuffle, and REST port families, and `tcp-`
+for all other families). No Service declares an external service type, and no pod allocates a host
+port or uses host networking. Peers continue to address one another by bare instance hostname—such
+as `zookeeper-0`, matching the existing configuration templates—because every pod is configured
+with a DNS search domain `<role>.<namespace>.svc.<PX_K8S_CLUSTER_DOMAIN>` for each headless
+Service. Supporting more than six DNS search domains alongside the pod-index label requires at
+least Kubernetes 1.28, which `sb_preflight` enforces as the minimum cluster version.
+
+In milestone K1, `sb_endpoint` returns the cluster-internal FQDN `<pod>.<role>.<namespace>.svc`
+together with the family's base port, which resolves inside the cluster, while `sb_endpoint_release`
+is a no-op that returns exit code 0; milestone K2 adds host-side loopback port-forward tunnels
+(RQ-287). Roles that do not have a Service—specifically `setup`, `client`, and `tooling`—expose no
+endpoints and cause `sb_endpoint` to return exit code 6.
+
+### Probes
+
+Every cluster daemon container configures three probes: a startup probe executing
+`healthcheck.sh live` with a 10 s period and a failure threshold of 90 (matching the 900 s Compose
+`start_period`), a readiness probe executing `healthcheck.sh ready` with a 5 s period, a 15 s
+timeout, and a failure threshold of 3 (matching the Compose healthcheck parameters), and a liveness
+probe executing `live` with a 10 s period, a 15 s timeout, and a failure threshold of
+`PX_K8S_MAX_PAUSE_S / 10 + 2`. Consequently, a JVM pause lasting up to `PX_K8S_MAX_PAUSE_S` does
+not trigger a container restart, whereas a pause exceeding that bound causes the kubelet to restart
+the daemon—a behavior that never occurs on Compose. The setup Job and the two standalone Pods
+configure only the readiness probe, because a liveness probe failure on a workload with a
+non-restarting policy would permanently terminate the pod.
+
+### Lifecycle
+
+* `sb_provision` first validates every manifest in `manifests/` using
+  `kubectl apply --dry-run=client -f` and applies the files in lexical name order only after every
+  dry-run check succeeds; if any dry run fails, the function returns exit code 1 without applying
+  any resources to the cluster. Once applied, it waits until a pod exists for every instance listed
+  in `services.tsv`. Passing a deployment directory rendered for a cluster name that does not match
+  the target scope fails with exit code 2.
+* `sb_teardown` deletes all StatefulSets, Jobs, and Pods matching the cluster label selector. When
+  `keep_data` is 0, it also deletes the persistent volume claims by label and verifies that no
+  selected resources remain. When `keep_data` is 1, the persistent volume claims, ConfigMaps,
+  Services, and namespace are preserved for post-mortem diagnosis. `sb_scope_delete` deletes the
+  namespace and waits for its removal, provided that the namespace carries the scope's cluster
+  label; if the namespace belongs to another owner, it is left untouched and the function returns
+  exit code 1. Setting `PX_KEEP` preserves the namespace. Consequently, `px-cluster down` removes
+  both the volume claims and the namespace, whereas `px-cluster down --keep` preserves both.
+* `sb_scale` validates and applies `10-env.yaml` along with the target role's manifest after a
+  client-side dry run, then waits for any newly added pod ordinals to appear; when scaling down, the
+  StatefulSet's claim retention policy automatically removes the persistent volume claims of removed
+  ordinals. Scaling an on-demand role belonging to a group that has not yet been started updates
+  only the rendered files on disk, which take effect when the group is subsequently started.
+* `sb_group_start` validates and applies `groups/<group>/*.yaml` after a client-side dry run and
+  waits for all roles in the group to become ready. `sb_group_stop` deletes the group's StatefulSets
+  while retaining their persistent volume claims so that a subsequent start reattaches the existing
+  volume state. In this way, StatefulSet replica counts in the manifests always match the configured
+  topology counts, and every state transition performed by the backend consists solely of an `apply`
+  of a rendered manifest or a resource `delete`.
+* `sb_wait_ready` waits for every instance expected by the rendered topology, treating any pod not
+  yet created by its controller as pending rather than absent. Conversely, any pod not expected by
+  the current render—such as an excess ordinal being terminated during a scale-down—is ignored once
+  its controller initiates deletion, ensuring that scaling down does not block on a Terminating pod.
+  The wait aborts immediately with exit code 3 upon encountering a non-zero container termination, a
+  failed or evicted pod, a container waiting reason that cannot recover without modifying the
+  deployment (`CrashLoopBackOff`, `ErrImageNeverPull`, `ErrImagePull`, `ImagePullBackOff`,
+  `InvalidImageName`, or `CreateContainerConfigError`), or any increase in an instance's restart
+  count during the wait.
+
+### Exec, logs and copies
+
+`sb_exec` invokes `kubectl exec -i POD -c px -- sh -c 'exec "$@"' px-exec CMD...`, passing `-t`
+only when standard input is a terminal. Framing execution through the container shell yields the
+exact exit codes 126 and 127 when a command is not executable or cannot be found, while targeting a
+pod that is not running returns exit code 125. `sb_logs` reads from the `px` container, and
+specifying `previous=1` retrieves the logs of the previously terminated container instance: because
+Kubernetes retains the prior container's logs, the backend serves them directly and returns exit
+code 6 when the instance has no previous container. `sb_copy_in` and `sb_copy_out` delegate to
+`kubectl cp`, which executes `tar` inside the container and therefore requires a running pod, unlike
+Compose.
+
+### Faults and the drain-aware restart
+
+* `sb_kill hard` and `sb_signal KILL` send SIGKILL to every child process of PID 1 inside the
+  container. Because the Linux kernel ignores SIGKILL sent from within a PID namespace to that
+  namespace's init process, killing the child processes causes `tini` to exit with status 137,
+  prompting the kubelet to restart the container inside a StatefulSet pod. `sb_signal TERM` delivers
+  SIGTERM to PID 1, which `tini` forwards to its child process. All other signals are delivered to
+  the oldest `java` process via the shared signal script in `contract.sh`, enforcing the same STOP
+  and CONT state verification performed on Compose.
+* `sb_kill delete` first terminates every child process of PID 1—just as `sb_kill hard`
+  does—whenever the container is currently running, and then invokes `delete pod --wait=true`
+  bounded by a timeout of `PX_TIMEOUT_STOP` plus 30 s without passing `--force`. Deleting a pod
+  directly without killing its children first would send SIGTERM to the container, which `tini`
+  would forward to the JVM to trigger a graceful shutdown via its shutdown hooks rather than an
+  abrupt fault; killing the child processes first ensures that the termination is immediate.
+  Waiting for pod deletion to complete ensures that the replacement pod created by the StatefulSet
+  controller (with a new UID) never contends with the terminating pod for the same persistent
+  volume claim, as `OnDelete` only defers template updates rather than pod recreation after
+  deletion. A deleted standalone Pod is not recreated and remains terminated, matching Compose
+  behavior.
+* `sb_restart_drain` executes the HBase region mover inside `tooling 0`—so that the saved region
+  list file persists across the target pod's deletion and recreation—targeting the pod's hostname
+  (under which the RegionServer registered in ZooKeeper) and the base rpc port. When the target
+  instance is currently ready, the operation unloads its regions, runs `delete pod --wait`, waits
+  for a replacement pod with a new UID to appear, waits for that pod to pass its readiness probe
+  (returning exit code 4 if the timeout bound expires), and reloads the regions. When the target
+  instance is not ready, the drain and rebalance phases are skipped, but the pod is still deleted
+  because `OnDelete` applies the latest rendered StatefulSet template only upon pod deletion:
+  deleting a running pod is recorded as the stop phase, whereas deleting a pod with no running
+  container marks the stop phase as skip and records the deletion under the start phase. If
+  tooling 0 is absent, the function fails with exit code 2.
+
+### Evidence
+
+`sb_restart_count` sums the container's current Kubernetes restart count with the cumulative count
+recorded for that role and index in the local restart table; whenever a pod is recreated with a new
+UID, the table increments the cumulative count by one while preserving the prior total, and rows for
+deleted pods are retained in the table. `sb_termination_reason current` reports the container's
+active termination state—or its last termination state while the container is waiting in backoff to
+restart—whereas `previous` inspects the prior termination state and returns exit code 6 if none
+exists. A Kubernetes termination reason of `OOMKilled` maps to `oom`, and an evicted pod maps to
+`evicted`; `sb_oom_killed` inspects both current and previous states for these conditions.
+`sb_sample_resources` queries `kubectl top --containers` for the `px` container; because the
+Kubernetes Metrics API does not expose network or block I/O counters, those four schema columns are
+emitted as empty fields (denoting unknown values rather than 0), and an unavailable Metrics API
+causes the function to return exit code 5. Milestone K2 extends `px-run` and the cluster health
+checks to inspect prior container terminations and pod events (RQ-288, RQ-300).
+
+### Images
+
+`sb_image_ref` outputs the image reference declared in the pod specification alongside the resolved
+image identifier reported by the container status. Because pods never pull images remotely,
+`sb_image_present` verifies that every node in the cluster already holds every image required by the
+rendered deployment, matching node image names even when the container runtime prefixes them with a
+registry hostname. Both `sb_image_build` and `sb_image_base_digest` return exit code 5 on the
+Kubernetes backend: container images are built locally through the Compose backend, and milestone K2
+handles loading and promoting those images into the target Kubernetes cluster.
+
+### What K1 leaves to later rounds
+
+Live cluster bring-up requires `scripts/preflight-k8s.sh`, which is introduced in milestone K2;
+until that script is present, `px-cluster up`, `scale`, and on-demand group starts triggered by a
+test suite halt with exit code 5 via `px_preflight_script` in `lib/common.sh` before modifying the
+target cluster. Every other `px-cluster` subcommand operates on a Kubernetes scope in K1. Milestone
+K2 also introduces host loopback tunnels, cluster target configuration files supporting node
+placement and image pull secrets, image promotion via `scripts/push-images.sh` with immutable digest
+references, the mesh fault-injection overlay, `px-k3d`, and the setup Job monitor heartbeat.
+Milestone K3 then validates against a live k3d cluster the runtime behaviors that a fake cannot
+prove: DNS search domain resolution, the pod-index label, probe timing behavior, the shared
+persistent volume claim mounted by the setup Job, `kubectl cp`, resource metrics sampling, and
+drain-aware restarts.

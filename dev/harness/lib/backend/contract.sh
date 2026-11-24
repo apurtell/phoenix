@@ -562,3 +562,574 @@ sb_planned_contains() {
   done <"$file"
   return 1
 }
+
+# ---------------------------------------------------------------------------
+# Shared backend helpers
+# ---------------------------------------------------------------------------
+# Every backend evaluates timeouts, boolean flags, contract function arguments, dry-run gates,
+# version floors, scope records, and compound-operation phase rows according to the same rules. The
+# helpers below define those rules in one place so that separate backends cannot drift apart. They
+# do not reference any container runtime and are not part of the required contract function set.
+
+# Reads the positive integer number of seconds stored in the variable named by NAME, falling back to
+# FALLBACK when the variable is unset, non-numeric, or not a whole number of seconds above zero.
+## @description  Reports the whole seconds above zero held by the variable NAME, or FALLBACK.
+## @param        NAME: Name of the variable holding a timeout in whole seconds above zero.
+## @param        FALLBACK: Default number of seconds to report when NAME is unset or invalid.
+## @return       Writes the resolved number of seconds, or FALLBACK, to stdout and exits 0.
+sb_seconds() {
+  local value=${!1:-}
+  case "$value" in
+  '' | *[!0-9]*) value=$2 ;;
+  *) [ "$((10#$value))" -gt 0 ] || value=$2 ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+# Resolves a timeout argument in whole seconds above zero. When ARGUMENT is empty, delegates to
+# sb_seconds to read the variable NAME or use FALLBACK; when ARGUMENT is provided, exits 2 if it is
+# not a whole number of seconds above 0.
+## @description  Resolves a timeout from ARGUMENT, falling back to the variable NAME or FALLBACK.
+## @param        ARGUMENT: Explicit timeout in whole seconds above 0, or empty for the fallback.
+## @param        NAME: Variable name consulted when ARGUMENT is empty.
+## @param        FALLBACK: Default timeout in seconds used when ARGUMENT and NAME provide no value.
+## @return       Writes the seconds to stdout; exits 0, or 2 if ARGUMENT is not whole seconds > 0.
+sb_timeout_arg() {
+  local given=${1:-} name=${2:-} fallback=${3:-}
+  if [ -z "$given" ]; then
+    sb_seconds "$name" "$fallback"
+    return 0
+  fi
+  if ! [[ $given =~ $PX_RE_INT ]] || [ "$((10#$given))" -lt 1 ]; then
+    px_error "a timeout must be a whole number of seconds above zero, got '$given'"
+    return "$SB_EXIT_USAGE"
+  fi
+  printf '%s\n' "$given"
+}
+
+# Determines whether an exit status returned by px_timeout indicates that the wait expired,
+# including status 137 when the process was terminated with KILL after the grace period.
+## @description  Tests whether a px_timeout exit status represents a timeout expiry, including KILL.
+## @param        status: The exit status returned by px_timeout.
+## @return       Exits 0 when the wait expired, or 1 otherwise.
+sb_expired() {
+  case "${1:-}" in
+  "$SB_EXEC_TIMEOUT" | 137) return 0 ;;
+  esac
+  return 1
+}
+
+# Translates the exit STATUS of a timed runtime call into a contract exit code and logs an error on
+# failure. Logs "WHAT expired after <TIMEOUT_S>s" and exits 4 when STATUS indicates a timeout
+# expiry, or logs MESSAGE and exits 1 for any other non-zero STATUS.
+## @description  Maps and logs the exit STATUS of a timed runtime call.
+## @param        STATUS: The exit status returned by the runtime call.
+## @param        TIMEOUT_S: The timeout in seconds that governed the call.
+## @param        WHAT: Description of the operation used in the timeout message ("WHAT expired").
+## @param        MESSAGE: Error message logged when STATUS is a non-timeout failure.
+## @return       Exits 0 when STATUS is 0, 4 on expiry ("WHAT expired"), or 1 otherwise (MESSAGE).
+sb_outcome() {
+  if sb_expired "$1"; then
+    px_error "$3 expired after ${2}s"
+    return "$SB_EXIT_TIMEOUT"
+  fi
+  [ "$1" != 0 ] || return 0
+  px_error "$4"
+  return "$SB_EXIT_FAIL"
+}
+
+# Validates that a boolean flag argument VALUE passed as NAME to FUNCTION is either 0 or 1, logging
+# a diagnostic and exiting 2 otherwise.
+## @description  Validates that the flag argument NAME of FUNCTION has a VALUE of 0 or 1.
+## @param        FUNCTION: Calling function name used in diagnostic messages.
+## @param        NAME: Parameter name of the flag being validated.
+## @param        VALUE: Candidate flag value to test against 0 and 1.
+## @return       Exits 0 when VALUE is 0 or 1, or exits 2 with an error message otherwise.
+sb_flag() {
+  case "${3:-}" in
+  0 | 1) return 0 ;;
+  esac
+  px_error "$1 needs $2 of 0 or 1, got '${3:-}'"
+  return "$SB_EXIT_USAGE"
+}
+
+# Validates that VALUE, supplied for the argument WHAT of FUNCTION, belongs to the contract
+# vocabulary for KIND, logging the allowed vocabulary words and exiting 2 when it does not.
+## @description  Validates that the argument WHAT of FUNCTION has a VALUE in the KIND vocabulary.
+## @param        FUNCTION: Calling function name used in diagnostic messages.
+## @param        WHAT: Human-readable argument description for diagnostics.
+## @param        KIND: Contract vocabulary kind passed to sb_valid_value and sb_vocabulary.
+## @param        VALUE: Candidate word to validate against the vocabulary of KIND.
+## @return       Exits 0 when VALUE belongs to the KIND vocabulary, or 2 with a message otherwise.
+sb_value_arg() {
+  if sb_valid_value "${3:-}" "${4:-}"; then
+    return 0
+  fi
+  px_error "$1 needs $2: $(sb_vocabulary "${3:-}"), got '${4:-}'"
+  return "$SB_EXIT_USAGE"
+}
+
+# Validates the framing arguments of an sb_exec call: SCOPE ROLE INDEX TIMEOUT_S -- CMD [ARG...].
+# Once this check succeeds, the caller shifts five positional arguments to reach CMD and its
+# arguments.
+## @description  Validates the argument frame of an sb_exec call before the caller shifts five args.
+## @param        args: The full positional argument list SCOPE ROLE INDEX TIMEOUT_S -- CMD [ARG...].
+## @return       Exits 0 when the frame includes -- and a command, or 2 with a message otherwise.
+sb_exec_args() {
+  if [ $# -lt 6 ]; then
+    px_error "sb_exec needs a scope, a role, an index, a timeout, -- and a command"
+    return "$SB_EXIT_USAGE"
+  fi
+  if [ "$5" != "--" ]; then
+    px_error "sb_exec separates the command with --, got '$5'"
+    return "$SB_EXIT_USAGE"
+  fi
+}
+
+# Validates the SINCE, PREVIOUS, and FOLLOW arguments of sb_logs and normalizes SINCE. Accepts "-"
+# or an empty string to request the full log (writing nothing), or a whole number of seconds
+# (writing the seconds to stdout).
+## @description  Validates the SINCE, PREVIOUS, and FOLLOW arguments of sb_logs, normalizing SINCE.
+## @param        SINCE: Log lookback window in whole seconds, or "-" or empty for the entire log.
+## @param        PREVIOUS: Flag (0 or 1) selecting logs from the previous instance execution.
+## @param        FOLLOW: Flag (0 or 1) enabling live log streaming.
+## @return       Writes whole seconds (nothing for the whole log) and exits 0, or 2 with a message.
+sb_logs_args() {
+  sb_flag sb_logs previous "${2:-}" || return $?
+  sb_flag sb_logs follow "${3:-}" || return $?
+  case "${1:-}" in
+  - | '') return 0 ;;
+  *[!0-9]*)
+    px_error "sb_logs needs since in whole seconds or -, got '$1'"
+    return "$SB_EXIT_USAGE"
+    ;;
+  esac
+  printf '%s\n' "$1"
+}
+
+# Validates the local and remote path arguments for sb_copy_in (in LOCAL REMOTE) or sb_copy_out
+# (out REMOTE LOCAL) and resolves the local path. Exits 2 on missing paths, a non-existent local
+# source for "in", or an output destination refused by policy for "out", and exits 1 when the local
+# destination path cannot be resolved.
+## @description  Validates copy paths (in LOCAL REMOTE or out REMOTE LOCAL) and resolves LOCAL.
+## @param        direction: Copy direction, either "in" (LOCAL REMOTE) or "out" (REMOTE LOCAL).
+## @param        src: Source path (LOCAL when direction is "in", or REMOTE when direction is "out").
+## @param        dst: Target path (REMOTE when direction is "in", or LOCAL when direction is "out").
+## @return       Writes LOCAL; exits 0, 2 on usage, absent source, or refused dst, or 1 on error.
+sb_copy_args() {
+  if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+    if [ "$1" = in ]; then
+      px_error "sb_copy_in needs a scope, a role, an index, a local path and a remote path"
+    else
+      px_error "sb_copy_out needs a scope, a role, an index, a remote path and a local path"
+    fi
+    return "$SB_EXIT_USAGE"
+  fi
+  if [ "$1" = out ]; then
+    # When the destination escapes the allowed output root, px_out_resolve terminates the caller's
+    # subshell with the usage exit status so that the error code propagates directly to the caller.
+    px_out_resolve "$3"
+    return $?
+  fi
+  if [ ! -e "$2" ]; then
+    px_error "no such local path: $2"
+    return "$SB_EXIT_USAGE"
+  fi
+  printf '%s\n' "$2"
+}
+
+# Normalizes a signal name for sb_signal by stripping an optional SIG prefix and converting the name
+# to uppercase. Accepts only the supported signal set and exits 2 for any other name.
+## @description  Normalizes a signal name for sb_signal (either case, with or without a SIG prefix).
+## @param        signal: The candidate signal name to normalize and validate.
+## @return       Writes the uppercase name without SIG; exits 0, or 2 for a name outside the set.
+sb_signal_name() {
+  local name
+  name="$(printf '%s' "${1#SIG}" | tr '[:lower:]' '[:upper:]')"
+  case "$name" in
+  HUP | INT | QUIT | ABRT | KILL | ALRM | TERM | USR1 | USR2 | STOP | CONT | TSTP)
+    printf '%s\n' "$name"
+    return 0
+    ;;
+  esac
+  px_error "sb_signal does not accept the signal name '${1:-}'"
+  return "$SB_EXIT_USAGE"
+}
+
+## @description  Reports the delay in seconds between wait polls from PX_POLL_INTERVAL_S, or 2.
+## @return       Writes the polling interval in seconds to stdout and exits 0.
+sb_poll_interval() {
+  local interval=${PX_POLL_INTERVAL_S:-2}
+  [[ $interval =~ $PX_RE_SECONDS ]] || interval=2
+  printf '%s\n' "$interval"
+}
+
+# Verifies that every space-separated role in SELECTION exists within the space-separated list of
+# PRESENT roles for SCOPE, logging an error and exiting 6 if any requested role has no instances.
+## @description  Verifies that every space-separated role in SELECTION is listed in PRESENT.
+## @param        SCOPE: The scope id checked, used in the diagnostic message when a role is absent.
+## @param        PRESENT: Space-separated list of role names currently present in the scope.
+## @param        SELECTION: Space-separated list of target role names to verify.
+## @return       Exits 0 when every selected role is present, or 6 with an error message otherwise.
+sb_selection_check() {
+  local word missing=""
+  for word in ${3:-}; do
+    case " ${2:-} " in
+    *" $word "*) ;;
+    *) missing="$missing $word" ;;
+    esac
+  done
+  [ -n "$missing" ] || return 0
+  px_error "no instance in scope ${1:-} has the role:$missing"
+  return "$SB_EXIT_NO_OBJECT"
+}
+
+# Checks whether dry-run mode is active so that a mutating operation should be skipped, logging the
+# skipped action description formed from WORDS when dry-run mode is enabled.
+## @description  Tests whether dry-run mode prevents a change, logging the skipped action WORDS.
+## @param        WORDS: Words describing the mutating action that is skipped during a dry run.
+## @return       Exits 0 when dry-run mode stops the action, or 1 when the action should proceed.
+sb_dry_run() {
+  px_is_dry_run || return 1
+  px_info "dry run: $* not performed"
+  return 0
+}
+
+# Scope metadata that cannot be represented in container or cluster labels is persisted in the
+# backend's state directory. Each scope stores a key-value record in scope-<id>.tsv, with one key
+# and one value per row, alongside backend-specific tables. Because characters in the scope id
+# outside A-Za-z0-9._- are sanitized to underscores in file names, the record preserves the raw
+# scope id under the key "scope".
+
+# Resolves and ensures the existence of the per-backend state directory under px_state_dir. Exits 2
+# when the output policy refuses the state directory, and exits 1 if the directory cannot be
+# created.
+## @description  Resolves and creates the state directory for BACKEND.
+## @param        BACKEND: The backend identifier whose state subdirectory is requested.
+## @return       Writes the directory path to stdout; exits 0, 2 on policy refusal, or 1 on error.
+sb_state_dir() {
+  local dir
+  dir="$(px_state_dir)" || return $?
+  mkdir -p "$dir/${1:-}" ||
+    px_die "$SB_EXIT_FAIL" "cannot create the backend state directory in $dir"
+  printf '%s/%s\n' "$dir" "${1:-}"
+}
+
+# Computes the path to a per-scope TSV state file for BACKEND, KIND, and SCOPE, where a KIND of
+# "scope" names the primary scope record.
+## @description  Reports the per-scope state file path for BACKEND, KIND, and SCOPE.
+## @param        BACKEND: The backend identifier owning the state directory.
+## @param        KIND: The state table kind, where "scope" names the scope record file.
+## @param        SCOPE: The scope id, with characters outside A-Za-z0-9._- sanitized to _.
+## @return       Writes the file path to stdout; exits 0, 2, or 1 under the rules of sb_state_dir.
+sb_record_path() {
+  local dir id=${3:-}
+  dir="$(sb_state_dir "${1:-}")" || return $?
+  printf '%s/%s-%s.tsv\n' "$dir" "${2:-}" "${id//[^A-Za-z0-9._-]/_}"
+}
+
+## @description  Reads the value associated with KEY from the scope record of SCOPE on BACKEND.
+## @param        BACKEND: The backend identifier owning the scope record.
+## @param        SCOPE: The target scope id to inspect.
+## @param        KEY: The record key to look up.
+## @return       Writes the value to stdout; exits 0, or 6 when the record or KEY is absent.
+sb_record_get() {
+  local path
+  path="$(sb_record_path "${1:-}" scope "${2:-}")" || return "$SB_EXIT_NO_OBJECT"
+  [ -f "$path" ] || return "$SB_EXIT_NO_OBJECT"
+  sb_row_get "${3:-}" "$(cat "$path")"
+}
+
+# Atomically sets KEY to a single row holding VALUE in the scope record for SCOPE on BACKEND,
+# replacing any existing row for KEY.
+## @description  Writes KEY once with VALUE into the scope record for BACKEND and SCOPE.
+## @param        BACKEND: The backend identifier owning the scope record.
+## @param        SCOPE: The target scope id to update.
+## @param        KEY: The record key to insert or replace.
+## @param        VALUE: The value to associate with KEY.
+## @return       Exits 0 on success, or 1 when the scope record cannot be written.
+sb_record_set() {
+  local path tmp row
+  path="$(sb_record_path "${1:-}" scope "${2:-}")" || return "$SB_EXIT_FAIL"
+  tmp="$path.$$"
+  {
+    if [ -f "$path" ]; then
+      while IFS= read -r row; do
+        case "$row" in
+        "${3:-}$PX_TAB"* | '') continue ;;
+        esac
+        printf '%s\n' "$row"
+      done <"$path"
+    fi
+    px_tsv_row "${3:-}" "${4:-}"
+  } >"$tmp" && mv -f "$tmp" "$path" && return 0
+  rm -f "$tmp"
+  px_error "cannot write the scope record $path"
+  return "$SB_EXIT_FAIL"
+}
+
+## @description  Removes the specified KIND state files (for example, scope) for SCOPE on BACKEND.
+## @param        BACKEND: The backend identifier owning the state directory.
+## @param        SCOPE: The target scope id whose state files should be removed.
+## @param        KIND: One or more state file kinds to delete, such as scope.
+## @return       Exits 0, even when the output policy refuses the state directory.
+sb_record_drop() {
+  local backend=${1:-} scope=${2:-} kind path
+  shift 2
+  for kind in "$@"; do
+    if path="$(sb_record_path "$backend" "$kind" "$scope")"; then
+      rm -f "$path"
+    fi
+  done
+  return 0
+}
+
+# Executes the admission gate for creating a new scope while holding the backend's host lock. The
+# callback FUNCTION inspects the substrate for conflicting scopes and then invokes sb_record_gate.
+## @description  Runs the scope-creation gate FUNCTION for SCOPE under the BACKEND host lock.
+## @param        BACKEND: The backend identifier whose host lock is acquired.
+## @param        FUNCTION: Callback that checks the substrate and invokes sb_record_gate.
+## @param        SCOPE: The candidate scope id passed to FUNCTION.
+## @return       Exits 0 when the gate passes, or 1 if the gate refuses or the lock is not taken.
+sb_scope_gated() {
+  local dir status=0
+  dir="$(sb_state_dir "${1:-}")" || return "$SB_EXIT_FAIL"
+  px_lock "$dir/host.lock" 30 || return "$SB_EXIT_FAIL"
+  "$2" "${3:-}" || status=$?
+  px_unlock "$dir/host.lock"
+  return "$status"
+}
+
+# Performs the state-record check of the new-scope gate for BACKEND and SCOPE. Unless PX_FORCE=1 is
+# set, refuses creation if any scope record already exists on the host, then initializes a fresh
+# record containing the scope id and the creation timestamp.
+## @description  Enforces the state-record gate for a new scope and initializes its scope record.
+## @param        BACKEND: The backend identifier owning the state directory.
+## @param        SCOPE: The new scope id to admit and record.
+## @return       Exits 0 when the new record is written, or 1 if the gate refuses or writing fails.
+sb_record_gate() {
+  local backend=${1:-} scope=${2:-} dir path name others=""
+  dir="$(sb_state_dir "$backend")" || return "$SB_EXIT_FAIL"
+  if ! px_is_true "${PX_FORCE:-0}"; then
+    for path in "$dir"/scope-*.tsv; do
+      [ -f "$path" ] || continue
+      name="$(sb_row_get scope "$(cat "$path")")" || continue
+      [ "$name" != "$scope" ] || continue
+      others="$others $name"
+    done
+    if [ -n "$others" ]; then
+      px_error "another scope is recorded on this host:$others. Tear it down first," \
+        "or set PX_FORCE=1 when the record is stale."
+      return "$SB_EXIT_FAIL"
+    fi
+  fi
+  path="$(sb_record_path "$backend" scope "$scope")" || return "$SB_EXIT_FAIL"
+  if [ -f "$path" ] && ! px_is_true "${PX_FORCE:-0}"; then
+    px_error "scope $scope already exists in $path." \
+      "Run a teardown, or set PX_FORCE=1 to replace the record."
+    return "$SB_EXIT_FAIL"
+  fi
+  rm -f "$path"
+  sb_record_set "$backend" "$scope" scope "$scope" || return "$SB_EXIT_FAIL"
+  sb_record_set "$backend" "$scope" created_at "$(px_timestamp)" || return "$SB_EXIT_FAIL"
+}
+
+## @description  Reports the label namespace prefix that scopes every substrate object.
+## @return       Writes the label prefix to stdout and exits 0.
+sb_label_prefix() { printf '%s\n' "${PX_LABEL_PREFIX:-px.harness}"; }
+
+## @description  Reports the project name prefix used when constructing a scope identifier.
+## @return       Writes the scope name prefix to stdout and exits 0.
+sb_project_prefix() { printf '%s\n' "${PX_PROJECT_PREFIX:-px}"; }
+
+## @description  Tests whether ROLE matches the space-separated role filter SELECTION.
+## @param        ROLE: The role name to test.
+## @param        SELECTION: Space-separated list of selected roles, or empty to match every role.
+## @return       Exits 0 when ROLE is in SELECTION or SELECTION is empty, or 1 otherwise.
+sb_role_selected() {
+  local role=${1:-} selection=${2:-} word
+  [ -n "$selection" ] || return 0
+  for word in $selection; do
+    if [ "$word" = "$role" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Compares a semantic version string (with or without a leading "v") numerically against a required
+# major and minor version floor.
+## @description  Compares VERSION numerically against FLOOR_MAJOR and FLOOR_MINOR.
+## @param        VERSION: Version string to test (leading "v" and patch suffix are ignored).
+## @param        FLOOR_MAJOR: Minimum required major version number; defaults to 0.
+## @param        FLOOR_MINOR: Minimum required minor version number; defaults to 0.
+## @return       Exits 0 if VERSION meets the floor, 1 if lower, or 2 if VERSION holds no number.
+sb_version_at_least() {
+  local version=${1:-} major_floor=${2:-0} minor_floor=${3:-0} major minor
+  version="${version#v}"
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  case "$major" in
+  '' | *[!0-9]*) return "$SB_EXIT_USAGE" ;;
+  esac
+  case "$minor" in
+  '' | *[!0-9]*) minor=0 ;;
+  esac
+  if [ "$((10#$major))" -gt "$major_floor" ]; then
+    return 0
+  fi
+  if [ "$((10#$major))" -lt "$major_floor" ]; then
+    return 1
+  fi
+  if [ "$((10#$minor))" -ge "$minor_floor" ]; then
+    return 0
+  fi
+  return 1
+}
+
+## @description  Emits one phase TSV row for a compound operation with elapsed time since START_MS.
+## @param        PHASE: The phase name, such as drain, stop, start, ready, or rebalance.
+## @param        status: The phase outcome word: ok, fail, or skip.
+## @param        START_MS: Phase start timestamp in epoch milliseconds; defaults to 0.
+## @return       Writes one phase TSV row to stdout and exits 0.
+sb_phase_row() {
+  px_tsv_row "${1:-}" "${2:-}" "$(($(px_epoch_ms) - ${3:-0}))"
+}
+
+## @description  Emits a fail row for PHASE and a skip row for each subsequent restart-drain phase.
+## @param        PHASE: The phase that failed within drain, stop, start, ready, and rebalance.
+## @param        START_MS: Start timestamp in epoch milliseconds for the failed phase.
+## @return       Writes the fail and remaining skip phase TSV rows to stdout and exits 0.
+sb_phase_fail() {
+  local phase row=""
+  for phase in drain stop start ready rebalance; do
+    if [ "$phase" = "$1" ]; then
+      sb_phase_row "$phase" fail "$2"
+      row=skip
+    elif [ -n "$row" ]; then
+      sb_phase_row "$phase" skip "$2"
+    fi
+  done
+}
+
+# Expands the region mover template from PX_REGION_MOVER_CMD (or SB_MOVER_DEFAULT) by substituting
+# OPERATION, HOST, PORT, TIMEOUT_S, and FILE into their corresponding placeholders.
+## @description  Substitutes placeholders in PX_REGION_MOVER_CMD or SB_MOVER_DEFAULT.
+## @param        OPERATION: Mover operation to perform, such as unload or load.
+## @param        HOST: Registered RegionServer hostname for {host}.
+## @param        PORT: RegionServer RPC port for {port}.
+## @param        TIMEOUT_S: Timeout in seconds for {timeout}.
+## @param        FILE: State file path inside the container for {file}.
+## @return       Writes the command line; exits 0, or 6 when the template requires an empty PORT.
+sb_mover_cmd() {
+  local operation=${1:-} host=${2:-} port=${3:-} timeout=${4:-} file=${5:-} cmd
+  cmd="${PX_REGION_MOVER_CMD:-$SB_MOVER_DEFAULT}"
+  case "$cmd" in
+  *'{port}'*) [ -n "$port" ] || return "$SB_EXIT_NO_OBJECT" ;;
+  esac
+  cmd="${cmd//\{operation\}/$operation}"
+  cmd="${cmd//\{host\}/$host}"
+  cmd="${cmd//\{port\}/$port}"
+  cmd="${cmd//\{timeout\}/$timeout}"
+  cmd="${cmd//\{file\}/$file}"
+  printf '%s\n' "$cmd"
+}
+
+# Executes either the drain or rebalance mover phase of a drain-aware restart inside the target
+# container (SCOPE, ROLE, INDEX) via sb_exec, emitting the resulting phase TSV rows to stdout.
+## @description  Runs the drain or rebalance mover phase of a drain-aware restart via sb_exec.
+## @param        PHASE: The mover phase to execute, either drain or rebalance.
+## @param        START_MS: Phase start timestamp in epoch milliseconds.
+## @param        SUBJECT: Human-readable target label used in diagnostic messages.
+## @param        TIMEOUT_S: Timeout in seconds for the mover execution.
+## @param        CMD: Shell command line to execute inside the target container.
+## @param        SCOPE: The scope id containing the execution target.
+## @param        ROLE: The target role name for sb_exec.
+## @param        INDEX: The target instance index for sb_exec.
+## @return       Writes phase TSV rows to stdout; exits 0 if ok, 4 if the mover expired, or 1.
+sb_mover_phase() {
+  local phase=$1 start=$2 subject=$3 timeout=$4 status=0 what=rebalance
+  [ "$phase" != drain ] || what="region drain"
+  # Because the region mover writes progress messages to stdout while this function reserves stdout
+  # for structured phase TSV rows, the mover's output is redirected to stderr.
+  sb_exec "$6" "$7" "$8" "$timeout" -- sh -c "$5" </dev/null >&2 || status=$?
+  if [ "$status" = 0 ]; then
+    sb_phase_row "$phase" ok "$start"
+    return 0
+  fi
+  sb_phase_fail "$phase" "$start"
+  if [ "$status" = "$SB_EXEC_TIMEOUT" ]; then
+    px_error "the $what of $subject expired after ${timeout}s"
+    return "$SB_EXIT_TIMEOUT"
+  fi
+  px_error "the $what of $subject failed with status $status"
+  return "$SB_EXIT_FAIL"
+}
+
+# Defines the default region mover command template with five placeholders substituted by
+# sb_mover_cmd: {operation}, {host}, {port}, {timeout}, and {file}. Here {host} is the hostname
+# under which the RegionServer registered, and {port} is its rpc port from the port map as
+# advertised in the RegionServer server name; each backend resolves both values for its substrate.
+# Setting PX_REGION_MOVER_CMD overrides this template. A role's drain label, rather than this
+# variable, determines whether the role uses drain semantics.
+SB_MOVER_DEFAULT='hbase org.apache.hadoop.hbase.util.RegionMover'
+SB_MOVER_DEFAULT="$SB_MOVER_DEFAULT --regionserverhost {host}:{port}"
+SB_MOVER_DEFAULT="$SB_MOVER_DEFAULT --operation {operation}"
+SB_MOVER_DEFAULT="$SB_MOVER_DEFAULT --timeout {timeout}"
+SB_MOVER_DEFAULT="$SB_MOVER_DEFAULT --filename {file}"
+
+# Defines the remote script that delivers a signal to an instance's daemon JVM, identified as the
+# oldest java process. Because the container's initial process is tini, which cannot forward SIGSTOP
+# to child processes, the script signals the JVM directly. It then polls the JVM process state for
+# up to five seconds to verify that STOP or TSTP transitions the process to the stopped state and
+# that CONT resumes execution, ensuring that an ineffective pause is treated as a failure. The
+# script exits 6 when no JVM is running, 1 when kill fails, and 3 when the expected state is not
+# observed within five seconds (including when the state cannot be read). The script is assigned via
+# read rather than command substitution because bash 3.2 misparses a case statement inside $(...).
+SB_SIGNAL_SCRIPT=""
+read -r -d '' SB_SIGNAL_SCRIPT <<'SCRIPT_EOF' || true
+pid="$(pgrep -o -x java)" || exit 6
+kill -s "$1" "$pid" || exit 1
+case "$1" in
+STOP | TSTP) want=T ;;
+CONT) want=R ;;
+*) exit 0 ;;
+esac
+n=0
+while :; do
+  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+  case "$want:$state" in
+  T:T* | R:[!T]*) exit 0 ;;
+  esac
+  [ "$n" -lt 50 ] || exit 3
+  n=$((n + 1))
+  sleep 0.1
+done
+SCRIPT_EOF
+
+# Delivers a normalized signal NAME to the daemon JVM of an already-resolved instance via sb_exec
+# and SB_SIGNAL_SCRIPT. Exits 0 on success, 6 when the instance runs no JVM process, and 1 when the
+# signal cannot be delivered or the expected process state does not appear within 5 s.
+## @description  Sends signal NAME to the daemon JVM of a resolved instance via sb_exec.
+## @param        SCOPE: The scope id containing the target instance.
+## @param        ROLE: The role name of the target instance (must be resolved before calling).
+## @param        INDEX: The instance index of the target instance (must be resolved before calling).
+## @param        TIMEOUT_S: Timeout in seconds passed to sb_exec.
+## @param        NAME: Normalized signal name passed to SB_SIGNAL_SCRIPT.
+## @return       Exits 0, 1 if delivery fails or the state does not show within 5 s, or 6 if no JVM.
+sb_signal_jvm() {
+  local status=0
+  sb_exec "$1" "$2" "$3" "$4" -- bash -c "$SB_SIGNAL_SCRIPT" px-signal "$5" </dev/null \
+    >/dev/null || status=$?
+  case "$status" in
+  0) return 0 ;;
+  "$SB_EXIT_NO_OBJECT")
+    px_error "$2/$3 runs no JVM, so the signal $5 has no target"
+    return "$SB_EXIT_NO_OBJECT"
+    ;;
+  3) px_error "the JVM of $2/$3 did not reach the $5 state within 5 s" ;;
+  *) px_error "the signal $5 to $2/$3 was not delivered" ;;
+  esac
+  return "$SB_EXIT_FAIL"
+}

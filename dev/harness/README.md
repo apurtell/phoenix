@@ -24,11 +24,18 @@ requires only a POSIX userland, `bash`, and a container runtime accessible to th
 It operates without `jq`, `python`, or Maven at runtime, and it never writes any data inside the
 repository working tree.
 
-All commands interact with a cluster exclusively through a single substrate contract defined in
-`lib/backend/contract.sh`. That contract is backed by Docker Compose today and is designed to
-support a Kubernetes backend in a subsequent phase, allowing test drivers, suites, health checks,
-and telemetry collectors to run unmodified across both substrates. `docs/backends.md` serves as the
-authoritative contract specification and the blueprint for implementing additional backends.
+All commands interact with a cluster through a single substrate contract defined in
+`lib/backend/contract.sh`. The contract supports two backends: Docker Compose by default, and
+Kubernetes via `--backend k8s`. Test drivers, suites, checks, and telemetry collectors therefore
+execute unmodified across both substrates. `docs/backends.md` serves as the authoritative contract
+reference and documents the mapping for each backend.
+
+The Kubernetes backend applies static manifests using `kubectl` without relying on any chart,
+operator, or custom resource. Running `px-cluster render --backend k8s` produces these manifests
+in `$PX_OUT/deploy-k8s/<cluster>` from the same role table, value
+checks, and configuration templates used by the Compose render, and the pods execute the same
+container image. Cluster bring-up depends on the Kubernetes cluster preflight and `px-k3d`, which
+are added in K2; until then, `px-cluster up` exits with code 5 on that backend.
 
 Three additional documents specify the interfaces layered above the contract.
 `docs/driver-contract.md` defines the six lifecycle verbs of a driver, their exit codes, the
@@ -257,7 +264,11 @@ $PX_OUT/
     down-<scope>                the lock that one px-cluster down holds
     compose/                    the Compose backend: its scope records and its
                                 host lock
+    k8s/                        the Kubernetes backend: its scope records, its
+                                restart tables and its lock
   deploy/<cluster>/    the rendered deployment directory: compose.yaml,
+                       ports.generated.env, topology.env, services.tsv
+  deploy-k8s/<cluster>/  the rendered Kubernetes deployment: manifests/, groups/,
                        ports.generated.env, topology.env, services.tsv
   dist/                the verified distributions, and pins.env, the pins that trust on
                        first use recorded
@@ -341,8 +352,9 @@ to the baseline defaults, it must be specified on the command line, in the envir
 `--config` file, or in `local.env`; declaring it in a later stage is too late to take effect.
 
 Operators also use `local.env` to configure `PX_DOCKER_BIN` when the Docker CLI resides outside the
-standard search paths inspected by the backend. Every `px-*` command reads this file directly, while
-the private variable rule prevents the setting from leaking into child processes.
+paths searched by the backend, as well as `PX_KUBECTL_BIN` for `kubectl`. Every `px-*` process reads
+this file directly, and neither value is exported to child processes. When `PX_BACKEND=k8s` is set,
+the loader evaluates `k8s/env/k8s.env` after the run class and before the baseline defaults.
 
 Because the generated port map is a runtime artifact, stage 8 loads it from the rendered deployment
 directory beneath `$PX_OUT` and never from the source tree; setting `PX_PORT_MAP_ENV` redirects this
@@ -672,13 +684,13 @@ row.
 ## Self-test
 
 The self-test suite in `test/run-tests.sh` executes without a container runtime, network access, or
-a prior Maven build, allowing it to run both on a developer laptop and inside the pre-commit
-container. It emits TAP-formatted test output and exits with code 1 if any assertion fails. Among
-its architectural guarantees, the suite verifies through three independent enforcement layers that
-no component outside the active backend directly invokes a container runtime or a Kubernetes tool: a
-static source scan paired with a reasoned allowlist that also fails on stale entries, a runtime
-trap that forces any stray invocation to exit with code 2, and a fake runtime shim exercised against
-a negative control, a hostile driver, and a positive control. The design of these three layers is
-documented in `docs/backends.md`. Against the same fake runtime, the suite exercises every substrate
-contract function and every `px-cluster` subcommand, and its final test group proves that no command
-created any new path beneath the root of the working tree.
+a Maven build, allowing it to run both on a developer laptop and inside the pre-commit container. It
+emits TAP-formatted output lines and exits with code 1 if any assertion fails. Among its
+architectural guarantees, the suite verifies across three independent enforcement layers that no
+component outside the two backends invokes a container runtime or a Kubernetes tool, and that each
+backend invokes only its own toolchain: a static source scan paired with a reasoned allowlist that
+also fails on stale entries, a runtime trap that forces any stray invocation to exit with code 2,
+and a fake runtime shim exercised against a negative control, a hostile driver, and a positive
+control. The design of these three layers is documented in `docs/backends.md`. Against the same fake
+runtime, the suite exercises every substrate contract function and every `px-cluster` subcommand,
+and its final test group proves that no command added any path beneath the root of the working tree.

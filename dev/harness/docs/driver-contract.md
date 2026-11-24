@@ -311,15 +311,15 @@ timeout bounds, and all other resolved configuration parameters for the active r
 | `PX_OUT` | The root directory for harness output. |
 | `PX_RUN_ID` | The unique run identifier, formatted as `<YYYYMMDDTHHMMSSZ>-<4 characters>`. |
 | `PX_RUN_DIR` | The run bundle directory, located at `$PX_OUT/runs/<run-id>`. |
-| `PX_RUN_CLASS` | Either `validation` or `measurement`; always populated for an active run. |
+| `PX_RUN_CLASS` | Either `validation` or `measurement`; every real run is assigned one. |
 | `PX_CONTAMINATION` | Host contamination causes, such as `quiet-host`; empty on a quiet host. |
 | `PX_BACKEND` | The bound substrate backend identifier passed to `sb_load`. |
-| `PX_SCOPE_ID` | The target cluster scope identifier, or empty when running without a cluster. |
+| `PX_SCOPE_ID` | The cluster scope, opaque to a driver, or empty when the run has no cluster. |
 | `PX_DRIVER_NAME` | The canonical name of the driver. |
-| `PX_DRIVER_DIR` | The driver directory `$PX_RUN_DIR/drivers/<name>`, created by `px-run`. |
+| `PX_DRIVER_DIR` | The driver directory `$PX_RUN_DIR/drivers/<name>`, which `px-run` creates. |
 | `PX_VERB` | The lifecycle verb currently being executed. |
-| `PX_RECORD_SOURCE` | The provenance tag `driver:<name>`, recorded by every bundle writer. |
-| `PX_SUITE_NAME` | The enclosing suite name when invoked via `px-suite`, or empty otherwise. |
+| `PX_RECORD_SOURCE` | The source tag `driver:<name>`, which every writer puts into its record. |
+| `PX_SUITE_NAME` | The enclosing suite name when `px-suite` runs the test, or empty otherwise. |
 | `PX_SUITE_FILE` | The absolute path to that suite file, or empty otherwise. |
 | `PX_TEST_ID` | The test identifier within the suite, or empty otherwise. |
 
@@ -342,14 +342,15 @@ readable state.
 
 ## Reaching the cluster
 
-A driver interacts with the cluster exclusively by invoking three substrate contract functions
-against `client` role instances: `sb_exec`, `sb_copy_in`, and `sb_copy_out` (`sb_load` only binds
-the backend implementation locally without contacting the cluster). To ensure portability across
-all supported substrates, a driver must never invoke any other `sb_*` function or reference
-container runtimes or Kubernetes CLI tools directly. The harness self-test statically scans both
-`drivers/` and all plug-in drivers for forbidden `sb_*` calls and tool names, while a runtime trap
-in `lib/common.sh` intercepts any unauthorized substrate call and terminates the process with exit
-2.
+A driver interacts with the cluster exclusively through three substrate contract functions invoked
+against `client` instances: `sb_exec`, `sb_copy_in`, and `sb_copy_out` (`sb_load` binds the backend
+locally without contacting the cluster). Because a driver never invokes any other `sb_*` function
+and never references a container runtime or Kubernetes tool, it executes without modification across
+both backends. On Kubernetes, file copy operations require a running pod because `kubectl cp`
+executes `tar` inside the container; accordingly, the `client` Pod remains running for the entire
+lifetime of the cluster. The harness self-test statically scans `drivers/` and all plug-in drivers
+for any other `sb_*` call or prohibited tool name, while the runtime trap in `lib/common.sh`
+intercepts any unauthorized call and terminates the process with exit 2.
 
 All client workloads execute inside the `client` instance at index 0, which is guaranteed to exist
 in every deployment topology. Within the container image, the Phoenix client JARs and the one bson

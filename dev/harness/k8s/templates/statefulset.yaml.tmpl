@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Defines the StatefulSet for a single cluster role. Because the update strategy is set to
+# OnDelete, re-rendering the manifest never automatically replaces running pods. Persistent volume
+# claims are retained when the StatefulSet is deleted, but are deleted when a scale-down removes
+# their corresponding ordinal.
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${PX_M_ROLE}
+  namespace: ${PX_M_NAMESPACE}
+  labels:
+${PX_M_LABELS}
+spec:
+  serviceName: ${PX_M_ROLE}
+  replicas: ${PX_M_REPLICAS}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+  selector:
+    matchLabels:
+${PX_M_SELECTOR}
+  template:
+    metadata:
+      labels:
+${PX_M_POD_LABELS}
+    spec:
+${PX_M_POD_SPEC}
+  volumeClaimTemplates:
+${PX_M_CLAIMS}

@@ -25,7 +25,7 @@
 #
 # A round appends its own group. The harness-generic names come first, then
 # the topology, image, version and build names of the deployment generator.
-# The Kubernetes names arrive with the second backend.
+# The Kubernetes names come last.
 
 # --- Layout -----------------------------------------------------------------
 PX_HOME                  # the dev/harness directory, resolved from lib/common.sh
@@ -237,3 +237,12 @@ PX_PHERF_ZOOKEEPER       # the ZooKeeper quorum of an external target, only from
 PX_PHERF_AGENT_COUNT     # the agents of the tier, 1 to 9; 1 to 2 in the validation class
 PX_PHERF_CONTROLLER_MEM_MIB # the container limit of the controller
 PX_PHERF_AGENT_MEM_MIB   # the container limit of each agent
+
+# --- The Kubernetes backend (lib/backend/k8s.sh, k8s/) ----------------------
+PX_KUBECTL_BIN  private  # the kubectl binary of the Kubernetes backend, set in env/local.env
+PX_K8S_CONTEXT           # the kubeconfig context of the target cluster, no default
+PX_K8S_STORAGE_CLASS     # the StorageClass of every claim, no default
+PX_K8S_VOLUME_GIB        # the size of the claim of each stateful role, GiB
+PX_K8S_CPU_MILLI_PER_GIB # the CPU of a container in millicores per GiB of its memory limit
+PX_K8S_MAX_PAUSE_S       # the longest JVM pause, seconds, that the liveness probe tolerates
+PX_K8S_CLUSTER_DOMAIN    # the DNS domain of the cluster, default cluster.local

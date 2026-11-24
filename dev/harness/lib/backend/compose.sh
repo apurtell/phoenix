@@ -62,19 +62,7 @@ PX_COMPOSE_ENGINE_FLOOR_MAJOR=20
 PX_COMPOSE_ENGINE_FLOOR_MINOR=10
 PX_COMPOSE_FLOOR_MAJOR=2
 
-# Default command template for the region mover utility, parameterized by five placeholders that
-# this module substitutes at runtime: {operation}, {host}, {port}, {timeout}, and {file}. Here,
-# {host} resolves to the container hostname, and {port} resolves to the instance's rpc port from the
-# port map, which the RegionServer advertises in its server name. Setting PX_REGION_MOVER_CMD
-# overrides this default command line. Whether a role supports drain semantics is governed by the
-# role's drain label rather than by this template value.
-PX_COMPOSE_MOVER='hbase org.apache.hadoop.hbase.util.RegionMover'
-PX_COMPOSE_MOVER="$PX_COMPOSE_MOVER --regionserverhost {host}:{port}"
-PX_COMPOSE_MOVER="$PX_COMPOSE_MOVER --operation {operation}"
-PX_COMPOSE_MOVER="$PX_COMPOSE_MOVER --timeout {timeout}"
-PX_COMPOSE_MOVER="$PX_COMPOSE_MOVER --filename {file}"
-
-## @description  Report the backend identifier recorded in the bundle manifest.
+## @description  Report the backend name recorded in the bundle manifest.
 ## @return       Write compose to stdout and exit 0.
 sb_backend_id() { printf 'compose\n'; }
 
@@ -208,93 +196,13 @@ px_compose_project() {
 # ---------------------------------------------------------------------------
 # 3. Configuration Values, Timeouts, and Dry-Run Execution
 # ---------------------------------------------------------------------------
-# Every blocking operation in this backend enforces a finite timeout. Operations that accept an
-# explicit timeout argument use it directly, while operations without a contract-level timeout
-# parameter draw from the corresponding PX_TIMEOUT_* environment variable. The hardcoded fallback
-# durations at each call site mirror docker/env/defaults.env so that callers binding the backend
-# without the configuration loader still observe identical timeout behavior.
-
-# Resolve a positive integer duration in whole seconds above zero from the configuration variable
-# NAME, falling back to FALLBACK when NAME is unset, empty, non-numeric, or not greater than zero.
-## @description  Report the whole seconds above zero held by variable NAME, or FALLBACK otherwise.
-## @return       Write the resolved seconds or FALLBACK to stdout and exit 0.
-px_compose_seconds() {
-  local value=${!1:-}
-  case "$value" in
-  '' | *[!0-9]*) value=$2 ;;
-  *) [ "$((10#$value))" -gt 0 ] || value=$2 ;;
-  esac
-  printf '%s\n' "$value"
-}
-
-# Validate and resolve an optional timeout argument (ARGUMENT NAME FALLBACK). When ARGUMENT is
-# empty, the timeout defaults to the value of variable NAME or to FALLBACK if NAME is unset.
-## @description  Validate a timeout argument or resolve its default from variable NAME or FALLBACK.
-## @return       Write the timeout in seconds to stdout and exit 0, or exit 2 when the argument is
-##               not a whole number of seconds above 0.
-px_compose_timeout_arg() {
-  local given=${1:-} name=${2:-} fallback=${3:-}
-  if [ -z "$given" ]; then
-    px_compose_seconds "$name" "$fallback"
-    return 0
-  fi
-  if ! [[ $given =~ $PX_RE_INT ]] || [ "$((10#$given))" -lt 1 ]; then
-    px_error "a timeout must be a whole number of seconds above zero, got '$given'"
-    return "$SB_EXIT_USAGE"
-  fi
-  printf '%s\n' "$given"
-}
-
-## @description  Test whether a px_timeout exit status represents a timeout expiry, including a
-##               SIGKILL termination after the grace period.
-## @return       Exit 0 when the wait expired, or exit 1 otherwise.
-px_compose_expired() {
-  case "${1:-}" in
-  "$SB_EXEC_TIMEOUT" | 137) return 0 ;;
-  esac
-  return 1
-}
-
-# Map and log the exit STATUS of a timed Compose invocation given STATUS, TIMEOUT_S, an operation
-# description WHAT, and a failure MESSAGE.
-## @description  Translate and log the outcome of a timed Compose call (STATUS TIMEOUT_S WHAT MSG).
-## @return       Exit 0 when STATUS is 0, exit 4 on timeout expiry (logging that WHAT expired), or
-##               exit 1 otherwise (logging MESSAGE).
-px_compose_outcome() {
-  if px_compose_expired "$1"; then
-    px_error "$3 expired after ${2}s"
-    return "$SB_EXIT_TIMEOUT"
-  fi
-  [ "$1" != 0 ] || return 0
-  px_error "$4"
-  return "$SB_EXIT_FAIL"
-}
-
-## @description  Verify that boolean argument NAME of FUNCTION holds 0 or 1 (FUNCTION NAME VALUE).
-## @return       Exit 0 when VALUE is 0 or 1, or log an error message and exit 2 otherwise.
-px_compose_flag() {
-  case "${3:-}" in
-  0 | 1) return 0 ;;
-  esac
-  px_error "$1 needs $2 of 0 or 1, got '${3:-}'"
-  return "$SB_EXIT_USAGE"
-}
-
-## @description  Test whether dry-run mode intercepts a state change and log the skipped WORDS.
-## @return       Exit 0 when dry-run mode prevents the action from running, or exit 1 otherwise.
-px_compose_dry_run() {
-  px_is_dry_run || return 1
-  px_info "dry run: $* not performed"
-  return 0
-}
-
-## @description  Report the label namespace prefix that scopes every harness-managed object.
-## @return       Write the label prefix to stdout and exit 0.
-px_compose_label_prefix() { printf '%s\n' "${PX_LABEL_PREFIX:-px.harness}"; }
-
-## @description  Report the project name prefix used to construct scope identifiers.
-## @return       Write the project prefix to stdout and exit 0.
-px_compose_project_prefix() { printf '%s\n' "${PX_PROJECT_PREFIX:-px}"; }
+# Every blocking wait enforces a finite timeout. Operations that accept an explicit timeout argument
+# use it directly, while operations without a contract-level timeout parameter fall back to the
+# corresponding PX_TIMEOUT_* configuration variable. The fallback durations in seconds at each call
+# site match docker/env/defaults.env so that callers binding the backend without the configuration
+# loader observe identical wait durations. The helper functions that resolve timeouts, boolean
+# flags, and dry-run mode are shared in lib/backend/contract.sh so that both backends apply uniform
+# validation rules.
 
 # ---------------------------------------------------------------------------
 # 4. Scope Management: Project Names, Labels, and Persistent State Records
@@ -318,84 +226,12 @@ PX_COMPOSE_FILE=""
 PX_COMPOSE_DEPLOY_DIR=""
 PX_COMPOSE_NETWORK=""
 
-## @description  Resolve and create the persistent state directory for this backend.
-## @return       Write the directory path to stdout and exit 0, exit 2 when the output policy
-##               refuses the directory, or exit 1 when it cannot be created.
-px_compose_state_dir() {
-  local dir
-  dir="$(px_state_dir)" || return $?
-  mkdir -p "$dir/compose" ||
-    px_die "$SB_EXIT_FAIL" "cannot create the backend state directory in $dir"
-  printf '%s/compose\n' "$dir"
-}
-
-## @description  Report the filesystem path of the persistent state record for SCOPE.
-## @return       Write the record path to stdout and exit 0, exit 2 when the output policy refuses
-##               the state directory, or exit 1 when the directory cannot be created.
-px_compose_record_path() {
-  local dir
-  dir="$(px_compose_state_dir)" || return $?
-  printf '%s/scope-%s.tsv\n' "$dir" "${1:-}"
-}
-
-## @description  Read the value associated with KEY in the persistent state record of SCOPE.
-## @return       Write the value to stdout and exit 0, or exit 6 when the record or key is absent.
-px_compose_record_get() {
-  local path
-  path="$(px_compose_record_path "${1:-}")" || return "$SB_EXIT_NO_OBJECT"
-  [ -f "$path" ] || return "$SB_EXIT_NO_OBJECT"
-  sb_row_get "${2:-}" "$(cat "$path")"
-}
-
-## @description  Write or replace KEY with a single entry of VALUE in the state record of SCOPE.
-## @return       Exit 0 on success, or exit 1 when the state record cannot be written.
-px_compose_record_set() {
-  local scope=${1:-} key=${2:-} value=${3:-} path tmp row status=0
-  path="$(px_compose_record_path "$scope")" || return "$SB_EXIT_FAIL"
-  tmp="$path.$$"
-  : >"$tmp" || {
-    px_error "cannot write the scope record $path"
-    return "$SB_EXIT_FAIL"
-  }
-  if [ -f "$path" ]; then
-    while IFS= read -r row; do
-      case "$row" in
-      "$key$PX_TAB"* | '') continue ;;
-      esac
-      printf '%s\n' "$row" >>"$tmp"
-    done <"$path"
-  fi
-  px_tsv_row "$key" "$value" >>"$tmp" || status=$?
-  if [ "$status" != 0 ]; then
-    rm -f "$tmp"
-    return "$SB_EXIT_FAIL"
-  fi
-  mv -f "$tmp" "$path" || {
-    rm -f "$tmp"
-    px_error "cannot replace the scope record $path"
-    return "$SB_EXIT_FAIL"
-  }
-}
-
-## @description  Remove the persistent state record and start table for SCOPE.
-## @return       Exit 0.
-px_compose_record_delete() {
-  local path
-  if path="$(px_compose_record_path "${1:-}")"; then
-    rm -f "$path" "${path%/scope-*}/starts-${1:-}.tsv"
-  fi
-  return 0
-}
-
-# Populate the PX_COMPOSE_* scoping globals for SCOPE. Because the scope identifier itself encodes
-# the Compose project name and cluster identifier, both values resolve even before a state record is
-# written to disk.
-## @description  Load the PX_COMPOSE_* scoping variables for SCOPE from its ID and state record.
-## @return       Exit 0 on success, or exit 2 when the scope ID is empty or does not belong to this
+## @description  Load the PX_COMPOSE_* values of SCOPE; the ID alone names the project and cluster.
+## @return       Exit 0 on success, or exit 2 when the ID is empty or does not belong to this
 ##               backend.
 px_compose_scope_load() {
   local scope=${1:-} prefix
-  prefix="$(px_compose_project_prefix)"
+  prefix="$(sb_project_prefix)"
   if [ -z "$scope" ]; then
     px_error "a scope id is required"
     return "$SB_EXIT_USAGE"
@@ -413,12 +249,12 @@ px_compose_scope_load() {
   PX_COMPOSE_SCOPE="$scope"
   PX_COMPOSE_PROJECT="$scope"
   PX_COMPOSE_CLUSTER="${scope#"$prefix"-}"
-  # A scope without a persisted record is a normal pre-provisioning state, so missing-record
-  # lookups must be absorbed inside the command substitution via `|| true` to avoid triggering any
-  # ERR trap armed by the caller.
-  PX_COMPOSE_DEPLOY_DIR="$(px_compose_record_get "$scope" deployment_dir || true)"
-  PX_COMPOSE_FILE="$(px_compose_record_get "$scope" compose_file || true)"
-  PX_COMPOSE_NETWORK="$(px_compose_record_get "$scope" network || true)"
+  # A scope without a persisted record is a normal pre-provisioning state, so an absent lookup
+  # result must be absorbed inside the command substitution. The inline || guard prevents that
+  # expected non-zero status from triggering a failure trap armed by the caller.
+  PX_COMPOSE_DEPLOY_DIR="$(sb_record_get compose "$scope" deployment_dir || true)"
+  PX_COMPOSE_FILE="$(sb_record_get compose "$scope" compose_file || true)"
+  PX_COMPOSE_NETWORK="$(sb_record_get compose "$scope" network || true)"
   if [ -z "$PX_COMPOSE_NETWORK" ]; then
     PX_COMPOSE_NETWORK="${scope}_default"
   fi
@@ -431,7 +267,7 @@ px_compose_scope_load() {
 px_compose_selector() {
   local prefix
   px_compose_scope_load "${1:-}" || return $?
-  prefix="$(px_compose_label_prefix)"
+  prefix="$(sb_label_prefix)"
   printf '%s.cluster=%s\n' "$prefix" "$PX_COMPOSE_CLUSTER"
 }
 
@@ -440,7 +276,7 @@ px_compose_selector() {
 ##               container runtime cannot be reached.
 px_compose_host_clusters() {
   local prefix out
-  prefix="$(px_compose_label_prefix)"
+  prefix="$(sb_label_prefix)"
   out="$(px_compose_engine 30 ps -a --filter "label=$prefix.cluster" \
     --format "{{.Label \"$prefix.cluster\"}}|{{.Label \"com.docker.compose.project\"}}")" ||
     return "$SB_EXIT_FAIL"
@@ -451,24 +287,11 @@ px_compose_host_clusters() {
     LC_ALL=C sort -u
 }
 
-## @description  List all scope IDs that currently have a state record in the backend directory.
-## @return       Write one scope ID per line to stdout and exit 0, or exit 1 when the state
-##               directory is refused.
-px_compose_recorded_scopes() {
-  local dir path name
-  dir="$(px_compose_state_dir)" || return "$SB_EXIT_FAIL"
-  for path in "$dir"/scope-*.tsv; do
-    [ -f "$path" ] || continue
-    name="${path##*/scope-}"
-    printf '%s\n' "${name%.tsv}"
-  done
-}
-
-## @description  Enforce the host gate against any harness container or scope record, then record
-##               SCOPE.
-## @return       Exit 0 when the record is written, or 1 when the gate refuses or a step fails.
+## @description  Refuse admission if any harness container exists on the host or another scope
+##               record is present, then record SCOPE with its project and network.
+## @return       Exit 0 when the record is written, or exit 1 if the gate refuses or a step fails.
 px_compose_scope_gate() {
-  local scope=${1:-} present others="" name path now status=0
+  local scope=${1:-} present status=0
   present="$(px_compose_host_clusters)" || status=$?
   if [ "$status" != 0 ]; then
     px_error "the container runtime did not answer, so the host gate cannot run"
@@ -479,31 +302,10 @@ px_compose_scope_gate() {
       "Tear it down first, because the harness runs one cluster per host."
     return "$SB_EXIT_FAIL"
   fi
-  if ! px_is_true "${PX_FORCE:-0}"; then
-    while IFS= read -r name; do
-      [ -n "$name" ] && [ "$name" != "$scope" ] || continue
-      others="$others $name"
-    done <<EOF
-$(px_compose_recorded_scopes)
-EOF
-    if [ -n "$others" ]; then
-      px_error "another scope is recorded on this host:$others. Tear it down first," \
-        "or set PX_FORCE=1 when the record is stale."
-      return "$SB_EXIT_FAIL"
-    fi
-  fi
-  path="$(px_compose_record_path "$scope")" || return "$SB_EXIT_FAIL"
-  if [ -f "$path" ] && ! px_is_true "${PX_FORCE:-0}"; then
-    px_error "scope $scope already exists in $path." \
-      "Run a teardown, or set PX_FORCE=1 to replace the record."
-    return "$SB_EXIT_FAIL"
-  fi
-  rm -f "$path"
-  now="$(px_timestamp)"
-  px_compose_record_set "$scope" cluster "$PX_COMPOSE_CLUSTER" || return "$SB_EXIT_FAIL"
-  px_compose_record_set "$scope" project "$PX_COMPOSE_PROJECT" || return "$SB_EXIT_FAIL"
-  px_compose_record_set "$scope" network "$PX_COMPOSE_NETWORK" || return "$SB_EXIT_FAIL"
-  px_compose_record_set "$scope" created_at "$now" || return "$SB_EXIT_FAIL"
+  sb_record_gate compose "$scope" || return "$SB_EXIT_FAIL"
+  sb_record_set compose "$scope" cluster "$PX_COMPOSE_CLUSTER" || return "$SB_EXIT_FAIL"
+  sb_record_set compose "$scope" project "$PX_COMPOSE_PROJECT" || return "$SB_EXIT_FAIL"
+  sb_record_set compose "$scope" network "$PX_COMPOSE_NETWORK" || return "$SB_EXIT_FAIL"
 }
 
 # Create the scope envelope for a cluster deployment—consisting of a Compose project name, a
@@ -514,7 +316,7 @@ EOF
 ## @return       Write the scope ID to stdout and exit 0, exit 1 if the gate refuses, the runtime
 ##               does not respond, or the record cannot be written, or exit 2 on invalid usage.
 sb_scope_create() {
-  local cluster=${1:-${PX_CLUSTER_ID:-}} prefix scope dir status=0
+  local cluster=${1:-${PX_CLUSTER_ID:-}} prefix scope
   if [ -z "$cluster" ]; then
     px_error "sb_scope_create needs a cluster id"
     return "$SB_EXIT_USAGE"
@@ -524,20 +326,14 @@ sb_scope_create() {
       "lower-case letters, digits, - and _ only: '$cluster'"
     return "$SB_EXIT_USAGE"
   fi
-  prefix="$(px_compose_project_prefix)"
+  prefix="$(sb_project_prefix)"
   scope="$prefix-$cluster"
   px_compose_scope_load "$scope" || return $?
-  if px_compose_dry_run "create the scope $scope"; then
+  if sb_dry_run "create the scope $scope"; then
     printf '%s\n' "$scope"
     return 0
   fi
-  dir="$(px_compose_state_dir)" || return "$SB_EXIT_FAIL"
-  px_lock "$dir/host.lock" 30 || return "$SB_EXIT_FAIL"
-  px_compose_scope_gate "$scope" || status=$?
-  px_unlock "$dir/host.lock"
-  if [ "$status" != 0 ]; then
-    return "$status"
-  fi
+  sb_scope_gated compose px_compose_scope_gate "$scope" || return $?
   px_config_set PX_SCOPE_ID "$scope" backend
   printf '%s\n' "$scope"
 }
@@ -553,7 +349,7 @@ sb_scope_exists() {
   if [ "$status" = 0 ] && [ -n "$rows" ]; then
     return 0
   fi
-  path="$(px_compose_record_path "$scope")" || return "$SB_EXIT_FAIL"
+  path="$(sb_record_path compose scope "$scope")" || return "$SB_EXIT_FAIL"
   if [ -f "$path" ]; then
     px_debug "scope $scope has a record but no instance"
     return 0
@@ -570,10 +366,10 @@ sb_scope_exists() {
 sb_scope_delete() {
   local scope=${1:-} timeout failed=0 name out
   px_compose_scope_load "$scope" || return $?
-  if px_compose_dry_run "delete the scope $scope"; then
+  if sb_dry_run "delete the scope $scope"; then
     return 0
   fi
-  timeout="$(px_compose_seconds PX_TIMEOUT_TEARDOWN 300)"
+  timeout="$(sb_seconds PX_TIMEOUT_TEARDOWN 300)"
   out="$(px_compose_engine "$timeout" network ls --format '{{.Name}}' \
     --filter "name=^${PX_COMPOSE_NETWORK}$")" || {
     px_error "the container runtime did not list the networks of $scope"
@@ -604,7 +400,7 @@ sb_scope_delete() {
 $out
 EOF
   fi
-  px_compose_record_delete "$scope"
+  sb_record_drop compose "$scope" scope starts
   PX_COMPOSE_SCOPE=""
   [ "$failed" = 0 ] || return "$SB_EXIT_FAIL"
 }
@@ -659,7 +455,7 @@ PX_COMPOSE_INDEX=""
 ## @return       Write the Go template format string to stdout and exit 0.
 px_compose_ps_format() {
   local prefix fmt
-  prefix="$(px_compose_label_prefix)"
+  prefix="$(sb_label_prefix)"
   fmt="{{.ID}}|{{.Label \"$prefix.role\"}}|{{.Names}}|{{.State}}|{{.Status}}"
   fmt="$fmt|{{.Image}}|{{.Label \"com.docker.compose.service\"}}"
   fmt="$fmt|{{.Label \"com.docker.compose.container-number\"}}"
@@ -773,22 +569,9 @@ px_compose_ps_split() {
   return 0
 }
 
-## @description  Test whether ROLE appears in the space-separated word list SELECTION.
-## @return       Exit 0 when ROLE is selected or SELECTION is empty, or exit 1 otherwise.
-px_compose_role_selected() {
-  local role=${1:-} selection=${2:-} word
-  [ -n "$selection" ] || return 0
-  for word in $selection; do
-    if [ "$word" = "$role" ]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-## @description  Load the inventory attributes of instance (SCOPE ROLE INDEX) into PX_PS_*.
+## @description  Load the instance identified by SCOPE, ROLE, and INDEX into the PX_PS_* variables.
 ## @return       Exit 0 when found, exit 6 when the instance is absent, exit 2 on invalid usage, or
-##               exit 1 when the container runtime does not respond.
+##               exit 1 when the runtime does not respond.
 px_compose_instance() {
   local scope=${1:-} role=${2:-} index=${3:-} rows line
   if [ -z "$role" ] || ! [[ $index =~ $PX_RE_INT ]]; then
@@ -895,33 +678,6 @@ px_compose_compose_version() {
   printf '%s\n' "${value#v}"
 }
 
-## @description  Compare VERSION numerically against FLOOR_MAJOR and FLOOR_MINOR.
-## @return       Exit 0 when VERSION meets or exceeds the floor, exit 1 when it is lower, or exit 2
-##               when VERSION contains no numeric major component.
-px_compose_version_at_least() {
-  local version=${1:-} major_floor=${2:-0} minor_floor=${3:-0} major minor
-  version="${version#v}"
-  major="${version%%.*}"
-  minor="${version#*.}"
-  minor="${minor%%.*}"
-  case "$major" in
-  '' | *[!0-9]*) return "$SB_EXIT_USAGE" ;;
-  esac
-  case "$minor" in
-  '' | *[!0-9]*) minor=0 ;;
-  esac
-  if [ "$((10#$major))" -gt "$major_floor" ]; then
-    return 0
-  fi
-  if [ "$((10#$major))" -lt "$major_floor" ]; then
-    return 1
-  fi
-  if [ "$((10#$minor))" -ge "$minor_floor" ]; then
-    return 0
-  fi
-  return 1
-}
-
 _PXC_PORTS_FROM=""
 
 ## @description  Load the ports.generated.env file recorded for SCOPE once per deployment directory.
@@ -1010,7 +766,7 @@ sb_preflight() {
   server="$(printf '%s\n' "$server" | sed -n '$p')"
   floor="$PX_COMPOSE_ENGINE_FLOOR_MAJOR.$PX_COMPOSE_ENGINE_FLOOR_MINOR"
   px_tsv_row engine_responsive ok "server $server"
-  if px_compose_version_at_least "$server" \
+  if sb_version_at_least "$server" \
     "$PX_COMPOSE_ENGINE_FLOOR_MAJOR" "$PX_COMPOSE_ENGINE_FLOOR_MINOR"; then
     px_tsv_row engine_version ok "$server"
   else
@@ -1025,7 +781,7 @@ sb_preflight() {
   fi
   compose="$(px_compose_compose_version)" || compose=""
   if [ -n "$compose" ] &&
-    px_compose_version_at_least "$compose" "$PX_COMPOSE_FLOOR_MAJOR" 0; then
+    sb_version_at_least "$compose" "$PX_COMPOSE_FLOOR_MAJOR" 0; then
     px_tsv_row compose_version ok "$compose"
   else
     px_tsv_row compose_version fail \
@@ -1092,7 +848,7 @@ EOF
 ## @return       Write the space-padded group names to stdout and exit 0, even without a record.
 px_compose_stopped_groups() {
   local groups
-  groups="$(px_compose_record_get "${1:-}" stopped_groups || true)"
+  groups="$(sb_record_get compose "${1:-}" stopped_groups || true)"
   printf ' %s \n' "$groups"
 }
 
@@ -1107,7 +863,7 @@ px_compose_stopped_mark() {
   if [ "$action" = add ]; then
     out="$out $group"
   fi
-  px_compose_record_set "$scope" stopped_groups "${out# }"
+  sb_record_set compose "$scope" stopped_groups "${out# }"
 }
 
 ## @description  Report the active role groups that participate in a whole-scope readiness wait
@@ -1156,7 +912,7 @@ px_compose_parked() {
 ##               listed in SELECTION.
 ## @return       Exit 0 when the selection matches, or log an error message and exit 6 otherwise.
 px_compose_selection_found() {
-  local scope=${1:-} selection=${2:-} rows=${3:-} roles=" " line word missing=""
+  local scope=${1:-} selection=${2:-} rows=${3:-} roles=" " line
   while IFS= read -r line; do
     px_compose_ps_split "$line" || continue
     roles="$roles$PX_PS_ROLE "
@@ -1167,17 +923,7 @@ EOF
     px_error "scope $scope holds no instance that carries its cluster label"
     return "$SB_EXIT_NO_OBJECT"
   fi
-  for word in $selection; do
-    case "$roles" in
-    *" $word "*) ;;
-    *) missing="$missing $word" ;;
-    esac
-  done
-  if [ -n "$missing" ]; then
-    px_error "no instance in scope $scope has the role:$missing"
-    return "$SB_EXIT_NO_OBJECT"
-  fi
-  return 0
+  sb_selection_check "$scope" "$roles" "$selection"
 }
 
 ## @description  Wait for targeted instances to become ready, skipping groups stopped on purpose.
@@ -1197,10 +943,9 @@ sb_wait_ready() {
   shift || true
   shift || true
   roles="$*"
-  timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_READY 600)" || return $?
+  timeout="$(sb_timeout_arg "$timeout" PX_TIMEOUT_READY 600)" || return $?
   px_compose_scope_load "$scope" || return $?
-  interval=${PX_POLL_INTERVAL_S:-2}
-  [[ $interval =~ $PX_RE_SECONDS ]] || interval=2
+  interval="$(sb_poll_interval)"
   start="$(px_epoch_ms)"
   deadline=$(($(px_epoch_s) + timeout))
   while :; do
@@ -1216,7 +961,7 @@ sb_wait_ready() {
     pending=0
     while IFS= read -r line; do
       px_compose_ps_split "$line" || continue
-      px_compose_role_selected "$PX_PS_ROLE" "$roles" || continue
+      sb_role_selected "$PX_PS_ROLE" "$roles" || continue
       px_compose_parked "$roles" "$up" && continue
       key="$PX_PS_ROLE/$PX_PS_INDEX"
       if sb_row_get "$key" "$seen" >/dev/null; then
@@ -1253,7 +998,7 @@ EOF
   elapsed=$(($(px_epoch_ms) - start))
   while IFS= read -r line; do
     px_compose_ps_split "$line" || continue
-    px_compose_role_selected "$PX_PS_ROLE" "$roles" || continue
+    sb_role_selected "$PX_PS_ROLE" "$roles" || continue
     key="$PX_PS_ROLE/$PX_PS_INDEX"
     if out_elapsed="$(sb_row_get "$key" "$seen" || exit "$?")"; then
       out="$out$(px_tsv_row "$PX_PS_ROLE" "$PX_PS_INDEX" ready "$out_elapsed")$PX_NL"
@@ -1294,7 +1039,7 @@ sb_provision() {
     px_error "sb_provision needs a scope and a rendered deployment directory"
     return "$SB_EXIT_USAGE"
   fi
-  timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_PROVISION 900)" || return $?
+  timeout="$(sb_timeout_arg "$timeout" PX_TIMEOUT_PROVISION 900)" || return $?
   px_compose_scope_load "$scope" || return $?
   dir="$(px_realpath "$dir")" || dir=""
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then
@@ -1306,17 +1051,17 @@ sb_provision() {
     px_error "deployment directory $dir holds no compose.yaml"
     return "$SB_EXIT_USAGE"
   fi
-  px_compose_record_set "$scope" deployment_dir "$dir" || return "$SB_EXIT_FAIL"
-  px_compose_record_set "$scope" compose_file "$file" || return "$SB_EXIT_FAIL"
+  sb_record_set compose "$scope" deployment_dir "$dir" || return "$SB_EXIT_FAIL"
+  sb_record_set compose "$scope" compose_file "$file" || return "$SB_EXIT_FAIL"
   PX_COMPOSE_DEPLOY_DIR="$dir"
   PX_COMPOSE_FILE="$file"
   px_config_set PX_DEPLOYMENT_DIR "$dir" backend
   px_compose_ports_load "$scope" || return $?
-  if px_compose_dry_run "provision $scope from $file"; then
+  if sb_dry_run "provision $scope from $file"; then
     return 0
   fi
   px_compose_project "$scope" "$timeout" up --no-start --no-build >&2 || status=$?
-  px_compose_outcome "$status" "$timeout" "provision of $scope" \
+  sb_outcome "$status" "$timeout" "provision of $scope" \
     "compose could not create the instances of $scope" || return $?
   rows="$(px_compose_ps "$scope")" || return "$SB_EXIT_FAIL"
   if [ -z "$rows" ]; then
@@ -1340,7 +1085,7 @@ EOF
     px_compose_project "$scope" "$timeout" up -d --no-recreate --no-build "$@" >&2 ||
       status=$?
   fi
-  px_compose_outcome "$status" "$timeout" "provision of $scope" \
+  sb_outcome "$status" "$timeout" "provision of $scope" \
     "compose could not start the instances of $scope" || return $?
   rows="$(sb_list "$scope")" || return "$SB_EXIT_FAIL"
   printf '%s\n' "$rows"
@@ -1366,13 +1111,13 @@ EOF
 ##               the teardown wait expires, or exit 2 on invalid usage.
 sb_teardown() {
   local scope=${1:-} keep=${2:-} timeout grace rows volumes status=0
-  px_compose_flag sb_teardown keep_data "$keep" || return $?
+  sb_flag sb_teardown keep_data "$keep" || return $?
   px_compose_scope_load "$scope" || return $?
-  if px_compose_dry_run "tear down $scope with keep_data=$keep"; then
+  if sb_dry_run "tear down $scope with keep_data=$keep"; then
     return 0
   fi
-  timeout="$(px_compose_seconds PX_TIMEOUT_TEARDOWN 300)"
-  grace="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  timeout="$(sb_seconds PX_TIMEOUT_TEARDOWN 300)"
+  grace="$(sb_seconds PX_TIMEOUT_STOP 120)"
   if [ "$keep" = 0 ]; then
     px_compose_project "$scope" "$timeout" down --volumes --remove-orphans \
       --timeout "$grace" >&2 || status=$?
@@ -1380,7 +1125,7 @@ sb_teardown() {
     px_compose_project "$scope" "$timeout" down --remove-orphans \
       --timeout "$grace" >&2 || status=$?
   fi
-  if px_compose_expired "$status"; then
+  if sb_expired "$status"; then
     px_error "teardown of $scope expired after ${timeout}s"
     return "$SB_EXIT_FAIL"
   fi
@@ -1428,7 +1173,7 @@ sb_scale() {
     return "$SB_EXIT_USAGE"
     ;;
   esac
-  timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_SCALE 600)" || return $?
+  timeout="$(sb_timeout_arg "$timeout" PX_TIMEOUT_SCALE 600)" || return $?
   px_compose_scope_load "$scope" || return $?
   file="$PX_COMPOSE_DEPLOY_DIR/services.tsv"
   # The rendered service table enumerates each instance with columns for service, role, index,
@@ -1466,17 +1211,17 @@ EOF
   done <<EOF
 $wanted
 EOF
-  if px_compose_dry_run "scale $role to $count in $scope"; then
+  if sb_dry_run "scale $role to $count in $scope"; then
     return 0
   fi
   # Reload the generated port map from the updated render so that port bindings for newly added
   # instances are available in the environment.
   px_config_load_ports "$PX_COMPOSE_DEPLOY_DIR"
   _PXC_PORTS_FROM="$PX_COMPOSE_DEPLOY_DIR|${PX_PORT_MAP_ENV:-}"
-  # Because scaled-down instances are absent from the updated render, stop and remove them directly
-  # by container ID along with any project volumes they mount; leaving mounted project volumes
-  # behind would cause the teardown verification check to fail.
-  grace="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  # Because scaled-down instances are absent from the updated render, the runtime removes each
+  # instance directly by its container ID along with any project volumes it mounts; leaving a
+  # volume behind would cause the teardown verification check to fail.
+  grace="$(sb_seconds PX_TIMEOUT_STOP 120)"
   for line in $remove; do
     volumes="$(px_compose_engine 60 inspect --format \
       '{{range .Mounts}}{{.Name}} {{end}}' "$line")" || volumes=""
@@ -1504,7 +1249,7 @@ EOF
       px_compose_project "$scope" "$timeout" up -d --no-recreate --no-build --no-deps \
         "${add[@]}" >&2 || status=$?
     fi
-    px_compose_outcome "$status" "$timeout" "scale of $role" \
+    sb_outcome "$status" "$timeout" "scale of $role" \
       "compose could not scale $role to $count" || return $?
     if [ "$start" != on-demand ] || [ "$running" = 1 ]; then
       sb_wait_ready "$scope" "$timeout" "$role" >/dev/null || status=$?
@@ -1541,20 +1286,10 @@ EOF
 ## @return       Return the command exit status, 124 on timeout expiry, 125 on start or substrate
 ##               failure, 126 if not executable, 127 if not found, 2 on usage, or 6 if absent.
 sb_exec() {
-  local scope=${1:-} role=${2:-} index=${3:-} timeout=${4:-} separator
-  local service number status=0
-  if [ $# -lt 6 ]; then
-    px_error "sb_exec needs a scope, a role, an index, a timeout, -- and a command"
-    return "$SB_EXIT_USAGE"
-  fi
-  shift 4
-  separator=$1
-  shift
-  if [ "$separator" != "--" ]; then
-    px_error "sb_exec separates the command with --, got '$separator'"
-    return "$SB_EXIT_USAGE"
-  fi
-  timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_EXEC 600)" || return $?
+  local scope=${1:-} role=${2:-} index=${3:-} timeout=${4:-} service number status=0
+  sb_exec_args "$@" || return $?
+  shift 5
+  timeout="$(sb_timeout_arg "$timeout" PX_TIMEOUT_EXEC 600)" || return $?
   px_compose_instance "$scope" "$role" "$index" || status=$?
   case "$status" in
   0) ;;
@@ -1598,15 +1333,7 @@ sb_exec() {
 sb_logs() {
   local scope=${1:-} role=${2:-} index=${3:-} since=${4:--} previous=${5:-0}
   local follow=${6:-0} timeout status=0
-  px_compose_flag sb_logs previous "$previous" || return $?
-  px_compose_flag sb_logs follow "$follow" || return $?
-  case "$since" in
-  - | '') since="" ;;
-  *[!0-9]*)
-    px_error "sb_logs needs since in whole seconds or -, got '${4:-}'"
-    return "$SB_EXIT_USAGE"
-    ;;
-  esac
+  since="$(sb_logs_args "$since" "$previous" "$follow")" || return $?
   if [ "$previous" = 1 ]; then
     px_error "Compose keeps no previous container, so read sb_restart_count" \
       "and sb_termination_reason instead"
@@ -1619,7 +1346,7 @@ sb_logs() {
   # (`-`).
   timeout="-"
   if [ "$follow" = 0 ]; then
-    timeout="$(px_compose_seconds PX_TIMEOUT_DEFAULT 300)"
+    timeout="$(sb_seconds PX_TIMEOUT_DEFAULT 300)"
   fi
   if [ "$follow" = 1 ] && [ -n "$since" ]; then
     px_compose_call merged "$timeout" logs --follow --since "${since}s" "$PX_PS_ID" ||
@@ -1643,14 +1370,14 @@ sb_logs() {
 ##               fails.
 px_compose_cp() {
   local parent=${5:-}
-  if px_compose_dry_run "copy $2"; then
+  if sb_dry_run "copy $2"; then
     return 0
   fi
   if [ -n "$parent" ] && [ ! -d "$parent" ] && ! mkdir -p "$parent"; then
     px_error "cannot create the destination directory $parent"
     return "$SB_EXIT_FAIL"
   fi
-  if ! px_compose_project "$1" "$(px_compose_seconds PX_TIMEOUT_DEFAULT 300)" cp \
+  if ! px_compose_project "$1" "$(sb_seconds PX_TIMEOUT_DEFAULT 300)" cp \
     --index="$(px_compose_number)" "$3" "$4" >&2; then
     px_error "the copy of $2 failed"
     return "$SB_EXIT_FAIL"
@@ -1667,14 +1394,7 @@ px_compose_cp() {
 ##               exit 2 on invalid usage or a missing local_path, or exit 6 if no instance exists.
 sb_copy_in() {
   local scope=${1:-} role=${2:-} index=${3:-} source=${4:-} target=${5:-}
-  if [ -z "$source" ] || [ -z "$target" ]; then
-    px_error "sb_copy_in needs a scope, a role, an index, a local path and a remote path"
-    return "$SB_EXIT_USAGE"
-  fi
-  if [ ! -e "$source" ]; then
-    px_error "no such local path: $source"
-    return "$SB_EXIT_USAGE"
-  fi
+  source="$(sb_copy_args in "$source" "$target")" || return $?
   px_compose_instance "$scope" "$role" "$index" || return $?
   px_compose_cp "$scope" "$source into $role/$index at $target" "$source" \
     "${PX_PS_SERVICE:-$role}:$target"
@@ -1690,13 +1410,7 @@ sb_copy_in() {
 ##               exit 2 on invalid usage or a refused destination, or exit 6 if no instance exists.
 sb_copy_out() {
   local scope=${1:-} role=${2:-} index=${3:-} source=${4:-} target=${5:-} resolved
-  if [ -z "$source" ] || [ -z "$target" ]; then
-    px_error "sb_copy_out needs a scope, a role, an index, a remote path and a local path"
-    return "$SB_EXIT_USAGE"
-  fi
-  # px_out_resolve terminates the command-substitution subshell with the usage exit code (2) when
-  # the destination escapes the output root, propagating that status directly to the caller.
-  resolved="$(px_out_resolve "$target")" || return $?
+  resolved="$(sb_copy_args out "$source" "$target")" || return $?
   px_compose_instance "$scope" "$role" "$index" || return $?
   px_compose_cp "$scope" "$source out of $role/$index to $resolved" \
     "${PX_PS_SERVICE:-$role}:$source" "$resolved" "${resolved%/*}"
@@ -1723,7 +1437,7 @@ _PXC_GROUP_SERVICES=()
 ##               usage, or exit 1 when the runtime does not respond.
 px_compose_group_rows() {
   local scope=${1:-} group=${2:-} prefix
-  prefix="$(px_compose_label_prefix)"
+  prefix="$(sb_label_prefix)"
   px_compose_ps "$scope" --filter "label=$prefix.group=$group"
 }
 
@@ -1774,7 +1488,7 @@ EOF
 sb_group_stop() {
   local scope=${1:-} group=${2:-} timeout=${3:-} rows line grace before="" out=""
   local still=0 state status=0
-  timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_GROUP 600)" || return $?
+  timeout="$(sb_timeout_arg "$timeout" PX_TIMEOUT_GROUP 600)" || return $?
   px_compose_group_load sb_group_stop "$scope" "$group" || return $?
   rows="$(px_compose_group_rows "$scope" "$group")" || return "$SB_EXIT_FAIL"
   while IFS= read -r line; do
@@ -1783,14 +1497,14 @@ sb_group_stop() {
   done <<EOF
 $rows
 EOF
-  if px_compose_dry_run "stop the group $group in $scope"; then
+  if sb_dry_run "stop the group $group in $scope"; then
     return 0
   fi
-  grace="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  grace="$(sb_seconds PX_TIMEOUT_STOP 120)"
   px_compose_stopped_mark "$scope" "$group" add || return "$SB_EXIT_FAIL"
   px_compose_project "$scope" "$timeout" stop --timeout "$grace" \
     "${_PXC_GROUP_SERVICES[@]}" >&2 || status=$?
-  if px_compose_expired "$status"; then
+  if sb_expired "$status"; then
     px_error "the stop of group $group expired after ${timeout}s"
     return "$SB_EXIT_TIMEOUT"
   fi
@@ -1831,7 +1545,7 @@ EOF
 sb_group_start() {
   local scope=${1:-} group=${2:-} timeout=${3:-} roles status=0
   local -a names
-  timeout="$(px_compose_timeout_arg "$timeout" PX_TIMEOUT_GROUP 600)" || return $?
+  timeout="$(sb_timeout_arg "$timeout" PX_TIMEOUT_GROUP 600)" || return $?
   px_compose_group_load sb_group_start "$scope" "$group" || return $?
   # An empty resolved role list would widen sb_wait_ready to the entire scope, so treat a missing
   # role mapping as an explicit error rather than falling back to a scope-wide wait.
@@ -1840,12 +1554,12 @@ sb_group_start() {
     px_error "the group $group in scope $scope names no role to wait for"
     return "$SB_EXIT_FAIL"
   fi
-  if px_compose_dry_run "start the group $group in $scope"; then
+  if sb_dry_run "start the group $group in $scope"; then
     return 0
   fi
   px_compose_stopped_mark "$scope" "$group" remove || return "$SB_EXIT_FAIL"
   px_compose_project "$scope" "$timeout" start "${_PXC_GROUP_SERVICES[@]}" >&2 || status=$?
-  px_compose_outcome "$status" "$timeout" "the start of group $group" \
+  sb_outcome "$status" "$timeout" "the start of group $group" \
     "compose could not start the group $group" || return $?
   IFS="$PX_NL" read -r -d '' -a names <<EOF || true
 $roles
@@ -1907,15 +1621,12 @@ EOF
 ##               invalid usage or an unknown mode, or exit 6 if no such instance exists.
 sb_kill() {
   local scope=${1:-} role=${2:-} index=${3:-} mode=${4:-} timeout status=0
-  if ! sb_valid_value kill_mode "$mode"; then
-    px_error "sb_kill needs a mode of $(sb_vocabulary kill_mode), got '$mode'"
-    return "$SB_EXIT_USAGE"
-  fi
+  sb_value_arg sb_kill "a mode" kill_mode "$mode" || return $?
   px_compose_instance "$scope" "$role" "$index" || return $?
-  if px_compose_dry_run "$mode kill of $role/$index in $scope"; then
+  if sb_dry_run "$mode kill of $role/$index in $scope"; then
     return 0
   fi
-  timeout="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  timeout="$(sb_seconds PX_TIMEOUT_STOP 120)"
   if [ "$mode" = hard ]; then
     px_compose_engine "$timeout" kill -s KILL "$PX_PS_ID" >/dev/null || status=$?
   else
@@ -1928,78 +1639,32 @@ sb_kill() {
   return 0
 }
 
-# Remote script that delivers a signal to the daemon JVM, identified as the oldest java process in
-# the container instance. Because the initial process of the instance is tini, which cannot forward
-# a STOP signal, the script signals the JVM process directly and then polls its process state for
-# up to five seconds: STOP or TSTP must place the JVM into a stopped state, and CONT must return it
-# to a running state, ensuring that any pause that fails to take effect is treated as a failure.
-# The script exits with 6 when no JVM exists, 1 when the kill command fails, and 3 when the target
-# state does not appear within five seconds (treating an unreadable state as not yet observed). The
-# script is assigned via read because bash 3.2 misparses a case statement inside $(...).
-PX_COMPOSE_SIGNAL_SCRIPT=""
-read -r -d '' PX_COMPOSE_SIGNAL_SCRIPT <<'SCRIPT_EOF' || true
-pid="$(pgrep -o -x java)" || exit 6
-kill -s "$1" "$pid" || exit 1
-case "$1" in
-STOP | TSTP) want=T ;;
-CONT) want=R ;;
-*) exit 0 ;;
-esac
-n=0
-while :; do
-  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
-  case "$want:$state" in
-  T:T* | R:[!T]*) exit 0 ;;
-  esac
-  [ "$n" -lt 50 ] || exit 3
-  n=$((n + 1))
-  sleep 0.1
-done
-SCRIPT_EOF
-
 # Deliver a named signal to a single instance, such as QUIT to trigger a thread dump. KILL and TERM
 # are sent to the container instance and terminate it, whereas every other signal is delivered to
-# its daemon JVM process, where STOP or TSTP must stop the JVM and CONT must resume it.
-## @description  Deliver a named signal to an instance (KILL, TERM) or its daemon JVM.
+# its daemon JVM process, where STOP or TSTP must stop the JVM and CONT must resume it; exit 6 is
+# returned when either the instance or its JVM is absent.
+## @description  Deliver a named signal to an instance (KILL or TERM) or to its daemon JVM.
 ## @param        scope_id: the scope ID returned by sb_scope_create
 ## @param        role: the target role name
 ## @param        index: the zero-based instance index
 ## @param        signal_name: HUP, INT, QUIT, ABRT, KILL, ALRM, TERM, USR1, USR2, STOP, CONT, or
-##               TSTP (case-insensitive, with or without a leading SIG prefix)
-## @return       Exit 0, 1 if delivery fails, STOP, TSTP, or CONT fails, or no runtime answer, 2 on
-##               invalid usage or unknown signal, or 6 if the instance or its JVM is absent.
+##               TSTP (case-insensitive, with or without the SIG prefix)
+## @return       Exit 0, 1 if delivery fails, STOP/TSTP fails to stop, CONT fails to resume, or no
+##               runtime answers, 2 on usage or unknown signal, or 6 if the instance/JVM is absent.
 sb_signal() {
-  local scope=${1:-} role=${2:-} index=${3:-} signal=${4:-} name timeout status=0
-  name="$(printf '%s' "${signal#SIG}" | tr '[:lower:]' '[:upper:]')"
-  case "$name" in
-  HUP | INT | QUIT | ABRT | KILL | ALRM | TERM | USR1 | USR2 | STOP | CONT | TSTP) ;;
-  *)
-    px_error "sb_signal does not accept the signal name '$signal'"
-    return "$SB_EXIT_USAGE"
-    ;;
-  esac
+  local scope=${1:-} role=${2:-} index=${3:-} name timeout status=0
+  name="$(sb_signal_name "${4:-}")" || return $?
   px_compose_instance "$scope" "$role" "$index" || return $?
-  if px_compose_dry_run "signal $name to $role/$index in $scope"; then
+  if sb_dry_run "signal $name to $role/$index in $scope"; then
     return 0
   fi
-  timeout="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  timeout="$(sb_seconds PX_TIMEOUT_STOP 120)"
   case "$name" in
   KILL | TERM)
     px_compose_engine "$timeout" kill -s "$name" "$PX_PS_ID" >/dev/null || status=$?
     ;;
   *)
-    sb_exec "$scope" "$role" "$index" "$timeout" -- bash -c "$PX_COMPOSE_SIGNAL_SCRIPT" \
-      px-signal "$name" </dev/null >/dev/null || status=$?
-    case "$status" in
-    "$SB_EXIT_NO_OBJECT")
-      px_error "$role/$index runs no JVM, so the signal $name has no target"
-      return "$SB_EXIT_NO_OBJECT"
-      ;;
-    3)
-      px_error "the JVM of $role/$index did not reach the $name state within 5 s"
-      return "$SB_EXIT_FAIL"
-      ;;
-    esac
+    sb_signal_jvm "$scope" "$role" "$index" "$timeout" "$name" || return $?
     ;;
   esac
   if [ "$status" != 0 ]; then
@@ -2007,46 +1672,6 @@ sb_signal() {
     return "$SB_EXIT_FAIL"
   fi
   return 0
-}
-
-# Render the region-mover command line by substituting OPERATION, HOST, PORT, TIMEOUT_S, and FILE
-# into PX_REGION_MOVER_CMD (or the default PX_COMPOSE_MOVER template).
-## @description  Fill PX_REGION_MOVER_CMD (or default) using OPERATION, HOST, PORT, TIMEOUT_S, FILE.
-## @return       Write the command line to stdout and exit 0, or exit 6 when the template requires
-##               a non-empty PORT.
-px_compose_mover_cmd() {
-  local operation=${1:-} host=${2:-} port=${3:-} timeout=${4:-} file=${5:-} cmd
-  cmd="${PX_REGION_MOVER_CMD:-$PX_COMPOSE_MOVER}"
-  case "$cmd" in
-  *'{port}'*) [ -n "$port" ] || return "$SB_EXIT_NO_OBJECT" ;;
-  esac
-  cmd="${cmd//\{operation\}/$operation}"
-  cmd="${cmd//\{host\}/$host}"
-  cmd="${cmd//\{port\}/$port}"
-  cmd="${cmd//\{timeout\}/$timeout}"
-  cmd="${cmd//\{file\}/$file}"
-  printf '%s\n' "$cmd"
-}
-
-## @description  Emit one phase timing and status row for a compound operation
-##               (PHASE ok|fail|skip START_MS).
-## @return       Write one phase TSV row to stdout and exit 0.
-px_compose_phase() {
-  px_tsv_row "${1:-}" "${2:-}" "$(($(px_epoch_ms) - ${3:-0}))"
-}
-
-## @description  Emit a fail row for PHASE and a skip row for each later phase (PHASE START_MS).
-## @return       Write the phase TSV rows to stdout and exit 0.
-px_compose_phase_fail() {
-  local phase row=""
-  for phase in drain stop start ready rebalance; do
-    if [ "$phase" = "$1" ]; then
-      px_compose_phase "$phase" fail "$2"
-      row=skip
-    elif [ -n "$row" ]; then
-      px_compose_phase "$phase" skip "$2"
-    fi
-  done
 }
 
 # Perform a drain-aware restart of a single regionmover instance; an already exited instance skips
@@ -2063,14 +1688,14 @@ px_compose_phase_fail() {
 ##               answer, 2 on usage, no drain label, or no rpc port, 4 on phase expiry, 6 if absent.
 sb_restart_drain() {
   local scope=${1:-} role=${2:-} index=${3:-} drain=${4:-} ready=${5:-}
-  local host port file cmd container grace start status=0 outcome=0 exited=0
+  local host port file cmd container grace start status=0 exited=0
   local deadline interval
-  drain="$(px_compose_timeout_arg "$drain" PX_TIMEOUT_DRAIN 600)" || return $?
-  ready="$(px_compose_timeout_arg "$ready" PX_TIMEOUT_READY 600)" || return $?
+  drain="$(sb_timeout_arg "$drain" PX_TIMEOUT_DRAIN 600)" || return $?
+  ready="$(sb_timeout_arg "$ready" PX_TIMEOUT_READY 600)" || return $?
   px_compose_instance "$scope" "$role" "$index" || return $?
   if [ "$PX_PS_DRAIN" != regionmover ]; then
     px_error "role '$role' has no drain semantics: the deployment gives it no" \
-      "$(px_compose_label_prefix).drain=regionmover label"
+      "$(sb_label_prefix).drain=regionmover label"
     return "$SB_EXIT_USAGE"
   fi
   container="$PX_PS_ID"
@@ -2082,15 +1707,15 @@ sb_restart_drain() {
   if [ -z "$host" ]; then
     host="$PX_PS_NAME"
   fi
-  cmd="$(px_compose_mover_cmd unload "$host" "$port" "$drain" "$file")" || cmd=""
+  cmd="$(sb_mover_cmd unload "$host" "$port" "$drain" "$file")" || cmd=""
   if [ -z "$cmd" ]; then
     px_error "the port map holds no rpc port for $role/$index, so the mover cannot name it"
     return "$SB_EXIT_USAGE"
   fi
-  if px_compose_dry_run "drain-aware restart of $role/$index in $scope"; then
+  if sb_dry_run "drain-aware restart of $role/$index in $scope"; then
     return 0
   fi
-  grace="$(px_compose_seconds PX_TIMEOUT_STOP 120)"
+  grace="$(sb_seconds PX_TIMEOUT_STOP 120)"
 
   # An exited instance has no running process, regardless of whether it terminated due to a kill,
   # an OOM condition, or a crash. Because it cannot drain regions, has no running process to stop,
@@ -2099,91 +1724,65 @@ sb_restart_drain() {
   start="$(px_epoch_ms)"
   if [ "$PX_PS_STATE" = exited ]; then
     exited=1
-    px_compose_phase drain skip "$start"
-    px_compose_phase stop skip "$start"
+    sb_phase_row drain skip "$start"
+    sb_phase_row stop skip "$start"
   else
-    # Because the region mover writes its progress output to stdout while this function's stdout is
-    # reserved for the phase TSV rows, redirect the mover's stdout stream to stderr.
-    sb_exec "$scope" "$role" "$index" "$drain" -- sh -c "$cmd" >&2 || status=$?
-    if [ "$status" != 0 ]; then
-      px_compose_phase_fail drain "$start"
-      if [ "$status" = "$SB_EXEC_TIMEOUT" ]; then
-        px_error "the region drain of $role/$index expired after ${drain}s"
-        return "$SB_EXIT_TIMEOUT"
-      fi
-      px_error "the region drain of $role/$index failed with status $status"
-      return "$SB_EXIT_FAIL"
-    fi
-    px_compose_phase drain ok "$start"
+    sb_mover_phase drain "$start" "$role/$index" "$drain" "$cmd" "$scope" "$role" "$index" ||
+      return $?
 
     start="$(px_epoch_ms)"
     px_compose_engine "$drain" stop --time "$grace" "$container" >/dev/null || status=$?
     if [ "$status" != 0 ]; then
-      px_compose_phase_fail stop "$start"
+      sb_phase_fail stop "$start"
       px_error "the stop of $role/$index failed"
       return "$SB_EXIT_FAIL"
     fi
-    px_compose_phase stop ok "$start"
+    sb_phase_row stop ok "$start"
   fi
 
   start="$(px_epoch_ms)"
   status=0
   px_compose_engine "$ready" start "$container" >/dev/null || status=$?
   if [ "$status" != 0 ]; then
-    px_compose_phase_fail start "$start"
+    sb_phase_fail start "$start"
     px_error "the start of $role/$index failed"
     return "$SB_EXIT_FAIL"
   fi
-  px_compose_phase start ok "$start"
+  sb_phase_row start ok "$start"
 
   # Scope the readiness wait strictly to the instance being restarted; another instance of the same
   # role may be exited, which is not a failure of this restart operation.
   start="$(px_epoch_ms)"
   deadline=$(($(px_epoch_s) + ready))
-  interval=${PX_POLL_INTERVAL_S:-2}
-  [[ $interval =~ $PX_RE_SECONDS ]] || interval=2
+  interval="$(sb_poll_interval)"
   while :; do
     status=0
     px_compose_instance "$scope" "$role" "$index" || status=$?
     if [ "$status" != 0 ] || [ "$PX_PS_STATE" = exited ]; then
-      px_compose_phase_fail ready "$start"
+      sb_phase_fail ready "$start"
       px_error "$role/$index stopped while the restart waited for it to become ready"
       return "$SB_EXIT_FAIL"
     fi
     [ "$PX_PS_READY" != ready ] || break
     if [ "$(px_epoch_s)" -ge "$deadline" ]; then
-      px_compose_phase_fail ready "$start"
+      sb_phase_fail ready "$start"
       px_error "$role/$index did not become ready in ${ready}s"
       return "$SB_EXIT_TIMEOUT"
     fi
     sleep "$interval"
   done
-  px_compose_phase ready ok "$start"
+  sb_phase_row ready ok "$start"
 
   start="$(px_epoch_ms)"
   if [ "$exited" = 1 ]; then
     # Because this restart wrote no region list, any list left behind by an earlier drain of the
-    # same instance must not be reloaded to move regions back, ensuring that the outcome of an
-    # instance rejoin never depends on previous restarts.
-    px_compose_phase rebalance skip "$start"
+    # instance must not be reloaded to move regions back, ensuring that the outcome of an instance
+    # rejoin never depends on earlier restarts.
+    sb_phase_row rebalance skip "$start"
     return 0
   fi
-  status=0
-  cmd="$(px_compose_mover_cmd load "$host" "$port" "$drain" "$file")"
-  sb_exec "$scope" "$role" "$index" "$drain" -- sh -c "$cmd" >&2 || status=$?
-  if [ "$status" = "$SB_EXEC_TIMEOUT" ]; then
-    px_compose_phase rebalance fail "$start"
-    px_error "the rebalance of $role/$index expired after ${drain}s"
-    return "$SB_EXIT_TIMEOUT"
-  fi
-  if [ "$status" != 0 ]; then
-    px_compose_phase rebalance fail "$start"
-    px_error "the rebalance of $role/$index failed with status $status"
-    outcome=$SB_EXIT_FAIL
-  else
-    px_compose_phase rebalance ok "$start"
-  fi
-  return "$outcome"
+  cmd="$(sb_mover_cmd load "$host" "$port" "$drain" "$file")"
+  sb_mover_phase rebalance "$start" "$role/$index" "$drain" "$cmd" "$scope" "$role" "$index"
 }
 
 # ---------------------------------------------------------------------------
@@ -2232,13 +1831,12 @@ EOF
     px_error "the runtime did not answer an inspection of scope $scope"
     return "$SB_EXIT_FAIL"
   fi
-  # The container runtime increments RestartCount only for restarts triggered by a restart policy,
-  # whereas every service in the deployment uses a policy of no. Consequently, an external restart
-  # outside the harness—such as "docker restart"—leaves the runtime counter at 0 and the container
-  # state as running. To detect these events, the start table records the most recent start time of
-  # each container and increments the reported restart count by 1 whenever that timestamp changes
-  # between successive calls.
-  path="$(px_compose_state_dir)/starts-$scope.tsv" || return "$SB_EXIT_FAIL"
+  # The container runtime counts only restarts triggered by a restart policy, whereas every
+  # service in the deployment uses a policy of no. Consequently, an external restart outside the
+  # harness, such as "docker restart", leaves that runtime count at 0 and the container state as
+  # running. To detect these events, the start table records the most recent start time of each
+  # container and adds 1 to the count whenever that timestamp changes between two calls.
+  path="$(sb_record_path compose starts "$scope")" || return "$SB_EXIT_FAIL"
   [ ! -f "$path" ] || seen="$(cat "$path")"
   # Container inspection prefixes each reported container name with a leading slash.
   while IFS='|' read -r name count cid started; do
@@ -2280,10 +1878,7 @@ EOF
 ##               respond, 2 on invalid usage, 5 when previous is unsupported, or 6 if absent.
 sb_termination_reason() {
   local which=${4:-current} fields state code oom finished reason signal=""
-  if ! sb_valid_value term_which "$which"; then
-    px_error "sb_termination_reason needs current or previous, got '$which'"
-    return "$SB_EXIT_USAGE"
-  fi
+  sb_value_arg sb_termination_reason which term_which "$which" || return $?
   if [ "$which" = previous ]; then
     px_error "Compose keeps no previous container, so read sb_restart_count instead"
     return "$SB_EXIT_UNSUPPORTED"
@@ -2567,8 +2162,8 @@ sb_image_build() {
     fi
     args+=(--build-arg "$arg")
   done
-  timeout="$(px_compose_seconds PX_TIMEOUT_BUILD 3600)"
-  if px_compose_dry_run "build of $tag from $ctx"; then
+  timeout="$(sb_seconds PX_TIMEOUT_BUILD 3600)"
+  if sb_dry_run "build of $tag from $ctx"; then
     return 0
   fi
   # Attaching a provenance attestation causes the containerd image store to assign a new image ID
@@ -2580,7 +2175,7 @@ sb_image_build() {
   esac
   px_compose_engine "$timeout" build --tag "$tag" ${args[@]+"${args[@]}"} \
     --file "$ctx/Dockerfile" "$ctx" >&2 || status=$?
-  px_compose_outcome "$status" "$timeout" "the build of $tag" \
+  sb_outcome "$status" "$timeout" "the build of $tag" \
     "the engine could not build $tag from $ctx" || return $?
   id="$(px_compose_engine 60 image inspect --format '{{.Id}}' "$tag")" || id=""
   if [ -z "$id" ]; then

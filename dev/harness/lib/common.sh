@@ -1477,11 +1477,16 @@ px_run_dir() {
 # Configuration is governed by a single loader that enforces a deterministic precedence hierarchy
 # and records the provenance of every variable. The loader evaluates stages in the following order,
 # and the first stage that defines a variable wins:
+#   0. Command-line options, recorded by px_cli_parse before the configuration loader runs.
 #   1. The inherited process environment.
 #   2. Explicit configuration files named on the command line.
+#      2b. The cluster record at $PX_OUT/$PX_STATE_DIR/cluster-<ID>.env written by px-cluster up.
 #   3. Local environment overrides in <layout>/env/local.env.
 #      3a. Enabled plug-ins (the sizing and JVM lines of each plugin.env).
 #   4. Run-class defaults in <layout>/env/class-<class>.env.
+#      4a. Backend defaults when PX_BACKEND is k8s: k8s/env/k3d.env for the local px-k3d cluster
+#          whenever PX_K8S_TARGET does not designate an external cluster, followed by
+#          k8s/env/k8s.env (which is mandatory for the Kubernetes backend).
 #   5. Baseline defaults in <layout>/env/defaults.env (mandatory).
 #   6. Component version definitions in <layout>/versions.env.
 #   7. Local version overrides in <layout>/versions.local.env.
@@ -1737,6 +1742,19 @@ px_config_load() {
   if [ -n "${PX_RUN_CLASS:-}" ]; then
     px_config_parse_file "${PX_CLASS_ENV:-$env_dir/class-$PX_RUN_CLASS.env}" \
       "class:$PX_RUN_CLASS" || true
+  fi
+  # Backend defaults are loaded after the run-class configuration so that run-class and operator
+  # settings take precedence. Because any non-default PX_BACKEND selection is supplied by an earlier
+  # stage or on the command line, the active backend is already known before baseline defaults load.
+  if [ "${PX_BACKEND:-}" = k8s ]; then
+    # The local px-k3d cluster serves as the default Kubernetes target unless a target file
+    # designates an external cluster.
+    if [ -z "${PX_K8S_TARGET:-}" ]; then
+      px_config_parse_file "$PX_HOME/k8s/env/k3d.env" backend:px-k3d || true
+    fi
+    px_config_parse_file "$PX_HOME/k8s/env/k8s.env" backend:k8s ||
+      px_die "$PX_EXIT_FAIL" "the defaults of the Kubernetes backend are mandatory:" \
+        "$PX_HOME/k8s/env/k8s.env"
   fi
   file="${PX_DEFAULTS_ENV:-$env_dir/defaults.env}"
   px_config_parse_file "$file" defaults ||
@@ -2423,21 +2441,44 @@ EOF
   )
 }
 
-# Invokes scripts/preflight.sh --phase memory under PX_TIMEOUT_DEFAULT against the supplied
-# deployment directory (DIR) or the recorded deployment before starting a group or scaling,
-# redirecting its report to stderr.
-## @description  Re-evaluates memory capacity via scripts/preflight.sh before group start or scale.
-## @return       Returns 0 to admit, 1 if the script is missing or not executable, 4 on timeout
-##               expiry, or the exit status of preflight.sh.
+# Selects scripts/preflight.sh for the compose backend or scripts/preflight-<name>.sh for any other
+# configured PX_BACKEND.
+## @description  Resolves the host preflight script path for the active PX_BACKEND.
+## @return       Writes the path to stdout and exits 0; returns 1 if the compose script is missing
+##               or not executable, or returns 5 if another backend lacks a preflight script.
+px_preflight_script() {
+  local backend=${PX_BACKEND:-compose} script
+  if [ "$backend" = compose ]; then
+    script="$PX_HOME/scripts/preflight.sh"
+  else
+    script="$PX_HOME/scripts/preflight-$backend.sh"
+  fi
+  if [ -x "$script" ]; then
+    printf '%s\n' "$script"
+    return 0
+  fi
+  if [ "$backend" = compose ]; then
+    px_error "the host preflight $script is missing or not executable"
+    return "$PX_EXIT_FAIL"
+  fi
+  # Because a backend lacking a preflight script cannot verify that the target environment can hold
+  # the deployment, the command aborts before mutating target state.
+  px_error "the $backend backend has no host preflight $script yet"
+  return "$PX_EXIT_UNSUPPORTED"
+}
+
+# Invokes the active backend's preflight script with --phase memory under PX_TIMEOUT_DEFAULT against
+# the supplied deployment directory (DIR) or the recorded deployment before starting a group or
+# scaling.
+## @description  Re-evaluates memory capacity via the backend preflight before group start or scale.
+## @return       Returns 0 to admit, 1 or 5 when no preflight script is available, 4 on timeout
+##               expiry, or the exit status of the preflight script.
 px_memory_recheck() {
   # Although the memory phase invokes sb_preflight, it inspects only the engine_memory row; host
   # port availability checks inside sb_preflight fail against an already-running cluster, so the
   # memory phase ignores their outcome.
-  local script="$PX_HOME/scripts/preflight.sh" status=0
-  if [ ! -x "$script" ]; then
-    px_error "the memory check $script is missing or not executable"
-    return "$PX_EXIT_FAIL"
-  fi
+  local script status=0
+  script="$(px_preflight_script)" || return $?
   px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" --phase memory \
     ${1:+--deployment "$1"} >&2 ||
     status=$?

@@ -1,0 +1,35 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Defines the one-shot setup Job that executes the HDFS format followed by the bootstrap probe.
+# Because the job never retries, any execution failure remains visible as a failed pod.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${PX_M_NAME}
+  namespace: ${PX_M_NAMESPACE}
+  labels:
+${PX_M_LABELS}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+${PX_M_POD_LABELS}
+    spec:
+      hostname: ${PX_M_HOSTNAME}
+${PX_M_AFFINITY}
+${PX_M_POD_SPEC}
