@@ -456,10 +456,10 @@ database becomes unresponsive:
   soon as the operations currently in flight terminate—namely, when their Phoenix client timeouts
   expire. A fault-injection scenario that requires rapid termination configures short client
   timeouts within the `phoenixProperties` map of its query set.
-- Any external caller requiring a hard wall-clock deadline cancels the run explicitly via the REST
+- Any external client requiring a hard wall-clock deadline cancels the run explicitly via the REST
   `cancel` endpoint (step 2). The harness driver `pherf-distributed` issues this cancellation
-  automatically when its verb time limit expires; [H15][h15] demonstrates that scenario and
-  documents its known limitation (the resulting harness bundle contains no fleet report).
+  automatically when its verb time limit expires and copies the resulting `CANCELLED` run bundle
+  into the harness bundle; [H15][h15] demonstrates that scenario.
 
 This design summary is drawn from the module README and the D7 and H3 architecture records; no
 interactive step in this guide executes it.

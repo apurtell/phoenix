@@ -655,8 +655,18 @@ copied for every terminal run state so that failed executions preserve their dia
 HTTP 409 response when starting the run (such as from a faulted agent), an unresponsive controller,
 or a missing, busy, or `FAULTED` agent produces an `ERROR` verdict row under `pherf.agents` and
 exits with code 3, as the driver never resets an agent automatically. Upon receiving TERM, the verb
-cancels any active controller run and terminates any running Java process inside `client` instance 0
-in the same manner as the other drivers.
+cancels any active controller run and terminates any running Java process inside `client` 0 in the
+same manner as the other drivers. During `run`, after cancelling the active controller run, the
+handler copies the resulting `CANCELLED` bundle into `controller/` and appends its record to
+`tests.tsv`. The cancellation and bundle copy share an 8 s time budget that concludes before
+`px-run` escalates to `KILL` 10 s after sending TERM: each individual call is bounded to finish
+`PX_TIMEOUT_GRACE_S` before the budget expires, and the run-status polling loop sleeps inside a
+`wait` built-in so that the signal handler runs immediately upon TERM. A complete copy records a
+`PASS` verdict row for `pherf.bundle`, whereas a copy truncated by the time budget retains every
+file that transferred completely, leaves the in-flight file as `<path>.part`, and records a `FAIL`
+row for `pherf.bundle` reporting the file count and failure cause. If TERM arrives after the verb
+has already written its own `pherf.bundle` row, both the existing copy and that verdict row are
+preserved.
 
 **restore** concludes every test recorded in `tests.tsv`, where an already concluded test
 idempotently returns HTTP 200. When targeting a harness cluster, it then drops the tables defined in

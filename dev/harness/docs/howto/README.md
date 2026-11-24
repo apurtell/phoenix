@@ -286,9 +286,8 @@ distributed fleet.
 
 ## Known defects
 
-Live verification of these HOWTOs surfaced five defects. The first four have been resolved (though
-builds compiled prior to the fixes still exhibit the earlier behavior), while the fifth remains
-open.
+Live verification of these HOWTOs and of the D7 proof surfaced six defects. All six have been
+resolved; builds compiled prior to each fix still exhibit the earlier behavior.
 * **Memory retention in the Pherf detail report**, resolved in 63c9dd0ec2: builds prior to that fix
   exhausted a 1 GiB heap once a single query set exceeded approximately 10,000 operations.
 * **Spurious HBase `ERROR` log line.** The HBase Master can log `RemoteProcedureDispatcher:
@@ -304,14 +303,19 @@ open.
   the initial process of the container. Every signal other than `KILL` and `TERM` is now routed
   directly to the JVM process, and any `STOP` signal that fails to place the JVM into a stopped
   state is immediately recorded as a failure (see H09, step 12).
-* **Open: the recovery gate misses a delayed process exit after the initial readiness check
-  succeeds.** In a cluster with 2 RegionServers, a 50 s pause expired the ZooKeeper session of
-  RegionServer 0, causing it to abort 3.5 s after receiving `CONT`. Because the initial readiness
-  poll had already observed RegionServer 0 as ready, the recovery barrier proceeded to wait on the
-  Master, which reported `1 of 2 RegionServers checked in`. Consequently, the gate waited out the
-  full 600 s of `PX_TIMEOUT_READY` and terminated with `timeout, exit 4` rather than failing
-  immediately. The `cluster.recovery` check evaluates to FAIL in either case, and on a cluster with
-  1 RegionServer the gate fails immediately (H15 step 22, H09 step 13).
+* **The recovery gate missed a process exit after the readiness check observed the instance as
+  ready**, resolved in round H3b. In a cluster with 2 RegionServers, a 50 s pause expired the
+  session of RegionServer 0, causing it to abort upon resuming execution. Because the readiness
+  barrier had already observed the instance as ready, it continued waiting only on the Master,
+  which reported `1 of 2 RegionServers checked in`, and the gate waited out the full 600 s of
+  `PX_TIMEOUT_READY` before terminating with `timeout, exit 4`. The gate now polls the barrier in
+  1 s intervals and verifies the instance state prior to each interval, failing within seconds of
+  an unexpected process termination (see H15, step 23, and H09, step 12).
+* **Missing fleet report when the verb time bound interrupted a fleet run**, resolved in round H3b.
+  Upon receiving TERM, the `pherf-distributed` driver previously cancelled the controller run
+  without retrieving its `CANCELLED` bundle. It now copies that bundle into
+  `drivers/pherf-distributed/controller/` within the 10 s grace period that `px-run` waits after
+  sending TERM (H15, "The run bound").
 
 ## Out of scope
 

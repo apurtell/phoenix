@@ -402,20 +402,22 @@ conditions are outside the scope of this mechanism.
     Keep any pause shorter than 25 s. Because the container image runs ZooKeeper with
     `tickTime=2000`, a session lasts at most 40 s, and the paused server may have transmitted its
     last heartbeat ping up to one-third of that interval before receiving the `STOP` signal. A
-    longer pause causes the session to expire: the Master processes the server as dead, the server
+    longer pause causes the session to expire: the master processes the server as dead, the server
     aborts upon resuming execution, and recovery from the pause fails. When this occurs, the
     recovery gate detects that the instance has exited and fails immediately without waiting for
     the remainder of `PX_TIMEOUT_READY`; a 30 s pause triggered this failure in 1 of 1 runs (run
-    `20261123T064007Z-ro1h`). Under a known defect, however, if the readiness check observes the
-    resumed instance as ready before it aborts and another role subsequently becomes unready
-    (because the Master of a 2-RegionServer cluster waits for both servers), the gate waits for the
-    entire `PX_TIMEOUT_READY` interval and terminates with a timeout; see [H15, step 22][h15].
+    `20261123T064007Z-ro1h`). The gate also fails immediately when the readiness wait observes the
+    paused instance as ready before it aborts and another role subsequently cannot become ready
+    (as when the master of a 2-RegionServer cluster waits for both servers): because the readiness
+    wait executes as a series of 1 s barrier waits and the gate inspects the disrupted instance
+    before each one, the exit is detected on the next poll. See [H15, step 23][h15]; builds before
+    round H3b waited for the full `PX_TIMEOUT_READY` interval in that scenario.
 
     The recovery gate also fails immediately if an instance becomes absent, such as when a
     container is deleted during recovery. Because the gate verifies instance presence before each
-    region-count query and again immediately after a query returns the full region count, a read
-    that started just before the instance disappeared cannot erroneously satisfy the gate. The
-    session standard error stream identifies the missing instance:
+    barrier wait and each region-count read, and again immediately after a read returns the full
+    region count, a read that started just before the instance disappeared cannot erroneously
+    satisfy the gate. The session stderr stream identifies the missing instance:
 
     ```text
     ... ERROR disruption 2: regionserver/0 is absent, so it cannot recover

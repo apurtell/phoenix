@@ -364,6 +364,22 @@ Because Pherf `-analyze` reads each replicate from `drivers/pherf-distributed/co
 than from the root of the harness bundle, pass that subdirectory from each bundle in a replicate
 set.
 
+A `run` verb that `px-run` terminates upon reaching its time bound also preserves the controller
+bundle. On receiving TERM, the driver cancels the active controller run—causing the controller to
+write its bundle with the state `CANCELLED`—and copies that bundle into `controller/` using the
+same retrieval procedure within an 8 s time budget that concludes before `px-run` escalates to
+`KILL` 10 s after sending TERM. The driver appends the run entry to `tests.tsv` with the state
+recorded in the copied manifest, and records `PASS` for the `pherf.bundle` verdict row when the
+copy completes in full. If the time budget expires before the transfer finishes, all files that
+arrived completely are retained, the file currently in flight remains at `<path>.part`, and
+`pherf.bundle` is recorded as `FAIL` along with the completed file count and the failure cause. If
+TERM arrives after the verb has already written its own `pherf.bundle` row, both the completed copy
+and that verdict row are preserved. Because a cancelled execution produces neither `run.tsv` nor
+`report.json`, the `report` verb emits no steady-state metrics from the copied bundle. Instead, the
+archived copy serves as diagnostic evidence for downstream inspection: `-analyze` evaluates it as a
+replicate with an overall result of `FAIL` because its `pherf.fleet.agents` verdict row is `FAIL`
+for a `CANCELLED` run.
+
 ## The collectors
 
 `px-collect` serves as the unified entry point for all six telemetry collectors. During execution,
@@ -576,7 +592,7 @@ the substrate disruption call. Before invoking that call, `px-run` determines th
 region count of the cluster by summing `regionCount` across the RegionServers queried by
 `px-region-count` inside `client` 0. Immediately after a restart or a rebalance, a RegionServer can
 respond before publishing `regionCount`, so a failed read indicates that the server is not yet
-ready; `px-run` retries the read within the `PX_TIMEOUT_READY` bound and the active verb time
+ready; `px-run` retries the read within the same `PX_TIMEOUT_READY` bound and the active verb time
 bound. If the read still fails at the end of that bound, no disruption is injected and the
 disruption state is recorded as `fail`. A resume operation skips this read because a paused server
 cannot respond, reusing instead the baseline count captured before the pause. The timestamp
@@ -584,28 +600,32 @@ cannot respond, reusing instead the baseline count captured before the pause. Th
 sequence: any killed RegionServer has been started again through the drain-aware restart procedure,
 every configured instance reports ready, and the summed online region count has returned to the
 count measured before the disruption. Because the region-count wait uses the remainder of the
-post-restart `PX_TIMEOUT_READY` bound, a single disruption consumes at most one `PX_TIMEOUT_DRAIN`
-interval and two `PX_TIMEOUT_READY` intervals. Immediately after the readiness wait and on each
-subsequent region-count poll, the gate also inspects the state of the disrupted instance: if the
-instance has exited with any exit code or is absent, the gate terminates immediately with state
-`fail` because a terminated server cannot restore online regions. Because the backend treats a
-one-shot exit status of 0 as ready, the readiness wait alone would not detect an instance that
-exited cleanly with code 0. If a restart or readiness wait expires, the recovery state is recorded
-as `timeout`, whereas if the online region count has not returned to the baseline by the end of the
-bound, the state is recorded as `fail` with both counts included in the diagnostic message. A
-disruption that fires while a verb is running waits within the time bound of that verb—the shared
-deadline governing prepare and run—so each recovery step receives at most the time remaining in the
-verb budget. Any drain, readiness, or region wait truncated by that verb bound enters the state
-`timeout` and terminates the verb at its deadline, assigning exit code 4 to the verb and causing
-`px-run` to exit with code 4. Consequently, `mttr_seconds` measures the full interval until the
-server is live and every region is back online. The recovery gate never inspects `ritCount` (the
-regions-in-transition count, which can lag by up to a minute), and region rebalancing is excluded
-from recovery because a rejoined server does not need to be balanced to serve traffic. A kill action
-must target a RegionServer—the service role whose drain label is `regionmover`—using the mode
-`hard`, because only the drain-aware restart procedure starts a killed instance again and a deleted
-instance cannot be started again; `px-run` rejects any other kill configuration with exit code 2
-before any verb runs. Finally, the cluster check `cluster.recovery` compares the measured value
-against the threshold `recovery.seconds.max`.
+same `PX_TIMEOUT_READY` bound, a single disruption consumes at most one `PX_TIMEOUT_DRAIN`
+interval and two `PX_TIMEOUT_READY` intervals. The readiness wait executes as a series of 1 s
+barrier waits. Before each barrier wait, before each region-count read, and again after observing a
+full region count, the gate inspects the state of the disrupted instance: if the instance has exited
+with any exit code or is absent, the gate terminates immediately with state `fail` because a
+terminated server cannot restore online regions. Because the readiness barrier waits only for
+instances that it has not yet seen ready and the backend treats an exit status of 0 as ready, a
+single barrier wait alone would not detect an instance that exits after being seen ready while
+another instance remains unready, as the master does when a RegionServer aborts. An instance that
+terminates with a non-zero exit code while a barrier wait is still waiting on it also ends the gate
+immediately with the barrier's diagnostic message. If a restart or readiness wait expires, the
+recovery state is recorded as `timeout`, whereas if the online region count has not returned to the
+baseline by the end of the bound, the state is recorded as `fail` with both counts included in the
+diagnostic message. A disruption that fires while a verb is running waits within the time bound of
+that verb—the shared deadline governing prepare and run—so each recovery wait receives at most the
+time remaining in the verb budget. Any drain, readiness, or region wait truncated by that verb bound
+enters the state `timeout` and terminates the verb at its deadline, assigning exit code 4 to the
+verb and causing `px-run` to exit with code 4. Consequently, `mttr_seconds` measures the full
+interval until the server is live and every region is back online. The recovery gate never inspects
+`ritCount` (the regions-in-transition count, which can lag by up to a minute), and region
+rebalancing is excluded from recovery because a rejoined server does not need to be balanced to
+serve traffic. A kill action must target a RegionServer—the service role whose drain label is
+`regionmover`—using the mode `hard`, because only the drain-aware restart procedure starts a killed
+instance again and a deleted instance cannot be started again; `px-run` rejects any other kill
+configuration with exit code 2 before any verb runs. Finally, the cluster check `cluster.recovery`
+compares the measured value against the threshold `recovery.seconds.max`.
 
 **A pause.** A `signal` disruption delivering `STOP` or `TSTP` pauses the daemon JVM of the target
 instance (`sb_signal` in [backends.md](backends.md)), and the JVM cannot recover while it remains

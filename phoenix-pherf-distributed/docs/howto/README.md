@@ -254,7 +254,7 @@ H15 belong to the [harness HOWTOs][hindex].
 | `fleet-rww.suite` and `fleet-rules.suite` | H14 |
 | `fleet-ab.suite` with `-analyze A B` and `B A` | H15 |
 | Run bound, decision (e): LATE drain, DROP and `maxLagMs`, client timeouts | D03 (text), H15 |
-| The verb bound and the cancel of `pd_term`; no fleet report on that path (D8) | H15 |
+| The verb bound, the cancel of `pd_term` and the copy of the `CANCELLED` bundle | H15 |
 | Recovery gate on an absent instance after the full count | H09 step 12, H15 step 24 (text) |
 
 ### H3: the harness tier
@@ -269,7 +269,7 @@ H15 belong to the [harness HOWTOs][hindex].
 | `fleet.suite`: r1, then r1 to r3 as replicates | H14, H15 |
 | P13 `-analyze` over `drivers/pherf-distributed/controller` (the root exits 1) | H15, H03 |
 | Tier log and collector exemptions | H14, H10 |
-| Recovery gate on an exited instance; its gap with 2 RegionServers (known defect) | H09, H15 |
+| Recovery gate on an exited instance, also in the barrier with 2 RegionServers | H09, H15 |
 | Schedule anchors per slot | H14 |
 
 ### Load-generator performance engineering tasks
@@ -288,13 +288,11 @@ H15 belong to the [harness HOWTOs][hindex].
 
 ## Out of scope
 
-- **Kubernetes.** Deploying the distributed Pherf container image on Kubernetes is deferred to the K
-  track; until that work lands, `px-k3d` exits with code 5.
+- **Kubernetes.** The D-series HOWTO guides execute on Docker Compose. You can run the same
+  distributed tier on a local px-k3d cluster using `px-pherf --backend k8s`; consult the
+  [harness README][harness] for details.
 - **Authentication and TLS.** The distributed module implements neither authentication nor TLS
-  encryption; see the [Security][security] section of the module README as well as [D01][d01].
-- **The D8 items.** Deferred items tracked under D8—such as preserving a fleet report inside the
-  harness bundle when a run is terminated via the `pd_term` cancellation path—remain outside the
-  scope of these guides ([H15][h15] documents this limitation).
+  encryption; see [Security][security] in the module README and [D01][d01].
 
 [d01]: 01-standalone-fleet-and-rest-api.md
 [d02]: 02-first-fleet-run.md

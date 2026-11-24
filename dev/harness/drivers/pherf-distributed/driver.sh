@@ -91,6 +91,16 @@ PD_STATE=""
 PD_REASON=""
 PD_AGENT_IDS=""
 
+# The run verb sets PD_COPIED once it has recorded the pherf.bundle verdict row, signaling the TERM
+# handler to preserve the existing bundle copy and verdict row rather than downloading it again.
+PD_COPIED=""
+
+# Because px-run escalates to KILL 10 s after delivering TERM, the TERM handler bounds the combined
+# controller cancellation and bundle retrieval to this budget, recording the active deadline in
+# epoch seconds in PD_TERM_END while the handler executes.
+PD_TERM_BUDGET_S=8
+PD_TERM_END=""
+
 # Parse the test arguments and run topology into the PD_* variables, validating option values,
 # reserved driver and agent flags, and controller document naming rules.
 ## @description  Parse the test arguments and the run topology configuration into PD_* variables.
@@ -265,11 +275,23 @@ pd_json() {
   pb_json_get "$2" "$rows"
 }
 
+# Invokes the controller REST API with the request payload on standard input, constraining each
+# request to the remaining TERM time budget when executing inside the TERM signal handler.
 ## @description  Invoke the controller REST API (method, path, output file) with the body on stdin.
-## @return       Returns 0 on success, 22 on an HTTP error (saving the error document to the output
+## @return       Returns 0 on success, 22 on an HTTP error (with the error document in the output
 ##               file), 3 if the controller does not answer, or 1 on any other failure.
 pd_api() {
   local status=0
+  # Because an API invocation can consume both its timeout bound and the timeout grace period,
+  # reserve the grace period so that every call made by the handler finishes before the budget
+  # expires.
+  if [ -n "$PD_TERM_END" ]; then
+    PF_API_BOUND=$((PD_TERM_END - $(px_epoch_s) - PX_TIMEOUT_GRACE_S))
+    if [ "$PF_API_BOUND" -lt 1 ]; then
+      px_error "the TERM budget of ${PD_TERM_BUDGET_S}s has no time left for $1 $2"
+      return "$PX_EXIT_FAIL"
+    fi
+  fi
   pf_api "$PX_SCOPE_ID" "$1" "$2" >"$3" || status=$?
   case "$status" in
   0 | 22) return "$status" ;;
@@ -346,7 +368,11 @@ pd_test_run() {
     fi
     PD_STATE="$(pd_json "$out" /state)" || PD_STATE=""
     [ "$PD_STATE" = RUNNING ] || break
-    sleep "${PX_POLL_INTERVAL_S:-2}"
+    # Because the shell defers signal traps until a foreground command completes but dispatches
+    # them immediately during a wait builtin, backgrounding sleep ensures that TERM does not wait
+    # for the sleep interval to finish and that the TERM budget starts immediately upon receipt.
+    sleep "${PX_POLL_INTERVAL_S:-2}" &
+    wait "$!"
   done
   PD_REASON="$(pd_json "$out" /reason)" || PD_REASON=""
   rm -f "$out"
@@ -373,7 +399,10 @@ pd_bundle_get() {
   local dir=$1 base="/v1/tests/$PD_TEST/runs/$PD_RUN/bundle" list rows path bytes got status=0
   PD_FILES=0 PD_BYTES=0
   rm -rf "$dir"
-  mkdir -p "$dir" || return "$PX_EXIT_FAIL"
+  if ! mkdir -p "$dir"; then
+    PD_REASON="cannot make the directory of the copy of run $PD_RUN"
+    return "$PX_EXIT_FAIL"
+  fi
   list="$dir.listing.json"
   pd_api GET "$base" "$list" </dev/null || status=$?
   if [ "$status" != 0 ]; then
@@ -394,14 +423,20 @@ pd_bundle_get() {
       PD_REASON="the listing of run $PD_RUN names a refused path or size"
       return "$PX_EXIT_FAIL"
     fi
-    mkdir -p "$(dirname "$dir/$path")" || return "$PX_EXIT_FAIL"
+    if ! mkdir -p "$(dirname "$dir/$path")"; then
+      PD_REASON="cannot make the directory of $path of run $PD_RUN"
+      return "$PX_EXIT_FAIL"
+    fi
     pd_api GET "$base/$path" "$dir/$path.part" </dev/null || status=$?
     got="$(wc -c <"$dir/$path.part" 2>/dev/null | tr -d ' ')"
     if [ "$status" != 0 ] || [ "$got" != "$bytes" ]; then
       PD_REASON="$path of run $PD_RUN: status $status, ${got:-0} of $bytes bytes"
       return "$PX_EXIT_FAIL"
     fi
-    mv "$dir/$path.part" "$dir/$path" || return "$PX_EXIT_FAIL"
+    if ! mv "$dir/$path.part" "$dir/$path"; then
+      PD_REASON="cannot move $path.part of run $PD_RUN"
+      return "$PX_EXIT_FAIL"
+    fi
     PD_FILES=$((PD_FILES + 1))
     PD_BYTES=$((PD_BYTES + bytes))
   done <<EOF
@@ -413,19 +448,42 @@ EOF
   fi
 }
 
-## @description  Handle SIGTERM from px-run by canceling the active controller run and stopping the
-##               exec client and any Java process on client 0 via dv_term.
+# Handles TERM from px-run by canceling the active controller run, copying its run bundle during
+# the run verb, and stopping the exec client and any Java process on client 0 via dv_term.
+## @description  Handle TERM from px-run: cancel the controller run, copy its bundle in the run
+##               verb, and stop the exec client and any Java process on client 0 (dv_term).
 ## @return       Always exits with status 1.
 pd_term() {
-  # The Java helper process on client 0 launches only after the controller run has finished, so at
-  # most one of the controller cancellation or the Java shutdown has active work to perform. Each
-  # operation is bounded to 8 s, fitting within the 10 s grace period that px-run waits after
-  # sending TERM.
+  local out="$PX_DRIVER_DIR/.cancel.json" status=0 state
+  # Because the Java process on client 0 launches only after the controller run has ended, at most
+  # one of the controller cancellation or the Java shutdown has active work to perform. The Java
+  # shutdown is bounded to 8 s, and the cancellation and bundle copy share the 8 s TERM budget, so
+  # either path fits within the 10 s grace period that px-run waits after delivering TERM.
   if [ -n "$PD_TEST" ] && [ -n "$PD_RUN" ] && [ -z "$DV_JAVA_REMOTE" ]; then
     px_warn "the verb received TERM, so it cancels the controller run $PD_RUN"
-    PF_API_BOUND=8
-    printf '{}' | pf_api "$PX_SCOPE_ID" POST "/v1/tests/$PD_TEST/runs/$PD_RUN/cancel" \
-      >/dev/null || true
+    PD_TERM_END=$(($(px_epoch_s) + PD_TERM_BUDGET_S))
+    printf '{}' | pd_api POST "/v1/tests/$PD_TEST/runs/$PD_RUN/cancel" "$out" || status=$?
+    # Because the controller commits the bundle of an ended run before returning its HTTP response,
+    # the run bundle is available both after an HTTP 200 cancellation and after an HTTP 409 when
+    # the run had already ended in another terminal state. Retrieving the bundle preserves the
+    # fleet report inside the harness bundle; any file truncated by the TERM budget remains as a
+    # .part file and is noted in the pherf.bundle verdict row. If the run verb already recorded
+    # pherf.bundle before TERM arrived, its completed copy is left intact.
+    if [ "${PX_VERB:-}" = run ] && [ -z "$PD_COPIED" ] &&
+      { [ "$status" = 0 ] || [ "$status" = 22 ]; }; then
+      if pd_bundle_get "$PX_DRIVER_DIR/controller"; then
+        sx_verdict pherf.bundle PASS "copied $PD_FILES files, $PD_BYTES bytes, of run" \
+          "$PD_RUN after the cancel at TERM" || true
+      else
+        sx_verdict pherf.bundle FAIL "the TERM budget of ${PD_TERM_BUDGET_S}s or a failed" \
+          "call ended the copy of run $PD_RUN after $PD_FILES files: $PD_REASON; a file in" \
+          "transfer at the cut stays <path>.part" || true
+      fi
+      state="$(pd_json "$PX_DRIVER_DIR/controller/manifest.json" /run/state 2>/dev/null ||
+        pd_json "$out" /state 2>/dev/null)" || state=unknown
+      pd_test_row run "$PD_TEST" "$PD_RUN" "$state" || true
+    fi
+    rm -f "$out"
   fi
   dv_term
 }
@@ -622,6 +680,7 @@ verb_run() {
   else
     sx_verdict pherf.bundle PASS "copied $PD_FILES files, $PD_BYTES bytes, of run $PD_RUN"
   fi
+  PD_COPIED=1
   pd_test_end "$PD_TEST" || true
   pd_test_row run "$PD_TEST" "$PD_RUN" "$PD_STATE" || return
   if [ "$PD_STATE" != COMPLETE ]; then

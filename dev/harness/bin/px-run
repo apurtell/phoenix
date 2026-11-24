@@ -1190,6 +1190,34 @@ gate_exited() {
   return 1
 }
 
+# Polls scope readiness in 1 s barrier waits and checks the disrupted instance before each wait.
+## @description  Waits until the scope is ready (index, seconds, deadline in epoch seconds).
+## @return       Exits 0 when ready, 1 if the instance exited or is absent, 4 at the deadline, or
+##               returns the barrier exit status.
+gate_ready() {
+  local status out
+  # The readiness barrier waits only for instances that it has not yet seen ready. Because an
+  # instance can exit after being seen ready while another instance remains unready—as the master
+  # does when a RegionServer aborts—a single long wait would hold the gate until its timeout bound.
+  # Each barrier wait is therefore kept short so that the gate can inspect the disrupted instance
+  # between waits. Because the expiration of an individual short wait is not a final outcome, only
+  # the messages from the final wait are forwarded to stderr.
+  while :; do
+    if gate_exited "$1"; then
+      return "$PX_EXIT_FAIL"
+    fi
+    status=0
+    out="$(sb_wait_ready "$SCOPE" 1 2>&1 >/dev/null || exit "$?")" || status=$?
+    [ "$status" = "$PX_EXIT_TIMEOUT" ] || break
+    if [ "$(px_epoch_s)" -ge "$3" ]; then
+      px_error "the readiness barrier expired after ${2}s in scope $SCOPE"
+      return "$PX_EXIT_TIMEOUT"
+    fi
+  done
+  [ -z "$out" ] || printf '%s\n' "$out" >&2
+  return "$status"
+}
+
 # Restarts a killed RegionServer, waits for the scope to become ready, and waits for the online
 # region count to return to its pre-disruption baseline (aborting immediately if the target instance
 # has exited or vanished), then writes a recover row whose timestamps determine mttr_seconds.
@@ -1214,7 +1242,7 @@ recover_gate() {
   if [ "$status" = 0 ]; then
     ready="$(gate_bound "$ready" "$shared")"
     deadline=$(($(px_epoch_s) + ready))
-    sb_wait_ready "$SCOPE" "$ready" >/dev/null || status=$?
+    gate_ready "$index" "$ready" "$deadline" || status=$?
   fi
   # A server reports ready before its regions finish coming back online. Waiting for the regions
   # reuses the remainder of the same readiness bound so that a single disruption consumes at most
@@ -1225,8 +1253,8 @@ recover_gate() {
   # cannot bring any regions back online even when the aggregate count has already recovered, each
   # poll checks the instance state before reading the count. Because a read can start while the
   # instance is running and complete after it exits, observing a full count rechecks the instance
-  # state as well. The recovery gate therefore monitors the instance until recovery completes, and
-  # any exit after that point is handled by the anomaly watcher.
+  # state as well. Together with the checks in gate_ready, the recovery gate monitors the instance
+  # until recovery completes, and any exit after that point is handled by the anomaly watch.
   if [ "$status" = 0 ]; then
     while :; do
       if gate_exited "$index"; then

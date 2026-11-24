@@ -53,28 +53,26 @@ who evaluate fleet A/B comparisons or resilience claims.
 
 **Cost.**
 
-* Wall time is approximately 40 min in total, comprising a cluster bring-up of about 1.5 min, 3
+* Wall time: approximately 40 min in total, comprising a cluster bring-up of about 1.5 min, 3
   replicates taking about 2 min each, 6 A/B replicates taking about 2 min each, an initial fault
-  run of 2 min, a second fault run of about 17 min (due to the known defect examined in step 22),
-  and a teardown of about 1 min. Part 3 is optional and excluded from this baseline total: running
-  it adds an initial teardown, a measurement class bring-up, 3 replicates and a teardown totaling
-  about 9 min, plus a second validation bring-up of about 1.5 min in step 20.
-* Docker memory requires 15360 MiB of aggregate container limits: the validation class with 1
-  RegionServer consumes 8704 MiB, adding a second RegionServer requires 2560, and the distributed
-  tier adds 4096 (a controller of 1024 and 2 agents of 1536). Because the preflight check admits
-  the engine memory less 4096 MiB, the engine needs at least 19456 MiB, which fits comfortably
-  within a 24 GiB engine allocation.
-* Disk usage remains under 1 GiB within `$PX_OUT`, consisting of 11 bundles that each occupy a few
-  MiB.
-* Files written on disk include `$PX_OUT/howto/15/`, 11 bundles in `$PX_OUT/runs/`, and 4 sessions
-  in `$PX_OUT/sessions/`, while Part 3 writes 3 additional bundles and a fifth session.
+  run of 2 min, a second fault run of roughly 7 min (step 23), and a 1 min teardown. Part 3
+  is optional and excluded from this baseline total: running it adds an initial teardown, a
+  measurement-class bring-up, 3 replicates, and a teardown totaling about 9 min, plus a second
+  validation-class bring-up of roughly 1.5 min prior to step 20.
+* Docker memory: 15360 MiB of aggregate container limits. The validation class with 1 RegionServer
+  consumes 8704 MiB, adding a second RegionServer requires 2560, and the distributed tier adds 4096
+  (a controller of 1024 and 2 agents of 1536). Because the preflight check admits the engine memory
+  less 4096 MiB, the engine needs at least 19456 MiB, which fits comfortably within a 24 GiB engine.
+* Disk: under 1 GiB within `$PX_OUT`, consisting of 11 bundles of a few MiB each.
+* Files written: creates `$PX_OUT/howto/h15/`, 11 bundles under `$PX_OUT/runs/`, and 4 sessions in
+  `$PX_OUT/sessions/`. Part 3 adds 3 bundles and a fifth session.
 
-Execute every command from the root of the repository, beginning with the three setup lines below:
+Initialize every shell session for this guide with the following three lines:
 
 ```sh
 export PATH="$PWD/dev/harness/bin:$PATH"
 export PX_OUT="${PX_OUT:-$HOME/phoenix-harness}"
-HOWTO="$PX_OUT/howto/15"; mkdir -p "$HOWTO"
+HOWTO="$PX_OUT/howto/h15"; mkdir -p "$HOWTO"
 ```
 
 ## Method
@@ -83,16 +81,16 @@ HOWTO="$PX_OUT/howto/15"; mkdir -p "$HOWTO"
 
 1. Replicates executed by `fleet.suite` produce distinct controller runs while preserving identical
    data-plane identities (slot seed, offset, and prefix), ensuring that every replicate drives the
-   exact same workload.
+   same workload.
 2. Setting `UPDATE_CACHE_FREQUENCY=0` forces every statement execution to re-read table metadata
-   from `SYSTEM.CATALOG`. Because this introduces an extra RPC on every lookup, the merged service
-   time (tracked under the `query` key) increases, whereas aggregate throughput remains unchanged
-   because the offered rate is fixed.
-3. Pausing RegionServer 0 for a duration shorter than the ZooKeeper session timeout allows the node
-   to recover and the fleet to finish executing across both RegionServers. Conversely, pausing the
-   node longer than the session timeout causes the RegionServer to abort upon resuming, which fails
-   the recovery gate while the fleet finishes its workload on RegionServer 1. (The live execution
-   refuted the expectation that the gate fails "at once" for this topology, as detailed in step 22.)
+   from `SYSTEM.CATALOG`. Because this adds one RPC to every lookup, the merged service time
+   (tracked under the `query` key) rises, whereas throughput remains unchanged because the offered
+   rate is fixed.
+3. Pausing the RegionServer hosting the fleet table for a duration shorter than the ZooKeeper
+   session timeout allows the instance to recover and the fleet to complete execution across both
+   RegionServers. Conversely, pausing RegionServer 0 beyond the session timeout causes the
+   RegionServer to abort upon resuming; the recovery gate then fails immediately, while the fleet
+   completes its workload on RegionServer 1.
 
 **Controls.** A single cluster configuration is used across the experiments: the validation class
 provisioned with 2 RegionServers and 2 agents. The suite definitions lock the workload parameters
@@ -751,64 +749,70 @@ of 40 s; [H09][h09] explains why a process pause must remain under 25 s to recov
 23. Pause RegionServer 0 for 50 s to exceed the ZooKeeper session timeout.
 
     ```sh
-    px-pherf --class validation -e PX_RS_COUNT=2 --keep run fleet.suite -- --only r1 \
-      -e 'PX_DISRUPT_SPEC=+15,signal,regionserver,0,STOP;+65,signal,regionserver,0,CONT'
-    echo "exit $?"
-    S2="$(ls -d "$PX_OUT"/sessions/2* | tail -n 1)"; F2="$(sed -n 1p "$S2/tests/r1/stdout.txt")"
+    px-pherf -e 'PX_DISRUPT_SPEC=+15,signal,regionserver,0,STOP;+65,signal,regionserver,0,CONT' \
+      run fleet --only r1 | tee "$HOWTO/f2.tsv"
+    S2="$(awk -F '\t' '$1 == "result" { print $4 }' "$HOWTO/f2.tsv")"
+    F2="$(bundle "$HOWTO/f2.tsv" r1)"
     grep -E 'disruption [0-9]|terminated' "$S2/tests/r1/stderr.log" | cut -c1-120
     awk -F '\t' '$1 ~ /^(cluster\.recovery|pherf\.fleet\.agents)$/ { print $1, $6 }' \
       "$F2/report/verdicts.tsv"
     ```
 
     ```text
-    1	r1	FAIL	1	1014243	exit 1 (failure), messages in .../tests/r1/stderr.log
-    exit 1
+    1	r1	FAIL	1	416211	exit 1 (failure), messages in .../tests/r1/stderr.log	.../runs/...
+    result	FAIL	1	.../phoenix-harness/sessions/...
+    ... ERROR px-pherf: run ends (exit 1, failure)
     ... INFO  px: disruption 1: signal regionserver/0 STOP
     ... INFO  px: disruption 1: regionserver/0 is paused; its recovery waits for a CONT
     ... INFO  px: disruption 2: signal regionserver/0 CONT
-    ... ERROR px: disruption 2: no recovery, timeout, exit 4
+    ... ERROR px: disruption 2: the backend reports regionserver/0 as exited, so it cannot recover
+    ... ERROR px: disruption 2: no recovery, fail, exit 1
     pherf.fleet.agents PASS
     cluster.recovery FAIL
     ```
 
-    This test ran for 16 min 54 s. RegionServer 0's ZooKeeper session expired during the pause,
-    causing the master to process the server as dead and reassign its regions, including
-    `hbase:meta`, to RegionServer 1. Roughly 3.5 s after receiving `CONT`, RegionServer 0 aborted
-    with `YouAreDeadException` and exit code 1. The Pherf fleet completed its workload against
-    RegionServer 1, so `pherf.fleet.agents` resolves to PASS.
+    RegionServer 0's ZooKeeper session expired during the pause, causing the master to process the
+    server as dead and reassign its regions—including `hbase:meta`—to RegionServer 1. When
+    RegionServer 0 resumed execution, it aborted with `YouAreDeadException` and exit code 1. The
+    fleet completed its workload on RegionServer 1, so `pherf.fleet.agents` resolves to PASS. The
+    test ran for 6 min 56 s, roughly 5 min of which was spent in the bootstrap probe of
+    `cluster.post_recovery` before reaching its timeout bound (exit 124) while RegionServer 0 was
+    down.
 
-    **Known defect: with 2 RegionServers the gate does not fail at once.** Instead, the recovery
-    gate waited for the full `PX_TIMEOUT_READY` duration of 600 s. Inspect the gate log lines:
+    **The gate fails at once.** In this execution, the `CONT` action was recorded at 02:55:05.94,
+    the master transitioned to unhealthy at 02:55:07.67 while RegionServer 0 still reported
+    healthy, RegionServer 0 exited at 02:55:07.87, and the recovery gate failed at 02:55:08. This
+    event ordering is the critical case: because the readiness barrier waits only for instances
+    that it has not yet observed ready, a RegionServer that reported ready before exiting is not
+    polled again by the barrier, while the master—whose readiness probe reports
+    `1 of 2 RegionServers checked in`—cannot become ready with that RegionServer gone. To handle
+    this condition, the gate polls readiness in 1 s barrier waits and inspects the disrupted
+    instance before each barrier wait, before each region-count read, and again after observing a
+    full region count. An instance that exits with any exit code or becomes absent terminates the
+    gate immediately. Inspect the gate log lines:
 
     ```sh
     grep -E 'barrier|no recovery' "$S2/tests/r1/stderr.log"
     ```
 
     ```text
-    ... ERROR px: the readiness barrier expired after 600s in scope px-default
-    ... ERROR px: disruption 2: no recovery, timeout, exit 4
+    ... ERROR px: disruption 2: no recovery, fail, exit 1
     ```
 
-    The initial readiness poll immediately following `CONT` observed RegionServer 0 still ready
-    before the process aborted. Once an instance passes its check, the readiness barrier continues
-    waiting only for instances not yet seen ready—here the master, whose readiness probe reports
-    `1 of 2 RegionServers checked in`. That probe can never pass with one RegionServer gone, and
-    the barrier does not re-check the exited RegionServer. Because the gate's container-exit check
-    runs only after the barrier returns, the gate blocks until the timeout bound expires. By
-    contrast, in the H3 window 1 run where the sole RegionServer was paused, that RegionServer was
-    still in the readiness wait when it exited, allowing the barrier to fail immediately:
+    Notice that no `readiness barrier expired` line appears: the gate did not block until
+    `PX_TIMEOUT_READY`. By contrast, builds prior to round H3b waited for the full 600 s timeout
+    in this scenario and terminated with `no recovery, timeout, exit 4` (as seen in the W2 run,
+    where the test took 16 min 54 s). When the target instance exits with a non-zero exit code
+    while a barrier wait is still waiting on it directly, the barrier logs the termination first:
 
     ```text
     ... ERROR px: an instance terminated while the barrier waited: regionserver/0(Exited (1) ...
     ... ERROR px: disruption 2: no recovery, fail, exit 3
     ```
 
-    Thus, the invariant "an exited instance fails the gate at once" holds when the process exits
-    while still in the readiness wait, or during the region availability poll (`disruption 2: the
-    backend reports regionserver/0 as exited, so it cannot recover`). It does not hold when the
-    exited instance was observed ready first and thereby prevents another role from becoming ready.
-    Both paths ultimately record `cluster.recovery` as FAIL. Because the planned signal accounts for
-    the exit, the anomaly watch reports no anomaly, and px-run exits with code 1 rather than 3.
+    Both paths record `cluster.recovery` as FAIL. Because the planned signal accounts for the
+    instance exit, the anomaly watch reports no unplanned anomaly, and px-run exits with code 1 (or
+    code 3 when reported by the barrier) rather than code 4.
 
 24. Review the post-count absent-instance check. This verification is drawn from D7 evidence and is
     not executed interactively here because it requires a second shell that deletes RegionServer 0
@@ -833,13 +837,14 @@ of 40 s; [H09][h09] explains why a process pause must remain under 25 s to recov
 
 A distributed controller run enforces no internal time limit of its own (decision (e) of D7). When
 a cluster stops responding, the first failed operation halts the open-loop generator on each agent,
-and the run concludes only when all in-flight operations hit their Phoenix client timeouts. The
-outer execution limit of a harness run is the verb bound, set by the `timeout` parameter of the
-suite test (1200 s for the fleet suites), which px-run shares across the prepare and run verbs.
-When the verb bound expires, px-run sends TERM to the driver. The driver catches the signal in
-`pd_term`, which posts `cancel` for the active controller run with a timeout bound of 8 s, fitting
-inside the 10 s grace period that px-run waits after sending TERM. The controller run transitions to
-`CANCELLED`, and the agents return to `IDLE`.
+and the run concludes once all in-flight operations reach their Phoenix client timeouts. The outer
+execution limit of a harness run is the verb bound—the `timeout` parameter of the suite test
+(1200 s for the fleet suites)—which px-run shares across the prepare and run verbs. When the verb
+bound expires, px-run sends TERM to the driver. The driver traps the signal in `pd_term`, posts
+`cancel` for the active controller run, and copies the resulting `CANCELLED` controller bundle into
+`drivers/pherf-distributed/controller/`. The cancellation and bundle copy share an 8 s time budget
+within the 10 s grace period that px-run waits after sending TERM. The controller run transitions
+to `CANCELLED`, and the agents return to `IDLE`.
 
 In the H3 window 1 execution, pausing the sole RegionServer for 50 s exercised this path, as shown
 in the px-run log:
@@ -856,11 +861,45 @@ also reached its timeout bound because client 0 cannot drop a table when no Regi
 available. Fault scenarios that need to terminate more rapidly should configure shorter client
 timeouts inside the `phoenixProperties` block of their query set.
 
-**Known limit (D8 item).** Along this timeout path, `pd_term` cancels the active controller run but
-does not copy back the resulting `CANCELLED` controller bundle. That bundle remains inside
-pherf-controller 0 until teardown, leaving the outer harness bundle without
-`drivers/pherf-distributed/controller/`, a fleet report, or slot logs, so `-analyze` cannot read
-such a replicate.
+**The fleet report on this path.** A run terminated by its verb bound preserves the `CANCELLED`
+controller bundle along with its fleet report and per-slot histogram logs. Round H3b verified this
+path by enforcing a 60 s verb bound across prepare and a 120 s run (`px-run pherf-distributed
+--timeout 60 -- ... --rows 6000 --rate 100 --duration-ms 120000 --threads 4`, which terminated with
+exit code 4):
+
+```text
+02:43:57Z ERROR px-run: the run verb passed its bound
+02:43:57Z WARN  px-run: stopping driver process 15702
+02:43:57Z WARN  pherf-distributed: the verb received TERM, so it cancels the controller run ...
+02:43:59Z INFO  px-run: verb run ended with exit 1, code 4
+```
+
+In the resulting bundle, `tests.tsv` records
+`run t-20261124T024331992Z-2 20261124T024332176Z-2 CANCELLED`, `controller/manifest.json` contains
+`"state":"CANCELLED","reason":"cancelled"`, the `pherf.bundle` verdict row records
+`PASS copied 7 files, 26682 bytes, of run 20261124T024332176Z-2 after the cancel
+at TERM`, and `px-bundle validate "$RUN"` succeeds with exit code 0. Archiving the controller bundle
+consumed 2 s of the 8 s budget. If the budget expires before the copy finishes, every file that
+transferred in full is retained, the file in flight remains as `<path>.part`, and `pherf.bundle`
+reports FAIL with the copied file count and failure cause. If TERM arrives after the run verb has
+already copied the bundle during normal test teardown, that existing copy and its verdict row are
+retained. Because a cancelled execution produces neither `run.tsv` nor `report.json`, the `report`
+verb emits no steady-state metrics from it. When inspected offline, `-analyze` reads the copied
+bundle as a replicate with a result of FAIL because its fleet verdict contains
+`pherf.fleet.agents FAIL ... run CANCELLED: cancelled`. Using the JDK and class path from step 6:
+
+```sh
+mkdir -p "$HOWTO/C" && cp -R "$RUN/drivers/pherf-distributed/controller" "$HOWTO/C/r1"
+(cd "$HOWTO" && "$JAVA" -cp "$CP" org.apache.phoenix.pherf.Pherf -analyze C -label term) \
+  2>/dev/null
+```
+
+```text
+Set set C: run class validation
+  r1 bundle 20261124T024332176Z-2 class validation contamination [noisy-host] result FAIL
+pherf.analysis.count_parity	SKIP	count	pherf	no set has two or more replicates
+Analysis: SKIP. Report: RESULTS/ANALYSIS_term.json
+```
 
 **Known limit (D7).** Following a planned container delete, each poll of the anomaly watch logs a
 noisy diagnostic line such as `ERROR px: command failed with status 6 at px-run line 743` (triggered
@@ -880,11 +919,10 @@ planned, only the log output is affected.
   PASS, and `pherf.fleet.agents` PASS confirms that the cluster recovered and the fleet executed
   its plan. In a fault run, the `pherf.health.*` rows quantify the client-side cost of the fault
   rather than a functional defect.
-* **A failed gate.** An exited or absent container fails the recovery gate immediately when the
-  gate observes it during the readiness wait or the region poll. A gate that blocks until
-  `PX_TIMEOUT_READY` indicates either a genuinely slow recovery or the known defect analyzed in
-  step 22; inspect the live instance states with `px-cluster status` before concluding that recovery
-  was slow.
+* **A failed gate.** An exited or absent instance fails the recovery gate immediately, whether
+  observed during the readiness wait or during the region poll (step 23). A gate that waits out the
+  full `PX_TIMEOUT_READY` interval therefore indicates a genuinely slow recovery; inspect the
+  instance states with `px-cluster status` to confirm it.
 
 ## Performance engineering notes
 

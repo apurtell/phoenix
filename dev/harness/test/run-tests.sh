@@ -155,6 +155,9 @@ T_ZK_PORT=""
 T_ZK_PID=""
 T_H3=""
 T_H3_BIN=""
+T_H3_RUN=""
+T_H3_STATE=""
+T_H3_IN_TIME=""
 
 # Default CLI options for executing against the fake selftest cluster recorded by t_seed_deployment:
 # a full validation run configuration, and the cluster identifier option alone.
@@ -934,9 +937,19 @@ ps)
     [ "$fake_running" = 0 ] || [ "$f_state" = running ] || continue
     printf '%s\n' "$fake_line"
   done <"$fake_inv"
+  # A next-after file holds how many listings show the inventory before
+  # next.txt replaces it. Without the file, one listing does.
   case "$fake_format" in
   '{{.ID}}|'*)
-    [ ! -f "$fake_state/next.txt" ] || mv -f "$fake_state/next.txt" "$fake_inv"
+    if [ -f "$fake_state/next.txt" ]; then
+      fake_after="$(cat "$fake_state/next-after" 2>/dev/null || echo 1)"
+      if [ "$fake_after" -gt 1 ]; then
+        printf '%s\n' "$((fake_after - 1))" >"$fake_state/next-after"
+      else
+        mv -f "$fake_state/next.txt" "$fake_inv"
+        rm -f "$fake_state/next-after"
+      fi
+    fi
     ;;
   esac
   ;;
@@ -1026,11 +1039,16 @@ start)
     fake_rewrite id "$1" exited 'Exited (1) 1 second ago'
   elif [ -e "$fake_state/start-unready" ]; then
     fake_rewrite id "$1" running 'Up 1 second (health: starting)'
-  elif [ -e "$fake_state/start-then-exit-0" ]; then
-    # The instance starts and is healthy, and it exits 0 after the next listing.
+  elif [ -e "$fake_state/start-then-exit-0" ] || [ -e "$fake_state/start-then-exit-1" ]; then
+    # The instance starts and is healthy. After the next listing it exits 0,
+    # or it exits 1 as a RegionServer does when the master processed it as
+    # dead.
+    fake_code=0
+    [ ! -e "$fake_state/start-then-exit-1" ] || fake_code=1
     fake_rewrite id "$1" running 'Up 1 second (healthy)'
-    awk -F '|' -v OFS='|' -v id="$1" '$1 == id { $4 = "exited"; $5 = "Exited (0) 1 second ago" }
-      { print }' "$fake_inv" >"$fake_state/next.txt"
+    awk -F '|' -v OFS='|' -v id="$1" -v c="$fake_code" \
+      '$1 == id { $4 = "exited"; $5 = "Exited (" c ") 1 second ago" } { print }' \
+      "$fake_inv" >"$fake_state/next.txt"
   elif [ -e "$fake_state/start-then-absent" ]; then
     # The instance starts and is healthy, and it is removed after the next
     # listing.
@@ -1038,6 +1056,17 @@ start)
     awk -F '|' -v id="$1" '$1 != id' "$fake_inv" >"$fake_state/next.txt"
   else
     fake_rewrite id "$1" running 'Up 1 second (healthy)'
+  fi
+  # The start-then-peer-unready file names a service that is unhealthy from
+  # the start on, as hbase-master is when it counts one RegionServer too few.
+  if [ -f "$fake_state/start-then-peer-unready" ]; then
+    fake_peer="$(cat "$fake_state/start-then-peer-unready")"
+    for fake_file in "$fake_inv" "$fake_state/next.txt"; do
+      [ -f "$fake_file" ] || continue
+      awk -F '|' -v OFS='|' -v s="$fake_peer" '$7 == s { $5 = "Up 3 minutes (unhealthy)" }
+        { print }' "$fake_file" >"$fake_file.new"
+      mv -f "$fake_file.new" "$fake_file"
+    done
   fi
   ;;
 logs)
@@ -11231,9 +11260,17 @@ case "$method $path" in
   ;;
 "GET /v1/tests/"*/report) reply report ;;
 "GET /v1/tests/"*/bundle) reply bundle ;;
-"GET /v1/tests/"*/bundle/*) reply "files/${path#*/bundle/}" ;;
+"GET /v1/tests/"*/bundle/*)
+  # The file-sleep file holds the seconds that each file of a bundle takes.
+  [ ! -f "$st/file-sleep" ] || sleep "$(cat "$st/file-sleep")"
+  reply "files/${path#*/bundle/}"
+  ;;
 "POST /v1/tests/"*/cancel) reply cancel ;;
-"POST /v1/tests/"*/end) reply end ;;
+"POST /v1/tests/"*/end)
+  # The end-sleep file holds the seconds that the end of a test takes.
+  [ ! -f "$st/end-sleep" ] || sleep "$(cat "$st/end-sleep")"
+  reply end
+  ;;
 esac
 reply not-found
 H3_EOF
@@ -12398,6 +12435,49 @@ t_h3_verb() {
 ## @return       Writes the recorded request lines to stdout. Exit 0.
 t_h3_calls() { cat "$T_A5_STATE/pherf/calls.log" 2>/dev/null; }
 
+## @description  Configures the stub controller to serve a CANCELLED run manifest in each bundle.
+## @return       Exit 0.
+t_h3_cancelled() {
+  local file="$T_H3/cancelled.json" bytes
+  sed 's/"state": "COMPLETE"/"state": "CANCELLED"/' "$T_H3/fx/files/manifest.json" >"$file"
+  t_h3_reply files/manifest.json 200 "$file"
+  bytes="$(wc -c <"$file" | tr -d ' ')"
+  sed "s|\"path\":\"manifest.json\",\"bytes\":[0-9]*|\"path\":\"manifest.json\",\"bytes\":$bytes|" \
+    "$T_A5_STATE/pherf/bundle" >"$T_H3/bundle.new"
+  mv "$T_H3/bundle.new" "$T_A5_STATE/pherf/bundle"
+}
+
+## @description  Executes the driver run verb (poll interval, call, argument...) against the stub
+##               controller and delivers TERM 1 s after the first request matching call.
+## @return       Sets T_H3_RUN, T_H3_STATE (last run state in tests.tsv), and T_H3_IN_TIME. Exit 0.
+t_h3_term() {
+  local interval=$1 call=$2 pid start ms
+  shift 2
+  T_H3_RUN="$(t_a5_bundle)"
+  (
+    exec env "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
+      "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_A5_STATE" \
+      "PX_POLL_INTERVAL_S=$interval" PX_CLUSTER_ID=selftest "PX_RUN_DIR=$T_H3_RUN" \
+      "PX_RUN_ID=${T_H3_RUN##*/}" PX_DRIVER_NAME=pherf-distributed \
+      "PX_DRIVER_DIR=$T_H3_RUN/drivers/pherf-distributed" PX_VERB=run \
+      PX_RECORD_SOURCE=driver:pherf-distributed PX_RUN_CLASS=validation PX_BACKEND=compose \
+      PX_SCOPE_ID=px-selftest "$T_BASH" "$PX_HOME/drivers/pherf-distributed/driver.sh" run "$@"
+  ) </dev/null >"$T_H3/term.out" 2>&1 &
+  pid=$!
+  px_wait_until 30 0.2 grep -q "$call\$" "$T_A5_STATE/pherf/calls.log" 2>/dev/null || true
+  sleep 1
+  start="$(px_epoch_ms)"
+  kill -s TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null
+  ms=$(($(px_epoch_ms) - start))
+  # Because px-run escalates to KILL 10 s after delivering TERM, record yes when the process exits
+  # within that window or report the elapsed duration otherwise.
+  T_H3_IN_TIME=yes
+  [ "$ms" -lt 10000 ] || T_H3_IN_TIME="no, $ms ms"
+  T_H3_STATE="$(awk -F '\t' '$1 == "run" { s = $4 } END { print s }' \
+    "$T_H3_RUN/drivers/pherf-distributed/tests.tsv" 2>/dev/null)"
+}
+
 ## @description  Verifies the pherf-distributed workload driver across its lifecycle verbs and
 ##               fault conditions against the stub controller (RQ-250, RQ-253).
 ## @return       Records test assertions. Exit 0.
@@ -12581,27 +12661,47 @@ EOF
   t_h3_verb run "$run" "${args[@]}"
   t_equals report_mismatch_fails_the_bundle "1 FAIL yes" "$T_STATUS $(t_severity_of "$run" \
     pherf.bundle) $(t_flag 'report.json differs' "$(t_detail_of "$run" pherf.bundle)")"
-  # Verify that delivering SIGTERM during the run verb cancels the active controller run.
+  # Verify that delivering TERM from px-run cancels the active controller run and retrieves its
+  # CANCELLED bundle, and that a poll interval longer than the 10 s grace period that px-run waits
+  # after sending TERM does not delay the signal handler.
   t_h3_driver_reset
   printf '1000000\n' >"$T_A5_STATE/pherf/running"
-  run="$(t_a5_bundle)"
-  (
-    exec env "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_DOCKER_BIN=$T_SHIM_DIR/docker" \
-      "PX_FAKE_DOCKER_LOG=$T_SHIM_LOG" "PX_FAKE_STATE_DIR=$T_A5_STATE" PX_POLL_INTERVAL_S=0.2 \
-      PX_CLUSTER_ID=selftest "PX_RUN_DIR=$run" "PX_RUN_ID=${run##*/}" \
-      PX_DRIVER_NAME=pherf-distributed "PX_DRIVER_DIR=$run/drivers/pherf-distributed" \
-      PX_VERB=run PX_RECORD_SOURCE=driver:pherf-distributed PX_RUN_CLASS=validation \
-      PX_BACKEND=compose PX_SCOPE_ID=px-selftest "$T_BASH" \
-      "$PX_HOME/drivers/pherf-distributed/driver.sh" run "${args[@]}"
-  ) </dev/null >"$T_H3/term.out" 2>&1 &
-  pid=$!
-  px_wait_until 30 0.2 grep -q '/status$' "$T_A5_STATE/pherf/calls.log" || true
-  kill -s TERM "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null
+  t_h3_cancelled
+  t_h3_term 12 /status "${args[@]}"
+  run=$T_H3_RUN
+  dir="$run/drivers/pherf-distributed"
   t_equals term_cancels_the_run "1" "$(t_h3_calls | grep -c '^POST /v1/tests/.*/runs/.*/cancel$')"
-  # Verify that delivering SIGTERM during the post-load catalog query in prepare terminates the
-  # Java process inside client 0 without sending a cancellation request, since the controller load
-  # run has already completed.
+  t_lib t_a5_json_get "$dir/controller/manifest.json" /run/state
+  t_equals term_copies_the_cancelled_bundle "7 CANCELLED PASS CANCELLED yes" "$(find \
+    "$dir/controller" -type f 2>/dev/null | grep -c .) $T_STDOUT $(t_severity_of "$run" \
+    pherf.bundle) $T_H3_STATE $T_H3_IN_TIME"
+  # Verify that when the TERM budget interrupts bundle retrieval, every completed file is retained,
+  # the file in transfer remains on disk with a .part suffix, and the pherf.bundle verdict row
+  # records the partial copy.
+  t_h3_driver_reset
+  printf '1000000\n' >"$T_A5_STATE/pherf/running"
+  printf '20\n' >"$T_A5_STATE/pherf/file-sleep"
+  t_h3_term 0.2 /status "${args[@]}"
+  run=$T_H3_RUN
+  dir="$run/drivers/pherf-distributed"
+  t_equals term_records_a_partial_copy_at_the_budget "FAIL yes 1 CANCELLED yes" \
+    "$(t_severity_of "$run" pherf.bundle) $(t_flag 'the TERM budget' "$(t_detail_of "$run" \
+    pherf.bundle)") $(find "$dir/controller" -name '*.part' 2>/dev/null | grep -c .) $(
+    printf '%s' "$T_H3_STATE $T_H3_IN_TIME")"
+  # Verify that delivering TERM after the run verb has already downloaded the bundle (simulated
+  # here during the test end request) preserves that bundle copy and its single pherf.bundle row.
+  t_h3_driver_reset
+  printf '3\n' >"$T_A5_STATE/pherf/end-sleep"
+  t_h3_term 0.2 /end "${args[@]}"
+  run=$T_H3_RUN
+  dir="$run/drivers/pherf-distributed"
+  t_equals term_after_the_copy_keeps_it "7 0 1 PASS yes" "$(find "$dir/controller" -type f \
+    2>/dev/null | grep -c .) $(find "$dir/controller" -name '*.part' 2>/dev/null | grep -c .) $(
+    t_h3_calls | grep -c '^GET /v1/tests/.*/bundle$') $(awk -F '\t' \
+    '$1 == "pherf.bundle" { printf "%s", $2 }' "$run/verdicts.tsv") $T_H3_IN_TIME"
+  # Verify that delivering TERM during the post-load catalog query in prepare terminates the Java
+  # process inside client 0 without issuing a cancellation request, since the controller run has
+  # already ended.
   t_h3_driver_reset
   : >"$T_A5_STATE/catalog-sleeps"
   t_shim_log_reset
@@ -12718,11 +12818,14 @@ t_group_h3_suite() {
   t_a5_state_reset
 }
 
-## @description  Verifies that a disrupted instance that exits after restart (even with exit 0) or
-##               becomes absent terminates the recovery gate immediately, even after a full count.
+# Verifies that a disrupted instance that exits (even with exit status 0) or becomes absent
+# terminates the recovery gate immediately during the readiness barrier, at a region count poll,
+# and after a full region count.
+## @description  Verifies that an exited (including exit 0) or absent instance terminates the
+##               recovery gate immediately in the barrier, at a region poll, and at a full count.
 ## @return       Records test assertions. Exit 0.
 t_group_h3_gate() {
-  local run start elapsed
+  local run start elapsed got flag
   printf '# H2b follow-up: an exited instance ends the recovery gate\n'
   t_a5_state_reset
   printf '%s\n' 12 8 >"$T_A5_STATE/region-count"
@@ -12753,6 +12856,28 @@ t_group_h3_gate() {
   t_equals full_count_of_an_absent_instance_fails_the_recovery "fail yes" "$(awk -F '\t' \
     '$1 == "recover" { print $5 }' "$run/run-record.tsv") $(t_flag \
     'is absent, so it cannot recover' "$T_STDERR")"
+  # H3b: after the readiness barrier observes the restarted instance as ready, the instance exits
+  # with status 1, exits with status 0, or becomes absent while hbase-master remains unready.
+  # Because the barrier continues waiting only on instances not yet seen ready, only re-checking
+  # the disrupted instance between barrier polls terminates the recovery gate immediately.
+  got=""
+  for flag in start-then-exit-1 start-then-exit-0 start-then-absent; do
+    t_a5_state_reset
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|||\n' c0ffee00a503 hbase-master \
+      px-selftest-hbase-master-1 running 'Up 3 minutes (healthy)' phoenix-harness:selftest \
+      hbase-master 1 0 >>"$T_A5_STATE/instances.txt"
+    printf 'hbase-master\n' >"$T_A5_STATE/start-then-peer-unready"
+    printf '3\n' >"$T_A5_STATE/next-after"
+    : >"$T_A5_STATE/$flag"
+    t_a5_run phase-kill -e PX_TIMEOUT_READY=20 --disrupt 'phase:phase@kill,kill,regionserver,0'
+    run="$(t_bundle)"
+    got="$got|${flag#start-then-} $(awk -F '\t' '$1 == "recover" { print $5 }' \
+      "$run/run-record.tsv") $(printf '%s\n' "$T_STDERR" | grep -cE \
+      'cannot recover|terminated while the barrier waited') $(printf '%s\n' "$T_STDERR" |
+      grep -c 'readiness barrier expired')"
+  done
+  t_equals exit_after_the_barrier_saw_ready_fails_the_recovery_at_once \
+    "|exit-1 fail 1 0|exit-0 fail 1 0|absent fail 1 0" "$got"
   t_a5_state_reset
 }
 

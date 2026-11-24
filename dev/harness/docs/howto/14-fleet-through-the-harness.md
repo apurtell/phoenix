@@ -282,7 +282,7 @@ with grep isolates the memory evaluation rows.
 
    ```sh
    px-cluster --class validation -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
-     -e PX_PHERF_ZOOKEEPER=zk1.example.com:2181 render --check | cut -f 1-4
+     -e PX_PHERF_ZOOKEEPER=zk1.example.invalid:2181 --dry-run render | cut -f 1-4
    ```
 
    ```text
@@ -293,28 +293,29 @@ with grep isolates the memory evaluation rows.
 
    An external deployment contains only the tier services within its own scope and container
    network, omitting all standard harness roles. Running `px-pherf start` brings the deployment up
-   when no active scope is recorded, and `px-pherf stop` tears it down. The agent containers must
+   whenever no cluster is recorded, while `px-pherf stop` tears it down. The agent containers must
    be able to resolve and reach the ZooKeeper quorum, the HBase Master, and every RegionServer
    hostname of that external cluster. Because the external target does not include client 0, the
    driver preserves the test tables upon completion (`pherf.tables` reports SKIP). This step
-   performs a render check only, as the reference host does not run a second cluster.
+   executes a dry-run render only, because no second cluster is running on the reference host.
 
 8. Pass `PX_PHERF_ZOOKEEPER` to the harness target, and then pass a quorum string containing a
    disallowed character to the external target.
 
    ```sh
-   px-cluster --class validation -e PX_PHERF=1 -e PX_PHERF_ZOOKEEPER=zk1:2181 render --check \
-     >/dev/null; echo "exit $?"
+   px-cluster --class validation -e PX_PHERF=1 -e PX_PHERF_ZOOKEEPER=zk1.invalid:2181 \
+     --dry-run render >/dev/null
    px-cluster --class validation -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
-     -e 'PX_PHERF_ZOOKEEPER=zk1:2181;x' render --check >/dev/null; echo "exit $?"
+     -e 'PX_PHERF_ZOOKEEPER=zk1.invalid:2181 x' --dry-run render >/dev/null
    ```
 
    ```text
    ... ERROR ... PX_PHERF_ZOOKEEPER is for PX_PHERF_TARGET=external. The harness target reads
    the ZooKeeper of the deployment
-   exit 2
-   ... ERROR ... PX_PHERF_ZOOKEEPER='zk1:2181;x' must hold letters, digits and . _ : , / - only
-   exit 2
+   ... ERROR px-cluster: render ends (exit 2, usage)
+   ... ERROR ... PX_PHERF_ZOOKEEPER='zk1.invalid:2181 x' must hold letters, digits and . _ : , /
+   - only
+   ... ERROR px-cluster: render ends (exit 2, usage)
    ```
 
    The harness target always derives its ZooKeeper ensemble from its own deployment. No file in the
@@ -899,16 +900,17 @@ then 2 threads), 300 executions per thread, and the stage duration ceiling.
   columns of a co-generated table so that each primary key depends solely on the global row index.
 - **Fleet sizing.** On a single container engine, every agent reserves 1536 MiB of memory that the
   cluster cannot use, and the agent processes compete directly with the RegionServers for CPU
-  cores. Size the fleet using the preflight memory arithmetic first (steps 2 through 5). Running a
+  cores. Size the fleet using the preflight memory arithmetic first (steps 2 to 5). Running a
   multi-agent fleet on a single host removes the bottleneck of a single client JVM, not the
   resource ceiling of the host itself.
-- **The same identities in each replicate.** Every replicate in a comparison series must use the
-  same seed, agent count, weights, and row count. Changing any of these parameters produces
-  different slot seeds and row offsets, defining a different workload.
+- **The same identities in each replicate.** Every replicate set must use the same seed, agent
+  count, weights, and row count. Changing any of these parameters produces different slot seeds and
+  row offsets, defining a different workload.
 - **The run bound.** The distributed tier does not impose an independent run timeout on a Pherf
   child process. Against a stopped cluster, the first failed operation halts the open arrival loop,
   and the run finishes once the client timeouts for in-flight operations expire. [H15][h15]
-  demonstrates the harness verb bound and its known limitations.
+  demonstrates the harness verb bound and the `CANCELLED` controller bundle that the driver copies
+  when that bound is reached.
 
 ## Reproduce it
 
