@@ -1454,8 +1454,9 @@ SHIM_EOF
 # k3d-<name> to k8s-contexts.txt of the fake kubectl when that file exists,
 # and a delete removes it. An image import adds the image to k8s-images, so
 # the nodes of the fake kubectl hold it, and to k3d-images.txt. k3d-version
-# holds the version that it reports; k3d-create-fails makes a create fail, and
-# k3d-create-partial makes it fail after it registered the cluster.
+# holds the version that it reports; k3d-create-fails makes a create fail,
+# k3d-create-partial makes it fail after it registered the cluster, and
+# k3d-create-stops-list makes every list after a create fail.
 # Any other verb, a registry verb included, is recorded only.
 if [ -n "${PX_FAKE_DOCKER_LOG:-}" ]; then
   printf 'k3d %s\n' "$*" >>"$PX_FAKE_DOCKER_LOG"
@@ -1468,6 +1469,7 @@ case "${1:-} ${2:-}" in
     "$(cat "$st/k3d-version" 2>/dev/null || printf 'v5.7.4')"
   ;;
 'cluster create')
+  [ ! -e "$st/k3d-create-stops-list" ] || : >"$st/k3d-list-fails"
   if [ -e "$st/k3d-create-fails" ] || grep -q "^${3:-}|" "$clusters" 2>/dev/null; then
     printf 'FATA[0000] Failed to create cluster %s\n' "${3:-}" >&2
     exit 1
@@ -1482,6 +1484,10 @@ case "${1:-} ${2:-}" in
   fi
   ;;
 'cluster list')
+  if [ -e "$st/k3d-list-fails" ]; then
+    printf 'FATA[0000] Failed to list clusters\n' >&2
+    exit 1
+  fi
   [ ! -f "$clusters" ] || awk -F '|' '{ print $1 "   1/1   0/0   true" }' "$clusters"
   ;;
 'cluster delete')
@@ -15269,7 +15275,7 @@ t_group_k2_target() {
 ##               (RQ-284, RQ-285, RQ-286, RQ-289, RQ-290, RQ-298).
 ## @return       Records test assertions. Exit 0.
 t_group_k2_preflight() {
-  local total budget mib bad="" calls
+  local total budget mib bad="" calls pin
   printf '# K2: the Kubernetes preflight\n'
   t_k2_reset
   t_mgen --class validation --cluster selftest
@@ -15333,8 +15339,9 @@ t_group_k2_preflight() {
   t_equals k8s_preflight_refuses_an_old_kubectl "3 fail yes yes" "$T_STATUS $(t_k2_row \
     "$T_STDOUT" client_version) $(t_flag v1.27.0 "$T_STDOUT") $(t_flag 1.28 "$T_STDOUT")"
   rm -f "$T_K8S_STATE/client-version"
-  t_equals versions_env_pins_k3s_and_tool_floors "rancher/k3s: 1.28 5.0" "$(sed -n \
-    's/^PX_K3S_IMAGE=\(rancher\/k3s:\).*/\1/p' "$PX_HOME/docker/versions.env") $(sed -n \
+  pin="$(grep -cE '^PX_K3S_IMAGE=rancher/k3s:[^@]+@sha256:[0-9a-f]{64}$' \
+    "$PX_HOME/docker/versions.env")"
+  t_equals versions_env_pins_k3s_and_tool_floors "1 1.28 5.0" "$pin $(sed -n \
     's/^PX_KUBECTL_MIN_VERSION=//p' "$PX_HOME/docker/versions.env") $(sed -n \
     's/^PX_K3D_MIN_VERSION=//p' "$PX_HOME/docker/versions.env")"
   # Verify that preflight rejects the target when another harness deployment exists on the cluster
@@ -15662,7 +15669,7 @@ t_group_k2_evidence() {
 ##               and one cluster per host (RQ-284, RQ-291, RQ-292, RQ-298, RQ-303, RQ-304, R-258).
 ## @return       Records test assertions. Exit 0.
 t_group_k2_k3d() {
-  local line calls bad="" word
+  local line calls bad="" word pin
   printf '# K2: the local cluster manager\n'
   t_k2_reset
   # The diagnostic remedy for a missing image is determined by whether the context has a px-k3d
@@ -15763,9 +15770,19 @@ t_group_k2_k3d() {
   # Verify that cluster creation rejects a k3s image reference that lacks an immutable SHA-256
   # digest pin before invoking k3d (RQ-291).
   t_shim_log_reset
-  t_k8s PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-k3d" create
+  t_k8s PX_K8S_CONTEXT=k3d-px PX_K3S_IMAGE=rancher/k3s:v1.31.4-k3s1 "$T_BASH" "$T_BIN/px-k3d" \
+    create
   t_equals px_k3d_create_refuses_a_pin_without_digest "2 yes no" "$T_STATUS $(t_flag @sha256 \
     "$T_STDERR") $(t_flag 'cluster create' "$(cat "$T_SHIM_LOG")")"
+  # Verify that the default image pin shipped in docker/versions.env satisfies the digest
+  # validation rule and is passed through to k3d unaltered (RQ-291, RQ-298).
+  t_shim_log_reset
+  t_k8s PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-k3d" create
+  line="$(grep '^k3d cluster create' "$T_SHIM_LOG")"
+  pin="$(sed -n 's/^PX_K3S_IMAGE=//p' "$PX_HOME/docker/versions.env")"
+  t_equals px_k3d_create_admits_the_shipped_pin "0 $pin" "$T_STATUS $(printf '%s\n' "$line" |
+    sed -n 's/.* --image \([^ ]*\) .*/\1/p')"
+  t_k3d delete
   printf 'v4.4.8\n' >"$T_K8S_STATE/k3d-version"
   t_k3d create
   t_equals px_k3d_create_refuses_an_old_k3d "3 yes yes no" "$T_STATUS $(t_flag v4.4.8 \
@@ -15798,6 +15815,18 @@ t_group_k2_k3d() {
   t_k3d create
   t_equals px_k3d_failed_create_removes_the_partial_cluster "1 yes no 0 0" "$line $T_STATUS"
   t_k3d delete
+  # Verify that when cluster creation fails and k3d subsequently fails to list its clusters, the
+  # scope record is retained so that px-k3d delete can remove the partially created cluster.
+  : >"$T_K8S_STATE/k3d-create-partial"
+  : >"$T_K8S_STATE/k3d-create-stops-list"
+  t_k3d create
+  line="$T_STATUS $(t_flag 'did not list' "$T_STDERR") $(t_exists \
+    "$T_K8S_OUT/state/px-k3d/scope-k3d-px.tsv")"
+  rm -f "$T_K8S_STATE/k3d-create-partial" "$T_K8S_STATE/k3d-create-stops-list" \
+    "$T_K8S_STATE/k3d-list-fails"
+  t_k3d delete
+  t_equals px_k3d_failed_create_keeps_the_record_when_k3d_cannot_list "1 yes yes 0 0" \
+    "$line $T_STATUS $(grep -c . "$T_K8S_STATE/k3d-clusters.txt")"
   t_k3d create
   t_shim_log_reset
   t_with_shim "PX_OUT=$T_K8S_OUT" PX_CLUSTER_ID=selftest "$T_BASH" "$T_BIN/px-cluster" up \

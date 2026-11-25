@@ -204,7 +204,7 @@ pxd_gate() {
 ## @return       Returns 0 on success, 1 on k3d failure, 2 on usage or unpinned image digest error,
 ##               3 on gate refusal, or 4 on timeout expiry.
 pxd_create() {
-  local timeout status=0
+  local timeout status=0 listed
   local -a args=()
   if ! [[ ${PX_K3S_IMAGE:-} =~ $PXD_PIN_RE ]]; then
     px_die "$PX_EXIT_USAGE" "PX_K3S_IMAGE='${PX_K3S_IMAGE:-}' names no digest: pin the k3s" \
@@ -236,12 +236,16 @@ pxd_create() {
   pxd_call $((timeout + 60)) "${args[@]}" >&2 || status=$?
   if [ "$status" != 0 ]; then
     # Clean up any partially created cluster that k3d may have left behind after a failure or kill.
-    if pxd_listed && ! pxd_call "$(sb_seconds PX_TIMEOUT_TEARDOWN 300)" cluster delete \
+    listed=0
+    pxd_listed || listed=$?
+    if [ "$listed" = 0 ] && ! pxd_call "$(sb_seconds PX_TIMEOUT_TEARDOWN 300)" cluster delete \
       "$PXD_CLUSTER" >&2; then
-      px_error "k3d left the cluster $PXD_CLUSTER, and its delete failed: the record stays," \
-        "so px-k3d delete can remove it"
-      exit "$PX_EXIT_FAIL"
+      px_die "$PX_EXIT_FAIL" "k3d left the cluster $PXD_CLUSTER, and its delete failed: the" \
+        "record stays, so px-k3d delete can remove it"
     fi
+    [ "$listed" = 0 ] || [ "$listed" = "$PX_EXIT_NO_OBJECT" ] ||
+      px_die "$PX_EXIT_FAIL" "k3d did not list its clusters after the failed create: the" \
+        "record stays, so px-k3d delete can remove $PXD_CLUSTER"
     sb_record_drop px-k3d "$PXD_CONTEXT" scope
     sb_expired "$status" && px_die "$PX_EXIT_TIMEOUT" "the create of $PXD_CLUSTER expired"
     px_die "$PX_EXIT_FAIL" "k3d could not create the cluster $PXD_CLUSTER"

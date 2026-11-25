@@ -66,8 +66,7 @@ PX_K8S_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The minimum supported Kubernetes API version is 1.28: pods must be able to resolve bare peer
 # names across more than six DNS search domains, and StatefulSet pods must expose their ordinal via
 # the apps.kubernetes.io/pod-index label. Both are enabled by default and stable from 1.28 on.
-PX_K8S_API_FLOOR_MAJOR=1
-PX_K8S_API_FLOOR_MINOR=28
+PX_K8S_API_FLOOR=1.28
 
 # A Kubernetes namespace must conform to the DNS label grammar, and every scope identifier must
 # terminate with a valid namespace name.
@@ -715,11 +714,10 @@ sb_preflight() {
     return "$SB_EXIT_ANOMALY"
   fi
   px_tsv_row engine_responsive ok "API server $server on context $PXK_CONTEXT"
-  if sb_version_at_least "$server" "$PX_K8S_API_FLOOR_MAJOR" "$PX_K8S_API_FLOOR_MINOR"; then
+  if sb_version_floor "$server" PX_K8S_API_FLOOR; then
     px_tsv_row engine_version ok "$server"
   else
-    px_tsv_row engine_version fail \
-      "API server $server is below the floor $PX_K8S_API_FLOOR_MAJOR.$PX_K8S_API_FLOOR_MINOR"
+    px_tsv_row engine_version fail "API server $server is below the floor $PX_K8S_API_FLOOR"
     failed=1
   fi
   if sb_version_floor "${client:-none}" PX_KUBECTL_MIN_VERSION; then

@@ -58,9 +58,8 @@ PX_COMPOSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # required by this module: the cp subcommand, the index selector on exec and cp, and project
 # selection without an explicit compose file. The minimum Compose version floor is set to the v2
 # release series for the same reason.
-PX_COMPOSE_ENGINE_FLOOR_MAJOR=20
-PX_COMPOSE_ENGINE_FLOOR_MINOR=10
-PX_COMPOSE_FLOOR_MAJOR=2
+PX_COMPOSE_ENGINE_FLOOR=20.10
+PX_COMPOSE_FLOOR=2.0
 
 ## @description  Report the backend name recorded in the bundle manifest.
 ## @return       Write compose to stdout and exit 0.
@@ -735,7 +734,7 @@ px_compose_port_free() {
 ## @return       Write check TSV rows to stdout and exit 0 when no check fails, exit 3 when any
 ##               check fails, or exit 2 on invalid usage or a port-map line rejected by the loader.
 sb_preflight() {
-  local scope=${1:-} failed=0 server compose memory cpus busy="" names name port floor status=0
+  local scope=${1:-} failed=0 server compose memory cpus busy="" names name port status=0
   px_compose_ports_load "$scope" || return $?
   if px_compose_resolve_engine; then
     px_tsv_row engine_binary ok "$_PXC_ENGINE"
@@ -764,13 +763,11 @@ sb_preflight() {
     return "$SB_EXIT_ANOMALY"
   fi
   server="$(printf '%s\n' "$server" | sed -n '$p')"
-  floor="$PX_COMPOSE_ENGINE_FLOOR_MAJOR.$PX_COMPOSE_ENGINE_FLOOR_MINOR"
   px_tsv_row engine_responsive ok "server $server"
-  if sb_version_at_least "$server" \
-    "$PX_COMPOSE_ENGINE_FLOOR_MAJOR" "$PX_COMPOSE_ENGINE_FLOOR_MINOR"; then
+  if sb_version_floor "$server" PX_COMPOSE_ENGINE_FLOOR; then
     px_tsv_row engine_version ok "$server"
   else
-    px_tsv_row engine_version fail "engine $server is below the floor $floor"
+    px_tsv_row engine_version fail "engine $server is below the floor $PX_COMPOSE_ENGINE_FLOOR"
     failed=1
   fi
   if px_compose_engine 30 info --format '{{.ID}}' >/dev/null 2>&1; then
@@ -780,12 +777,11 @@ sb_preflight() {
     failed=1
   fi
   compose="$(px_compose_compose_version)" || compose=""
-  if [ -n "$compose" ] &&
-    sb_version_at_least "$compose" "$PX_COMPOSE_FLOOR_MAJOR" 0; then
+  if sb_version_floor "$compose" PX_COMPOSE_FLOOR; then
     px_tsv_row compose_version ok "$compose"
   else
     px_tsv_row compose_version fail \
-      "compose ${compose:-unknown} is absent or below the floor $PX_COMPOSE_FLOOR_MAJOR"
+      "compose ${compose:-unknown} is absent or below the floor $PX_COMPOSE_FLOOR"
     failed=1
   fi
   memory="$(px_compose_engine 30 info --format '{{.MemTotal}}')" || memory=""

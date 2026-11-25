@@ -217,14 +217,14 @@ ck_restart() {
   # pb_anomaly_rows helper aggregates each anomalous instance along with its state change, restart
   # counts, termination reason, and out-of-memory evidence recorded by px-run.
   result="$(pb_anomaly_rows "$CK_REC" | awk -F "$PB_US" 'NR > 1 {
-      n++
+      n++; keys = keys $1 "/" $2 " "
       list = list " " $1 "/" $2 " (" $3 "; restarts " ($4 == "" ? "?" : $4) " to " \
         ($5 == "" ? "?" : $5) "; reason " ($6 == "" ? "unknown" : $6) \
         ($7 == "" ? "" : ", exit " $7) "; oom " ($8 == "" ? "unknown" : $8) ")"
-    } END { printf "%d\t%s\n", n, list }')"
+    } END { printf "%d\t%s\t%s\n", n, list, keys }')"
   count="$(px_tsv_field 1 "$result")"
   list="$(px_tsv_field 2 "$result")"
-  keys="$(pb_anomaly_rows "$CK_REC" | awk -F "$PB_US" 'NR > 1 { printf "%s/%s ", $1, $2 }')"
+  keys="$(px_tsv_field 3 "$result")"
   live="$(ck_restart_live "$keys")"
   while read -r key before after; do
     [ -n "$key" ] || continue

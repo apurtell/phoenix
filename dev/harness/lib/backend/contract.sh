@@ -930,6 +930,8 @@ sb_record_gate() {
 }
 
 ## @description  Reports every recorded scope id for BACKEND except an optional EXCEPT scope.
+## @param        BACKEND: Identifier of the backend that owns the state directory.
+## @param        EXCEPT: Optional scope id to exclude from the reported list.
 ## @return       Writes each scope id preceded by a space, or nothing if none exist; exits 0, or 2
 ##               when the output policy refuses the state directory.
 sb_record_scopes() {
@@ -965,15 +967,22 @@ sb_role_selected() {
   return 1
 }
 
-# Compares a semantic version string (with or without a leading "v") numerically against a required
-# major and minor version floor.
-## @description  Compares VERSION numerically against FLOOR_MAJOR and FLOOR_MINOR.
+# Compares VERSION numerically against the major.minor version floor configured in the variable
+# named by NAME, such as PX_K3D_MIN_VERSION from docker/versions.env. Exits 0 when VERSION meets or
+# exceeds the floor, 1 when it falls below the floor, or 2 when either value contains no version
+# number.
+## @description  Validates VERSION against the major.minor version floor held in the variable NAME.
 ## @param        VERSION: Version string to test (leading "v" and patch suffix are ignored).
-## @param        FLOOR_MAJOR: Minimum required major version number; defaults to 0.
-## @param        FLOOR_MINOR: Minimum required minor version number; defaults to 0.
-## @return       Exits 0 if VERSION meets the floor, 1 if lower, or 2 if VERSION holds no number.
-sb_version_at_least() {
-  local version=${1:-} major_floor=${2:-0} minor_floor=${3:-0} major minor
+## @param        NAME: Name of the variable holding the required major.minor version floor.
+## @return       Exits 0 if VERSION meets the floor, 1 if lower, or 2 if either holds no version.
+sb_version_floor() {
+  local version=${1:-} floor=${!2:-} major_floor minor_floor major minor
+  case "$floor" in
+  [0-9]*.[0-9]*) ;;
+  *) return "$SB_EXIT_USAGE" ;;
+  esac
+  major_floor=${floor%%.*}
+  minor_floor=${floor#*.}
   version="${version#v}"
   major="${version%%.*}"
   minor="${version#*.}"
@@ -996,19 +1005,6 @@ sb_version_at_least() {
   return 1
 }
 
-# Compares VERSION against the major.minor version floor stored in the variable named by NAME, such
-# as PX_K3D_MIN_VERSION from docker/versions.env.
-## @description  Tests VERSION against the major.minor floor stored in the variable NAME.
-## @return       Exits 0 when VERSION meets the floor, 1 when it is lower, or 2 when either value
-##               contains no version number.
-sb_version_floor() {
-  local floor=${!2:-}
-  case "$floor" in
-  [0-9]*.[0-9]*) sb_version_at_least "${1:-}" "${floor%%.*}" "${floor#*.}" ;;
-  *) return "$SB_EXIT_USAGE" ;;
-  esac
-}
-
 # Defines the lowercase grammar for a registry address, consisting of a host, an optional port, and
 # an optional path. Because the container engine interprets a leading component without a dot, a
 # port, or the name localhost as a Docker Hub namespace, accepting such a value would direct a push
@@ -1016,6 +1012,7 @@ sb_version_floor() {
 SB_REGISTRY_RE='^[a-z0-9]([-a-z0-9.]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([-a-z0-9._]*[a-z0-9])?)*$'
 
 ## @description  Validates a registry value against SB_REGISTRY_RE and the explicit host rule.
+## @param        REGISTRY: Registry address in host[:port][/path] format to validate.
 ## @return       Exits 0 when the value names an explicit registry host, or 1 otherwise.
 sb_registry_check() {
   local host=${1:-}
