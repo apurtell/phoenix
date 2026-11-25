@@ -1122,7 +1122,7 @@ EOF
       # Anomaly detection runs before the readiness check because a container that crashed and
       # restarted between polling intervals may already report ready again on the next listing.
       if [ -n "$PXK_P_NAME" ]; then
-        if cause="$(px_k8s_anomaly "$base")"; then
+        if cause="$(px_k8s_anomaly "$base" || exit "$?")"; then
           anomaly="$anomaly $key($cause)"
         elif [ "$PXK_P_READY" = ready ]; then
           seen="$seen$key$PX_TAB$(($(px_epoch_ms) - start))$PX_NL"
@@ -2061,9 +2061,11 @@ sb_oom_killed() {
     px_tsv_row yes "the last container terminated OOMKilled, exit code ${PXK_P_LAST_CODE:-137}"
     return 0
   fi
-  # When a node-level OOM kill targets a descendant process rather than PID 1 of the container, no
-  # container termination reason is recorded; instead, the kubelet emits a pod event that can be
-  # queried for that single pod via a field selector.
+  # Container termination state serves as the primary evidence because a cgroup OOM kill terminates
+  # the entire container even when a descendant process rather than PID 1 exhausted the memory
+  # limit, and k3s emits no OOM event in that case. Querying events for the individual pod via a
+  # field selector provides a fallback for clusters that record a process-level OOM kill without
+  # terminating the container.
   events="$(px_k8s_call 30 get events --field-selector "involvedObject.name=$PXK_P_NAME" \
     -o 'jsonpath={range .items[*]}{.reason}|{.message}{"\n"}{end}')" || {
     px_error "kubectl did not list the events of $PXK_P_NAME"

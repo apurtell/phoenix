@@ -959,13 +959,15 @@ containing the process ID, local port, pod UID, and scope). The function waits u
 tunnel to emit its `Forwarding from 127.0.0.1:<port>` line and then outputs `127.0.0.1` together
 with that dynamically allocated local port (returning exit code 4 if the readiness line does not
 appear within the timeout, or exit code 1 if the process terminates early or the pod is not
-running). Subsequent calls reuse an active tunnel targeting the same pod; if the controller replaces
-the pod, the old tunnel terminates and the next call establishes a new one. `sb_endpoint_release`
-terminates a single tunnel—or all tunnels belonging to the scope when passed `all`, which teardown
-performs as its initial step. Because the detached tunnel holds no open file descriptors inherited
-from its caller, `px-cluster endpoint` returns immediately while the tunnel continues running in the
-background. Roles that do not have a Service—specifically `setup`, `client`, and `tooling`—expose no
-endpoints and return exit code 6.
+running). Subsequent calls reuse an active tunnel that targets the same pod. When a controller
+replaces the pod, the existing tunnel can no longer reach it: the `kubectl` process exits on its
+first failed connection attempt, and the next endpoint call terminates the stale tunnel after
+detecting that the recorded pod UID has changed before establishing a replacement tunnel.
+`sb_endpoint_release` stops an individual tunnel—or every tunnel in the scope when given `all`,
+which cluster teardown executes as its opening step. Because the detached tunnel process inherits no
+open file descriptors from the caller, `px-cluster endpoint` returns immediately while the tunnel
+continues operating in the background. Roles without a Service—specifically `setup`, `client`, and
+`tooling`—expose no endpoints and return exit code 6.
 
 ### Probes
 
@@ -1078,7 +1080,11 @@ containing `OOMKilled`, indicates an out-of-memory kill. `sb_sample_resources` r
 block I/O counters, those four schema columns are emitted as empty fields (denoting unknown values
 rather than 0), and an unavailable Metrics API causes the function to return exit code 5. While a
 workload runs, px-run aborts the run with exit code 3 if any instance's restart count increases or a
-container terminates unexpectedly. In addition, the cluster health checks compare live restart
+container terminates unexpectedly. Because the kubelet immediately restarts a terminated container,
+the instance typically reports a current state of `running` by the time px-run inspects it; when the
+restart count has increased, px-run instead records the `previous` container termination state in
+both the run record and the manifest anomaly block—such as `killed` with exit code 137 following a
+SIGKILL, or `oom`. Furthermore, the cluster health checks compare live restart
 counts against the run's snapshots and capture the previous container log of every instance that
 restarted or suffered an out-of-memory kill into `logs/instance/<role>-<index>.previous.log`.
 
@@ -1273,23 +1279,29 @@ absolute binary path stored in `_PXD_K3D`, discovered by searching `PATH` follow
   `127.0.0.1:8081:80@loadbalancer`. Every published port binds exclusively to 127.0.0.1, and the
   active context in the operator's kubeconfig remains unchanged.
 * `import [IMAGE...]` executes `k3d image import -c px <image>` once for each specified local image
-  tag, defaulting to `PX_IMAGE_TAG`. No container registry is created and no image is pushed.
-* `check` emits the `k3d_binary`, `k3d_version`, and `engine_memory` check rows, obtaining the
-  Compose backend's engine memory figure, which `px-k3d` binds exclusively for that row.
+  tag, defaulting to every image tag required by the active configuration: `PX_IMAGE_TAG`, plus
+  `PX_PHERF_IMAGE_TAG` when `PX_PHERF=1` is enabled. Running `px-cluster build --backend k8s`
+  automatically invokes this import step after building the images. No container registry is
+  created and no image is pushed.
+* `check` executes prior to `create` without requiring a state record. It emits the `k3d_binary`,
+  `k3d_version`, and `engine_memory` check rows, querying the total engine memory through the
+  Compose backend, which `px-k3d` binds solely to produce that row.
 * `delete` fails with exit code 3 if an active Kubernetes scope is still recorded for the target
   context; otherwise, it deletes the k3d cluster and removes its state record.
 
-The state record `$(px_state_dir)/k3d/scope-<context>.tsv` (storing the scope and created_at fields)
-tracks every cluster created by `px-k3d`. Every subcommand other than `create` inspects this record
-before making any tool call: if no record exists for the target context—including when targeting a
-remote cluster—the command immediately returns exit code 6 without invoking `k3d`, ensuring `px-k3d`
-never deletes a cluster owned by someone else. The single-cluster-per-host invariant is enforced in
-both directions: `px-k3d create` refuses to run when a Compose scope record is present, and
-`px-cluster up` on the Compose backend fails with exit code 1 when a `px-k3d` state record is
-present. The command returns exit code 0 on success, 1 if k3d fails or is not installed, 2 on
-invalid usage or an image pin lacking a digest, 3 when a pre-creation gate or version floor check
-rejects the operation, 4 when a wait operation expires, and 6 when no `px-k3d` cluster is recorded
-for the context.
+The state file `$(px_state_dir)/px-k3d/scope-<context>.tsv` (recording the scope and created_at
+fields) tracks each cluster provisioned by `px-k3d`. Both `delete` and `import` verify this record
+before invoking any external tool: when no record exists for the target context, they terminate
+immediately with exit code 6 without calling `k3d`, guaranteeing that `px-k3d` never removes an
+externally managed cluster. Targeting a context that does not follow the k3d naming convention,
+such as a remote cluster, causes every subcommand except `create` to exit with code 6, whereas
+`create` rejects it with exit code 2. The single-cluster-per-host invariant is enforced
+symmetrically: `px-k3d create` refuses to run if a Compose scope record is present, while
+`px-cluster up` on the Compose backend fails with exit code 3 if a `px-k3d` state record exists.
+Overall, the command exits with code 0 on success, 1 if k3d is absent or fails, 2 on invalid usage
+or an image pin lacking a digest, 3 when a pre-creation gate or version floor check rejects the
+operation, 4 when a wait operation expires, and 6 when no `px-k3d` cluster is recorded for the
+target context during `delete` or `import`.
 
 ### Dedicated nodes and the end of a measurement
 
@@ -1322,8 +1334,26 @@ of `--api-port` and `-p`, the actual memory footprint of k3s relative to `PX_K3S
 the resolved image ID following an image import, live port-forward tunnel creation and termination
 upon pod restart, the event reasons emitted by a genuine out-of-memory kill, DNS search domain
 resolution, the pod-index label, probe timing behavior, the shared persistent volume claim mounted
-by the setup Job, `kubectl cp`, resource metrics sampling, and drain-aware restarts. Milestone K4
-then validates behavioral parity with Compose along with full measurement run teardown; milestone K5
-validates the Distributed Pherf tier and its mesh role group; milestone K6 validates service mesh
-integration and image promotion against a live registry; and milestone K7 validates node placement,
-resource quotas, and operator-prepared namespaces on dedicated hardware.
+by the setup Job, `kubectl cp`, resource metrics sampling, and drain-aware restarts. Live cluster
+execution established several runtime behaviors that cannot be observed against a simulated fake:
+
+* Across a three-node validation cluster, the node containers consume approximately 780 MiB when
+  idle and up to 2210 MiB beyond the pod working sets under load; accordingly, `k3d.env` configures
+  the node memory allowance at 2304 MiB. With this allowance reserved, a five-RegionServer
+  deployment at validation sizing does not fit within a 24 GiB container engine.
+* Following `px-k3d import`, the kubelet reports the digest of the image configuration as the
+  container's image ID rather than the manifest digest used as the local image ID by the containerd
+  image store. Consequently, a Kubernetes run bundle records a digest that does not match any local
+  image ID.
+* A cgroup out-of-memory kill sets the container termination reason to `OOMKilled` with exit code
+  137, while k3s emits neither an `OOMKilling` nor an `OOMKilled` pod event, making the container
+  termination state the sole evidence of the kill.
+* At the 250 millicores per GiB CPU ratio, the 125-millicore tooling pod requires approximately
+  45 s to launch the region mover JVM, resulting in a total drain-aware restart duration of
+  approximately 130 to 170 s.
+
+Subsequent milestones build on this baseline: milestone K4 validates behavioral parity with Compose
+and end-to-end measurement run teardown; milestone K5 validates the Distributed Pherf tier and its
+mesh role group; milestone K6 validates service mesh integration and image promotion against a live
+registry; and milestone K7 validates node placement, resource quotas, and operator-prepared
+namespaces on dedicated hardware.

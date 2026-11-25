@@ -751,17 +751,32 @@ EOF
   return 0
 }
 
-## @description  Records failure diagnostic evidence for an anomalous instance by capturing both its
-##               termination reason and its out-of-memory kill status.
+## @description  Records an instance's termination reason (from the previous container when rose is
+##               1 and the current one is running again) and OOM kill status (role, index, rose).
 ## @return       Exit 0.
 evidence_record() {
-  local role=$1 index=$2 term="" oom="" reason="" kill="" status=0 column
+  local role=$1 index=$2 rose=${3:-0} term="" oom="" reason="" kill="" status=0 column previous
   term="$(sb_termination_reason "$SCOPE" "$role" "$index" current || exit "$?")" ||
     status=$?
+  column="$(sb_schema_index term reason)" || column=1
+  [ "$status" != 0 ] || reason="$(px_tsv_field "$column" "$term")" || reason=""
+  # Because a container restarted by its controller is already running again when this check occurs,
+  # the termination that triggered the restart is recorded on the previous container retained by the
+  # backend. If the restart count did not increase, any prior termination record may predate the
+  # current run, so the current container state is preserved.
+  if [ "$reason" = running ] && [ "$rose" = 1 ]; then
+    previous="$(sb_termination_reason "$SCOPE" "$role" "$index" previous 2>/dev/null ||
+      exit "$?")" || status=$?
+    if [ "$status" = 0 ] && [ -n "$previous" ]; then
+      term=$previous
+      reason="$(px_tsv_field "$column" "$term")" || reason=""
+    elif [ "$status" != "$SB_EXIT_UNSUPPORTED" ] && [ "$status" != "$SB_EXIT_NO_OBJECT" ]; then
+      record_row skip post "previous termination reason of $role/$index" "exit $status"
+    fi
+    status=0
+  fi
   if [ "$status" = 0 ] && [ -n "$term" ]; then
     record_line "term$PX_TAB$role$PX_TAB$index$PX_TAB$term"
-    column="$(sb_schema_index term reason)" || column=1
-    reason="$(px_tsv_field "$column" "$term")" || reason=""
   else
     record_row skip post "termination reason of $role/$index" "exit $status"
   fi
@@ -782,7 +797,7 @@ evidence_record() {
 ## @return       Sets ANOMALY when an unexplained change is detected and exits 0.
 restart_diff() {
   local line rest role index before after pre_state post_state verdict status
-  local changed comparable
+  local changed comparable rose
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     role=${line%%"$PX_TAB"*}
@@ -828,7 +843,9 @@ restart_diff() {
     record_row diff "$role" "$index" "$before" "$after" "$verdict" "$pre_state" \
       "$post_state"
     if [ "$verdict" = unplanned ]; then
-      evidence_record "$role" "$index"
+      rose=0
+      [ "$comparable" = 0 ] || [ "$after" -le "$before" ] || rose=1
+      evidence_record "$role" "$index" "$rose"
     fi
   done <<EOF
 $PRE_RESTARTS

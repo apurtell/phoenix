@@ -1526,7 +1526,11 @@ SHIM_EOF
 # StatefulSets are in k8s-sts.txt (name|replicas|strategy|cksum|claims), the
 # claims in k8s-pvc.txt, the namespaces in k8s-namespaces.txt and every
 # applied file in k8s-applied/. A flag file turns on one fault. k8s-next.txt
-# replaces the pods after k8s-next-after listings, for a change during a wait.
+# replaces the pods after k8s-next-after listings, for a change during a wait,
+# and then the flag file that k8s-next-flag names, if any, is created. When
+# k8s-next-sel holds a text, only a listing whose selector holds it counts.
+# When k8s-view-sel holds a text, a listing whose selector holds it reads the
+# pods of k8s-view.txt, for an instance that changes between two reads.
 # With scale-lingers, an ordinal that a scale down removes stays Terminating
 # for the number of listings that the file holds, as on a cluster.
 # PX_FAKE_KUBECTL_LOG keeps every call of the K1 cases in one more log. A
@@ -1738,8 +1742,8 @@ fk_docs() {
     END { flush() }' "$1"
 }
 
-## @description  Moves the pods to the next state after the listings that k8s-next-after names,
-##               and makes a warm pod ready.
+## @description  Moves the pods to the next state, and sets the flag of k8s-next-flag, after the
+##               listings that k8s-next-after names, and makes a warm pod ready.
 ## @return       Exit 0.
 fk_after_listing() {
   local after
@@ -1747,6 +1751,12 @@ fk_after_listing() {
     $25 ~ /^doomed:/ { n = substr($25, 8) - 1; if (n < 1) next; $25 = "doomed:" n }
     { print }' "$pods" >"$pods.new"
   mv -f "$pods.new" "$pods"
+  if [ -f "$st/k8s-next-sel" ]; then
+    case "$fk_sel" in
+    *"$(cat "$st/k8s-next-sel")"*) ;;
+    *) return 0 ;;
+    esac
+  fi
   if [ -f "$st/k8s-next.txt" ]; then
     after="$(cat "$st/k8s-next-after" 2>/dev/null || echo 1)"
     if [ "$after" -gt 1 ]; then
@@ -1754,6 +1764,10 @@ fk_after_listing() {
     else
       mv -f "$st/k8s-next.txt" "$pods"
       rm -f "$st/k8s-next-after"
+      if [ -f "$st/k8s-next-flag" ]; then
+        : >"$st/$(cat "$st/k8s-next-flag")"
+      fi
+      rm -f "$st/k8s-next-flag" "$st/k8s-next-sel"
     fi
   fi
 }
@@ -1900,12 +1914,18 @@ EOF
 get)
   case "${fk_pos[0]:-}" in
   pods)
+    fk_list=$pods
+    if [ -f "$st/k8s-view-sel" ]; then
+      case "$fk_sel" in
+      *"$(cat "$st/k8s-view-sel")"*) fk_list="$st/k8s-view.txt" ;;
+      esac
+    fi
     while IFS= read -r fk_line; do
       [ -n "$fk_line" ] || continue
       fk_match "$fk_line" "$fk_sel" || continue
       case "$fk_sel" in *.cluster=*) ;; *) continue ;; esac
       printf '%s\n' "$fk_line"
-    done <"$pods"
+    done <"$fk_list"
     fk_after_listing
     ;;
   namespaces)
@@ -2372,6 +2392,16 @@ PROBE_EOF
 #!/usr/bin/env bash
 . "$PX_HOME/lib/backend/contract.sh"
 set -u
+sb_load
+"$@"
+PROBE_EOF
+  # Invokes a contract call with the report-only ERR trap armed, matching how commands such as
+  # px-run execute substrate operations.
+  cat >"$T_WORK/probe/sb-trap.sh" <<'PROBE_EOF'
+#!/usr/bin/env bash
+. "$PX_HOME/lib/backend/contract.sh"
+set -u
+px_trap_enable
 sb_load
 "$@"
 PROBE_EOF
@@ -14448,6 +14478,16 @@ $(grep -c '^data-datanode-' "$T_K8S_STATE/k8s-pvc.txt") $(grep -c '^datanode-' \
   t_k8s_sb sb_wait_ready fake/px-selftest 5
   t_equals k8s_wait_stops_on_a_rising_restart_count "3 yes" "$T_STATUS $(t_flag restarted \
     "$T_STDERR")"
+  # Verify that polling an unready pod that exhibits no anomaly does not trigger the ERR trap in a
+  # command such as px-run while the readiness barrier waits.
+  t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
+  cp "$T_K8S_STATE/k8s-pods.txt" "$T_K8S_STATE/k8s-next.txt"
+  printf '3\n' >"$T_K8S_STATE/k8s-next-after"
+  awk -F '|' -v OFS='|' '$1 == "client-0" { $10 = "False" } { print }' \
+    "$T_K8S_STATE/k8s-pods.txt" >"$T_K1/pod" && mv "$T_K1/pod" "$T_K8S_STATE/k8s-pods.txt"
+  t_k8s "$T_BASH" "$T_WORK/probe/sb-trap.sh" sb_wait_ready fake/px-selftest 5
+  t_equals k8s_wait_on_an_unready_pod_keeps_the_err_trap_quiet "0 no" "$T_STATUS $(t_flag \
+    'command failed with status' "$T_STDERR")"
   t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
   printf '%s\n' "$(t_k8s_pod regionserver-1 regionserver '' 1 regionmover StatefulSet unready)" \
     >>"$T_K8S_STATE/k8s-pods.txt"
@@ -14928,11 +14968,45 @@ t_fixtures_k2() {
 #!/usr/bin/env bash
 . "${0%/*}/stub-lib.sh" "$@"
 shift
-# A stub driver. The kubelet restarts the container of regionserver 0: its
-# restart count rises. Then the driver works on for 30 seconds.
+# A stub driver. A SIGKILL ends the container of regionserver 0, and the
+# kubelet starts it again at once: its restart count rises, it runs, and its
+# last state holds the exit code 137. Then the driver works on for 30 seconds.
 pods="$PX_FAKE_STATE_DIR/k8s-pods.txt"
-awk -F '|' -v OFS='|' '$1 == "regionserver-0" { $19 = $19 + 1 } { print }' "$pods" \
-  >"$pods.new" && mv -f "$pods.new" "$pods"
+awk -F '|' -v OFS='|' '$1 == "regionserver-0" { $19 = $19 + 1; $16 = 137; $17 = "Error"
+  $18 = "2026-01-03T00:00:07Z" } { print }' "$pods" >"$pods.new" && mv -f "$pods.new" "$pods"
+exec sleep 30
+DRIVER_EOF
+  cat >"$T_WORK/drivers/k8s-unknown-wait.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. The node of regionserver 0 stops reporting, so a listing of
+# all pods finds its state unknown, while a read of that instance alone finds
+# it running again with no new restart, and with a last state that holds an
+# exit code 1 from before the run. Then the driver works on for 30 seconds.
+pods="$PX_FAKE_STATE_DIR/k8s-pods.txt"
+awk -F '|' -v OFS='|' '$1 == "regionserver-0" { $16 = 1; $17 = "Error"
+  $18 = "2026-01-02T00:00:00Z" } { print }' "$pods" >"$PX_FAKE_STATE_DIR/k8s-view.txt"
+printf 'role=regionserver\n' >"$PX_FAKE_STATE_DIR/k8s-view-sel"
+awk -F '|' -v OFS='|' '$1 == "regionserver-0" { $8 = "Unknown"; $10 = "False"; $11 = "" }
+  { print }' "$pods" >"$pods.new" && mv -f "$pods.new" "$pods"
+exec sleep 30
+DRIVER_EOF
+  cat >"$T_WORK/drivers/k8s-restart-unreachable.sh" <<'DRIVER_EOF'
+#!/usr/bin/env bash
+. "${0%/*}/stub-lib.sh" "$@"
+shift
+# A stub driver. As k8s-restart-wait.sh, the container of regionserver 0 ends
+# with exit code 137 and runs again. After the next listing of that instance
+# alone, the API server can no longer be reached. Then the driver works on.
+pods="$PX_FAKE_STATE_DIR/k8s-pods.txt"
+awk -F '|' -v OFS='|' '$1 == "regionserver-0" { $19 = $19 + 1; $16 = 137; $17 = "Error"
+  $18 = "2026-01-03T00:00:07Z" } { print }' "$pods" >"$pods.new"
+printf 'role=regionserver\n' >"$PX_FAKE_STATE_DIR/k8s-next-sel"
+printf 'unreachable\n' >"$PX_FAKE_STATE_DIR/k8s-next-flag"
+printf '1\n' >"$PX_FAKE_STATE_DIR/k8s-next-after"
+cp "$pods.new" "$PX_FAKE_STATE_DIR/k8s-next.txt"
+mv -f "$pods.new" "$pods"
 exec sleep 30
 DRIVER_EOF
   cat >"$T_WORK/drivers/k8s-oom-wait.sh" <<'DRIVER_EOF'
@@ -14948,7 +15022,8 @@ awk -F '|' -v OFS='|' '$1 == "client-0" { $8 = "Failed"; $10 = "False"; $11 = ""
   >"$pods.new" && mv -f "$pods.new" "$pods"
 exec sleep 30
 DRIVER_EOF
-  chmod +x "$T_WORK/drivers/k8s-restart-wait.sh" "$T_WORK/drivers/k8s-oom-wait.sh"
+  chmod +x "$T_WORK/drivers/k8s-restart-wait.sh" "$T_WORK/drivers/k8s-oom-wait.sh" \
+    "$T_WORK/drivers/k8s-unknown-wait.sh" "$T_WORK/drivers/k8s-restart-unreachable.sh"
 }
 
 ## @description  Materializes a target configuration file (name, NAME=VALUE...) in the round K2
@@ -15566,9 +15641,32 @@ t_group_k2_evidence() {
     "$T_STATUS $(t_manifest \
     "$run" /anomaly/aborted) $(t_manifest "$run" /anomaly/instances/0/role) $(t_manifest "$run" \
     /anomaly/instances/0/index)"
+  # Because the kubelet restarts a terminated container immediately, the recorded anomaly must
+  # report the previous container's termination state rather than the current running state.
+  t_equals k8s_run_anomaly_names_the_previous_termination "killed 137" "$(t_manifest "$run" \
+    /anomaly/instances/0/termination_reason) $(t_manifest "$run" /anomaly/instances/0/exit_code)"
+  # When an instance returns to the running state without an increased restart count, the anomaly
+  # retains the current state because any prior container termination may predate the run.
   t_k8s_seed "$T_K1_A5" "$PX_OUT"
-  t_k1_a5 "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation -e PX_TEARDOWN=0 \
-    --scope fake/px-selftest --driver "$T_WORK/drivers/k8s-oom-wait.sh"
+  t_k1_a5 "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest "$T_WORK/drivers/k8s-unknown-wait.sh"
+  run="$(t_bundle)"
+  t_equals k8s_run_anomaly_keeps_an_old_previous_termination_out "3 unplanned running 0" \
+    "$T_STATUS $(awk -F '\t' '$1 == "diff" && $2 == "regionserver" { print $6 }' \
+    "$run/run-record.tsv") $(t_manifest "$run" /anomaly/instances/0/termination_reason)\
+ $(t_manifest "$run" /anomaly/instances/0/exit_code)"
+  # Verify that a failed attempt to read the previous termination state records a skip row in the
+  # run record.
+  t_k8s_seed "$T_K1_A5" "$PX_OUT"
+  t_k1_a5 "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest "$T_WORK/drivers/k8s-restart-unreachable.sh"
+  run="$(t_bundle)"
+  t_equals k8s_run_records_a_failed_previous_termination_read "3 yes" "$T_STATUS $(t_flag \
+    "$(t_rows 4 skip post 'previous termination reason of regionserver/0' 'exit 1')" \
+    "$(cat "$run/run-record.tsv" 2>/dev/null)")"
+  t_k8s_seed "$T_K1_A5" "$PX_OUT"
+  t_k1_a5 "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest "$T_WORK/drivers/k8s-oom-wait.sh"
   run="$(t_bundle)"
   record="$(cat "$run/run-record.tsv" 2>/dev/null)"
   t_equals k8s_run_aborts_on_an_oom_killed_termination "3 client yes yes" "$T_STATUS $(t_manifest \
