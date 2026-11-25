@@ -1036,10 +1036,17 @@ Compose.
 * `sb_kill hard` and `sb_signal KILL` send SIGKILL to every child process of PID 1 inside the
   container. Because the Linux kernel ignores SIGKILL sent from within a PID namespace to that
   namespace's init process, killing the child processes causes `tini` to exit with status 137,
-  prompting the kubelet to restart the container inside a StatefulSet pod. `sb_signal TERM` delivers
-  SIGTERM to PID 1, which `tini` forwards to its child process. All other signals are delivered to
-  the oldest `java` process via the shared signal script in `contract.sh`, enforcing the same STOP
-  and CONT state verification performed on Compose.
+  prompting the kubelet to restart the container inside a StatefulSet pod. `sb_kill hard` returns
+  only after the pod status reflects the kill—evidenced by a higher restart count, a new pod, or a
+  container that is no longer running—within the `PX_TIMEOUT_STOP` timeout bound. Failed pod
+  listings are retried until that bound expires, and the function exits with code 1 and reports the
+  failure cause if the status never reflects the kill. This synchronization is necessary because
+  the kubelet reports a kill several seconds after it occurs; until the status updates, a
+  drain-aware restart reading the pod status would still observe a ready instance and drain the new
+  container that the kubelet just restarted. `sb_signal TERM` delivers SIGTERM to PID 1, which
+  `tini` forwards to its child process. All other signals are delivered to the oldest `java`
+  process via the shared signal script in `contract.sh`, enforcing the same STOP and CONT state
+  verification performed on Compose.
 * `sb_kill delete` first terminates every child process of PID 1—just as `sb_kill hard`
   does—whenever the container is currently running, and then invokes `delete pod --wait=true`
   bounded by a timeout of `PX_TIMEOUT_STOP` plus 30 s without passing `--force`. Deleting a pod

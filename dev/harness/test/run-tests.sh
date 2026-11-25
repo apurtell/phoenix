@@ -1522,7 +1522,7 @@ SHIM_EOF
 # The state is in PX_FAKE_STATE_DIR, in k8s-* files. k8s-pods.txt holds one
 # line per pod in the field order of px_k8s_pod_format of the backend, then
 # two fields of the fake: the kind of the owner and a warm flag. A pod that
-# a kill restarted is unready in one listing and ready in the next. The
+# a kill restarted is unready in two listings and ready in the next. The
 # StatefulSets are in k8s-sts.txt (name|replicas|strategy|cksum|claims), the
 # claims in k8s-pvc.txt, the namespaces in k8s-namespaces.txt and every
 # applied file in k8s-applied/. A flag file turns on one fault. k8s-next.txt
@@ -1531,6 +1531,10 @@ SHIM_EOF
 # k8s-next-sel holds a text, only a listing whose selector holds it counts.
 # When k8s-view-sel holds a text, a listing whose selector holds it reads the
 # pods of k8s-view.txt, for an instance that changes between two reads.
+# With kill-lags, the pods show a kill only after the number of listings
+# that the file holds, as a kubelet reports a kill some time after it.
+# With kill-lists-fail, the pod listings after a kill fail the number of
+# times that the file holds, as a loaded apiserver can.
 # With scale-lingers, an ordinal that a scale down removes stays Terminating
 # for the number of listings that the file holds, as on a cluster.
 # PX_FAKE_KUBECTL_LOG keeps every call of the K1 cases in one more log. A
@@ -1747,7 +1751,7 @@ fk_docs() {
 ## @return       Exit 0.
 fk_after_listing() {
   local after
-  awk -F '|' -v OFS='|' '$25 == "warm" { $10 = "True"; $25 = "" }
+  awk -F '|' -v OFS='|' '$25 == "warm" { $10 = "True"; $25 = "" } $25 == "warm2" { $25 = "warm" }
     $25 ~ /^doomed:/ { n = substr($25, 8) - 1; if (n < 1) next; $25 = "doomed:" n }
     { print }' "$pods" >"$pods.new"
   mv -f "$pods.new" "$pods"
@@ -1914,6 +1918,13 @@ EOF
 get)
   case "${fk_pos[0]:-}" in
   pods)
+    if [ -f "$st/lists-fail" ]; then
+      fk_left="$(cat "$st/lists-fail")"
+      rm -f "$st/lists-fail"
+      [ "$fk_left" -le 1 ] || printf '%s\n' "$((fk_left - 1))" >"$st/lists-fail"
+      printf 'Error from server (Timeout): the server was unable to return a response\n' >&2
+      exit 1
+    fi
     fk_list=$pods
     if [ -f "$st/k8s-view-sel" ]; then
       case "$fk_sel" in
@@ -2069,17 +2080,24 @@ exec)
     shift 4
   fi
   # A kill or a TERM of the container is modelled in the state and never runs
-  # on the host. A StatefulSet pod restarts, unready for one listing. A
+  # on the host. A StatefulSet pod restarts, unready for two listings. A
   # standalone pod stays ended, as its restart policy is Never.
   if [ "${1:-}" = sh ] && [ "${2:-}" = -c ] &&
     { [ "${4:-}" = px-kill ] || [ "${4:-}" = px-term ]; }; then
     fk_code=137
     [ "$4" = px-kill ] || fk_code=143
+    [ ! -f "$st/kill-lags" ] || cp "$pods" "$pods.now"
+    [ ! -f "$st/kill-lists-fail" ] || mv -f "$st/kill-lists-fail" "$st/lists-fail"
     if [ "$(fk_field "$fk_name" 24)" = StatefulSet ]; then
-      fk_set "$fk_name" "16=$fk_code" 17=Error 18=2026-01-03T00:00:02Z 10=False 25=warm \
+      fk_set "$fk_name" "16=$fk_code" 17=Error 18=2026-01-03T00:00:02Z 10=False 25=warm2 \
         "19=$(($(fk_field "$fk_name" 19) + 1))" 11=2026-01-03T00:00:03Z
     else
       fk_set "$fk_name" 8=Failed 10=False 11= "13=$fk_code" 14=Error 15=2026-01-03T00:00:02Z
+    fi
+    if [ -f "$st/kill-lags" ]; then
+      mv -f "$pods" "$st/k8s-next.txt"
+      mv -f "$pods.now" "$pods"
+      mv -f "$st/kill-lags" "$st/k8s-next-after"
     fi
     exit 0
   fi
@@ -14699,6 +14717,34 @@ t_group_k1_faults() {
  ready:ok rebalance:skip no yes" "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '{
     printf "%s:%s ", $1, $2 }')$(t_flag 'unload' "$(cat "$T_SHIM_LOG")") $(t_flag \
     'delete pod regionserver-0 --wait=true' "$(cat "$T_SHIM_LOG")")"
+  # Verify that a hard kill returns only after the pod status reflects the termination, tolerating
+  # both delayed kubelet status updates and transient pod-listing failures.
+  t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
+  printf '2\n' >"$T_K8S_STATE/kill-lags"
+  t_k8s_sb sb_kill fake/px-selftest regionserver 0 hard
+  line=$T_STATUS
+  t_shim_log_reset
+  t_k8s_sb sb_restart_drain fake/px-selftest regionserver 0 5 5
+  t_equals k8s_kill_returns_when_the_pod_status_shows_it "0 0 drain:skip stop:ok start:ok\
+ ready:ok rebalance:skip no" "$line $T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '{
+    printf "%s:%s ", $1, $2 }')$(t_flag 'unload' "$(cat "$T_SHIM_LOG")")"
+  t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
+  printf '1000\n' >"$T_K8S_STATE/kill-lags"
+  t_k8s PX_TIMEOUT_STOP=1 "$T_BASH" "$T_WORK/probe/sb.sh" sb_kill fake/px-selftest \
+    regionserver 0 hard
+  t_equals k8s_kill_fails_when_the_pod_status_never_shows_it "1 yes" "$T_STATUS $(t_flag \
+    'the pod status did not show the kill of regionserver/0' "$T_STDERR")"
+  t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
+  printf '2\n' >"$T_K8S_STATE/kill-lists-fail"
+  t_k8s_sb sb_kill fake/px-selftest regionserver 0 hard
+  t_equals k8s_kill_retries_a_failed_pod_listing "0 gone" "$T_STATUS $(
+    [ -e "$T_K8S_STATE/lists-fail" ] && echo left || echo gone)"
+  t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
+  printf '1000\n' >"$T_K8S_STATE/kill-lists-fail"
+  t_k8s PX_TIMEOUT_STOP=1 "$T_BASH" "$T_WORK/probe/sb.sh" sb_kill fake/px-selftest \
+    regionserver 0 hard
+  t_equals k8s_kill_names_a_pod_listing_that_keeps_failing "1 yes" "$T_STATUS $(t_flag \
+    'kubectl could not read the pod status of regionserver/0 (status 1)' "$T_STDERR")"
   t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
   t_k8s_pod regionserver-0 regionserver '' 0 regionmover StatefulSet crash >"$T_K1/pod"
   grep -v '^regionserver-0|' "$T_K8S_STATE/k8s-pods.txt" >>"$T_K1/pod"

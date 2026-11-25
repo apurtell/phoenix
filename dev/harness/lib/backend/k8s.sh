@@ -1749,25 +1749,64 @@ px_k8s_fault() {
   return "$SB_EXIT_FAIL"
 }
 
+# Because the kubelet reports container kills asynchronously, waiting for the updated pod status
+# prevents a subsequent restart from reading stale readiness state and draining the newly started
+# container. Failed pod listings are retried until the timeout bound expires.
+## @description  Polls until pod status reflects a kill (SCOPE ROLE INDEX OLD_UID OLD_RESTARTS).
+## @return       Exits with 0 once the status reflects the kill or the instance is absent, or 1 if
+##               the timeout bound expires before the kill is observed.
+px_k8s_await_kill() {
+  local bound deadline interval status
+  bound="$(sb_seconds PX_TIMEOUT_STOP 120)"
+  deadline=$(($(px_epoch_s) + bound))
+  interval="$(sb_poll_interval)"
+  while :; do
+    status=0
+    px_k8s_instance "$1" "$2" "$3" 2>/dev/null || status=$?
+    case "$status" in
+    0)
+      if [ "$PXK_P_UID" != "$4" ] || [ "$PXK_P_RESTARTS" -gt "$5" ] ||
+        [ "$PXK_P_STATE" != running ]; then
+        return 0
+      fi
+      ;;
+    "$SB_EXIT_NO_OBJECT") return 0 ;;
+    esac
+    if [ "$(px_epoch_s)" -ge "$deadline" ]; then
+      if [ "$status" = 0 ]; then
+        px_error "the pod status did not show the kill of $2/$3 in ${bound}s"
+      else
+        px_error "kubectl could not read the pod status of $2/$3 (status $status) in ${bound}s"
+      fi
+      return "$SB_EXIT_FAIL"
+    fi
+    sleep "$interval"
+  done
+}
+
 ## @description  Abruptly terminates a single workload instance using the specified kill mode.
 ## @param        scope_id: the scope identifier returned by sb_scope_create
 ## @param        role: the target role name
 ## @param        index: the zero-based instance index
-## @param        mode: hard (kills processes, keeps pod) or delete (also deletes pod and waits)
-## @return       Exits with 0, 1 if termination fails or kubectl fails to respond, 2 on usage error
-##               or unknown mode, or 6 if the instance does not exist.
+## @param        mode: hard (kills processes, keeps the pod, and waits for pod status to reflect
+##               the kill) or delete (also deletes the pod and waits for deletion to complete)
+## @return       Exits with 0, 1 if termination fails, pod status never reflects it, or kubectl
+##               fails to respond, 2 on usage error or unknown mode, or 6 if the instance is absent.
 sb_kill() {
-  local scope=${1:-} role=${2:-} index=${3:-} mode=${4:-} pod timeout
+  local scope=${1:-} role=${2:-} index=${3:-} mode=${4:-} pod timeout uid restarts
   sb_value_arg sb_kill "a mode" kill_mode "$mode" || return $?
   px_k8s_instance "$scope" "$role" "$index" || return $?
   if sb_dry_run "$mode kill of $role/$index in $scope"; then
     return 0
   fi
   pod=$PXK_P_NAME
+  uid=$PXK_P_UID
+  restarts=$PXK_P_RESTARTS
   if [ "$PXK_P_STATE" = running ] || [ "$mode" = hard ]; then
     px_k8s_fault "$scope" "$role" "$index" px-kill "$PX_K8S_KILL_SCRIPT" || return $?
   fi
-  [ "$mode" = delete ] || return 0
+  [ "$mode" = delete ] ||
+    { px_k8s_await_kill "$scope" "$role" "$index" "$uid" "$restarts"; return; }
   # Because the kubelet may have restarted the container immediately after the SIGKILL, and that
   # new container requires up to its termination grace period to stop, the deletion timeout adds an
   # extra buffer beyond PX_TIMEOUT_STOP.
