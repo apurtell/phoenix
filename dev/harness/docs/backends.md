@@ -1514,3 +1514,444 @@ and end-to-end measurement run teardown; milestone K5 validates the Distributed 
 mesh role group; milestone K6 validates service mesh integration and image promotion against a live
 registry; and milestone K7 validates node placement, resource quotas, and operator-prepared
 namespaces on dedicated hardware.
+
+### Multi-node proof
+
+Milestone K7 validates the Kubernetes backend across both run classes on an operator-provisioned
+cluster composed of multiple dedicated nodes. Because no such multi-node cluster is attached to the
+development host, this section serves as the operational runbook for that verification pass,
+specifying the execution commands, the diagnostic evidence required for each requirement, and the
+acceptance criteria for each check. Those aspects of multi-node operation that do not require a live
+cluster are verified against the test doubles by the self-test suite (group `t_group_k7_multinode`
+in `test/run-tests.sh`), including preflight resource summation across three nodes, the presence of
+the node selector, tolerations, image pull secret, and image digest on every pod in a remote
+manifest render that includes the Distributed Pherf tier, external tier rendering against a remote
+target, image promotion for both container images, and the three-node placement map recorded in a
+run bundle. However, only execution on a live multi-node cluster can validate the Kubernetes
+scheduler, the kubelet, registry image pulls, the dynamic storage provisioner, node clock
+synchronization, and cross-node networking.
+
+The external verification pass evaluates five primary checks (RQ-328), each defined by its required
+diagnostic evidence and acceptance criterion:
+
+1. **Digest resolution.** Evidence is drawn from `kubernetes.registry_digests` in each run bundle
+   and `PX_K8S_IMAGE_DIGESTS` in the cluster target file. To pass, every pod image reference must
+   have the form `<registry>/<repository>@sha256:<d>`, its resolved digest must equal `<d>`, and
+   `<d>` must match the digest configured for that repository in the target file.
+2. **Storage binding.** Evidence is drawn from the persistent volume claims carrying the cluster
+   label. To pass, every claim in the rendered deployment must be in the `Bound` phase using the
+   StorageClass specified by `PX_K8S_STORAGE_CLASS`.
+3. **Anti-affinity placement.** Evidence is drawn from the node column of `px-cluster status` and
+   `kubernetes.placement` in each run bundle. To pass, the DataNodes must span
+   `min(count, selected nodes)` distinct nodes, the RegionServers must span the same number of
+   distinct nodes, and every pod must reside on a node matching the node selector.
+4. **Cross-node start skew.** Evidence is drawn from `status.json` and `VERDICT_run.tsv` in the
+   controller bundle, together with `kubernetes.placement`. To pass, the agents participating in
+   each workload step must execute across at least two distinct nodes, every step must record a
+   `skewMs` value of at most 50, and the `pherf.fleet.start_skew` verdict must be PASS.
+5. **Clean namespace teardown.** Evidence is drawn from the cluster-labeled resources and claims,
+   the persistent volumes associated with the namespace, and the client host state. To pass, after
+   `px-cluster down` completes, no Kubernetes object or persistent volume claim may retain the
+   cluster label, no persistent volume may remain bound to a claim in the namespace, no port-forward
+   tunnel process may remain running, and no local cluster state record may remain on disk.
+
+The requirements covered by this verification pass and the specific evidence required for each are
+as follows:
+
+- RQ-328 requires all five checks above to pass in both the validation and measurement run classes.
+- RQ-301 (placement) requires every pod to run on a node selected by `PX_K8S_NODE_SELECTOR` and
+  requires the cross-node distribution defined in check 3.
+- RQ-306 (remote images) requires check 1 to pass and requires the readiness barrier to complete
+  without encountering any `ErrImagePull` error.
+- RQ-308 (dedicated nodes) requires a measurement run bundle whose `quiet_host` record equals
+  `{"state":"dedicated","tags":[]}`, and requires the same measurement run to be rejected with exit
+  code 2 when invoked with `PX_K8S_DEDICATED_NODES=0`.
+- RQ-313 and RQ-314 (faults) require an external pod deletion performed outside the harness to
+  abort the active run with exit code 3, and require a drain-aware restart of each RegionServer to
+  exit with code 0 while leaving the replacement pod hosting at least as many regions as it held
+  prior to the restart.
+- RQ-321 and RQ-322 (the tier) require the controller to serve an identical frozen report after its
+  pod is deleted and replaced, and require `px-pherf scale` to converge to the requested agent
+  replica count with each agent identified by its pod name.
+- RQ-323 (external quorum) requires a controller run targeting a ZooKeeper quorum outside the
+  harness to finish with status COMPLETE and with the merged count for every histogram key equal to
+  the sum of the corresponding per-slot counts.
+
+#### What the operator provides
+
+- A Kubernetes cluster running API version 1.28 or later, accessible via its own kubeconfig context,
+  containing at least three schedulable worker nodes that match a single node selector and carry the
+  taint tolerated by the cluster target file. These selected nodes must execute no other workloads
+  for the duration of the verification pass, matching the declaration `PX_K8S_DEDICATED_NODES=1`.
+- Sufficient allocatable memory and CPU across the selected nodes to host both the measurement
+  topology table and the Distributed Pherf tier. The preflight check reports the exact resource
+  totals required; under the K3 sizing arithmetic, the measurement topology table alone requests
+  41984 MiB of memory and 10250 millicores of CPU, and no selected node may offer less allocatable
+  capacity than the largest individual pod.
+- A StorageClass that dynamically provisions persistent volumes on demand, a container registry
+  from which the worker nodes can pull images and to which the build host can push images using its
+  own credentials, and an operator-prepared namespace `px-k7` carrying the label
+  `px.harness.cluster=k7` and containing the image pull secret, since the harness never creates a
+  secret.
+- Client permissions within `px-k7` allowing the operator to create StatefulSets, Deployments, Jobs,
+  Pods, Services, ConfigMaps, and persistent volume claims, as well as to exec into and establish
+  port-forward tunnels to pods.
+- A build host equipped with the Compose backend using the containerd image store (see "Remote
+  images and promotion"), `kubectl` 1.28 or later, `jq`, and `curl` 7.76 or later.
+- For the external-cluster clause of RQ-323, an independently deployed Phoenix cluster not managed
+  by the harness, whose ZooKeeper hosts, HBase Master, and RegionServers register hostnames that
+  resolve and accept connections from pods inside `px-k7`, running a Phoenix release supported by
+  the client in the pherf image.
+
+#### The commands
+
+All commands below are executed from the repository root. Because the cluster identifier is `k7`,
+the target Kubernetes namespace is `px-k7`.
+
+```sh
+export PATH="$PWD/dev/harness/bin:$PATH"
+export PX_OUT="${PX_OUT:-$HOME/phoenix-harness}"
+T="$HOME/targets/k7.env"
+CTX=perf-multi
+```
+
+1. Create the cluster target file outside the repository working tree, as the repository itself
+   must never store a target file (RQ-296).
+
+   ```sh
+   # $HOME/targets/k7.env, outside the repository
+   PX_K8S_CONTEXT=perf-multi
+   PX_K8S_STORAGE_CLASS=gp3
+   PX_K8S_REGISTRY=registry.example.com/phoenix-harness
+   PX_K8S_PULL_SECRET=harness-pull
+   PX_K8S_NODE_SELECTOR=pool=phoenix-perf
+   PX_K8S_TOLERATIONS=dedicated=phoenix:NoSchedule
+   PX_K8S_DEDICATED_NODES=1
+   ```
+
+2. Inspect the resolved configuration settings and their precedence origins, and then execute the
+   fast preflight check against the target cluster.
+
+   ```sh
+   px-cluster config --backend k8s --cluster k7 -e PX_K8S_TARGET="$T" 'PX_K8S_*'
+   dev/harness/scripts/preflight-k8s.sh --phase fast -e PX_K8S_TARGET="$T" -e PX_CLUSTER_ID=k7
+   ```
+
+   The following output is an illustrative excerpt rather than a recorded run:
+
+   ```text
+   PX_K8S_CONTEXT	perf-multi	target
+   PX_K8S_DEDICATED_NODES	1	target
+   engine_version	ok	...
+   engine_credentials	ok	the client may create the workloads
+   deployment_absent	ok	... the operator prepared it
+   storage_class	ok	the StorageClass gp3 exists
+   pull_secret	ok	the pull secret harness-pull is in px-k7
+   engine_memory	ok	... bytes allocatable on the selected nodes
+   ```
+
+3. Build both container images and generate a passing validation run bundle on the build host's
+   Compose backend. Starting the Distributed Pherf tier before running the suite ensures that the
+   cluster snapshot in each bundle records both images.
+
+   ```sh
+   px-cluster build -e PX_PHERF=1
+   px-cluster up --class validation -e PX_PHERF=1
+   px-pherf start
+   px-suite functional
+   SESSION="$(ls -d "$PX_OUT"/sessions/2* | tail -n 1)"
+   for d in "$SESSION"/tests/*/; do
+     b="$(cat "$d/stdout.txt")"
+     printf '%s %s\n' "$(jq -r '.run.class + " " + .run.result' "$b/manifest.json")" "$b"
+   done
+   px-cluster down
+   ```
+
+   Select a bundle whose status is `validation PASS` as `B0`, and verify that its manifest records
+   both images:
+
+   ```sh
+   jq -r '.images[] | .image_ref + " " + .image_id' "$B0/manifest.json" | sort -u
+   ```
+
+   Image promotion rejects any bundle whose overall result is not PASS with exit code 1; the psql
+   smoke bundles record a result of SKIP and therefore cannot be used. Furthermore, because a k3d
+   bundle records the configuration digest of an imported image—which does not match any local
+   image ID in the host engine—the source bundle for promotion must be produced on the Compose
+   backend.
+
+4. Promote both images to the remote registry and append their resulting registry digests to the
+   cluster target file so that all subsequent manifest renders resolve the digests from that file.
+
+   ```sh
+   D="$(px-cluster push "$B0" --cluster k7 --class validation -e PX_PHERF=1 \
+     -e PX_K8S_TARGET="$T")"
+   sed -n "s/^\(PX_K8S_IMAGE_DIGESTS=\)'\(.*\)'$/\1\2/p" "$D/render.env" >>"$T"
+   ```
+
+   The following output is an illustrative excerpt rather than a recorded run:
+
+   ```text
+   ... INFO  px-cluster: pushed registry.example.com/phoenix-harness/px-harness:... as ...
+   ... INFO  px-cluster: pushed registry.example.com/phoenix-harness/px-pherf:... as ...
+   ```
+
+5. Render the validation topology with three DataNodes and three RegionServers, run the full
+   deployment preflight check against the rendered directory, and provision the cluster.
+
+   ```sh
+   DIR="$(px-cluster render --backend k8s --cluster k7 --class validation \
+     -e PX_K8S_TARGET="$T" -e PX_PHERF=1 -e PX_DN_COUNT=3 -e PX_RS_COUNT=3)"
+   dev/harness/scripts/preflight-k8s.sh --deployment "$DIR" -e PX_K8S_TARGET="$T" \
+     -e PX_CLUSTER_ID=k7
+   px-cluster up "$DIR" -n --backend k8s --cluster k7 -e PX_K8S_TARGET="$T"
+   px-cluster up "$DIR" --backend k8s --cluster k7 -e PX_K8S_TARGET="$T"
+   ```
+
+   The following output is an illustrative excerpt rather than a recorded run:
+
+   ```text
+   memory_fit	ok	... against ...: the memory requests and the allocatable memory of ...
+   pod_fit	ok	... the largest pod regionserver and the largest selected node
+   cpu_fit	ok	...
+   quota_fit:memory	ok	...
+   ```
+
+   Because the preflight check compares aggregate resource sums rather than simulating bin-packing
+   across individual nodes, a pod that cannot fit onto any single node remains in the Pending state
+   until the readiness barrier expires with exit code 4.
+
+6. Verify pod placement and persistent volume claim binding on the active cluster; with the cluster
+   provisioned, the cluster state record automatically supplies both the active backend and the
+   target configuration settings.
+
+   ```sh
+   px-cluster status --cluster k7 | awk 'NR > 1 { print $1, $NF }' | sort | uniq -c
+   kubectl --context "$CTX" get nodes -l pool=phoenix-perf -o name
+   kubectl --context "$CTX" --namespace px-k7 get pvc -l px.harness.cluster=k7 \
+     -o custom-columns=CLAIM:.metadata.name,PHASE:.status.phase,CLASS:.spec.storageClassName
+   ```
+
+   The following output is an illustrative excerpt rather than a recorded run:
+
+   ```text
+         1 datanode node-a
+         1 datanode node-b
+         1 datanode node-c
+         1 regionserver node-a
+         1 regionserver node-b
+         1 regionserver node-c
+   CLAIM                      PHASE   CLASS
+   data-datanode-0            Bound   gp3
+   ```
+
+   Because role anti-affinity is configured as a scheduling preference rather than a hard
+   requirement, a resource-constrained node can cause the scheduler to co-locate two pods of the
+   same role on another node; such co-location fails the placement check, and the available
+   capacity of each selected node must be recorded in the round record.
+
+7. Execute the validation test suites, record the resulting bundle path for each test, and verify
+   image digest resolution across every bundle.
+
+   ```sh
+   px-suite smoke --cluster k7
+   px-suite functional --cluster k7
+   SESSION="$(ls -d "$PX_OUT"/sessions/2* | tail -n 1)"
+   B="$(cat "$SESSION/tests/schema/stdout.txt")"
+   jq -r '.kubernetes.registry_digests[] | .image_ref + " " + .digest' "$B/manifest.json"
+   grep '^PX_K8S_IMAGE_DIGESTS=' "$T"
+   ```
+
+   The following output is an illustrative excerpt rather than a recorded run:
+
+   ```text
+   registry.example.com/phoenix-harness/px-harness@sha256:4f1c... sha256:4f1c...
+   ```
+
+8. Execute the fault-injection and rolling-restart checks. First, perform a drain-aware restart of
+   each RegionServer, querying its hosted region count before and after the restart through the
+   loopback endpoint tunnel:
+
+   ```sh
+   regions() {
+     curl -fsS "http://127.0.0.1:$(px-cluster endpoint regionserver "$1" http --cluster k7 |
+       cut -f2)/jmx?qry=Hadoop:service=HBase,name=RegionServer,sub=Server" |
+       jq '.beans[0].regionCount'
+   }
+   for i in 0 1 2; do
+     before="$(regions "$i")"
+     px-cluster restart regionserver "$i" --cluster k7; echo "exit $?"
+     sleep 20
+     echo "regionserver-$i: $before -> $(regions "$i")"
+   done
+   ```
+
+   Next, execute a scheduled RegionServer restart inside an active test run, followed by an
+   unscheduled pod deletion triggered outside the harness from a second shell while a test is
+   executing its run phase:
+
+   ```sh
+   px-run psql --cluster k7 --disrupt 'phase:steady@script,restart,regionserver,1' -- \
+     --prepare "$PWD/dev/harness/suites/sql/functional-schema.sql" \
+     "$PWD/dev/harness/suites/sql/functional-query.sql"
+   px-suite functional --cluster k7 --skip recover; echo "exit $?"
+   # second shell, while the pherf test runs:
+   kubectl --context "$CTX" --namespace px-k7 delete pod regionserver-2 --wait=false
+   px-cluster ready --cluster k7
+   ```
+
+   The suite session interrupted by the external pod deletion terminates with exit code 3, and the
+   bundle manifest of its interrupted pherf test records `anomaly.aborted` as true. When backed by
+   a node-local StorageClass, the replacement pod is rescheduled onto the node hosting its existing
+   persistent volume claim, whereas a network-attached StorageClass allows the replacement pod to
+   schedule onto a different node. Until round K4b calibrates the recovery duration bound for the
+   Kubernetes backend, the `cluster.recovery` check may report FAIL against the 120 s default
+   threshold (milestone K3 measured 168.6 s on k3d); accordingly, the pass criterion for K7 is a
+   PASS verdict on `cluster.restart`, while the observed `mttr_seconds` value is recorded in the
+   round record.
+
+9. Execute the Distributed Pherf tier against the harness ZooKeeper ensemble, leave the tier
+   running upon completion, and inspect the start skew, the node placement of each agent, and the
+   histogram counter merge.
+
+   ```sh
+   px-pherf run fleet-rules --cluster k7 --keep
+   SESSION="$(ls -d "$PX_OUT"/sessions/2* | tail -n 1)"
+   B="$(cat "$SESSION/tests/rules/stdout.txt")"
+   C="$B/drivers/pherf-distributed/controller"
+   jq -c '.steps[] | {index, skewMs, agents: [.slots[].agent]}' "$C/status.json"
+   jq -r '.kubernetes.placement[] | select(.role == "pherf-agent") | .pod + " " + .node' \
+     "$B/manifest.json"
+   cut -f1,2 "$C/drivers/pherf/results_HDR/VERDICT_run.tsv"
+   jq -n --slurpfile r "$C/drivers/pherf/results_HDR/LATENCY_run.json" \
+     --slurpfile s "$C/status.json" '
+     ($r[0].histograms | map({key: (.operation + "|" + .phase), value: .count})
+       | from_entries) as $m
+     | ([$s[0].steps[].slots[].counters | to_entries[]] | group_by(.key)
+       | map({key: .[0].key, value: (map(.value) | add)}) | from_entries) as $a
+     | [($m | keys[]), ($a | keys[])] | unique | map(select($m[.] != $a[.]))'
+   ```
+
+   The following output is an illustrative excerpt rather than a recorded run:
+
+   ```text
+   {"index":0,"skewMs":7,"agents":["pherf-agent-6b8f9c7d5-aaaaa","pherf-agent-6b8f9c7d5-bbbbb"]}
+   pherf-agent-6b8f9c7d5-aaaaa node-b
+   pherf-agent-6b8f9c7d5-bbbbb node-c
+   pherf.fleet.start_skew	PASS
+   pherf.fleet.telemetry	PASS
+   pherf.fleet.agents	PASS
+   []
+   ```
+
+   The merge verification query outputs any histogram keys whose merged count diverges from the sum
+   of the per-slot counts, so an empty array `[]` confirms an exact match. Because a
+   validation-class run downgrades a start-skew FAIL verdict to ADVISORY, the acceptance criterion
+   inspects `skewMs` directly. Furthermore, because the agent Deployment does not configure pod
+   anti-affinity, both agents may occasionally schedule onto the same node; if that occurs, the
+   sample does not span multiple nodes and the step must be repeated after cycling the replica
+   count on the retained tier via `px-pherf scale 1` followed by `px-pherf scale 2`. Once a
+   cross-node sample is recorded, delete the controller pod, wait for its replacement to become
+   ready, and verify that the replacement serves a report byte-identical to the one captured in the
+   bundle, repeating the milestone K5 verification of RQ-321. Unlike single-node k3d, a
+   network-attached StorageClass permits the replacement controller pod to schedule onto a
+   different worker node.
+
+   ```sh
+   row="$(awk -F '\t' '$1 == "run" && $3 != "" { r = $2 " " $3 } END { print r }' \
+     "$B/drivers/pherf-distributed/tests.tsv")"
+   tid=${row% *} rid=${row#* }
+   kubectl --context "$CTX" --namespace px-k7 delete pod --wait=false \
+     -l px.harness.cluster=k7,px.harness.role=pherf-controller
+   px-cluster ready pherf-controller --cluster k7
+   port="$(px-cluster endpoint pherf-controller 0 rest --cluster k7 | cut -f2)"
+   curl -fsS "http://127.0.0.1:$port/v1/tests/$tid/runs/$rid/report" |
+     cmp - "$B/drivers/pherf-distributed/report.json"; echo "cmp $?"
+   px-pherf status --cluster k7
+   px-pherf stop --cluster k7
+   ```
+
+10. Tear down the validation cluster and verify that all harness resources and state records have
+    been removed.
+
+    ```sh
+    px-cluster down --cluster k7; echo "exit $?"
+    kubectl --context "$CTX" --namespace px-k7 get all,pvc,configmap -l px.harness.cluster=k7
+    pv='{range .items[?(@.spec.claimRef.namespace=="px-k7")]}'
+    kubectl --context "$CTX" get pv -o "jsonpath=$pv{.metadata.name} {.status.phase}{\"\\n\"}{end}"
+    pgrep -fl 'port-forward' || echo 'no tunnel'
+    test -e "$PX_OUT/state/cluster-k7.env" && echo 'record left' || echo 'no record'
+    ```
+
+    The following output is an illustrative excerpt rather than a recorded run:
+
+    ```text
+    exit 0
+    No resources found in px-k7 namespace.
+    no tunnel
+    no record
+    ```
+
+    Because `px-k7` was prepared by the operator, the namespace itself remains intact along with
+    its image pull secret. If the cluster's StorageClass uses a `Retain` reclaim policy, any
+    retained persistent volume transitions to the `Released` phase; because the harness never
+    deletes persistent volumes directly, the operator removes any released volumes out of band.
+    Notice that `down` is invoked without `--label` here, ensuring that teardown removes only the
+    resources owned by the harness deployment.
+
+11. Provision a measurement-class deployment with its dedicated sizing and execute the measurement
+    test suite. The dedicated-node declaration in the cluster target file makes timing verdicts
+    authoritative, whereas attempting the same run without that declaration is rejected prior to
+    the prepare phase.
+
+    ```sh
+    DIR="$(px-cluster render --backend k8s --cluster k7 --class measurement \
+      -e PX_K8S_TARGET="$T" -e PX_PHERF=1)"
+    dev/harness/scripts/preflight-k8s.sh --deployment "$DIR" -e PX_K8S_TARGET="$T" \
+      -e PX_CLUSTER_ID=k7
+    px-cluster up "$DIR" --backend k8s --cluster k7 -e PX_K8S_TARGET="$T"
+    px-cluster status --cluster k7 | awk 'NR > 1 { print $1, $NF }' | sort | uniq -c
+    px-suite smoke --cluster k7 --class measurement
+    SESSION="$(ls -d "$PX_OUT"/sessions/2* | tail -n 1)"
+    jq -c '.quiet_host' "$(cat "$SESSION/tests/sql/stdout.txt")/manifest.json"
+    px-run psql --cluster k7 -e PX_K8S_DEDICATED_NODES=0 -- \
+      "$PWD/dev/harness/suites/sql/smoke-query.sql"; echo "exit $?"
+    px-pherf run fleet --cluster k7 --keep
+    ```
+
+    The following output is an illustrative excerpt rather than a recorded run:
+
+    ```text
+    {"state":"dedicated","tags":[]}
+    exit 2
+    ```
+
+    Inspect the resulting `fleet` run bundles using the queries from step 9, confirming that the
+    three agents span at least two nodes and that all fleet verdicts report PASS. Next, repeat the
+    verification checks from step 6, step 7, and step 10 for the measurement deployment, running
+    `px-pherf stop --cluster k7` prior to tearing the cluster down.
+
+12. Execute the Distributed Pherf tier against an external ZooKeeper quorum (RQ-323). Because the
+    scope gate refuses to provision a standalone tier while another harness deployment exists on
+    the target context, this step must run after step 11 tears down the measurement cluster.
+
+    ```sh
+    Q=zk1.k7.invalid:2181,zk2.k7.invalid:2181,zk3.k7.invalid:2181
+    px-pherf run fleet-rules --backend k8s --cluster k7 --class validation --keep \
+      -e PX_K8S_TARGET="$T" -e PX_PHERF_TARGET=external -e PX_PHERF_ZOOKEEPER="$Q"
+    grep -rl zk1.k7.invalid "$PX_OUT/deploy-k8s/k7/manifests" "$PX_OUT/deploy-k8s/k7/groups"
+    ```
+
+    Here `Q` specifies the ZooKeeper quorum of the external cluster; because the repository never
+    contains a hardcoded production quorum, the command above uses reserved `.invalid` hostnames
+    for illustration (RQ-252). Inspect the resulting bundle using the queries from step 9 to verify
+    that the controller run reaches COMPLETE, every slot reports DONE, and the counter merge query
+    outputs `[]`. Across the rendered manifests, the quorum string appears exclusively in
+    `groups/pherf/50-pherf-target.yaml`, while `render.env` and the local cluster state record
+    persist it as a configuration setting. The `pherf.tables` check reports SKIP in this mode
+    because the tables created by `px_rules_schema.sql` remain on the external cluster for the
+    operator to drop after the pass. Finally, run `px-cluster down --cluster k7` and repeat the
+    teardown verification checks from step 10.
+
+For every step in this procedure, the round record captures the executed command, its exit code,
+its wall-clock duration, and the supporting evidence files for each check.

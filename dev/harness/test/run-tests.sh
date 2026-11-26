@@ -17354,6 +17354,214 @@ t_group_k5_fleet() {
 }
 
 # ---------------------------------------------------------------------------
+# K7: Multi-node target verification on the fakes
+# ---------------------------------------------------------------------------
+# Round K7 requires a real multi-node cluster, which is unavailable on this host (G22). These test
+# cases verify against the fakes every multi-node property that the runbook in docs/backends.md
+# ("Multi-node proof") inspects on a real cluster: the preflight capacity sum across nodes, the
+# placement configuration of every pod, the promoted digests of both images, the external tier, and
+# the placement map recorded in a run bundle.
+
+## @description  Populates the K2 state with three fake nodes (memory MiB, processors, labels of
+##               node 3).
+## @return       Writes the fake node inventory file. Exit 0.
+t_k7_nodes() {
+  printf 'n1|%sMi|%s||pool=phx\nn2|%sMi|%s||pool=phx\nn3|%sMi|%s||%s\n' "$1" "$2" "$1" "$2" \
+    "$1" "$2" "${3:-pool=phx}" >"$T_K8S_STATE/k8s-nodes.txt"
+}
+
+## @description  Extracts and flattens every workload manifest document in a rendered deployment
+##               directory (directory), including the tier manifests.
+## @return       Writes one line per StatefulSet, Job, Pod, or Deployment to stdout. Exit 0.
+t_k7_workloads() {
+  local file
+  for file in "$1"/manifests/*.yaml "$1"/groups/*/*.yaml; do
+    [ -f "$file" ] && t_k8s_docs "$file"
+  done | sed 's/| */|/g' | grep -E '\|kind: (StatefulSet|Job|Pod|Deployment)\|'
+}
+
+## @description  Extracts the pod placement entries from a run bundle (bundle) as sorted
+##               "role node" lines.
+## @return       Writes the sorted placement lines to stdout. Exit 0.
+t_k7_placement() {
+  local i=0 role
+  while :; do
+    role="$(t_manifest "$1" "/kubernetes/placement/$i/role")"
+    [ -n "$role" ] || break
+    printf '%s %s\n' "$role" "$(t_manifest "$1" "/kubernetes/placement/$i/node")"
+    i=$((i + 1))
+  done | LC_ALL=C sort
+}
+
+## @description  Verifies against the fakes the multi-node behavior inspected by the K7 runbook
+##               (RQ-289, RQ-295, RQ-299, RQ-301, RQ-306, RQ-318, RQ-328).
+## @return       Records test assertions. Exit 0.
+t_group_k7_multinode() {
+  local dir file total milli largest node cpu target d1 d2 tier docs bad="" line want bundle run
+  printf '# K7: a multi-node target, on the fakes\n'
+  # Verify that preflight sums allocatable memory and CPU across all selected nodes so that three
+  # nodes, none of which can host the deployment alone, together admit it (RQ-289).
+  t_k2_reset
+  t_mgen --class validation --cluster selftest
+  file="$T_K8S_OUT/deploy-k8s/selftest/requests.tsv"
+  total="$(awk -F '\t' '!/^#/ && NF { s += $3 * $5 } END { print s }' "$file")"
+  milli="$(awk -F '\t' '!/^#/ && NF { s += $3 * $4 } END { print s }' "$file")"
+  largest="$(awk -F '\t' '!/^#/ && NF && $5 > m { m = $5 } END { print m }' "$file")"
+  node=$(((total + 2) / 3 + 1))
+  cpu=$(((milli + 2999) / 3000))
+  t_k7_nodes "$node" "$cpu"
+  t_pfk
+  t_equals k7_preflight_sums_three_nodes "0 ok ok ok yes yes yes" "$T_STATUS $(t_k2_row \
+    "$T_STDOUT" memory_fit) $(t_k2_row "$T_STDOUT" pod_fit) $(t_k2_row "$T_STDOUT" cpu_fit)\
+ $(t_flag "$((3 * node * 1048576)) bytes allocatable on the selected nodes" "$T_STDOUT")\
+ $(t_flag "$((node * 1048576)) bytes allocatable on the largest selected node" "$T_STDOUT")\
+ $([ "$node" -lt "$total" ] && [ $((cpu * 1000)) -lt "$milli" ] && echo yes || echo no)"
+  # Verify that three nodes whose combined capacity falls short reject the deployment even when
+  # each individual node can accommodate the largest pod.
+  node=$((total / 3 - 1))
+  t_k7_nodes "$node" "$cpu"
+  t_pfk
+  t_equals k7_preflight_refuses_three_nodes_short_in_sum "3 fail ok yes" "$T_STATUS $(t_k2_row \
+    "$T_STDOUT" memory_fit) $(t_k2_row "$T_STDOUT" pod_fit) $([ "$largest" -le "$node" ] &&
+    echo yes || echo no)"
+  # Verify that a node selector matching only two of the three nodes restricts the capacity sum to
+  # those two matching nodes.
+  node=$(((total + 2) / 3 + 1))
+  t_k7_nodes "$node" "$cpu" pool=other
+  t_shim_log_reset
+  t_pfk PX_K8S_NODE_SELECTOR=pool=phx
+  t_equals k7_preflight_counts_two_of_three_selected_nodes "3 fail yes yes" "$T_STATUS \
+$(t_k2_row "$T_STDOUT" memory_fit) $(t_flag "$((2 * node * 1048576)) bytes allocatable on the\
+ selected nodes" "$T_STDOUT") $(t_flag 'get nodes -l pool=phx' "$(cat "$T_SHIM_LOG")")"
+  rm -f "$T_K8S_STATE/k8s-nodes.txt"
+  # Verify that when rendering for a remote multi-node target with the tier enabled, every workload
+  # manifest, including the tier Deployments, carries the node selector, both tolerations, and the
+  # pull secret, references its image by the promoted digest, and spreads the 3 DataNode and 3
+  # RegionServer replicas across hosts (RQ-301, RQ-306).
+  d1="sha256:$(printf '1%.0s' $(seq 1 64))"
+  d2="sha256:$(printf '2%.0s' $(seq 1 64))"
+  t_mgen --class validation --cluster k7t -e PX_PHERF=1
+  tier="$(t_env_value "$T_K8S_OUT/deploy-k8s/k7t/topology.env" PX_PHERF_IMAGE_TAG)"
+  target="$(t_k2_target k7 PX_K8S_STORAGE_CLASS=gp3 PX_K8S_REGISTRY=reg.example:5000/phx \
+    PX_K8S_PULL_SECRET=regcred PX_K8S_NODE_SELECTOR=pool=phx,tier=perf \
+    PX_K8S_TOLERATIONS=dedicated=phoenix:NoSchedule,spot:PreferNoSchedule \
+    PX_K8S_DEDICATED_NODES=1)"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$PX_HOME/k8s/manifests.gen.sh" --class validation \
+    --cluster k7 -e PX_PHERF=1 -e PX_RS_COUNT=3 -e PX_DN_COUNT=3 \
+    -e PX_IMAGE_TAG=phoenix-harness:selftest \
+    -e "PX_K8S_IMAGE_DIGESTS=phoenix-harness:selftest=$d1,$tier=$d2"
+  dir="$T_K8S_OUT/deploy-k8s/k7"
+  docs="$(t_k7_workloads "$dir")"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [[ $line == *'|nodeSelector:|pool: "phx"|tier: "perf"|'* ]] || bad="$bad selector;"
+    [[ $line == *'|- key: "dedicated"|operator: Equal|value: "phoenix"|effect: NoSchedule|'* ]] ||
+      bad="$bad equal;"
+    [[ $line == *'|- key: "spot"|operator: Exists|effect: PreferNoSchedule|'* ]] ||
+      bad="$bad exists;"
+    [[ $line == *'|imagePullSecrets:|- name: regcred|'* ]] || bad="$bad secret;"
+    case "$line" in
+    *'|kind: Deployment|'*) want="reg.example:5000/phx/${tier%%:*}@$d2" ;;
+    *) want="reg.example:5000/phx/phoenix-harness@$d1" ;;
+    esac
+    [[ $line == *"|image: \"$want\"|imagePullPolicy: IfNotPresent|"* ]] ||
+      bad="$bad image:${line:0:50};"
+  done <<EOF
+$docs
+EOF
+  t_equals k7_remote_tier_render_places_every_pod "0 2 yes" "$T_STATUS $(printf '%s\n' \
+    "$docs" | grep -c '|kind: Deployment|') $([ "$(printf '%s\n' "$docs" | grep -c .)" -gt 2 ] &&
+    echo yes || echo no)$bad"
+  bad=""
+  for line in datanode regionserver; do
+    file="$(t_k8s_role_file "$dir" "$line")"
+    t_k8s_docs "$file" | sed 's/| */|/g' | grep '|kind: StatefulSet|' | grep -q \
+      "|replicas: 3|.*|podAntiAffinity:|preferredDuringSchedulingIgnoredDuringExecution:|.*\
+|topologyKey: kubernetes.io/hostname|labelSelector:|matchLabels:|.*role: \"$line\"|" ||
+      bad="$bad $line;"
+  done
+  t_empty k7_three_datanodes_and_regionservers_spread_by_host "$bad"
+  rm -rf "$T_K8S_OUT/deploy-k8s/k7x"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$PX_HOME/k8s/manifests.gen.sh" --class validation \
+    --cluster k7x -e PX_PHERF=1 -e PX_IMAGE_TAG=phoenix-harness:selftest \
+    -e "PX_K8S_IMAGE_DIGESTS=phoenix-harness:selftest=$d1"
+  t_equals k7_remote_tier_render_without_the_tier_digest_is_refused "2 yes no" "$T_STATUS \
+$(t_flag 'px-cluster push' "$T_STDERR") $(t_exists "$T_K8S_OUT/deploy-k8s/k7x")"
+  # Verify that rendering the external tier for a remote target emits manifests for the tier alone,
+  # records the three-host quorum exclusively in the tier ConfigMap, and applies the target
+  # placement rules to the tier pods (RQ-318, RQ-323).
+  line=zk1.k7.invalid:2181,zk2.k7.invalid:2181,zk3.k7.invalid:2181
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$PX_HOME/k8s/manifests.gen.sh" --class validation \
+    --cluster k7e -e PX_PHERF=1 -e PX_PHERF_TARGET=external -e "PX_PHERF_ZOOKEEPER=$line" \
+    -e "PX_K8S_IMAGE_DIGESTS=$tier=$d2"
+  dir="$T_K8S_OUT/deploy-k8s/k7e"
+  docs="$(t_k7_workloads "$dir")"
+  t_equals k7_external_tier_on_a_remote_target "0 00-namespace.yaml 10-env.yaml 11-conf.yaml\
+ 50-pherf-target.yaml 51-pherf-controller.yaml 52-pherf-agent.yaml|groups/pherf/50-pherf-target.\
+yaml|2 2 2" "$T_STATUS $(t_k5_names "$dir/manifests") $(t_k5_names "$dir/groups")|$(cd "$dir" \
+    2>/dev/null && grep -rl zk2.k7.invalid . | sed 's|^\./||' | paste -sd ' ' -)|$(printf \
+    '%s\n' "$docs" | grep -c '|kind: Deployment|') $(printf '%s\n' "$docs" | grep -c \
+    "|nodeSelector:|pool: \"phx\"|tier: \"perf\"|.*|imagePullSecrets:|- name: regcred|") $(printf \
+    '%s\n' "$docs" | grep -c "|image: \"reg.example:5000/phx/${tier%%:*}@$d2\"|")"
+  # Verify that for a three-node run with the tier active, the bundle placement map records the
+  # assigned node of every pod and the per-role host spread inspected by the runbook, and the
+  # bundle image inventory records both images (RQ-299, RQ-328).
+  t_k8s_seed "$T_K1_A5" "$PX_OUT"
+  dir="$T_K1/deploy-selftest"
+  {
+    t_rows 9 regionserver-1 regionserver 1 '' '' 3584 3072 512 17
+    t_rows 9 regionserver-2 regionserver 2 '' '' 3584 3072 512 17
+    t_rows 9 pherf-agent-0 pherf-agent 0 pherf on-demand 1536 537 0 17
+    t_rows 9 pherf-agent-1 pherf-agent 1 pherf on-demand 1536 537 0 17
+  } >>"$dir/services.tsv"
+  {
+    t_k8s_pod regionserver-1 regionserver '' 1 regionmover StatefulSet
+    t_k8s_pod regionserver-2 regionserver '' 2 regionmover StatefulSet
+    t_k8s_pod pherf-agent-5c9f7d8b6-fk0001 pherf-agent '' '' '' Deployment
+    t_k8s_pod pherf-agent-5c9f7d8b6-fk0002 pherf-agent '' '' '' Deployment
+  } >>"$T_K1_A5/k8s-pods.txt"
+  printf 'regionserver|3|OnDelete|0|no\n' >"$T_K1_A5/k8s-sts.txt"
+  awk -F '|' -v OFS='|' -v t="$tier" -v d="$d2" '
+    $1 ~ /^regionserver-/ { $22 = "n" (substr($1, 14) + 1) }
+    $1 == "client-0" { $22 = "n1" } $1 == "tooling-0" { $22 = "n2" }
+    $1 ~ /^pherf-agent-/ { $20 = t; $21 = d; $22 = "n" (substr($1, 28) + 1) }
+    { print }' "$T_K1_A5/k8s-pods.txt" >"$T_K1/k7-pods" && mv "$T_K1/k7-pods" \
+    "$T_K1_A5/k8s-pods.txt"
+  t_k1_a5 "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest "$T_WORK/drivers/exit-code.sh"
+  run="$(t_bundle)"
+  t_equals k7_bundle_places_each_pod_on_its_node "0 client n1|pherf-agent n2|pherf-agent n3|\
+regionserver n1|regionserver n2|regionserver n3|tooling n2 3 2" "$T_STATUS $(t_k7_placement \
+    "$run" | paste -sd '|' -) $(t_k7_placement "$run" | awk '$1 == "regionserver" { n[$2] = 1 }
+    END { print length(n) }') $(t_k7_placement "$run" | awk '$1 == "pherf-agent" { n[$2] = 1 }
+    END { print length(n) }')"
+  t_validate "$run"
+  t_equals k7_bundle_of_three_nodes_validates "0 ok" "$T_STATUS $(t_check_status "$T_STDOUT" \
+    kubernetes.placement)"
+  # Verify that promoting that run bundle pushes both images to the target registry and renders the
+  # target manifests, including the tier, with each image pinned by its promoted digest (RQ-295,
+  # RQ-306).
+  bundle="$(t_bundle_copy "$run" k7-pass)"
+  sed 's/"result": "[A-Z]*"/"result": "PASS"/' "$bundle/manifest.json" >"$bundle/m.json" &&
+    mv "$bundle/m.json" "$bundle/manifest.json"
+  printf '%s|phoenix-harness:selftest\n%s|%s\n' "$T_K8S_IMAGE_ID" "$d2" "$tier" \
+    >"$T_K8S_STATE/local-images.txt"
+  rm -f "$T_K8S_STATE/registry.log"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_PHERF=1 -e PX_IMAGE_TAG=phoenix-harness:selftest
+  dir="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  docs="$(t_k7_workloads "$dir")"
+  t_equals k7_push_promotes_both_images_of_the_bundle "0 2 yes yes 2 yes" "$T_STATUS $(grep -c \
+    '^push ' "$T_K8S_STATE/registry.log" 2>/dev/null) $(t_flag \
+    "push reg.example:5000/phx/$tier $d2" "$(cat "$T_K8S_STATE/registry.log" 2>/dev/null)")\
+ $(t_flag "push reg.example:5000/phx/phoenix-harness:selftest $T_K8S_IMAGE_ID" \
+    "$(cat "$T_K8S_STATE/registry.log" 2>/dev/null)") $(printf '%s\n' "$docs" | grep -c \
+    "|kind: Deployment|.*|image: \"reg.example:5000/phx/${tier%%:*}@$d2\"|") $(t_flag \
+    "$tier=$d2" "$(cat "$dir/render.env" 2>/dev/null)")"
+  rm -f "$T_K8S_STATE/local-images.txt" "$T_K8S_STATE/registry.log"
+}
+
+# ---------------------------------------------------------------------------
 # Command-line option parsing and test suite execution
 # ---------------------------------------------------------------------------
 
@@ -17458,6 +17666,7 @@ t_group_k2_boundary
 t_group_k5_render
 t_group_k5_backend
 t_group_k5_fleet
+t_group_k7_multinode
 t_group_tree
 
 t_daemons_stop
