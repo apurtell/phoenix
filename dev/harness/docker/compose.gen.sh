@@ -81,34 +81,21 @@ PXG_STATE_MOUNT=/var/lib/px/state
 # path.
 PXG_OVERLAY_MOUNT=/opt/px/conf-overlay
 
-# Constants for the Distributed Pherf tier defined by the docker/pherf image, covering the health
-# probe script, the controller run directory, and the agent communication channel port. Because
-# agents reach the channel exclusively over the internal bridge network, the port map omits it just
-# as it omits internal MapReduce task ports. Each JVM claims a fixed percentage of its container
-# memory limit: the controller takes half (50 percent), and each agent takes 35 percent because the
-# agent daemon and one Pherf child process share the container memory limit.
+# Container paths for the health probe script and controller run directory in the docker/pherf
+# image. The tier environment variables rendered by both generators are defined in lib/deploy.sh.
 PXG_PHERF_HEALTHCHECK=/opt/pherf/healthcheck.sh
 PXG_PHERF_RUN_DIR=/var/lib/pherf/run
-PXG_PHERF_AGENT_PORT=8790
-PXG_PHERF_CONTROLLER_PCT=50
-PXG_PHERF_AGENT_PCT=35
-# Maximum number of Distributed Pherf agents permitted in the validation run class.
-PXG_PHERF_VALIDATION_AGENTS=2
 
 # Header marker written as the first line of topology.env. A target directory whose topology.env
 # begins with this marker is recognized as a rendered deployment that the generator may safely
 # replace.
 PXG_MARKER="# Rendered by compose.gen.sh. Render again instead of editing."
 
-# Validation grammar for the ZooKeeper quorum string when the tier targets an external cluster.
-PXG_QUORUM_RE='^[A-Za-z0-9._:,/-]+$'
-
 # Per-render output buffers and state accumulators populated during a single rendering pass.
 PXG_YAML=""
 PXG_VOLUMES=""
 PXG_PORTS=""
 PXG_PUBLISHED=""
-PXG_QUORUM=""
 PXG_STATE_HOST=""
 PXG_HEARTBEAT=""
 
@@ -145,52 +132,6 @@ pxg_configure_state() {
   fi
   name="$(px_guard_name monitor "$PX_PROJECT_PREFIX-$PX_CLUSTER_ID")"
   PXG_HEARTBEAT="$PXG_STATE_MOUNT/$name.heartbeat"
-}
-
-## @description  Validates the Distributed Pherf tier configuration, sets PXG_QUORUM, and appends
-##               the two tier roles to PXG_RENDERED.
-## @return       Exits 0 when valid, or exits 2 on any rejected value.
-pxg_configure_tier() {
-  local name ver_zk=$PXG_ZOOKEEPER ver_hadoop=$PXG_HBASE_HADOOP
-  pxg_require PX_PHERF_AGENT_COUNT PX_PHERF_CONTROLLER_MEM_MIB PX_PHERF_AGENT_MEM_MIB \
-    PX_PHERF_IMAGE_TAG
-  pxg_check_count pherf-agent
-  if [ "$PX_RUN_CLASS" = validation ] &&
-    [ "$PX_PHERF_AGENT_COUNT" -gt "$PXG_PHERF_VALIDATION_AGENTS" ]; then
-    px_die "$PX_EXIT_USAGE" "PX_PHERF_AGENT_COUNT=$PX_PHERF_AGENT_COUNT: the validation class" \
-      "runs 1 to $PXG_PHERF_VALIDATION_AGENTS agents"
-  fi
-  for name in PX_PHERF_CONTROLLER_MEM_MIB PX_PHERF_AGENT_MEM_MIB; do
-    pxg_check_mib "$name"
-  done
-  if ! sb_image_tag_local "$PX_PHERF_IMAGE_TAG"; then
-    px_die "$PX_EXIT_USAGE" "PX_PHERF_IMAGE_TAG='$PX_PHERF_IMAGE_TAG' must be a local image" \
-      "reference repository:tag, with no registry host and no digest"
-  fi
-  # The ZooKeeper quorum for an external target cluster must be supplied explicitly by the
-  # operator, whereas the harness target resolves the deployment's own ZooKeeper instance and
-  # client port.
-  if [ "$PX_PHERF_TARGET" = external ]; then
-    [ -n "${PX_PHERF_ZOOKEEPER:-}" ] || px_die "$PX_EXIT_USAGE" "the external target needs" \
-      "PX_PHERF_ZOOKEEPER, the ZooKeeper quorum of the target cluster: host:port,..."
-    [[ $PX_PHERF_ZOOKEEPER =~ $PXG_QUORUM_RE ]] || px_die "$PX_EXIT_USAGE" \
-      "PX_PHERF_ZOOKEEPER='$PX_PHERF_ZOOKEEPER' must hold letters, digits and . _ : , / - only"
-    PXG_QUORUM=$PX_PHERF_ZOOKEEPER
-  else
-    [ -z "${PX_PHERF_ZOOKEEPER:-}" ] || px_die "$PX_EXIT_USAGE" "PX_PHERF_ZOOKEEPER is for" \
-      "PX_PHERF_TARGET=external. The harness target reads the ZooKeeper of the deployment"
-    PXG_QUORUM="zookeeper-0:$(pxg_port zookeeper client 0)"
-  fi
-  # The staging record of the Pherf image supplies the ZooKeeper version for an external
-  # deployment, whereas the staging record of the harness image supplies it for a harness
-  # deployment.
-  pxg_staged PX_PHERF_IMAGE_TAG hbase_profile:PX_PHOENIX_HBASE_PROFILE \
-    hbase_version:PX_DIST_HBASE_VERSION
-  if [ "$PX_PHERF_TARGET" = harness ]; then
-    PXG_ZOOKEEPER=$ver_zk
-    PXG_HBASE_HADOOP=$ver_hadoop
-  fi
-  PXG_RENDERED="$PXG_RENDERED pherf-controller pherf-agent"
 }
 
 ## @description  Appends a single line to the accumulated Compose YAML buffer.
@@ -329,13 +270,9 @@ pxg_render_service() {
 ##               index), appends its service table row, and records its memory allocation.
 ## @return       Exits 0.
 pxg_render_tier_service() {
-  local role=$1 index=$2 service="$1-$2" prefix=$PX_LABEL_PREFIX var mem pct verb port
+  local role=$1 index=$2 service="$1-$2" prefix=$PX_LABEL_PREFIX var mem verb=agent port line
   var="PX_$(pxg_role "$role" key)_MEM_MIB" && mem=${!var}
-  if [ "$role" = pherf-controller ]; then
-    verb=controller pct=$PXG_PHERF_CONTROLLER_PCT
-  else
-    verb=agent pct=$PXG_PHERF_AGENT_PCT
-  fi
+  [ "$role" != pherf-controller ] || verb=controller
   pxg_y "  $service:"
   pxg_y "    image: \"$PX_PHERF_IMAGE_TAG\""
   pxg_y "    pull_policy: never"
@@ -353,15 +290,12 @@ pxg_render_tier_service() {
   pxg_y "      $prefix.start: \"on-demand\""
   pxg_y "    command: [\"$verb\", \"start\"]"
   pxg_y "    environment:"
+  while IFS= read -r line; do
+    pxg_y "      ${line%%=*}: \"${line#*=}\""
+  done <<EOF
+$(pxg_tier_env "$role" pherf-controller-0)
+EOF
   pxg_render_ports "$role" "$index"
-  if [ "$verb" = controller ]; then
-    pxg_y "      PHERF_JAVA_OPTS: \"-XX:MaxRAMPercentage=$pct\""
-    pxg_y "      PHERF_REST_PORT: \"${PXG_PUBLISHED# }\""
-  else
-    pxg_y "      PHERF_CONTROLLER: \"http://pherf-controller-0:$PXG_PHERF_AGENT_PORT\""
-    pxg_y "      PHERF_JAVA_OPTS: \"-XX:MaxRAMPercentage=$pct\""
-    pxg_y "      PHERF_ZOOKEEPER: \"$PXG_QUORUM\""
-  fi
   # Use the same healthcheck probe command and timing thresholds defined in
   # docker/pherf/compose.yaml.
   pxg_y "    healthcheck:"
@@ -384,11 +318,7 @@ pxg_render_tier_service() {
     PXG_VOLUMES="$PXG_VOLUMES    labels:$PX_NL"
     PXG_VOLUMES="$PXG_VOLUMES      $prefix.cluster: \"$PX_CLUSTER_ID\"$PX_NL"
   fi
-  PXG_TSV="$PXG_TSV$(px_tsv_row "$service" "$role" "$index" pherf on-demand "$mem" \
-    "$((mem * pct / 100))" 0 17)$PX_NL"
-  PXG_SERVICES=$((PXG_SERVICES + 1))
-  PXG_MEM_TOTAL=$((PXG_MEM_TOTAL + mem))
-  PXG_MEM_PHERF=$((PXG_MEM_PHERF + mem))
+  pxg_tier_row "$role" "$index"
 }
 
 # The self-test verifies that the maximum port map (nine instances of every scalable role) produces

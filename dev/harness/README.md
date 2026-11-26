@@ -85,24 +85,32 @@ every subsequent build uses that record:
 ```sh
 px-cluster build                           # the Phoenix jars, jHiccup and the image
 px-cluster up -n --class measurement --config dev/harness/docker/env/override-24gib.env
-px-cluster --class measurement --config dev/harness/docker/env/override-24gib.env up
+px-cluster up --class measurement --config dev/harness/docker/env/override-24gib.env
 px-cluster down                            # idempotent: exits 0 when nothing is recorded
 ```
 
 The Distributed Pherf controller and agents execute in a second local container image defined in
 `docker/pherf`, built on the `PX_IMAGE_BASE_JRE17` JRE base image and pinned by digest under the
 same policy (`PX_IMAGE_BASE_JRE17_SHA256_<ARCH>`). Enabling `PX_PHERF=1` serves as the single switch
-for the tier: running `px-cluster -e PX_PHERF=1 build` also compiles `phoenix-pherf-distributed`
+for the tier: invoking `px-cluster build -e PX_PHERF=1` also compiles `phoenix-pherf-distributed`
 and builds the `PX_PHERF_IMAGE_TAG` image, while rendering with that setting adds the tier to the
 deployment as the on-demand `pherf` role group. The `px-pherf` command starts the tier and executes
 a suite against it, and the `pherf-distributed` driver runs a workload plan on it:
 
 ```sh
-px-cluster -e PX_PHERF=1 build             # also phoenix-pherf-distributed and the pherf image
-px-pherf --class validation run fleet.suite -- --only r1   # up, start, the suite, then down
-px-cluster --class validation -e PX_PHERF=1 up && px-pherf --class validation start
+px-cluster build -e PX_PHERF=1             # also phoenix-pherf-distributed and the pherf image
+px-pherf run fleet.suite --class validation --only r1   # up, start, the suite, then down
+px-pherf start --class validation          # brings the cluster up with the tier, leaves it up
 px-pherf status                            # the group and the agents; px-pherf stop stops them
+px-pherf scale 1                           # px-cluster scale pherf-agent 1, then wait
+px-cluster down
+px-pherf run fleet-rules.suite --backend k8s --class validation
 ```
+
+Under `--backend k8s`, the tier is deployed as a controller Deployment with a persistent volume
+claim mounted at its run directory alongside an agent Deployment resized by `kubectl scale`; each
+agent takes its pod name as its agent ID, and every `px-pherf` request to the controller is routed
+through a `kubectl port-forward` tunnel bound to `127.0.0.1` (see docs/backends.md).
 
 By default, the tier targets the harness cluster. Setting `PX_PHERF_TARGET=external` with
 `PX_PHERF_ZOOKEEPER` pointed at the quorum of an external cluster renders a deployment containing
@@ -147,7 +155,7 @@ by the command, because no runtime output is ever written inside the repository 
 | `px-collect` | Gathers profiles, recordings, counters, and samples manually: start, stop, list. |
 | `px-bundle` | Generates, validates, and queries the metrics of a result bundle. |
 | `px-report` | Aggregates a bundle's verdict streams into a single verdict and exit code. |
-| `px-pherf` | Manages the Distributed Pherf tier: start, stop, status, and run of a suite on it. |
+| `px-pherf` | Controls the Distributed Pherf tier: start, stop, status, scale, and suite runs. |
 | `px-k3d` | Manages the Kubernetes backend's local k3d cluster: create, import, check, delete. |
 
 Every command responds to `--help` with exit code 0 and rejects any unknown flag with exit code 2.

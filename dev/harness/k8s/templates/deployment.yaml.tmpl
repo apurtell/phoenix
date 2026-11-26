@@ -1,0 +1,43 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Defines the Kubernetes Deployment for a single Distributed Pherf tier role. When rolling out a
+# modified pod template, the Recreate strategy ensures that all existing pods terminate before any
+# new pod is started. However, this ordering guarantee does not apply when an individual pod is
+# deleted or evicted: the ReplicaSet schedules a replacement immediately while the previous pod may
+# still be terminating, which can cause two controller pods to briefly overlap on the run directory
+# claim. To resolve this contention safely, the incoming controller waits up to a bounded duration
+# to acquire the run directory lock (see backends.md).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${PX_M_NAME}
+  namespace: ${PX_M_NAMESPACE}
+  labels:
+${PX_M_LABELS}
+spec:
+  replicas: ${PX_M_REPLICAS}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+${PX_M_SELECTOR}
+  template:
+    metadata:
+      labels:
+${PX_M_POD_LABELS}
+    spec:
+${PX_M_POD_SPEC}

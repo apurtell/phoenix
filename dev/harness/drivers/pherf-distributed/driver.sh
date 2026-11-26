@@ -34,8 +34,8 @@
 # it loaded. The documents bundled into a plan consist of the scenario, the profile files that it
 # references, and the schema files, each registered under its base file name.
 #
-# The driver itself does not launch a JVM; instead, lib/fleet.sh invokes curl inside
-# pherf-controller 0 for each API call. During the load phase, the single schema file is applied
+# The driver itself does not launch a JVM; instead, lib/fleet.sh dispatches each REST API request
+# to the controller. During the load phase, the single schema file is applied
 # through the agents: each agent runs Pherf from its working directory where plan documents are
 # materialized under slice/, and Pherf reads the schema file path directly from the local file
 # system. On a harness target, client 0 records the created tables after the load completes and

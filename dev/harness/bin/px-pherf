@@ -23,8 +23,11 @@
 #      global options, ensuring that the memory check, planned-action record, and readiness barrier
 #      of px-cluster apply uniformly. This command reads only the cluster scope, the role group
 #      state, and the controller's REST API.
-#   2. All controller REST API calls go through lib/fleet.sh from inside pherf-controller 0; no
-#      code in this script reads a host port.
+#   2. Every controller REST API call made by this script is routed through lib/fleet.sh: on
+#      Compose it executes inside pherf-controller 0, whereas on Kubernetes it connects through the
+#      loopback tunnel that sb_endpoint opens to the controller pod. During a run, the driver
+#      invokes the controller from inside that pod across both backends. No code in this script
+#      ever reads a host-published deployment port.
 #   3. Each command tears down only the resources that it provisioned. A failed start stops
 #      whatever resources it initiated, whereas a successful start that provisions a cluster leaves
 #      that cluster running until px-cluster down is invoked. The run subcommand validates the
@@ -50,71 +53,92 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 set -euo pipefail
 
-# Global command-line options forwarded to each px-cluster child process, alongside their
-# px-suite equivalents for the suite invoked by the run subcommand.
-PP_GLOBAL=()
+# Accumulates the options forwarded to px-suite by the run subcommand, consisting of this command's
+# shared options (excluding the -n dry-run flag) along with --keep.
 PP_SUITE=()
-# Set to "up" when this process provisioned the deployment itself, indicating that a failed start
-# must tear the deployment back down.
+# Tracks the resources provisioned by this process: "up" when it provisioned the cluster, or "tier"
+# when it started the tier on an already running cluster. Both a failed start and run completion
+# tear down only the recorded resource tier.
 PP_STARTED=""
+# Test selection options for the run subcommand, which are forwarded to px-suite.
+PP_ONLY=""
+PP_SKIP=""
+PP_FROM=""
+PP_TO=""
+PP_CONTINUE=0
 
-## @description  Prints the command-line usage summary, subcommands, and exit codes.
-## @return       Writes the usage text to stdout and exits with 0.
-usage() {
-  cat <<'EOF'
-Usage: px-pherf [global option...] <subcommand> [argument...]
-
-Starts, stops and reports the Distributed Pherf tier, one controller and its
-agents, and runs a suite against it.
-
-Global options, as px-cluster takes them, before the subcommand:
-  -h, --help             print this text and exit 0
-  -v, --verbose          report debug detail on stderr
-  -n, --dry-run          report the planned steps and change nothing
-      --keep             keep the tier and the cluster after a failure or a run
-      --strict           refuse a name that lib/varnames.txt does not declare
-      --backend NAME     backend to bind, default compose
-      --cluster ID       cluster name, default from the configuration
-      --class NAME       run class: validation or measurement
-      --config FILE      extra configuration file, repeatable
-  -e, --set NAME=VALUE   set one configuration value, repeatable
-
-Subcommands:
-  start                  start the tier and wait until each agent is IDLE.
-                         The harness target needs a cluster rendered with
-                         PX_PHERF=1. The external target brings its
-                         deployment up when no scope is recorded.
-  stop                   stop the group pherf, or take an external
-                         deployment down
-  status                 report the group row and the agents: id, state and
-                         incarnation
-  run SUITE [-- OPTION...]
-                         check the plan with px-suite --dry-run, bring the
-                         cluster up with PX_PHERF=1 when no scope is
-                         recorded, start the tier, then run px-suite SUITE
-                         with the px-suite options after --. The session
-                         teardown of px-suite removes the cluster, and run
-                         removes a cluster that it brought up when px-suite
-                         or a signal ended early, unless --keep
-
-stdout: the agent rows of start and status, or the result rows of px-suite.
-
-Exit codes: 0 ok, 1 failure, 2 usage or a cluster without the tier, 3 the
-tier does not run or an instance terminated, 4 a timeout, 6 no such cluster.
-run exits with the status of px-suite.
+px_cli_spec <<'EOF'
+about Starts, stops and reports the Distributed Pherf tier, one controller and its
++ agents, and runs a suite against it.
+about Each change of the cluster runs as a px-cluster child with the shared options of
++ this command.
+about On --backend k8s an agent id is the name of its pod. Each call that px-pherf
++ itself makes to the controller goes through a port-forward tunnel bound to
++ 127.0.0.1; the driver of a run calls the controller from inside its pod.
+shared --cluster --class --backend
+opt --keep - PX_KEEP=1 | keep the tier and the cluster after a failure or a
++ run
+sub start
+about start the tier and wait until each agent is IDLE
+about With no cluster recorded, start brings the cluster up with the tier
++ (PX_PHERF=1) and leaves it up; px-cluster down removes it. The external target
++ brings its deployment up in the same way.
+sub stop
+about stop the group pherf, or take an external deployment
++ down
+sub status
+about report the group row and the agents: id, state and
++ incarnation
+sub scale COUNT
+about set the agent count to COUNT (1 to 9) with
++ px-cluster scale, then wait until each agent is IDLE
+sub run SUITE
+about check the plan, bring the cluster up with the tier,
++ start the tier, and run the suite
+about run checks the plan with px-suite --dry-run, brings the cluster up with
++ PX_PHERF=1 when no cluster is recorded, starts the tier, then runs px-suite
++ SUITE with the selection options. run tears down what it brought up: the
++ cluster, or the tier when the cluster was up already, unless --keep.
+opt --only IDS PP_ONLY | run exactly these tests, comma separated
+opt --skip IDS PP_SKIP | do not run these tests, comma separated
+opt --from ID PP_FROM | the first test of the ordered plan, inclusive
+opt --to ID PP_TO | the last test of the ordered plan, inclusive
+opt --continue-on-failure - PP_CONTINUE=1 | record a failure and continue, then report the
++ worst severity of the session
+output the agent rows of start, scale and status, or the result rows of
++ px-suite.
+exits 3 also means that the tier does not run or an instance terminated, 6 no
++ such cluster or a cluster without the tier. run exits with the status of
++ px-suite.
+example px-pherf run smoke --class validation --only r1
 EOF
-}
 
-## @description  Invokes px-cluster with this command's global options (argument...), redirecting
+## @description  Executes px-cluster with this command's shared options (argument...), redirecting
 ##               stdout to stderr.
 ## @return       Exits with 0, or returns the px-cluster exit code (1, 2, 3, 4, 5, or 6).
 pp_cluster() {
-  px_config_child "$PX_HOME/bin/px-cluster" ${PP_GLOBAL[@]+"${PP_GLOBAL[@]}"} "$@" >&2
+  px_config_child "$PX_HOME/bin/px-cluster" "$@" ${PX_CLI_SHARED[@]+"${PX_CLI_SHARED[@]}"} >&2
 }
 
 ## @description  Resolves and prints the recorded scope identifier of the active cluster.
 ## @return       Writes the scope ID to stdout and exits 0, 6 when none is recorded, or 2 or 1.
 pp_scope() { sb_scope_resolve 2>/dev/null; }
+
+## @description  Emits the recorded scope identifier for the active cluster, or aborts if absent.
+## @return       Writes the scope ID to stdout and exits 0, or exits 6 if no scope is recorded.
+pp_scope_or_die() {
+  pp_scope || px_die "$PX_EXIT_NO_OBJECT" "no cluster ${PX_CLUSTER_ID:-default} is recorded:" \
+    "$PX_HINT_NO_CLUSTER"
+}
+
+## @description  Verifies that the active cluster's recorded deployment includes the Pherf tier.
+## @return       Exits with 0 when the tier is present, or 6 when the deployment lacks the tier.
+pp_tier_require() {
+  if [ "$(pp_topology PX_PHERF)" != 1 ]; then
+    px_die "$PX_EXIT_NO_OBJECT" "cluster ${PX_CLUSTER_ID:-default} was rendered without the" \
+      "tier: run px-cluster down, then px-pherf start"
+  fi
+}
 
 ## @description  Reads a single configuration value (name) from the recorded deployment's topology
 ##               record.
@@ -126,75 +150,141 @@ pp_topology() {
   pb_env_value "$1" "$dir/topology.env"
 }
 
-## @description  Applies the teardown policy after a failed start by tearing down an external
-##               deployment provisioned by this process or stopping the pherf role group.
-## @return       Exits with 0, emitting a warning if teardown fails.
-pp_start_failed() {
-  if ! px_teardown_wanted; then
-    px_info "the tier stays for a diagnosis: run px-pherf stop or px-cluster down"
-    return 0
+# On Kubernetes, client commands access the controller REST API exclusively through a loopback
+# tunnel to the controller pod opened on 127.0.0.1 by the backend endpoint call; the Compose
+# backend requires no tunnel.
+## @description  Resolves the local REST tunnel port for a scope (scope) into PF_API_PORT.
+## @return       Exits 0, or exits 3 if no loopback tunnel opens to pherf-controller 0's REST port.
+pp_api() {
+  local row
+  [ "$(sb_backend_id)" = k8s ] || return 0
+  if ! row="$(sb_endpoint "$1" pherf-controller 0 rest </dev/null)"; then
+    px_error "no loopback tunnel reaches the REST port of pherf-controller 0"
+    return "$PX_EXIT_ANOMALY"
   fi
-  if [ "$PP_STARTED" = up ]; then
-    px_info "the start failed, so the deployment comes down (teardown by default)"
-    pp_cluster down || px_warn "the teardown failed: run px-cluster down"
-  else
-    px_info "the start failed, so the group pherf stops (teardown by default)"
-    pp_cluster group stop pherf || px_warn "the group pherf did not stop: run px-pherf stop"
-  fi
+  IFS="$PX_TAB" read -r _ PF_API_PORT _ <<<"$row"
 }
 
-# Brings up an external deployment first when no scope is recorded, starts the pherf role group,
-# and waits until every rendered agent reports the IDLE state.
-## @description  Starts the Distributed Pherf tier and waits for all rendered agents to reach IDLE.
-## @return       Writes the agent rows to stdout and exits 0, 2 when the tier or scope is absent,
-##               or 1, 3, or 4 on failure, anomaly, or timeout.
-pp_start() {
+# Invoked both directly and via the process exit hook so that any failure, early exit, or INT or
+# TERM signal releases the resources provisioned by start or run: the entire cluster, or the tier
+# alone if the cluster was already running. Stopping the role group also closes the REST tunnel.
+## @description  Tears down the cluster or tier provisioned by this process unless --keep is set.
+## @return       Exits with 0, or returns the px-cluster exit status if the release fails.
+pp_release() {
+  local started=$PP_STARTED scope status=0
+  PP_STARTED=""
+  [ -n "$started" ] || return 0
+  if px_is_keep; then
+    px_info "what $PX_CLI_SUB brought up stays for a diagnosis: run px-pherf stop or" \
+      "px-cluster down"
+    return 0
+  fi
+  if [ "$started" = up ]; then
+    px_info "$PX_CLI_SUB ends, so the cluster that it brought up comes down"
+    pp_cluster down || status=$?
+    [ "$status" = 0 ] || px_warn "the teardown failed: run px-cluster down"
+    return "$status"
+  fi
+  px_info "$PX_CLI_SUB ends, so the tier that it started stops"
+  pp_cluster group stop pherf || status=$?
+  [ "$status" = 0 ] || px_warn "the group pherf did not stop: run px-pherf stop"
+  if scope="$(pp_scope)"; then
+    sb_endpoint_release "$scope" pherf-controller 0 rest || px_warn "the REST tunnel stays"
+  fi
+  return "$status"
+}
+
+# Provisions the cluster with the tier enabled when no cluster is currently recorded, starts the
+# pherf role group, and waits until every rendered agent reports the IDLE state. PP_STARTED records
+# the provisioned resource tier prior to each child invocation because signals are delivered to
+# this shell only after the child exits and px-cluster down exits 0 when nothing is recorded. If
+# startup fails, the exit hook releases whatever resources were started.
+## @description  Provisions or starts the tier and waits for all rendered agents to reach IDLE.
+## @return       Writes the agent rows to stdout and exits 0, 6 if the tier is absent, or 1, 3, or
+##               4 on failure, anomaly, or timeout.
+pp_tier_up() {
   local scope count ready rows status=0
   ready="$(px_int_setting PX_TIMEOUT_READY 600 1)"
   if px_is_dry_run; then
+    pp_scope >/dev/null || px_plan up px-cluster up -e PX_PHERF=1
     px_plan start px-cluster group start pherf
     px_plan wait GET /v1/agents
     return 0
   fi
   if ! scope="$(pp_scope)"; then
-    if [ "${PX_PHERF_TARGET:-harness}" != external ]; then
-      px_die "$PX_EXIT_USAGE" "cluster ${PX_CLUSTER_ID:-default} has no recorded scope: bring" \
-        "it up with px-cluster up -e PX_PHERF=1, or use px-pherf run"
-    fi
-    pp_cluster up || px_die "$?" "the external deployment of the tier did not come up"
     PP_STARTED=up
+    pp_cluster -e PX_PHERF=1 up || px_die "$?" "the cluster did not come up with the tier"
     scope="$(pp_scope)" || px_die "$PX_EXIT_FAIL" "the bring-up recorded no scope"
+  elif pp_tier_down "$scope"; then
+    PP_STARTED=tier
   fi
-  if [ "$(pp_topology PX_PHERF)" != 1 ]; then
-    px_die "$PX_EXIT_USAGE" "cluster ${PX_CLUSTER_ID:-default} was rendered without the tier:" \
-      "run px-cluster down, then px-cluster up -e PX_PHERF=1, or use px-pherf run"
-  fi
+  pp_tier_require
   count="$(pp_topology PX_PHERF_AGENT_COUNT)"
   pp_cluster group start pherf || status=$?
+  [ "$status" != 0 ] || pp_api "$scope" || status=$?
   if [ "$status" = 0 ]; then
     rows="$(pf_agents_wait "$scope" "$count" "$ready")" || status=$?
   fi
-  if [ "$status" != 0 ]; then
-    pp_start_failed
-    px_die "$status" "the tier did not start"
-  fi
+  [ "$status" = 0 ] || px_die "$status" "the tier did not start"
   px_info "the tier runs: one controller and $count IDLE agents"
   printf '%s\n' "$rows"
 }
 
+# Clears PP_STARTED upon completion so that any cluster or tier provisioned by start remains
+# running after a successful startup.
+## @description  Starts the Distributed Pherf tier and waits for all rendered agents to reach IDLE.
+## @return       Writes the agent rows to stdout and exits 0, 6 if the tier is absent, or 1, 3, or
+##               4 on failure, anomaly, or timeout.
+pp_start() {
+  pp_tier_up
+  PP_STARTED=""
+}
+
+# Stopping the role group also releases the REST API loopback tunnel (which the Compose backend
+# never opens), whereas tearing down an external deployment releases all tunnels for the scope.
 ## @description  Stops the Distributed Pherf tier by stopping the pherf role group or tearing down
 ##               an external deployment as a whole.
 ## @return       Exits 0, 6 when no scope is recorded, or with the px-cluster code (1, 2, 3, 4, 5).
 pp_stop() {
-  pp_scope >/dev/null || px_die "$PX_EXIT_NO_OBJECT" "cluster ${PX_CLUSTER_ID:-default} has" \
-    "no recorded scope"
+  local scope status=0
+  scope="$(pp_scope_or_die)" || exit "$?"
   if [ "$(pp_topology PX_PHERF_TARGET)" = external ]; then
     px_plan stop px-cluster down && return 0
     pp_cluster down
-  else
-    pp_cluster group stop pherf
+    return
   fi
   px_plan stop px-cluster group stop pherf && return 0
+  pp_cluster group stop pherf || status=$?
+  sb_endpoint_release "$scope" pherf-controller 0 rest || px_warn "the REST tunnel stays"
+  return "$status"
+}
+
+# Scaling re-renders the deployment via px-cluster scale—which executes the memory check and
+# records the planned action—before waiting until the new target count of agents reaches IDLE.
+# Re-rendering draws its configuration from the stored cluster record, which preserves PX_PHERF and
+# the run class established during cluster bring-up.
+## @description  Scales the tier to the requested agent count (count, 1 to 9) and waits for them.
+## @return       Writes agent rows to stdout and exits 0, 2 on usage, 6 if no scope is recorded or
+##               the cluster lacks the tier, or 1, 3, or 4 on failure, anomaly, or timeout.
+pp_scale() {
+  local count=${1:-} scope ready rows status=0
+  [[ $count =~ ^[1-9]$ ]] ||
+    px_die "$PX_EXIT_USAGE" "scale needs an agent count of 1 to 9, got '$count'"
+  scope="$(pp_scope_or_die)" || exit "$?"
+  pp_tier_require
+  ready="$(px_int_setting PX_TIMEOUT_READY 600 1)"
+  if px_is_dry_run; then
+    px_plan scale px-cluster scale pherf-agent "$count"
+    px_plan wait GET /v1/agents
+    return 0
+  fi
+  pp_cluster scale pherf-agent "$count" || px_die "$?" \
+    "the scale of the agents to $count failed"
+  pp_api "$scope" || px_die "$?" "the tier gives no REST path after the scale"
+  rows="$(pf_agents_wait "$scope" "$count" "$ready")" || status=$?
+  [ "$status" = 0 ] || px_die "$status" "the $count agents are not IDLE after the scale"
+  px_info "the tier runs: one controller and $count IDLE agents"
+  printf '%s\n' "$rows"
 }
 
 ## @description  Reports the state row of the pherf role group followed by the active agent rows.
@@ -202,117 +292,80 @@ pp_stop() {
 ##               state is unavailable, 3 if the controller does not respond, or 4 on timeout.
 pp_status() {
   local scope row
-  scope="$(pp_scope)" || px_die "$PX_EXIT_NO_OBJECT" "cluster ${PX_CLUSTER_ID:-default} has" \
-    "no recorded scope"
+  scope="$(pp_scope_or_die)" || exit "$?"
   row="$(sb_group_status "$scope" pherf)" || px_die "$?" "the group pherf has no state"
   printf '%s\n' "$row"
   case "$row" in
   *"${PX_TAB}down") return 0 ;;
   esac
+  pp_api "$scope" || px_die "$?" "the tier gives no REST path"
   pf_agents_wait "$scope" 0 0
 }
 
-# Invoked by the exit hook of run when px-suite exits early or is interrupted by an INT or TERM
-# signal before tearing down the cluster that run provisioned.
-## @description  Applies the teardown policy on exit to a cluster provisioned by run that px-suite
-##               did not remove.
-## @return       Exits with 0, emitting a warning if teardown fails.
-pp_run_abandon() {
-  if [ "$PP_STARTED" != up ] || ! px_teardown_wanted || ! pp_scope >/dev/null; then
+## @description  Checks whether the pherf role group in the given scope (scope) is currently down.
+## @return       Exits 0 when the role group is down, or returns 1 otherwise.
+pp_tier_down() {
+  local row
+  row="$(sb_group_status "$1" pherf 2>/dev/null)" || return 1
+  case "$row" in
+  *"${PX_TAB}down") return 0 ;;
+  esac
+  return 1
+}
+
+# Because a px-suite dry run makes no backend calls, validating the plan first ensures that any
+# invalid suite file or command-line option aborts execution before any resources are provisioned.
+## @description  Executes a test suite (suite) against the tier and tears down what it provisioned.
+## @return       Exits 0, or returns the px-suite status (1, 2, 3, or 6), a failed startup step
+##               status, or the teardown status if releasing resources fails after a passing suite.
+pp_run() {
+  local suite=$1 scope status=0 release=0
+  local -a words=()
+  [ -z "$PP_ONLY" ] || words+=(--only "$PP_ONLY")
+  [ -z "$PP_SKIP" ] || words+=(--skip "$PP_SKIP")
+  [ -z "$PP_FROM" ] || words+=(--from "$PP_FROM")
+  [ -z "$PP_TO" ] || words+=(--to "$PP_TO")
+  [ "$PP_CONTINUE" = 0 ] || words+=(--continue-on-failure)
+  if px_is_dry_run; then
+    px_plan check px-suite ${PP_SUITE[@]+"${PP_SUITE[@]}"} --dry-run ${words[@]+"${words[@]}"} \
+      "$suite"
+    pp_tier_up
+    px_plan suite px-suite ${PP_SUITE[@]+"${PP_SUITE[@]}"} ${words[@]+"${words[@]}"} "$suite"
+    if px_is_keep; then
+      :
+    elif ! scope="$(pp_scope)"; then
+      px_plan down px-cluster down
+    elif pp_tier_down "$scope"; then
+      px_plan stop px-cluster group stop pherf
+    fi
     return 0
   fi
-  px_info "run ends with the cluster that it brought up, so it comes down (teardown by default)"
-  pp_cluster down || px_warn "the teardown failed: run px-cluster down"
+  px_config_child "$PX_HOME/bin/px-suite" ${PP_SUITE[@]+"${PP_SUITE[@]}"} --dry-run \
+    ${words[@]+"${words[@]}"} "$suite" >/dev/null ||
+    px_die "$?" "px-suite refuses the suite $suite, so no cluster starts"
+  pp_tier_up >/dev/null
+  px_config_child "$PX_HOME/bin/px-suite" ${PP_SUITE[@]+"${PP_SUITE[@]}"} \
+    ${words[@]+"${words[@]}"} "$suite" || status=$?
+  pp_release || release=$?
+  [ "$status" != 0 ] || status=$release
+  return "$status"
 }
 
-## @description  Validates a suite plan (suite, --, and px-suite options), provisions a harness
-##               cluster when no scope is recorded, starts the tier, and runs the suite against it.
-## @return       Exits 0, with the px-suite status (1, 2, 3, or 6), or with a failed step's status.
-pp_run() {
-  local suite=$1
-  shift
-  if px_is_dry_run; then
-    px_plan check px-suite --dry-run "$suite"
-    if ! pp_scope >/dev/null && [ "${PX_PHERF_TARGET:-harness}" != external ]; then
-      px_plan up px-cluster up -e PX_PHERF=1
-    fi
-  else
-    # Because a px-suite dry run performs no backend calls, an invalid suite file or command-line
-    # option aborts the run before any cluster instances are provisioned.
-    px_config_child "$PX_HOME/bin/px-suite" ${PP_SUITE[@]+"${PP_SUITE[@]}"} --dry-run "$@" \
-      "$suite" >/dev/null || px_die "$?" "px-suite refuses the suite $suite, so no cluster starts"
-    # Convert interrupt and termination signals into normal process exits so that the registered
-    # exit hook enforces the default teardown policy.
-    px_on_exit pp_run_abandon
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    if ! pp_scope >/dev/null && [ "${PX_PHERF_TARGET:-harness}" != external ]; then
-      pp_cluster -e PX_PHERF=1 up || px_die "$?" "the cluster did not come up with the tier"
-      PP_STARTED=up
-    fi
-  fi
-  pp_start >/dev/null
-  px_config_child "$PX_HOME/bin/px-suite" ${PP_SUITE[@]+"${PP_SUITE[@]}"} "$@" "$suite"
-}
-
-## @description  Parses global options and the target subcommand, loads configuration, binds the
-##               substrate backend, and dispatches the subcommand.
-## @return       Exits with the status of the executed subcommand, or 2 on a usage error.
-pp_main() {
-  local sub line strict="" files=() sets=()
-  while [ $# -gt 0 ]; do
-    px_cli_common "$1" || case "$1" in
-    --keep) sets+=("PX_KEEP=1") && PP_SUITE+=(--keep) ;;
-    --strict) strict=--strict && sets+=("PX_STRICT_CONFIG=1") ;;
-    --backend | --cluster | --class | --config | -e | --set)
-      px_cli_need_value "$@"
-      case "$1" in
-      --backend) sets+=("PX_BACKEND=$2") ;;
-      --cluster) sets+=("PX_CLUSTER_ID=$2") ;;
-      --class) sets+=("PX_RUN_CLASS=$2") ;;
-      --config) files+=("$2") && PP_SUITE+=(--config "$2") ;;
-      *) sets+=("$2") ;;
-      esac
-      PP_GLOBAL+=("$1" "$2")
-      shift
-      ;;
-    --) shift && break ;;
-    -*) px_usage_error "unknown global option $1" ;;
-    *) break ;;
-    esac
-    case "$1" in
-    -v | --verbose | -n | --dry-run | --keep | --strict) PP_GLOBAL+=("$1") ;;
-    esac
-    shift
-  done
-  [ $# -gt 0 ] || px_usage_error "name a subcommand: start, stop, status or run"
-  sub=$1
-  shift
-  case "$sub" in
-  start | stop | status) [ $# -eq 0 ] || px_usage_error "$sub takes no argument, got: $*" ;;
-  run) ;;
-  *) px_usage_error "unknown subcommand '$sub'" ;;
+px_cli_parse "$@"
+# Exclude -n from PP_SUITE so that the suite plan row emitted during a dry run reflects the exact
+# argument vector of a live execution.
+for word in ${PX_CLI_SHARED[@]+"${PX_CLI_SHARED[@]}"}; do
+  case "$word" in
+  -n | --dry-run) ;;
+  *) PP_SUITE+=("$word") ;;
   esac
-  # Forward command-line overrides to px-suite via -e flags so that the suite executes against the
-  # same cluster, run class, and configuration settings as this command.
-  for line in ${sets[@]+"${sets[@]}"}; do
-    case "$line" in
-    PX_KEEP=1) ;;
-    PX_RUN_CLASS=*) PP_SUITE+=(--class "${line#*=}") ;;
-    *) PP_SUITE+=(-e "$line") ;;
-    esac
-  done
-  ! px_is_dry_run || PP_SUITE+=(--dry-run)
-  ! px_is_true "${PX_VERBOSE:-0}" || PP_SUITE+=(--verbose)
-  px_config_set_cli ${strict:+"$strict"} -- ${sets[@]+"${sets[@]}"}
-  px_config_load ${strict:+"$strict"} ${files[@]+"${files[@]}"}
-  sb_load
-  case "$sub" in
-  start) pp_start ;;
-  stop) pp_stop ;;
-  status) pp_status ;;
-  run) pp_run "$@" ;;
-  esac
-}
-
-pp_main "$@"
+done
+! px_is_keep || PP_SUITE+=(--keep)
+px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
+sb_load
+# Convert INT and TERM signals into normal process exits so that the registered exit hook tears
+# down any resources provisioned by start or run.
+px_on_exit pp_release
+trap 'exit 130' INT
+trap 'exit 143' TERM
+"pp_$PX_CLI_SUB" ${PX_CLI_ARGS[@]+"${PX_CLI_ARGS[@]}"}

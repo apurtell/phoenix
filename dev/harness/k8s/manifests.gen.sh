@@ -43,8 +43,13 @@
 #   6. A target configuration file and the run class modify bound configuration values only; the
 #      templates and overlays are strictly read-only and are never written.
 #
-# This generator does not yet render the Distributed Pherf tier. Enabling PX_PHERF=1 therefore
-# halts the render with exit code 2, and that tier must be rendered with the Compose backend.
+# Enabling PX_PHERF=1 renders the Distributed Pherf tier as the on-demand role group pherf. The
+# controller runs as a single-replica Deployment fronted by a ClusterIP Service with a persistent
+# volume claim mounted at its run directory, while the agents run as a Deployment resized via
+# kubectl scale in which each agent derives its operational identity from its pod name. The agents
+# read their ZooKeeper quorum exclusively from the pherf-target ConfigMap, which resolves to the
+# harness ZooKeeper service for the harness target or the operator-supplied PX_PHERF_ZOOKEEPER for
+# the external target (whose render contains the tier alone).
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/deploy.sh
@@ -72,9 +77,16 @@ PXK_CONF_MOUNT=/opt/px/conf
 PXK_OVERLAY_MOUNT=/opt/px/conf-overlay
 PXK_LOG_MOUNT=/var/lib/px/logs
 PXK_DATA_MOUNT=/data
+# Mount path inside the pherf image where the Distributed Pherf controller mounts its run-directory
+# persistent volume claim.
+PXK_PHERF_RUN_MOUNT=/var/lib/pherf/run
 
 # Kubernetes attaches this label to each StatefulSet pod to record its ordinal index.
 PXK_POD_INDEX_LABEL=apps.kubernetes.io/pod-index
+# Each daemon role's headless Service publishes pod addresses prior to readiness so peer instances
+# can resolve one another during startup, whereas the Distributed Pherf tier controller is fronted
+# by a ClusterIP Service instead.
+PXK_HEADLESS="  clusterIP: None${PX_NL}  publishNotReadyAddresses: true"
 
 # These non-daemon roles run without a long-lived daemon or a Kubernetes Service; alongside the
 # setup Job, they are rendered as the standalone client and tooling Pods.
@@ -102,51 +114,25 @@ PXK_CHECKED=()
 # These variables store the container image reference and pull policy for every pod alongside the
 # target placement constraints, each remaining an empty string when the target configures none.
 PXK_IMAGE=""
+PXK_PHERF_IMAGE=""
 PXK_PULL_POLICY=""
 PXK_NODE_SELECTOR=""
 PXK_TOLERATIONS=""
 PXK_PULL_SECRETS=""
 
-## @description  Prints the command-line usage instructions and exit code summary.
-## @return       Writes the usage text to stdout and returns exit code 0.
-usage() {
-  cat <<'EOF'
-Usage: manifests.gen.sh [option...]
-
-Renders the Kubernetes deployment directory of one cluster under $PX_OUT. It
-writes files only and never calls the Kubernetes API. It writes the path of the
-directory to stdout.
-
-Options.
-  -h, --help             print this text and exit 0
-  -v, --verbose          report debug detail on stderr
-  -n, --dry-run          validate and report, but write no file
-      --strict           refuse a name that lib/varnames.txt does not declare
-      --class NAME       run class: validation or measurement
-      --cluster ID       cluster name, default PX_CLUSTER_ID or default
-      --out DIR          deployment directory under $PX_OUT,
-                         default $PX_OUT/deploy-k8s/<cluster>
-      --config FILE      extra configuration file, strongest file stage,
-                         repeatable, for example k8s/env/k3d.env
-  -e, --set NAME=VALUE   set one configuration value, repeatable
-      --scale ROLE=COUNT set the count of one scaled role: datanode,
-                         nodemanager or regionserver
-      --check            validate and write the service table to stdout, but
-                         write no file
-
-The run class is required, as for the Compose generator. The configuration
-loads k8s/env/k8s.env. PX_K8S_STORAGE_CLASS has no default: k8s/env/k3d.env
-or a target file names it.
-
-The service table has the columns and the rows of the Compose generator:
-  service role index group start mem_limit_mib heap_mib direct_mib jdk
-
-Exit codes: 0 rendered; 1 the directory cannot be written or a placeholder
-survived; 2 usage, an unset or invalid value, an unknown run class,
-PX_PHERF=1, or a target directory that is not a rendered deployment; 6 a
---config file is absent.
+px_cli_spec <<'EOF'
+about Renders the Kubernetes deployment directory of one cluster under $PX_OUT, by
++ default $PX_OUT/deploy-k8s/<cluster>.
+about It writes files only and never calls the Kubernetes API.
+about The run class is required, as for the Compose generator. The configuration loads
++ k8s/env/k8s.env. PX_K8S_STORAGE_CLASS has no default: k8s/env/k3d.env or a
++ target file names it. The scaled roles are datanode, nodemanager and
++ regionserver.
+exits 1 also means that the directory cannot be written or that a placeholder
++ survived, 2 an unset or invalid value or a target directory that is not a
++ rendered deployment, 6 a --config file is absent.
+example manifests.gen.sh --class validation --config k8s/env/k3d.env
 EOF
-}
 
 ## @description  Expands a template file (path, columns, NAME=VALUE...) and indents each output
 ##               line by the specified column count.
@@ -232,26 +218,39 @@ pxk_digest_of() {
   return "$PX_EXIT_NO_OBJECT"
 }
 
-# Local renders use the local image tag with a Never pull policy, whereas remote targets resolve the
-# image by digest in PX_K8S_REGISTRY and pull it whenever a node lacks the image.
-## @description  Configures the container image reference and pull policy applied to every pod.
+# Because a mutable registry tag can be reassigned whereas a content digest is immutable, remote
+# pod manifests pin the exact digest recorded in a passing validation bundle.
+## @description  Resolves the digest-pinned remote image reference for a local tag (tag) in
+##               PX_K8S_REGISTRY.
+## @return       Writes the remote reference to stdout and exits 0, or exits 2 if no digest exists.
+pxk_remote_ref() {
+  local digest
+  if ! digest="$(pxk_digest_of "$1")"; then
+    px_die "$PX_EXIT_USAGE" "a remote render references images by digest, and" \
+      "PX_K8S_IMAGE_DIGESTS names none for $1: render it with" \
+      "px-cluster push BUNDLE"
+  fi
+  printf '%s\n' "$PX_K8S_REGISTRY/${1%%:*}@$digest"
+}
+
+# Local renders reference local image tags with a Never pull policy, whereas remote targets resolve
+# each image by immutable digest in PX_K8S_REGISTRY and pull on demand whenever a node lacks the
+# image. The harness image serves the harness cluster roles, while the pherf image serves the tier.
+## @description  Configures the container image references and pull policy applied to every pod.
 ## @return       Exits 0, or exits 2 on a rejected registry or a remote render missing a digest.
 pxk_image_source() {
-  local digest
-  PXK_IMAGE=$PX_IMAGE_TAG PXK_PULL_POLICY=Never
-  [ -n "${PX_K8S_REGISTRY:-}" ] || return 0
+  PXK_IMAGE="" PXK_PHERF_IMAGE="" PXK_PULL_POLICY=Never
+  if [ -z "${PX_K8S_REGISTRY:-}" ]; then
+    [ "$PX_PHERF_TARGET" != harness ] || PXK_IMAGE=$PX_IMAGE_TAG
+    [ "$PX_PHERF" != 1 ] || PXK_PHERF_IMAGE=$PX_PHERF_IMAGE_TAG
+    return 0
+  fi
   if ! sb_registry_check "$PX_K8S_REGISTRY"; then
     px_die "$PX_EXIT_USAGE" "PX_K8S_REGISTRY='$PX_K8S_REGISTRY' must be host[:port][/path] in" \
       "lower case, its host with a dot or a port, or localhost"
   fi
-  # Because a mutable registry tag can move whereas a content digest is immutable, remote pod
-  # manifests pin the exact digest recorded by a passing validation bundle.
-  if ! digest="$(pxk_digest_of "$PX_IMAGE_TAG")"; then
-    px_die "$PX_EXIT_USAGE" "a remote render references images by digest, and" \
-      "PX_K8S_IMAGE_DIGESTS names none for $PX_IMAGE_TAG: render it with" \
-      "scripts/push-images.sh"
-  fi
-  PXK_IMAGE="$PX_K8S_REGISTRY/${PX_IMAGE_TAG%%:*}@$digest"
+  [ "$PX_PHERF_TARGET" != harness ] || PXK_IMAGE="$(pxk_remote_ref "$PX_IMAGE_TAG")" || exit $?
+  [ "$PX_PHERF" != 1 ] || PXK_PHERF_IMAGE="$(pxk_remote_ref "$PX_PHERF_IMAGE_TAG")" || exit $?
   PXK_PULL_POLICY=IfNotPresent
 }
 
@@ -342,9 +341,9 @@ pxk_configure() {
 
 ## @description  Determines whether a role requires a headless Service, which applies to every
 ##               rendered daemon role.
-## @return       Returns 0 for a daemon role, or 1 for the setup, client, and tooling roles.
+## @return       Exits 0 for a daemon role, or 1 for the setup, client, tooling, and tier roles.
 pxk_has_service() {
-  case " setup $PXK_PODS " in
+  case " setup $PXK_PODS pherf-controller pherf-agent " in
   *" $1 "*) return 1 ;;
   esac
   return 0
@@ -487,7 +486,8 @@ pxk_pod_spec() {
 }
 
 # Pods managed by a Job or standalone Pod carry an explicit index label, whereas StatefulSet pods
-# rely on the ordinal label assigned by the StatefulSet controller.
+# rely on the ordinal label attached by the StatefulSet controller and Deployment replicas are
+# indexed by the backend in pod-name order.
 ## @description  Renders the pod metadata labels for a role (columns, role, kind).
 ## @return       Writes the rendered label lines to stdout and exits 0.
 pxk_pod_labels() {
@@ -496,7 +496,10 @@ pxk_pod_labels() {
   set --
   [ "$role" != regionserver ] || set -- "$@" "$prefix.drain=regionmover"
   [ -z "$group" ] || set -- "$@" "$prefix.group=$group"
-  [ "$kind" = statefulset ] || set -- "$@" "$prefix.index=0"
+  case "$kind" in
+  statefulset | deployment) ;;
+  *) set -- "$@" "$prefix.index=0" ;;
+  esac
   [ -z "$group" ] || set -- "$@" "$prefix.start=on-demand"
   pxk_labels "$columns" "$role" "$@"
 }
@@ -509,7 +512,7 @@ pxk_statefulset() {
   labels="$(pxk_pod_labels 4 "$role" statefulset)"
   ports="$(pxk_list 4 "$(pxk_ports 4 service-port "$role")")" || exit $?
   pxk_t service 0 "PX_M_ROLE=$role" "PX_M_NAMESPACE=$PXK_NAMESPACE" "PX_M_LABELS=$labels" \
-    "PX_M_SELECTOR=$(pxk_labels 4 "$role")" "PX_M_PORTS=$ports"
+    "PX_M_SERVICE_SPEC=$PXK_HEADLESS" "PX_M_SELECTOR=$(pxk_labels 4 "$role")" "PX_M_PORTS=$ports"
   printf -- '---\n'
   spec="$(pxk_pod_spec "$role" statefulset 6)" || exit $?
   if [ -n "$(pxg_volume_of "$role" 0)" ]; then
@@ -520,6 +523,88 @@ pxk_statefulset() {
     "PX_M_LABELS=$labels" "PX_M_SELECTOR=$(pxk_labels 6 "$role")" \
     "PX_M_POD_LABELS=$(pxk_pod_labels 8 "$role" statefulset)" "PX_M_POD_SPEC=$spec" \
     "PX_M_CLAIMS=$(pxk_list 4 "$claims")"
+}
+
+# Tier pods share the standard pod template used across all workloads: because the pherf image
+# consumes only PHERF_* variables, the imported px-env harness ConfigMap has no effect. The
+# controller pod mounts the persistent volume claim for its run directory, whereas each agent
+# derives its operational identity from its pod name and reads its ZooKeeper quorum from the
+# pherf-target ConfigMap. The template probe slot carries both the role verb and the probe block.
+## @description  Renders the pod specification for a Distributed Pherf tier role (role).
+## @return       Writes the specification to stdout and exits 0, or exits 2 on an unbound variable.
+pxk_tier_spec() {
+  local role=$1 verb=agent var mem env="" line item ports="" mounts="" volumes="" probes
+  var="PX_$(pxg_role "$role" key)_MEM_MIB"
+  mem=${!var}
+  if [ "$role" = pherf-controller ]; then
+    verb=controller
+    ports="$(pxk_ports 6 container-port "$role")" || exit $?
+    item="$(pxk_t container-port 6 PX_M_PORT_NAME=http-agent \
+      "PX_M_PORT=$PXG_PHERF_AGENT_PORT")" || exit $?
+    ports="$ports$PX_NL$item"
+    mounts="$(pxk_t mount 6 PX_M_VOLUME=run "PX_M_PATH=$PXK_PHERF_RUN_MOUNT" \
+      PX_M_READONLY=false)" || exit $?
+    volumes="$(pxk_t volume-claim 2 PX_M_VOLUME=run PX_M_CLAIM=data-pherf-controller-0)" ||
+      exit $?
+  else
+    env="$(pxk_t env-field 6 PX_M_ENV_NAME=PHERF_AGENT_ID PX_M_FIELD=metadata.name)" || exit $?
+    env="$env$PX_NL"
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+    PHERF_ZOOKEEPER=*)
+      item="$(pxk_t env-config 6 PX_M_ENV_NAME=PHERF_ZOOKEEPER PX_M_NAME=pherf-target \
+        PX_M_KEY=PHERF_ZOOKEEPER)" || exit $?
+      ;;
+    *)
+      item="$(pxk_t env-value 6 "PX_M_ENV_NAME=${line%%=*}" "PX_M_ENV_VALUE=${line#*=}")" ||
+        exit $?
+      ;;
+    esac
+    env="$env$item$PX_NL"
+  done <<EOF
+$(pxg_tier_env "$role" pherf-controller)
+EOF
+  env=${env%"$PX_NL"}
+  probes="$(pxk_t tier-container 4 "PX_M_VERB=$verb")" || exit $?
+  pxk_t pod-spec 6 PX_M_RESTART=Always "PX_M_GRACE=$PX_TIMEOUT_STOP" \
+    "PX_M_AFFINITY=$(pxk_t affinity-none 0)" \
+    "PX_M_NODE_SELECTOR=$(pxk_list 2 "$PXK_NODE_SELECTOR" '{}')" \
+    "PX_M_TOLERATIONS=$(pxk_list 2 "$PXK_TOLERATIONS")" \
+    "PX_M_PULL_SECRETS=$(pxk_list 2 "$PXK_PULL_SECRETS")" \
+    "PX_M_UID=$PXK_UID" "PX_M_GID=$PXK_GID" "PX_M_SEARCHES=$(pxk_list 4 "$PXK_SEARCHES")" \
+    "PX_M_IMAGE=$PXK_PHERF_IMAGE" "PX_M_PULL_POLICY=$PXK_PULL_POLICY" "PX_M_ENV=$env" \
+    "PX_M_PORTS=$(pxk_list 6 "$ports")" "PX_M_MEM=$mem" "PX_M_CPU=$(pxk_cpu "$mem")" \
+    "PX_M_PROBES=$probes" "PX_M_MOUNTS=$(pxk_list 6 "$mounts")" \
+    "PX_M_VOLUMES=$(pxk_list 2 "$volumes")"
+}
+
+# The controller manifest bundles its persistent volume claim, its ClusterIP Service (exposing both
+# the REST port and the agent channel), and its Deployment in the order in which they are applied.
+## @description  Renders the Kubernetes manifest documents for a Distributed Pherf tier role (role,
+##               count).
+## @return       Writes the documents to stdout and exits 0, or exits 2 on an unbound placeholder.
+pxk_tier() {
+  local role=$1 spec ports item
+  if [ "$role" = pherf-controller ]; then
+    pxk_t persistent-volume-claim 0 PX_M_NAME=data-pherf-controller-0 \
+      "PX_M_NAMESPACE=$PXK_NAMESPACE" \
+      "PX_M_LABELS=$(pxk_labels 4 "$role" "$PX_LABEL_PREFIX.group=pherf")" \
+      "PX_M_STORAGE_CLASS=$PX_K8S_STORAGE_CLASS" "PX_M_VOLUME_GIB=$PX_K8S_VOLUME_GIB"
+    printf -- '---\n'
+    ports="$(pxk_ports 4 service-port "$role")" || exit $?
+    item="$(pxk_t service-port 4 PX_M_PORT_NAME=http-agent PX_M_PROTOCOL=http \
+      "PX_M_PORT=$PXG_PHERF_AGENT_PORT")" || exit $?
+    pxk_t service 0 "PX_M_ROLE=$role" "PX_M_NAMESPACE=$PXK_NAMESPACE" \
+      "PX_M_LABELS=$(pxk_labels 4 "$role")" "PX_M_SERVICE_SPEC=  type: ClusterIP" \
+      "PX_M_SELECTOR=$(pxk_labels 4 "$role")" "PX_M_PORTS=$ports$PX_NL$item"
+    printf -- '---\n'
+  fi
+  spec="$(pxk_tier_spec "$role")" || exit $?
+  pxk_t deployment 0 "PX_M_NAME=$role" "PX_M_NAMESPACE=$PXK_NAMESPACE" "PX_M_REPLICAS=$2" \
+    "PX_M_LABELS=$(pxk_pod_labels 4 "$role" deployment)" \
+    "PX_M_SELECTOR=$(pxk_labels 6 "$role")" \
+    "PX_M_POD_LABELS=$(pxk_pod_labels 8 "$role" deployment)" "PX_M_POD_SPEC=$spec"
 }
 
 ## @description  Renders the setup Job document as a single non-restarting pod co-located on the
@@ -548,22 +633,31 @@ pxk_pod() {
 ## @return       Returns exit code 0.
 pxk_build() {
   local role count index group position=0 file
-  PXG_TSV="" PXK_EAGER_FILES="" PXK_GROUP_FILES="" PXG_YARN_ROLES=""
+  PXG_TSV="" PXK_EAGER_FILES="" PXK_GROUP_FILES="" PXG_YARN_ROLES="" PXG_PHERF_ROLES=""
   PXG_SERVICES=0 PXG_MEM_TOTAL=0 PXG_MEM_EAGER=0 PXG_MEM_YARN=0 PXG_MEM_PHERF=0
   pxk_collect
   for role in $PXG_RENDERED; do
     count="$(pxg_role_count "$role")"
+    group="$(pxg_role_group "$role")"
     index=0
     while [ "$index" -lt "$count" ]; do
-      pxg_service_row "$role" "$index"
+      if [ "$group" = pherf ]; then
+        pxg_tier_row "$role" "$index"
+      else
+        pxg_service_row "$role" "$index"
+      fi
       index=$((index + 1))
     done
-    group="$(pxg_role_group "$role")"
-    [ "$group" != yarn ] || PXG_YARN_ROLES="${PXG_YARN_ROLES:+$PXG_YARN_ROLES }$role"
+    case "$group" in
+    yarn) PXG_YARN_ROLES="${PXG_YARN_ROLES:+$PXG_YARN_ROLES }$role" ;;
+    pherf) PXG_PHERF_ROLES="${PXG_PHERF_ROLES:+$PXG_PHERF_ROLES }$role" ;;
+    esac
     case "$role" in
     setup) file="30-setup.yaml" ;;
     client) file="40-client.yaml" ;;
     tooling) file="41-tooling.yaml" ;;
+    pherf-controller) file="51-pherf-controller.yaml" ;;
+    pherf-agent) file="52-pherf-agent.yaml" ;;
     *)
       position="$(printf '%s\n' "$PXG_ROLES" | awk -v r="$role" '$1 == r { print NR - 1 }')"
       file="2$position-$role.yaml"
@@ -584,6 +678,7 @@ pxk_workload() {
   case "$1" in
   setup) pxk_job ;;
   client | tooling) pxk_pod "$1" ;;
+  pherf-controller | pherf-agent) pxk_tier "$1" "$2" ;;
   *) pxk_statefulset "$1" "$2" ;;
   esac
 }
@@ -665,6 +760,8 @@ pxk_requests() {
     case "$role" in
     setup) kind=Job name=setup-0 count=1 ;;
     client | tooling) kind=Pod name="$role-0" count=1 ;;
+    pherf-controller) kind=Deployment name=$role claims=1 gib=$PX_K8S_VOLUME_GIB ;;
+    pherf-agent) kind=Deployment name=$role ;;
     *)
       kind=StatefulSet name=$role
       if [ -n "$(pxg_volume_of "$role" 0)" ]; then
@@ -713,7 +810,9 @@ pxk_insert() {
 }
 
 # Adds the service-mesh injection label to the namespace and annotates each core workload pod to opt
-# out of the mesh unless PX_K8S_MESH_CORE is set to 1.
+# out of the mesh unless PX_K8S_MESH_CORE is set to 1. Because the Distributed Pherf tier pods
+# constitute the primary mesh group, they are enrolled in the mesh automatically without extra
+# opt-in configuration.
 ## @description  Applies the mesh overlay to the staged manifest documents (staging directory).
 ## @return       Exits 0, exits 1 if a file cannot be written, or exits 2 on a placeholder with no
 ##               value.
@@ -729,6 +828,11 @@ pxk_mesh_overlay() {
     [ -f "$file" ] || continue
     pxk_insert "$file" StatefulSet "$set" '    metadata:'
     pxk_insert "$file" Pod "$pod" 'metadata:'
+  done
+  set="$(pxk_tf "$PXK_OVERLAYS/mesh/pod.yaml.tmpl" 6 PX_M_INJECT=true)" || exit $?
+  for file in "$staging"/groups/*/5?-*.yaml; do
+    [ -f "$file" ] || continue
+    pxk_insert "$file" Deployment "$set" '    metadata:'
   done
 }
 
@@ -760,6 +864,13 @@ pxk_write() {
   if [ -n "$PXG_OVERLAY_HOST" ]; then
     text="$(pxk_configmap px-conf-overlay)" || exit $?
     pxk_emit manifests/12-conf-overlay.yaml "$text"
+  fi
+  # Store the agents' ZooKeeper quorum exclusively in this ConfigMap so that it is applied first
+  # when starting the tier role group.
+  if [ "$PX_PHERF" = 1 ]; then
+    text="$(pxk_configmap pherf-target)" || exit $?
+    text="$text$PX_NL$(pxk_pairs 2 "PHERF_ZOOKEEPER=$PXG_QUORUM")" || exit $?
+    pxk_emit groups/pherf/50-pherf-target.yaml "$text"
   fi
   for dir in manifests groups; do
     list=$PXK_EAGER_FILES
@@ -798,10 +909,6 @@ pxk_main() {
   px_config_set PX_BACKEND k8s cli
   pxg_cli "$@"
   pxg_load
-  if [ "${PX_PHERF:-0}" = 1 ]; then
-    px_die "$PX_EXIT_USAGE" "PX_PHERF=1: the Kubernetes render of the Distributed Pherf tier" \
-      "is a later round. Render the tier with the compose backend"
-  fi
   pxg_configure
   pxk_configure
   pxg_prepare pxk_build deploy-k8s instances
@@ -812,7 +919,7 @@ pxk_main() {
   pxk_write "$target"
   px_info "rendered $PXG_SERVICES instances for cluster $PX_CLUSTER_ID in namespace" \
     "$PXK_NAMESPACE, class $PX_RUN_CLASS: $PXG_MEM_TOTAL MiB of container limits," \
-    "$PXG_MEM_YARN MiB of them on demand, into $target"
+    "$((PXG_MEM_YARN + PXG_MEM_PHERF)) MiB of them on demand, into $target"
   printf '%s\n' "$target"
 }
 

@@ -473,9 +473,12 @@ agent, the health probe `/opt/pherf/healthcheck.sh <role>`, and the memory limit
 limits. The controller declares the `rest` port family, `PX_PORT_PHERF_CONTROLLER_REST` (8780),
 passed as `PHERF_REST_PORT` and published on `127.0.0.1` of the host for operator access, and mounts
 the volume `pherf-controller-0-data` at `/var/lib/pherf/run`. Each agent connects to the controller
-at `http://pherf-controller-0:8790` and connects to the cluster through `PHERF_ZOOKEEPER`. Harness
-code accesses the REST API exclusively via `sb_exec` inside `pherf-controller` instance 0
-(`lib/fleet.sh`) and never through a host-published port. The preflight memory check accounts for
+at `http://pherf-controller-0:8790` and reaches the target cluster via `PHERF_ZOOKEEPER`. Across
+both backends, the `pherf-distributed` driver invokes the REST API exclusively via `sb_exec` inside
+`pherf-controller` instance 0 (`lib/fleet.sh`), and `px-pherf` does the same on Compose without
+ever using a host-published port; on the Kubernetes backend, where the tier is rendered as
+Deployments, `px-pherf` connects to the API through a loopback tunnel instead (see "Workloads" and
+"Network, ports and DNS" under the Kubernetes backend). The preflight memory check accounts for
 this group alongside the other on-demand groups, and `px-cluster group start pherf` re-runs the
 memory check before starting the group.
 
@@ -490,7 +493,10 @@ The `PX_PHERF_TARGET` setting determines which cluster the agents target.
   character outside `[A-Za-z0-9._:,/-]` fails with exit code 2. No file in the repository working
   tree stores a hardcoded ZooKeeper quorum. In this mode, the topology record captures the run
   parameters, the tier settings, and the version set from the pherf image staging record, while
-  omitting all harness cluster roles.
+  omitting all harness cluster roles. Because the tier itself constitutes a harness deployment,
+  provisioning is refused on any target or host that already holds another harness deployment, and
+  the agents can communicate with the external cluster only if its daemons register hostnames that
+  resolve from within the tier's network or namespace.
 
 Because the tier acts as the load generator rather than a cluster daemon, the log subject of the
 cluster checks preserves the logs of the `pherf` group without counting any of their lines, and the
@@ -844,8 +850,7 @@ exit codes as `docker/compose.gen.sh`, sharing the common deployment generation 
 topology record writer, artifact staging, and the fail-closed template validator. Consequently, a
 given configuration produces identical `services.tsv` rows across both backends, and any invalid
 setting rejected by one generator is rejected by the other with the exact same diagnostic message.
-Setting `PX_PHERF=1` fails with exit code 2 because Kubernetes support for the Distributed Pherf
-tier is deferred to milestone K5. By default, manifests are rendered into
+Manifests are rendered by default into
 `$PX_OUT/deploy-k8s/<cluster>` so that Compose and Kubernetes renders for the same cluster name
 never overwrite one another.
 
@@ -867,6 +872,11 @@ deploy-k8s/<cluster>/
     30-setup.yaml       the setup Job
     40-client.yaml  41-tooling.yaml   the standalone Pods
   groups/<group>/       the files of an on-demand group, applied by sb_group_start
+  groups/pherf/         with PX_PHERF=1, the Distributed Pherf tier:
+    50-pherf-target.yaml      ConfigMap pherf-target: PHERF_ZOOKEEPER, the one quorum
+    51-pherf-controller.yaml  the claim data-pherf-controller-0, the ClusterIP Service
+                              pherf-controller and the controller Deployment
+    52-pherf-agent.yaml       the agent Deployment
   conf-overlay/  plugins/<id>/        the plug-in records, as on Compose
 ```
 
@@ -936,6 +946,32 @@ backend-specific branching.
   GiB per claim; attempting to render manifests without a configured StorageClass fails with exit
   code 2. Furthermore, `/var/lib/px/logs` is mounted as an `emptyDir` volume so that a daemon's
   garbage-collection log survives container restarts within the same pod.
+* When `PX_PHERF=1` is enabled, the Distributed Pherf tier is rendered as the on-demand `pherf`
+  group comprising two Deployments under `groups/pherf/`. Both Deployments specify the `Recreate`
+  strategy so that rolling out an updated pod template starts a replacement pod only after the old
+  pod has terminated, whereas pod deletion or eviction provides no such ordering guarantee (see
+  "Lifecycle"). The controller Deployment `pherf-controller` runs one replica and mounts the
+  persistent volume claim `data-pherf-controller-0` (`PX_K8S_STORAGE_CLASS`, `PX_K8S_VOLUME_GIB`)
+  at `/var/lib/pherf/run` so that frozen reports persist across pod replacements and group stops,
+  while the ClusterIP Service `pherf-controller` exposes `http-rest` on port 8780 and `http-agent`
+  on port 8790. The agent Deployment `pherf-agent` runs `PX_PHERF_AGENT_COUNT` replicas; each agent
+  populates `PHERF_AGENT_ID` from its pod name, reaches the controller through the Service at
+  `http://pherf-controller:8790`, and reads `PHERF_ZOOKEEPER` from the `pherf-target` ConfigMap via
+  `configMapKeyRef`. That ConfigMap is the sole place in the rendered manifests that stores the
+  quorum—set to `zookeeper-0:<PX_PORT_ZOOKEEPER_CLIENT>` for the harness target or
+  `PX_PHERF_ZOOKEEPER` for the external target, whose render contains only the namespace, the two
+  harness ConfigMaps, and `groups/pherf/`. Tier pods reuse the standard pod template shared by all
+  other workloads, configured with the `PX_PHERF_IMAGE_TAG` image, the role verb as their argument,
+  and a readiness-only probe; they preserve the container name `px`, the security context, and the
+  Guaranteed resource requests, receive the `px-env` ConfigMap (which the pherf image ignores), and
+  inherit the DNS search domains of the cluster daemons so that the bare hostnames registered by
+  those daemons resolve. Because a tier pod carries neither an explicit index label nor a pod-index
+  label, the backend assigns replica indices for a Deployment role by sorting live pods first in
+  pod-name order followed by Terminating pods, and `sb_list` reports instance `<i>` with the pod
+  name as its identifier. During a replacement, instance 0 therefore resolves to the live pod, and
+  after a scale-down, the removed pods occupy the indices at and above the new replica count until
+  they finish terminating. Consequently, a planned fault against an agent targets a positional
+  index that can shift to a different pod following a replacement.
 
 ### Network, ports and DNS
 
@@ -969,6 +1005,19 @@ open file descriptors from the caller, `px-cluster endpoint` returns immediately
 continues operating in the background. Roles without a Service—specifically `setup`, `client`, and
 `tooling`—expose no endpoints and return exit code 6.
 
+The Distributed Pherf controller is the sole workload fronted by a ClusterIP Service rather than a
+headless Service, providing the agents with a stable virtual address for the agent channel. No
+harness command contacts that Service from the host. `px-pherf` opens a tunnel via `sb_endpoint
+<scope> pherf-controller 0 rest` and names its local port in `PF_API_PORT`, so `lib/fleet.sh` runs
+its curl script on the host against `127.0.0.1:<tunnel port>`; any endpoint that fails to open is
+reported as a cluster anomaly with exit code 3. The host curl binary must be version 7.76 or later
+to support `--fail-with-body`. By contrast, the `pherf-distributed` driver uses the standard driver
+contract primitives (`sb_exec`, `sb_copy_in`, `sb_copy_out`) and executes the same curl script
+inside the controller pod. On Kubernetes, both callers wait for the target count of IDLE agents
+because each agent ID is a pod name that is not known in advance. Running `px-pherf stop` releases
+the tunnel after stopping the group, as does a failed `px-pherf start` after stopping the group,
+while a full teardown releases every tunnel in the scope.
+
 ### Probes
 
 Every cluster daemon container configures three probes: a startup probe executing
@@ -980,7 +1029,10 @@ probe executing `live` with a 10 s period, a 15 s timeout, and a failure thresho
 not trigger a container restart, whereas a pause exceeding that bound causes the kubelet to restart
 the daemon—a behavior that never occurs on Compose. The setup Job and the two standalone Pods
 configure only the readiness probe, because a liveness probe failure on a workload with a
-non-restarting policy would permanently terminate the pod.
+non-restarting policy would permanently terminate the pod. Similarly, the tier pods configure only
+the readiness probe `/opt/pherf/healthcheck.sh <controller|agent>` using the Compose probe timings
+(5 s period, 6 s timeout, and failure threshold 3); omitting a liveness probe ensures that a
+controller restart never causes the kubelet to restart agents whose communication channel closed.
 
 ### Lifecycle
 
@@ -990,7 +1042,8 @@ non-restarting policy would permanently terminate the pod.
   any resources to the cluster. Once applied, it waits until a pod exists for every instance listed
   in `services.tsv`. Passing a deployment directory rendered for a cluster name that does not match
   the target scope fails with exit code 2.
-* `sb_teardown` deletes all StatefulSets, Jobs, and Pods matching the cluster label selector. When
+* `sb_teardown` deletes all StatefulSets, Jobs, and Pods matching the cluster label selector—along
+  with the Deployments whenever the recorded render includes the Distributed Pherf tier. When
   `keep_data` is 0, it also deletes the persistent volume claims by label and verifies that no
   selected resources remain. When `keep_data` is 1, the persistent volume claims, ConfigMaps,
   Services, and namespace are preserved for post-mortem diagnosis. `sb_scope_delete` deletes the
@@ -1002,13 +1055,19 @@ non-restarting policy would permanently terminate the pod.
   client-side dry run, then waits for any newly added pod ordinals to appear; when scaling down, the
   StatefulSet's claim retention policy automatically removes the persistent volume claims of removed
   ordinals. Scaling an on-demand role belonging to a group that has not yet been started updates
-  only the rendered files on disk, which take effect when the group is subsequently started.
+  only the rendered files on disk, which take effect when the group is subsequently started. When
+  scaling the tier's agent Deployment, `sb_scale` validates and applies `10-env.yaml` before
+  executing `kubectl scale deployment pherf-agent --replicas=<count>`; `px-pherf scale <count>`
+  invokes this path through `px-cluster scale pherf-agent <count>` and then waits for the agents to
+  become idle.
 * `sb_group_start` validates and applies `groups/<group>/*.yaml` after a client-side dry run and
-  waits for all roles in the group to become ready. `sb_group_stop` deletes the group's StatefulSets
-  while retaining their persistent volume claims so that a subsequent start reattaches the existing
-  volume state. In this way, StatefulSet replica counts in the manifests always match the configured
-  topology counts, and every state transition performed by the backend consists solely of an `apply`
-  of a rendered manifest or a resource `delete`.
+  waits for all roles in the group to become ready. `sb_group_stop` deletes the group's
+  StatefulSets—as well as its Deployments when the render includes the tier—while retaining their
+  persistent volume claims so that a subsequent start reattaches the existing volume state,
+  including the controller's claim. Consequently, StatefulSet replica counts in the manifests
+  always match the configured topology counts, and every state transition performed by the backend
+  consists solely of an `apply` of a rendered manifest, a resource `delete`, or scaling the agent
+  Deployment.
 * `sb_wait_ready` waits for every instance expected by the rendered topology, treating any pod not
   yet created by its controller as pending rather than absent. Conversely, any pod not expected by
   the current render—such as an excess ordinal being terminated during a scale-down—is ignored once
@@ -1017,7 +1076,29 @@ non-restarting policy would permanently terminate the pod.
   failed or evicted pod, a container waiting reason that cannot recover without modifying the
   deployment (`CrashLoopBackOff`, `ErrImageNeverPull`, `ErrImagePull`, `ImagePullBackOff`,
   `InvalidImageName`, or `CreateContainerConfigError`), or any increase in an instance's restart
-  count during the wait.
+  count during the wait. One specific `CreateContainerConfigError` condition is treated as
+  transient: when the container's waiting message reports `failed to sync configmap cache`, the
+  node authorizer has not yet recorded the binding between the newly scheduled pod and its assigned
+  node, and the kubelet automatically retries container startup. The readiness barrier inspects the
+  pod's waiting message and treats the pod as pending until the barrier timeout expires, reporting
+  the most recent waiting message on timeout. Any other `CreateContainerConfigError` immediately
+  aborts the wait with exit code 3. If a pod disappears or transitions out of that waiting state
+  before the barrier can read its message, it is treated as pending and evaluated on the next
+  polling pass.
+* When a tier controller pod is deleted or evicted, its termination can overlap with its
+  replacement: the ReplicaSet creates the replacement pod immediately while the old pod may remain
+  terminating for up to `PX_TIMEOUT_STOP`, and under a node-local StorageClass such as k3d's
+  `local-path`, the ReadWriteOnce claim can be mounted simultaneously by both pods on the same
+  node. The `Recreate` deployment strategy does not prevent this overlap because it serializes only
+  template rollouts. Consequently, a starting controller that finds `controller.lock` held by
+  another controller instance waits to acquire it: it retries the lock every 500 ms for up to
+  150 s, logs a single diagnostic line while waiting, and proceeds with startup once the terminating
+  controller releases the lock. This 150 s bound accommodates the default 120 s `PX_TIMEOUT_STOP`
+  grace period—after which the kubelet forcibly kills the old pod—plus an additional 30 s margin
+  for forced termination and lock release. While waiting for the lock, the replacement pod remains
+  unready, and the readiness barrier waits for it without recording a restart. If the lock remains
+  held for the full 150 s, the controller exits with code 2; configuring `PX_TIMEOUT_STOP` above
+  120 s allows a terminating pod to outlast that acquisition bound.
 
 ### Exec, logs and copies
 
@@ -1256,9 +1337,10 @@ pods outside the mesh by default, while the setup Job unconditionally retains it
 annotation. Because the overlay modifies nothing else, a mesh-enabled render differs from a flat
 render solely by those added metadata lines. Both flags default to 0 in `k8s.env`, so renders
 without explicit mesh settings remain flat across both run classes, whereas a validation target that
-sets `PX_K8S_MESH=1` activates the overlay. The mesh role group for the Distributed Pherf tier,
-whose pods join the mesh automatically without an explicit opt-in annotation, is deferred to
-milestone K5.
+sets `PX_K8S_MESH=1` activates the overlay. The Distributed Pherf tier forms the primary mesh
+group: when the overlay is active, the pod templates of both tier Deployments automatically receive
+`sidecar.istio.io/inject: "true"` without requiring any additional opt-in, regardless of
+`PX_K8S_MESH_CORE`.
 
 ### The local cluster: px-k3d
 

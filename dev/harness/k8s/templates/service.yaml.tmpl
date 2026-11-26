@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Defines the cluster-internal headless Service for a single role. By publishing pod addresses
-# before pods reach readiness, it enables peer instances to resolve one another during startup.
+# Defines the cluster-internal Service for a single role, configured either as a headless service
+# for a daemon role or as a ClusterIP service for the Distributed Pherf controller, which is never
+# exposed outside the cluster.
 
 apiVersion: v1
 kind: Service
@@ -24,8 +25,7 @@ metadata:
   labels:
 ${PX_M_LABELS}
 spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
+${PX_M_SERVICE_SPEC}
   selector:
 ${PX_M_SELECTOR}
   ports:

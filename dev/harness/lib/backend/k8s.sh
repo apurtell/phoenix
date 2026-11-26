@@ -35,7 +35,8 @@
 #      uid, while the previous container termination state remains accessible for inspection.
 #   4. Rendered deployment manifests are completely static. The backend applies rendered manifest
 #      files only after validating each file with a client-side dry run, and it mutates cluster
-#      resources exclusively through apply and delete operations.
+#      resources solely via apply and delete operations or by invoking kubectl scale on the
+#      Distributed Pherf tier agent Deployment.
 #   5. Instance readiness is determined by the pod Ready condition, which is driven by the
 #      readiness probe configured in the container image. Any expected pod that a controller has
 #      not yet created is treated as pending, ensuring that a readiness barrier invoked immediately
@@ -74,9 +75,16 @@ PX_K8S_NAMESPACE_RE='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
 
 # Container waiting reasons that indicate a fatal configuration or image fault that cannot recover
 # without modifying the deployment. The readiness barrier aborts immediately upon observing any of
-# these states.
+# these states, with the exception of the transient CreateContainerConfigError identified by
+# PX_K8S_CONFIG_LAG.
 PX_K8S_BAD_WAITING=" CrashLoopBackOff ErrImageNeverPull ErrImagePull ImagePullBackOff"
 PX_K8S_BAD_WAITING="$PX_K8S_BAD_WAITING InvalidImageName CreateContainerConfigError "
+
+# One specific CreateContainerConfigError condition is transient: immediately after a pod is bound
+# to a node, the node authorizer may temporarily deny the kubelet access to a referenced ConfigMap,
+# prompting the kubelet to retry container startup. That transient condition produces a waiting
+# message containing this substring, and the readiness barrier treats the pod as pending.
+PX_K8S_CONFIG_LAG='failed to sync configmap cache'
 
 # Remote shell scripts used to deliver an immediate SIGKILL or a graceful SIGTERM inside a
 # container. Because the Linux kernel ignores SIGKILL sent to PID 1 from within the same PID
@@ -364,15 +372,44 @@ px_k8s_pod_format() {
   printf '%s\n' "$fmt{\"\\n\"}{end}"
 }
 
+# Pods managed by a Deployment carry neither an explicit index label nor a pod-index label, and
+# their names end with a random suffix. Consequently, the inventory query assigns replica indices
+# for each such role directly: active pods sorted by name receive indices 0 through k-1, followed by
+# Terminating and Failed pods sorted by name. Writing this computed ordinal into the line's index
+# field provides every inventory consumer with a uniform instance index. Under this ordering, the
+# active pod occupies index 0 during a replacement, pods removed by a scale-down occupy indices at
+# or above the new replica count until termination completes, and an evicted pod that remains listed
+# alongside its ReplicaSet replacement likewise occupies an index at or above the replica count.
 ## @description  Queries all pods in the loaded scope, filtered by any extra selector TERM... args.
 ## @return       Writes one raw inventory line per pod to stdout; exits with 0, or 1 if kubectl
 ##               fails to respond.
 px_k8s_pods() {
-  if ! px_k8s_call 60 get pods -l "$(px_k8s_selector "$@")" -o "jsonpath=$(px_k8s_pod_format)"
-  then
+  local rows
+  if ! rows="$(px_k8s_call 60 get pods -l "$(px_k8s_selector "$@")" \
+    -o "jsonpath=$(px_k8s_pod_format)")"; then
     px_error "kubectl did not list the pods of scope $PXK_SCOPE"
     return "$SB_EXIT_FAIL"
   fi
+  [ -n "$rows" ] || return 0
+  printf '%s\n' "$rows" | awk -F '|' -v OFS='|' '
+    { line[NR] = $0 }
+    $1 != "" && $4 == "" && $5 == "" {
+      rep[NR] = 1; role[NR] = $3; name[NR] = $1
+      gone[NR] = ($7 != "" || $8 == "Failed" || $8 == "Succeeded")
+    }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (!(i in rep)) { print line[i]; continue }
+        r = 0
+        for (j in rep) {
+          if (role[j] == role[i] && (gone[j] < gone[i] ||
+            (gone[j] == gone[i] && name[j] < name[i]))) r++
+        }
+        $0 = line[i]
+        $4 = r
+        print
+      }
+    }'
 }
 
 ## @description  Parses a raw inventory LINE into the PXK_P_* variables, including contract state.
@@ -1032,6 +1069,19 @@ px_k8s_anomaly() {
   return 1
 }
 
+# If the pod has disappeared since the inventory listing was taken, the query yields an empty
+# waiting message.
+## @description  Retrieves the waiting status message for the px container of pod PXK_P_NAME.
+## @return       Writes the waiting message to stdout; exits with 0, or 1 if kubectl fails to
+##               respond.
+px_k8s_waiting_message() {
+  px_k8s_call 30 get pod "$PXK_P_NAME" --ignore-not-found \
+    -o 'jsonpath={.status.containerStatuses[?(@.name=="px")].state.waiting.message}' || {
+    px_error "kubectl did not read the waiting message of pod $PXK_P_NAME"
+    return "$SB_EXIT_FAIL"
+  }
+}
+
 # Polls until selected instances report ready. A whole-scope wait skips on-demand groups that have
 # not been started by any step.
 ## @description  Waits until all selected instances in the scope reach the ready state.
@@ -1043,7 +1093,7 @@ px_k8s_anomaly() {
 sb_wait_ready() {
   local scope=${1:-} timeout=${2:-} roles start deadline interval rows line keys="" key
   local base="" seen="" anomaly="" pending elapsed status=0 role index cause roles_all=" "
-  local expected="" parked="" gone="" render=0 out="" row
+  local expected="" parked="" gone="" render=0 out="" row lag="" message
   if [ $# -lt 1 ]; then
     px_error "sb_wait_ready needs a scope and a timeout"
     return "$SB_EXIT_USAGE"
@@ -1097,6 +1147,7 @@ EOF
   sb_selection_check "$scope" "$roles_all" "$roles" || return $?
   while :; do
     pending=0
+    lag=""
     for key in $keys; do
       sb_role_selected "${key%/*}" "$roles" || continue
       case "$PX_NL$parked$gone" in
@@ -1109,8 +1160,10 @@ EOF
         PXK_P_NAME="" PXK_P_DELETING=""
       fi
       # Any pod that is not expected by the current rendered deployment is considered complete once
-      # its controller has deleted it or marked it for deletion.
-      if [ "$render" = 1 ] && { [ -z "$PXK_P_NAME" ] || [ -n "$PXK_P_DELETING" ]; }; then
+      # its controller has deleted it or marked it for deletion, or once it has reached a terminal
+      # phase such as an evicted Deployment pod that remains listed alongside its replacement.
+      if [ "$render" = 1 ] && { [ -z "$PXK_P_NAME" ] || [ -n "$PXK_P_DELETING" ] ||
+        [ "$PXK_P_PHASE" = Failed ] || [ "$PXK_P_PHASE" = Succeeded ]; }; then
         case "$PX_NL$expected" in
         *"$PX_NL$key$PX_NL"*) ;;
         *)
@@ -1121,9 +1174,24 @@ EOF
       fi
       # Anomaly detection runs before the readiness check because a container that crashed and
       # restarted between polling intervals may already report ready again on the next listing.
+      # A CreateContainerConfigError carrying the transient ConfigMap sync message remains pending.
+      # An empty message indicates that the container transitioned out of the waiting state or that
+      # the pod disappeared after the inventory listing, leaving the outcome to the next polling
+      # cycle. Because each lookup is a single bounded kubectl call and any failed call aborts the
+      # barrier immediately, these reads can extend a poll past the deadline by at most their own
+      # call latency.
       if [ -n "$PXK_P_NAME" ]; then
         if cause="$(px_k8s_anomaly "$base" || exit "$?")"; then
-          anomaly="$anomaly $key($cause)"
+          if [ "$cause" != CreateContainerConfigError ]; then
+            anomaly="$anomaly $key($cause)"
+          else
+            message="$(px_k8s_waiting_message)" || return "$SB_EXIT_FAIL"
+            case "$message" in
+            "") ;;
+            *"$PX_K8S_CONFIG_LAG"*) lag="$lag $key($message)" ;;
+            *) anomaly="$anomaly $key($cause: $message)" ;;
+            esac
+          fi
         elif [ "$PXK_P_READY" = ready ]; then
           seen="$seen$key$PX_TAB$(($(px_epoch_ms) - start))$PX_NL"
           continue
@@ -1139,6 +1207,8 @@ EOF
     [ "$pending" != 0 ] || break
     if [ "$(px_epoch_s)" -ge "$deadline" ]; then
       px_error "the readiness barrier expired after ${timeout}s in scope $scope"
+      [ -z "$lag" ] ||
+        px_error "the kubelet had not yet synced a ConfigMap:$(px_tsv_clean "$lag")"
       status=$SB_EXIT_TIMEOUT
       break
     fi
@@ -1287,6 +1357,20 @@ EOF
   return "$status"
 }
 
+# A deployment rendered with the Distributed Pherf tier includes Deployments alongside its
+# StatefulSets, requiring workload deletion and listing queries to target both controller kinds;
+# requests.tsv in the recorded deployment directory identifies the rendered kinds.
+## @description  Determines the workload controller kinds present in the recorded deployment.
+## @return       Writes statefulsets or statefulsets,deployments to stdout and exits with 0.
+px_k8s_kinds() {
+  if [ -n "$PXK_DEPLOY_DIR" ] && grep -q '^Deployment' "$PXK_DEPLOY_DIR/requests.tsv" 2>/dev/null
+  then
+    printf 'statefulsets,deployments\n'
+  else
+    printf 'statefulsets\n'
+  fi
+}
+
 # Deletes all StatefulSets, Jobs, and Pods in the scope. When keep_data is 0, PersistentVolumeClaims
 # are also deleted; when keep_data is 1, claims, ConfigMaps, Services, and the namespace are
 # retained to support post-run diagnosis.
@@ -1296,7 +1380,7 @@ EOF
 ## @return       Exits with 0 when clean, 1 if objects remain, kubectl fails, or teardown times out,
 ##               or 2 on invalid arguments.
 sb_teardown() {
-  local scope=${1:-} keep=${2:-} timeout selector kinds=statefulsets,jobs,pods left status=0
+  local scope=${1:-} keep=${2:-} timeout selector kinds left status=0
   sb_flag sb_teardown keep_data "$keep" || return $?
   px_k8s_scope_load "$scope" || return $?
   if sb_dry_run "tear down $scope with keep_data=$keep"; then
@@ -1304,7 +1388,8 @@ sb_teardown() {
   fi
   timeout="$(sb_seconds PX_TIMEOUT_TEARDOWN 300)"
   selector="$(px_k8s_selector)"
-  px_k8s_call "$timeout" delete statefulsets,jobs,pods -l "$selector" --ignore-not-found \
+  kinds="$(px_k8s_kinds),jobs,pods"
+  px_k8s_call "$timeout" delete "$kinds" -l "$selector" --ignore-not-found \
     --cascade=foreground --wait=true "--timeout=${timeout}s" >&2 || status=$?
   if [ "$keep" = 0 ] && [ "$status" = 0 ]; then
     kinds="$kinds,pvc"
@@ -1331,7 +1416,8 @@ sb_teardown() {
 ## @return       Writes the manifest path to stdout and exits with 0, or 6 if no manifest exists.
 px_k8s_role_file() {
   local file
-  for file in "$PXK_DEPLOY_DIR"/manifests/2?-"$1".yaml "$PXK_DEPLOY_DIR"/groups/*/2?-"$1".yaml; do
+  for file in "$PXK_DEPLOY_DIR"/manifests/2?-"$1".yaml "$PXK_DEPLOY_DIR"/groups/*/2?-"$1".yaml \
+    "$PXK_DEPLOY_DIR"/groups/*/5?-"$1".yaml; do
     if [ -f "$file" ]; then
       printf '%s\n' "$file"
       return 0
@@ -1342,7 +1428,9 @@ px_k8s_role_file() {
 
 # Re-applies the environment and workload manifests for a role after the caller has re-rendered the
 # deployment with an updated replica count. The StatefulSet controller creates or terminates only
-# the ordinals affected by the change.
+# the ordinals affected by the change. By contrast, a Distributed Pherf tier Deployment updates its
+# replica count via kubectl scale, and any pods removed during a scale-down retain indices at or
+# above the new target count until they finish terminating.
 ## @description  Scales a role to the new instance count rendered in the recorded deployment.
 ## @param        scope_id: the scope identifier returned by sb_scope_create
 ## @param        role: the role name in the rendered deployment to scale
@@ -1394,7 +1482,14 @@ sb_scale() {
       ;;
     esac
   fi
-  px_k8s_apply "$timeout" "$PXK_DEPLOY_DIR/manifests/10-env.yaml" "$file" || return $?
+  if grep -qx 'kind: Deployment' "$file"; then
+    px_k8s_apply "$timeout" "$PXK_DEPLOY_DIR/manifests/10-env.yaml" || return $?
+    px_k8s_call "$timeout" scale deployment "$role" "--replicas=$count" >&2 || status=$?
+    sb_outcome "$status" "$timeout" "the scale of $role" "kubectl could not scale $role" ||
+      return $?
+  else
+    px_k8s_apply "$timeout" "$PXK_DEPLOY_DIR/manifests/10-env.yaml" "$file" || return $?
+  fi
   px_k8s_wait_pods "$timeout" "$role" || status=$?
   if [ "$status" = 0 ]; then
     sb_wait_ready "$scope" "$timeout" "$role" >/dev/null || status=$?
@@ -1572,10 +1667,10 @@ sb_copy_out() {
 # An on-demand role group is represented both by a subdirectory in the rendered deployment
 # (groups/<group>/) and by a group label on its Kubernetes objects. Starting a group applies the
 # manifests in its group directory and waits for readiness. Stopping a group deletes its
-# StatefulSets while preserving their PersistentVolumeClaims, allowing a subsequent start within the
-# same run to reattach to the existing volume state. Consequently, StatefulSets always keep their
-# configured replica counts while present on the cluster, and all group state transitions are
-# realized purely through manifest apply and delete operations.
+# StatefulSets and Deployments while retaining their PersistentVolumeClaims, so a later start
+# within the same run reattaches to the preserved volume state. StatefulSets therefore maintain
+# their configured replica counts whenever they exist on the cluster, and group lifecycle
+# transitions are driven entirely by manifest apply and workload delete operations.
 
 ## @description  Lists the distinct roles belonging to GROUP in the render (CALLER SCOPE GROUP).
 ## @return       Writes one role name per line to stdout; exits with 0, or 2 if GROUP is empty or
@@ -1626,8 +1721,8 @@ sb_group_stop() {
     return 0
   fi
   px_k8s_started_mark "$scope" "$group" remove || return "$SB_EXIT_FAIL"
-  px_k8s_call "$timeout" delete statefulsets -l "$(px_k8s_selector "$term")" --ignore-not-found \
-    --cascade=foreground --wait=true "--timeout=${timeout}s" >&2 || status=$?
+  px_k8s_call "$timeout" delete "$(px_k8s_kinds)" -l "$(px_k8s_selector "$term")" \
+    --ignore-not-found --cascade=foreground --wait=true "--timeout=${timeout}s" >&2 || status=$?
   if sb_expired "$status"; then
     px_error "the stop of group $group expired after ${timeout}s"
     return "$SB_EXIT_TIMEOUT"

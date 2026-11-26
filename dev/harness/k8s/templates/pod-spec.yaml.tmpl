@@ -18,7 +18,8 @@
 # configures a dedicated DNS search domain for each headless Service to resolve the bare name of
 # any peer. Target placement rules (affinity, node selector, and tolerations) and pull secrets
 # apply uniformly to every pod. Local images are never pulled, whereas images from a remote
-# registry are pulled by digest.
+# registry are pulled by digest. The probe slot is populated with either the probes for a harness
+# container or the arguments and readiness probe for a Distributed Pherf tier container.
 
 restartPolicy: ${PX_M_RESTART}
 automountServiceAccountToken: false

@@ -1537,6 +1537,10 @@ SHIM_EOF
 # times that the file holds, as a loaded apiserver can.
 # With scale-lingers, an ordinal that a scale down removes stays Terminating
 # for the number of listings that the file holds, as on a cluster.
+# The Deployments are in k8s-deploy.txt (name|replicas|cluster|image|limit).
+# A Deployment pod is named <deployment>-5c9f7d8b6-fk<seq>, has no index
+# label and no pod-index label, and a deleted one is replaced by a pod with a
+# new name. "scale deployment NAME --replicas=N" adds or removes its pods.
 # PX_FAKE_KUBECTL_LOG keeps every call of the K1 cases in one more log. A
 # line break in an argument is logged as \n, so each call is one line.
 #
@@ -1546,7 +1550,10 @@ SHIM_EOF
 # k8s-secrets.txt; k8s-quotas.txt, one line per ResourceQuota in the field
 # order of px_k8s_preflight_quotas of the backend; the node labels, the
 # fifth field of k8s-nodes.txt, which a -l selector filters; k8s-events.txt
-# (pod|reason|message). A port-forward prints its Forwarding line, at the
+# (pod|reason|message); k8s-waiting.txt (pod|message), the waiting message
+# of the px container that "get pod NAME" reads (with --ignore-not-found, a
+# pod that is gone reads empty). A port-forward prints its Forwarding line,
+# at the
 # port of k8s-forward-port or at 40000 and a counter, records its pid in
 # PX_FAKE_FORWARD_PIDS, and on TERM appends "ended pod/<pod>" to
 # k8s-forward.log.
@@ -1595,15 +1602,17 @@ pods="$st/k8s-pods.txt"
 sts="$st/k8s-sts.txt"
 pvc="$st/k8s-pvc.txt"
 nss="$st/k8s-namespaces.txt"
+deploys="$st/k8s-deploy.txt"
 cluster=selftest
 [ ! -f "$st/k8s-cluster" ] || read -r cluster <"$st/k8s-cluster"
-touch "$pods" "$sts" "$pvc" "$nss" 2>/dev/null
+touch "$pods" "$sts" "$pvc" "$nss" "$deploys" 2>/dev/null
 
 ## @description  Reports the group of a role, as the generator does.
 ## @return       Writes the group to stdout. Exit 0.
 fk_group() {
   case "$1" in
   resourcemanager | nodemanager | jobhistory) printf 'yarn\n' ;;
+  pherf-controller | pherf-agent) printf 'pherf\n' ;;
   esac
 }
 
@@ -1649,8 +1658,8 @@ fk_pod_line() {
 ## @description  Removes the pod lines whose name matches an extended expression.
 ## @return       Exit 0.
 fk_drop() {
-  awk -F '|' -v re="$1" '$1 !~ re' "$pods" >"$pods.new"
-  mv -f "$pods.new" "$pods"
+  awk -F '|' -v re="$1" '$1 !~ re' "$pods" >"$pods.new.$$"
+  mv -f "$pods.new.$$" "$pods"
 }
 
 ## @description  Reports the field (number) of the pod named (name).
@@ -1667,8 +1676,8 @@ fk_set() {
   shift
   awk -F '|' -v OFS='|' -v n="$name" -v sets="$*" 'BEGIN { k = split(sets, a, " ") }
     $1 == n { for (i = 1; i <= k; i++) { split(a[i], p, "="); $(p[1]) = p[2] } } { print }' \
-    "$pods" >"$pods.new"
-  mv -f "$pods.new" "$pods"
+    "$pods" >"$pods.new.$$"
+  mv -f "$pods.new.$$" "$pods"
 }
 
 ## @description  Creates the pod of one ordinal of a StatefulSet (set, ordinal, drain, image, limit,
@@ -1689,9 +1698,9 @@ fk_apply_sts() {
   local name replicas strategy sum claims image limit drain old i n
   IFS='|' read -r name replicas strategy sum claims image limit drain <<<"$1"
   old="$(awk -F '|' -v n="$name" '$1 == n { print $4 }' "$sts")"
-  awk -F '|' -v n="$name" '$1 != n' "$sts" >"$sts.new"
-  printf '%s|%s|%s|%s|%s\n' "$name" "$replicas" "$strategy" "$sum" "$claims" >>"$sts.new"
-  mv -f "$sts.new" "$sts"
+  awk -F '|' -v n="$name" '$1 != n' "$sts" >"$sts.new.$$"
+  printf '%s|%s|%s|%s|%s\n' "$name" "$replicas" "$strategy" "$sum" "$claims" >>"$sts.new.$$"
+  mv -f "$sts.new.$$" "$sts"
   i=0
   while [ "$i" -lt "$replicas" ]; do
     if ! fk_field "$name-$i" 1 >/dev/null; then
@@ -1712,8 +1721,34 @@ fk_apply_sts() {
     else
       fk_drop "^$n\$"
     fi
-    grep -vx "data-$n" "$pvc" >"$pvc.new" || true
-    mv -f "$pvc.new" "$pvc"
+    grep -vx "data-$n" "$pvc" >"$pvc.new.$$" || true
+    mv -f "$pvc.new.$$" "$pvc"
+  done
+}
+
+## @description  Makes the live pods of a Deployment (name) match its replicas: new pods get the
+##               next name, and a scale down removes the last names, Terminating with scale-lingers.
+## @return       Exit 0.
+fk_deploy_sync() {
+  local name=$1 replicas image limit live n seq victim
+  IFS='|' read -r _ replicas _ image limit <<<"$(grep "^$name|" "$deploys")"
+  [ -n "$replicas" ] || return 0
+  live="$(awk -F '|' -v r="$name" '$3 == r && $24 == "Deployment" && $7 == "" { print $1 }' \
+    "$pods" | LC_ALL=C sort)"
+  n="$(printf '%s' "$live" | grep -c .)" || n=0
+  while [ "$n" -lt "$replicas" ]; do
+    seq=$(($(cat "$st/k8s-deploy-seq" 2>/dev/null || echo 0) + 1))
+    printf '%s\n' "$seq" >"$st/k8s-deploy-seq"
+    fk_pod_line "$(printf '%s-5c9f7d8b6-fk%04d' "$name" "$seq")" "$name" "" "" "" "$image" \
+      "$limit" Deployment >>"$pods"
+    n=$((n + 1))
+  done
+  for victim in $(printf '%s\n' "$live" | sed -n "$((replicas + 1)),\$p"); do
+    if [ -f "$st/scale-lingers" ]; then
+      fk_set "$victim" 7=2026-01-03T00:00:09Z 10=False "25=doomed:$(cat "$st/scale-lingers")"
+    else
+      fk_drop "^$victim\$"
+    fi
   done
 }
 
@@ -1734,7 +1769,7 @@ fk_docs() {
     /^metadata:/ { meta = 1 }
     meta == 1 && /^  name: / && name == "" { name = $2 }
     /^  replicas: / { reps = $2 }
-    /^    type: (OnDelete|RollingUpdate)/ { strat = $2 }
+    /^    type: (OnDelete|RollingUpdate|Recreate)/ { strat = $2 }
     /^  template:/ { tpl = 1 }
     /^  volumeClaimTemplates:/ { tpl = 0; vct = 1; next }
     vct == 1 { if ($0 ~ /^    - /) claims = "yes"; vct = 0 }
@@ -1753,8 +1788,8 @@ fk_after_listing() {
   local after
   awk -F '|' -v OFS='|' '$25 == "warm" { $10 = "True"; $25 = "" } $25 == "warm2" { $25 = "warm" }
     $25 ~ /^doomed:/ { n = substr($25, 8) - 1; if (n < 1) next; $25 = "doomed:" n }
-    { print }' "$pods" >"$pods.new"
-  mv -f "$pods.new" "$pods"
+    { print }' "$pods" >"$pods.new.$$"
+  mv -f "$pods.new.$$" "$pods"
   if [ -f "$st/k8s-next-sel" ]; then
     case "$fk_sel" in
     *"$(cat "$st/k8s-next-sel")"*) ;;
@@ -1794,7 +1829,8 @@ fk_node_match() {
 
 fk_verb=${1:-}
 shift || true
-fk_sel="" fk_out="" fk_dry=0 fk_file="" fk_prev=0 fk_pos=() fk_field_sel=""
+fk_sel="" fk_out="" fk_dry=0 fk_file="" fk_prev=0 fk_pos=() fk_field_sel="" fk_replicas=""
+fk_ignore=0
 if [ "$fk_verb" = port-forward ]; then
   fk_addr=localhost fk_pod="" fk_remote=""
   while [ $# -gt 0 ]; do
@@ -1834,6 +1870,8 @@ if [ "$fk_verb" != exec ] && [ "$fk_verb" != cp ]; then
     -c) shift ;;
     --dry-run=client) fk_dry=1 ;;
     --previous) fk_prev=1 ;;
+    --ignore-not-found) fk_ignore=1 ;;
+    --replicas=*) fk_replicas=${1#--replicas=} ;;
     -*) ;;
     *) fk_pos+=("$1") ;;
     esac
@@ -1887,15 +1925,25 @@ apply)
       fk_clu <<<"$fk_doc"
     case "$fk_kind" in
     Namespace)
-      grep -v "^$fk_name|" "$nss" >"$nss.new" || true
-      printf '%s|%s\n' "$fk_name" "$fk_clu" >>"$nss.new"
-      mv -f "$nss.new" "$nss"
+      grep -v "^$fk_name|" "$nss" >"$nss.new.$$" || true
+      printf '%s|%s\n' "$fk_name" "$fk_clu" >>"$nss.new.$$"
+      mv -f "$nss.new.$$" "$nss"
       printf '%s\n' "$fk_clu" >"$st/k8s-cluster"
       cluster=$fk_clu
       ;;
     StatefulSet)
       fk_sum="$(cksum <"$st/tpl.$fk_n" 2>/dev/null | cut -d' ' -f1)"
       fk_apply_sts "$fk_name|$fk_reps|$fk_strat|$fk_sum|$fk_claims|$fk_image|$fk_lim|$fk_drain"
+      ;;
+    Deployment)
+      grep -v "^$fk_name|" "$deploys" >"$deploys.new.$$" || true
+      printf '%s|%s|%s|%s|%s\n' "$fk_name" "$fk_reps" "$fk_clu" "$fk_image" "$fk_lim" \
+        >>"$deploys.new.$$"
+      mv -f "$deploys.new.$$" "$deploys"
+      fk_deploy_sync "$fk_name"
+      ;;
+    PersistentVolumeClaim)
+      grep -qx "$fk_name" "$pvc" || printf '%s\n' "$fk_name" >>"$pvc"
       ;;
     Job)
       if ! grep -q "^$fk_name-" "$pods"; then
@@ -1986,10 +2034,22 @@ get)
     awk -F '|' -v p="${fk_field_sel#involvedObject.name=}" '$1 == p { print $2 "|" $3 }' \
       "$st/k8s-events.txt" 2>/dev/null || true
     ;;
+  pod)
+    fk_field "${fk_pos[1]:-}" 1 >/dev/null || {
+      [ "$fk_ignore" = 0 ] || exit 0
+      printf 'Error from server (NotFound): pods "%s" not found\n' "${fk_pos[1]:-}" >&2
+      exit 1
+    }
+    awk -v p="${fk_pos[1]}|" 'index($0, p) == 1 { printf "%s", substr($0, length(p) + 1) }' \
+      "$st/k8s-waiting.txt" 2>/dev/null || true
+    ;;
   *)
     # A kind list with -o name: what a teardown left.
     case ",${fk_pos[0]:-}," in
     *,statefulsets,*) awk -F '|' '{ print "statefulset.apps/" $1 }' "$sts" ;;
+    esac
+    case ",${fk_pos[0]:-}," in
+    *,deployments,*) awk -F '|' '{ print "deployment.apps/" $1 }' "$deploys" ;;
     esac
     case ",${fk_pos[0]:-}," in
     *,pods,*)
@@ -2013,6 +2073,7 @@ delete)
       exit 1
     }
     fk_drain="$(fk_field "$fk_name" 6)"
+    fk_role="$(fk_field "$fk_name" 3)"
     fk_image="$(fk_field "$fk_name" 20)"
     fk_lim="$(fk_field "$fk_name" 23)"
     fk_drop "^$fk_name\$"
@@ -2022,14 +2083,16 @@ delete)
       [ ! -e "$st/recreate-never" ]; then
       fk_sts_pod "$fk_set_name" "${fk_name##*-}" "$fk_drain" "$fk_image" "$fk_lim" replace
     fi
+    [ "$fk_owner" != Deployment ] || fk_deploy_sync "$fk_role"
     printf 'pod "%s" deleted\n' "$fk_name"
     ;;
   namespace)
-    grep -v "^${fk_pos[1]:-}|" "$nss" >"$nss.new" || true
-    mv -f "$nss.new" "$nss"
+    grep -v "^${fk_pos[1]:-}|" "$nss" >"$nss.new.$$" || true
+    mv -f "$nss.new.$$" "$nss"
     : >"$pods"
     : >"$sts"
     : >"$pvc"
+    : >"$deploys"
     ;;
   pvc)
     : >"$pvc"
@@ -2037,23 +2100,46 @@ delete)
   configmaps,services)
     : >"$st/k8s-configmaps.txt"
     ;;
-  statefulsets)
+  statefulsets | statefulsets,deployments)
     for fk_name in $(cut -d'|' -f1 "$sts"); do
       fk_match "x|x|$fk_name" "$fk_sel" || continue
-      awk -F '|' -v n="$fk_name" '$1 != n' "$sts" >"$sts.new"
-      mv -f "$sts.new" "$sts"
+      awk -F '|' -v n="$fk_name" '$1 != n' "$sts" >"$sts.new.$$"
+      mv -f "$sts.new.$$" "$sts"
       fk_drop "^$fk_name-[0-9]+\$"
+    done
+    [ "${fk_pos[0]}" = statefulsets,deployments ] || exit 0
+    for fk_name in $(cut -d'|' -f1 "$deploys"); do
+      fk_match "x|x|$fk_name" "$fk_sel" || continue
+      awk -F '|' -v n="$fk_name" '$1 != n' "$deploys" >"$deploys.new.$$"
+      mv -f "$deploys.new.$$" "$deploys"
+      awk -F '|' -v r="$fk_name" '!($3 == r && $24 == "Deployment")' "$pods" \
+        >"$pods.new.$$"
+      mv -f "$pods.new.$$" "$pods"
     done
     ;;
   *)
     [ ! -e "$st/delete-leaves" ] || exit 0
     : >"$sts"
+    : >"$deploys"
     while IFS= read -r fk_line; do
       fk_match "$fk_line" "$fk_sel" || printf '%s\n' "$fk_line"
-    done <"$pods" >"$pods.new"
-    mv -f "$pods.new" "$pods"
+    done <"$pods" >"$pods.new.$$"
+    mv -f "$pods.new.$$" "$pods"
     ;;
   esac
+  ;;
+scale)
+  fk_name=${fk_pos[1]:-}
+  if [ "${fk_pos[0]:-}" != deployment ] || ! grep -q "^$fk_name|" "$deploys" ||
+    ! [[ $fk_replicas =~ ^[0-9]+$ ]]; then
+    printf 'Error from server (NotFound): deployments.apps "%s" not found\n' "$fk_name" >&2
+    exit 1
+  fi
+  awk -F '|' -v OFS='|' -v n="$fk_name" -v r="$fk_replicas" '$1 == n { $2 = r } { print }' \
+    "$deploys" >"$deploys.new.$$"
+  mv -f "$deploys.new.$$" "$deploys"
+  fk_deploy_sync "$fk_name"
+  printf 'deployment.apps/%s scaled\n' "$fk_name"
   ;;
 exec)
   while [ $# -gt 0 ]; do
@@ -13869,8 +13955,8 @@ t_k1_a5() {
     "$@"
 }
 
-# Supported pod states such as ready, unready, pending, crash, neverpull, and oom are defined by
-# the case branches of the function.
+# The case branches of this function define the supported pod states, such as ready, unready,
+# pending, crash, neverpull, config, and oom.
 ## @description  Formats a single fake kubectl pod inventory record for the given attributes (name,
 ##               role, index label, ordinal, drain, owner, state, restarts).
 ## @return       Writes the formatted pod line to stdout. Exit 0.
@@ -13885,6 +13971,7 @@ t_k8s_pod() {
     lfin=2026-01-03T00:00:05Z
     ;;
   neverpull) phase=Pending ready=False started="" waiting=ErrImageNeverPull ;;
+  config) phase=Pending ready=False started="" waiting=CreateContainerConfigError ;;
   oom) lcode=137 lreason=OOMKilled lfin=2026-01-03T00:00:05Z ;;
   restarted) lcode=1 lreason=Error lfin=2026-01-03T00:00:05Z ;;
   exited) phase=Failed ready=False started="" code=1 treason=Error fin=2026-01-03T00:00:06Z ;;
@@ -14330,9 +14417,6 @@ K1_EOF
     "$(cat "$PX_HOME/k8s/manifests.gen.sh")") $(t_flag 'pxg_require ' \
     "$(cat "$PX_HOME/lib/deploy.sh")") $(t_flag pxg_configure \
     "$(cat "$PX_HOME/k8s/manifests.gen.sh")")"
-  t_mgen --class validation -e PX_PHERF=1 --check
-  t_equals k8s_render_leaves_the_pherf_tier_to_a_later_round "2 yes" "$T_STATUS $(t_flag \
-    'later round' "$T_STDERR")"
   t_mgen --class validation --cluster bad_id --check
   t_equals k8s_render_refuses_a_cluster_name_that_is_no_namespace 2 "$T_STATUS"
 }
@@ -15624,7 +15708,7 @@ t_group_k2_tunnels() {
   # After a host reboot, the PID stored in a tunnel state record may have been recycled for an
   # unrelated process; the backend must recognize that the PID is not an active tunnel and open a
   # new port-forward tunnel.
-  kill "${pid:-0}" 2>/dev/null || true
+  [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
   sleep 60 &
   stale=$!
   awk -F '\t' -v p="$stale" 'BEGIN { OFS = FS } { $1 = p; print }' "$record" >"$record.new" &&
@@ -16327,6 +16411,516 @@ $(t_backend_verbs "$PX_HOME/lib/backend/compose.sh")$([ "$(sb_contract_functions
 }
 
 # ---------------------------------------------------------------------------
+# K5: Distributed Pherf tier on Kubernetes
+# ---------------------------------------------------------------------------
+# Every test case executes against the fake kubectl shim and the H3 stub controller. The fake
+# kubectl creates Deployment pods with names that carry no ordinal, and the stub controller serves
+# host curl requests routed through the fake port-forward loopback tunnel because it ignores the
+# URL host.
+
+# Pod names assigned by the fake kubectl shim to the tier pods during a fresh provision, where the
+# controller Deployment is applied first followed by the two-replica agent Deployment.
+T_K5_C='pherf-controller-5c9f7d8b6-fk0001'
+T_K5_A0='pherf-agent-5c9f7d8b6-fk0002'
+T_K5_A1='pherf-agent-5c9f7d8b6-fk0003'
+
+## @description  Runs px-pherf (option...) on the Kubernetes backend against the fake kubectl shim
+##               and the stub controller in the K1 state directory.
+## @return       Sets T_STATUS, T_STDOUT, and T_STDERR. Exit 0.
+t_k5_pherf() {
+  t_k8s "PATH=$T_H3_BIN:$T_SHIM_DIR:$PATH" "$T_BASH" "$T_BIN/px-pherf" --backend k8s \
+    --cluster selftest --class validation "$@"
+}
+
+## @description  Populates the stub GET /v1/agents response in the K1 state directory (agent
+##               id:state...).
+## @return       Exit 0.
+t_k5_agents() { T_A2_STATE=$T_K8S_STATE t_h3_agents agents "$@"; }
+
+## @description  Provisions a fresh selftest deployment with the Pherf tier in the fake kubectl
+##               state and resets the stub controller with two IDLE agents.
+## @return       Sets T_STATUS from the provision call. Exit 0.
+t_k5_provision() {
+  t_k8s_provision -e PX_PHERF=1
+  T_A2_STATE=$T_K8S_STATE t_h3_reset
+  t_k5_agents "$T_K5_A0:IDLE" "$T_K5_A1:IDLE"
+}
+
+## @description  Reports the process state of a tunnel (pid) via t_proc_state, or none when the
+##               tunnel record contains no PID.
+## @return       Writes the state word to stdout. Exit 0.
+t_k5_tunnel_state() { if [ -n "$1" ]; then t_proc_state "$1"; else printf none; fi; }
+
+## @description  Outputs the sorted basenames of all files in a directory (directory) on one line.
+## @return       Writes the space-separated file names to stdout. Exit 0.
+t_k5_names() {
+  find "$1" -type f 2>/dev/null | sed 's|.*/||' | LC_ALL=C sort | paste -sd ' ' -
+}
+
+## @description  Extracts rendered tier manifest documents (render dir) matching the specified
+##               resource kinds (kind regular expression).
+## @return       Writes one flattened line per matching document to stdout. Exit 0.
+t_k5_docs() {
+  local file
+  for file in "$1"/groups/pherf/*.yaml; do
+    t_k8s_docs "$file"
+  done | sed 's/| */|/g' | grep -E "\\|kind: ($2)\\|"
+}
+
+## @description  Verifies rendered Kubernetes manifests for the tier: controller, claim, Service,
+##               agents, quorum ConfigMap, and mesh rules (RQ-318, RQ-319).
+## @return       Records test assertions. Exit 0.
+t_group_k5_render() {
+  local dir g x doc bad="" file got want line on off name
+  printf '# K5: the render of the tier\n'
+  t_mgen --class validation --cluster k5 -e PX_PHERF=1
+  dir="$T_K8S_OUT/deploy-k8s/k5"
+  g="$dir/groups/pherf"
+  t_equals k5_render_writes_the_three_tier_files "0 50-pherf-target.yaml 51-pherf-controller.yaml\
+ 52-pherf-agent.yaml" "$T_STATUS $(t_k5_names "$g")"
+  # Verify that the controller renders as a single-replica Deployment with a persistent volume
+  # claim mounted at its run directory and a rollout strategy that never runs two pods concurrently
+  # against that directory (RQ-318).
+  doc="$(t_k5_docs "$dir" Deployment | grep '|name: pherf-controller|')"
+  t_equals k5_render_controller_is_one_replica_with_a_claim_at_the_run_dir \
+    "yes yes yes yes yes yes" "$(t_flag '|replicas: 1|' "$doc") $(t_flag \
+    '|strategy:|type: Recreate|' "$doc") $(t_flag \
+    '|persistentVolumeClaim:|claimName: data-pherf-controller-0' "$doc") $(t_flag \
+    '|mountPath: /var/lib/pherf/run|' "$doc") $(t_flag '|args:|- controller|- start|' \
+    "$doc") $(t_flag '|storageClassName: local-path|' "$(t_k5_docs "$dir" \
+    PersistentVolumeClaim | grep '|name: data-pherf-controller-0|')")"
+  doc="$(t_k5_docs "$dir" Service)"
+  t_equals k5_render_controller_service_is_cluster_ip_with_8780_and_8790 \
+    "1 yes no http-rest:8780:http http-agent:8790:http" "$(printf '%s\n' "$doc" | grep -c .)\
+ $(t_flag '|type: ClusterIP|' "$doc") $(t_flag 'clusterIP: None' "$doc") $(printf '%s\n' \
+    "$doc" | tr '|' '\n' | awk '/- name: / { n = $3 } /port: / && !/target/ { p = $2 }
+      /appProtocol: / { printf "%s%s:%s:%s", s, n, p, $2; s = " " }')"
+  doc="$(t_k5_docs "$dir" Deployment | grep '|name: pherf-agent|')"
+  line=PHERF_ZOOKEEPER
+  t_equals k5_render_agents_are_a_deployment_named_by_the_pod "yes yes yes yes yes yes" \
+    "$(t_flag '|replicas: 2|' "$doc") $(t_flag '|type: Recreate|' "$doc") $(t_flag \
+    '|- name: PHERF_AGENT_ID|valueFrom:|fieldRef:|fieldPath: "metadata.name"|' "$doc") $(t_flag \
+    '|- name: PHERF_CONTROLLER|value: "http://pherf-controller:8790"|' "$doc") $(t_flag \
+    "|- name: PHERF_ZOOKEEPER|valueFrom:|configMapKeyRef:|name: pherf-target|key: $line|" \
+    "$doc") $(t_flag '|args:|- agent|- start|' "$doc")"
+  t_equals k5_render_harness_quorum_is_the_harness_zookeeper "yes 1" "$(t_flag \
+    '|name: pherf-target|' "$(t_k5_docs "$dir" ConfigMap)") $(grep -c \
+    '^  PHERF_ZOOKEEPER: "zookeeper-0:2181"$' "$g/50-pherf-target.yaml" 2>/dev/null)"
+  # Verify that an external target render records the operator-supplied quorum string exclusively
+  # in a single ConfigMap and generates manifests for the Pherf tier alone (RQ-318).
+  t_mgen --class validation --cluster k5x -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+    -e PX_PHERF_ZOOKEEPER=zk1.k5.invalid:2181
+  x="$T_K8S_OUT/deploy-k8s/k5x"
+  t_equals k5_render_external_quorum_is_only_in_the_configmap "0 groups/pherf/50-pherf-target.yaml\
+ 1 00-namespace.yaml 10-env.yaml 11-conf.yaml 0 3" "$T_STATUS $(cd "$x" 2>/dev/null &&
+    grep -rl zk1.k5.invalid . | sed 's|^\./||' | tr '\n' ' ' | sed 's/ $//') $(cat \
+    "$x"/groups/pherf/*.yaml 2>/dev/null | grep -c zk1.k5.invalid) $(t_k5_names \
+    "$x/manifests") $(cat "$x"/manifests/*.yaml \
+    "$x"/groups/*/*.yaml 2>/dev/null | grep -cE '^kind: (StatefulSet|Job|Pod)$') $(cat \
+    "$x"/groups/*/*.yaml 2>/dev/null | grep -cE '^kind: (Deployment|PersistentVolumeClaim)$')"
+  # Verify that the Kubernetes and Compose generators reject invalid tier configurations with
+  # identical diagnostic messages (RQ-318).
+  bad=""
+  for line in PX_PHERF_TARGET=external PX_PHERF_ZOOKEEPER=zk1@k5.invalid:2181 \
+    PX_PHERF_ZOOKEEPER=zk1.k5.invalid:2181 PX_PHERF_AGENT_COUNT=3; do
+    set -- -e "$line"
+    [ "${line%%=*}" != PX_PHERF_ZOOKEEPER ] || [ "${line#*zk1.}" != "$line" ] ||
+      set -- "$@" -e PX_PHERF_TARGET=external
+    t_mgen --class validation --cluster k5r -e PX_PHERF=1 "$@" --check
+    got="${T_STDERR%%"$PX_NL"*}"
+    got="$T_STATUS ${got#*: }"
+    t_gen --class validation --cluster k5r -e PX_PHERF=1 "$@" --check
+    want="${T_STDERR%%"$PX_NL"*}"
+    want="$T_STATUS ${want#*: }"
+    [ "$got" = "$want" ] && [ "${got%% *}" = 2 ] || bad="$bad [$*] [$want] [$got];"
+  done
+  t_empty k5_render_refuses_what_compose_refuses "$bad"
+  bad=""
+  for line in harness external; do
+    set -- -e PX_PHERF=1
+    [ "$line" = harness ] || set -- "$@" -e PX_PHERF_TARGET=external \
+      -e PX_PHERF_ZOOKEEPER=zk1.k5.invalid:2181
+    t_mgen --class measurement --cluster k5t "$@" --check
+    got=$T_STDOUT
+    t_gen --class measurement --cluster k5t "$@" --check
+    [ "$T_STDOUT" = "$got" ] && [ -n "$got" ] || bad="$bad $line: [$T_STDOUT] [$got];"
+  done
+  t_empty k5_generators_give_the_same_tier_rows "$bad"
+  t_equals k5_render_requests_count_the_tier "Deployment pherf-controller 1 250 1024 1 10|\
+Deployment pherf-agent 2 375 1536 0 0|4096" "$(grep '^Deployment' "$dir/requests.tsv" |
+    tr '\t' ' ' | paste -sd '|' -)|$(sed -n 's/^PX_GROUP_PHERF_MEM_MIB=//p' \
+    "$dir/topology.env")"
+  # Verify that the rendered tier manifests satisfy all baseline K1 manifest invariants: namespace
+  # and cluster labels, Guaranteed QoS under the CPU-to-memory sizing rule, unprivileged container
+  # security contexts, no host exposure, and protocol-prefixed Service port names.
+  bad="$(t_k8s_docs "$g"/*.yaml | grep -vF '|  namespace: px-k5|'
+    t_k8s_docs "$g"/*.yaml | grep -vF 'px.harness.cluster: "k5"')"
+  for file in "$g"/*.yaml; do
+    awk '/^ *requests:$/ { r = 1; l = 0; next } /^ *limits:$/ { l = 1; r = 0; next }
+      r && /cpu:|memory:/ { req[$1] = $2 } l && /cpu:|memory:/ { lim[$1] = $2 }
+      /^ *(readinessProbe|volumeMounts):/ { r = l = 0 }
+      END { for (k in req) if (req[k] != lim[k]) bad = 1; for (k in lim) if (req[k] != lim[k])
+        bad = 1; exit bad }' "$file" || bad="$bad ${file##*/} requests;"
+  done
+  while IFS= read -r line; do
+    for want in 'runAsNonRoot: true' "runAsUser: $(id -u)" 'allowPrivilegeEscalation: false' \
+      '- ALL' 'type: RuntimeDefault' 'enableServiceLinks: false' \
+      'automountServiceAccountToken: false' '|- name: px|'; do
+      [[ $line == *"$want"* ]] || bad="$bad [$want]"
+    done
+  done <<EOF
+$(t_k5_docs "$dir" Deployment)
+EOF
+  bad="$bad$(grep -hE 'type: (NodePort|LoadBalancer)|hostPort|hostNetwork|hostPID|hostIPC' \
+    "$g"/*.yaml)$(cat "$g"/*.yaml | awk '/^ *limits:$/ { l = 1; next } l && /cpu:/ { c = $2 }
+    l && /memory:/ { m = $2; sub(/Mi$/, "", m); l = 0
+      if (c != int((m * 250 + 1023) / 1024) "m") print m, c }')$(awk '/^kind: Service$/ { s = 1 }
+    /^kind: Deployment$/ { s = 0 } s && /- name: / { n = $3 }
+    s && /appProtocol: / { if (index(n, $2 "-") != 1) print n, $2 }' "$g"/*.yaml)"
+  t_equals k5_tier_render_passes_the_k1_sweeps "2 " "$(t_k5_docs "$dir" Deployment |
+    grep -c .) $bad"
+  t_equals k5_tier_probes_are_readiness_only "controller agent|0" "$(cat "$g"/*.yaml | awk '
+    /readinessProbe:/ { r = 1; next } r && /- \/opt\/pherf\/healthcheck.sh$/ { getline
+      sub(/^ *- /, ""); printf "%s%s", s, $0; s = " "; r = 0 }')|$(cat "$g"/*.yaml |
+    grep -cE 'livenessProbe|startupProbe')"
+  # Verify that the image presence check includes the Pherf image, which the controller and agent
+  # pods pull from the local node cache just like the core harness image (RQ-318).
+  want="$(sed -n 's/^PX_PHERF_IMAGE_TAG=//p' "$dir/topology.env")"
+  printf 'docker.io/library/%s\n' "$(sed -n 's/^ *image: "\(.*\)"$/\1/p' \
+    "$dir/manifests/28-regionserver.yaml")" >"$T_K8S_STATE/k8s-images"
+  t_k8s_sb sb_image_present "$dir"
+  line="$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' -v w="$want" \
+    '$1 == w { print ($2 == "") ? "absent" : $2 }')"
+  printf 'docker.io/library/%s\n' "$want" >>"$T_K8S_STATE/k8s-images"
+  t_k8s_sb sb_image_present "$dir"
+  t_equals k5_image_present_names_the_pherf_image "6 absent 0 docker.io/library/$want Never" \
+    "$line $T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' -v w="$want" \
+    '$1 == w { print $2 }') $(sed -n 's/^ *imagePullPolicy: //p' "$g"/*.yaml | LC_ALL=C sort -u)"
+  rm -f "$T_K8S_STATE/k8s-images"
+  # Verify that enabling the service mesh overlay enrolls the tier pods in the mesh automatically
+  # without further opt-in, leaves the core cluster pods outside the mesh unless PX_K8S_MESH_CORE
+  # opts them in, and preserves the setup Job's sidecar opt-out (RQ-319).
+  t_mgen --class validation --cluster k5m -e PX_PHERF=1 --out deploy-k8s/k5-off
+  off="$T_K8S_OUT/deploy-k8s/k5-off"
+  t_mgen --class validation --cluster k5m -e PX_PHERF=1 -e PX_K8S_MESH=1 --out deploy-k8s/k5-on
+  on="$T_K8S_OUT/deploy-k8s/k5-on"
+  bad=""
+  for name in pherf-controller pherf-agent; do
+    [ "$(t_flag '|metadata:|annotations:|sidecar.istio.io/inject: "true"|' \
+      "$(t_k5_docs "$on" Deployment | grep "|name: $name|")")" = yes ] || bad="$bad $name;"
+  done
+  t_equals k5_mesh_puts_the_tier_in_with_no_opt_in "0 yes yes" "$T_STATUS$bad $(t_flag \
+    'sidecar.istio.io/inject: "false"' "$(t_k8s_docs "$on/manifests/28-regionserver.yaml" |
+    grep '|kind: StatefulSet|')") $(t_flag 'sidecar.istio.io/inject: "false"' \
+    "$(t_k8s_docs "$on/manifests/30-setup.yaml" | grep '|kind: Job|')")"
+  t_equals k5_mesh_overlay_adds_only_metadata "yes yes" "$(t_exists "$off/groups/pherf")\
+ $(t_exists "$on/groups/pherf")$(diff -r "$off" "$on" | grep '^[<>]' |
+    grep -vE '^> +(istio-injection: "enabled"|annotations:)$' |
+    grep -vE '^> +sidecar\.istio\.io/inject: "(false|true)"$')"
+  t_equals k5_flat_render_has_no_tier_annotation "0 0" "$(cat "$off"/groups/pherf/*.yaml |
+    grep -c 'sidecar.istio.io/inject') $(grep -rc 'istio-injection' "$off" | awk -F: \
+    '{ s += $2 } END { print s }')"
+}
+
+## @description  Verifies Kubernetes backend management of the tier Deployments: group startup,
+##               pod-name replica numbering, kubectl scale, group stop, and teardown (RQ-318).
+## @return       Records test assertions. Exit 0.
+t_group_k5_backend() {
+  local calls dir
+  printf '# K5: the backend for the tier\n'
+  t_k5_provision
+  dir="$T_K8S_OUT/deploy-k8s/selftest"
+  t_shim_log_reset
+  t_k8s_sb sb_group_start fake/px-selftest pherf 10
+  calls="$(cat "$T_SHIM_LOG")"
+  t_equals k5_group_start_dry_runs_every_tier_file_first "yes 3" "$(printf '%s\n' "$calls" | awk '
+    / apply --dry-run=client -f / { d[$NF] = 1; if (a) late = 1; next }
+    / apply -f / { a = 1; if (!(($NF) in d)) bad = 1; n++ }
+    END { print (n > 0 && !bad && !late) ? "yes" : "no" }') $(printf '%s\n' "$calls" |
+    grep -c ' apply -f .*/groups/pherf/5[0-2]-pherf-')"
+  t_equals k5_group_start_waits_for_the_deployment_replicas "$(t_rows 3 pherf-agent 0 ready \
+    pherf-agent 1 ready pherf-controller 0 ready)" "$(printf '%s\n' "$T_STDOUT" | cut -f1-3)"
+  t_equals k5_group_start_makes_the_pods_and_the_claim "0 2 1 yes" "$T_STATUS $(grep -c \
+    '^pherf-agent-5c9f7d8b6-' "$T_K8S_STATE/k8s-pods.txt") $(grep -c \
+    '^pherf-controller-5c9f7d8b6-' "$T_K8S_STATE/k8s-pods.txt") $(grep -qx \
+    data-pherf-controller-0 "$T_K8S_STATE/k8s-pvc.txt" && echo yes || echo no)"
+  # Because Deployment pods carry no StatefulSet ordinal, the backend assigns replica indices for
+  # a role in pod-name order, sorting live pods first and Terminating pods after them.
+  t_k8s_pod pherf-agent-5c9f7d8b6-fk0000 pherf-agent '' '' '' Deployment | awk -F '|' \
+    -v OFS='|' '{ $7 = "2026-01-03T00:00:09Z"; print }' >>"$T_K8S_STATE/k8s-pods.txt"
+  t_k8s_sb sb_list fake/px-selftest pherf-agent
+  t_equals k5_list_numbers_replicas_by_pod_name "$(t_rows 4 pherf-agent 0 "$T_K5_A0" running \
+    pherf-agent 1 "$T_K5_A1" running pherf-agent 2 pherf-agent-5c9f7d8b6-fk0000 stopped)" \
+    "$(printf '%s\n' "$T_STDOUT" | cut -f1-4)"
+  grep -v '^pherf-agent-5c9f7d8b6-fk0000|' "$T_K8S_STATE/k8s-pods.txt" >"$T_K1/pods.new"
+  mv "$T_K1/pods.new" "$T_K8S_STATE/k8s-pods.txt"
+  # Because an evicted Deployment pod remains in the pod listing alongside the replacement created
+  # by its ReplicaSet, it is ordered after the live pods and the role's readiness barrier does not
+  # stop on it.
+  t_k8s_pod pherf-agent-5c9f7d8b6-fk0000 pherf-agent '' '' '' Deployment evicted \
+    >>"$T_K8S_STATE/k8s-pods.txt"
+  t_k8s_sb sb_list fake/px-selftest pherf-agent
+  t_equals k5_list_numbers_a_failed_replica_after_the_live_ones "$(t_rows 3 pherf-agent 0 \
+    "$T_K5_A0" pherf-agent 1 "$T_K5_A1" pherf-agent 2 pherf-agent-5c9f7d8b6-fk0000)" \
+    "$(printf '%s\n' "$T_STDOUT" | cut -f1-3)"
+  t_k8s_sb sb_wait_ready fake/px-selftest 10 pherf-agent
+  t_equals k5_wait_passes_beside_an_evicted_replica 0 "$T_STATUS"
+  grep -v '^pherf-agent-5c9f7d8b6-fk0000|' "$T_K8S_STATE/k8s-pods.txt" >"$T_K1/pods.new"
+  mv "$T_K1/pods.new" "$T_K8S_STATE/k8s-pods.txt"
+  # Verify that scaling a Deployment down waits until the removed replica has fully disappeared,
+  # which is delayed while the removed pod remains in the Terminating state.
+  t_mgen --class validation --cluster selftest -e PX_PHERF=1 -e PX_PHERF_AGENT_COUNT=1
+  printf '2\n' >"$T_K8S_STATE/scale-lingers"
+  t_shim_log_reset
+  t_k8s_sb sb_scale fake/px-selftest pherf-agent 1 10
+  t_equals k5_scale_waits_until_the_removed_replica_is_gone "0 yes 1 no" "$T_STATUS $(t_flag \
+    'scale deployment pherf-agent --replicas=1' "$(cat "$T_SHIM_LOG")") $(grep -c \
+    '^pherf-agent-' "$T_K8S_STATE/k8s-pods.txt") $(t_flag doomed \
+    "$(cat "$T_K8S_STATE/k8s-pods.txt")")"
+  rm -f "$T_K8S_STATE/scale-lingers"
+  t_equals k5_scale_applies_the_env_and_not_the_deployment "yes no" "$(t_flag \
+    "apply -f $dir/manifests/10-env.yaml" "$(cat "$T_SHIM_LOG")") $(t_flag \
+    '52-pherf-agent.yaml' "$(cat "$T_SHIM_LOG")")"
+  # Verify that stopping the group deletes the group's Deployments while retaining the controller's
+  # persistent volume claim.
+  t_shim_log_reset
+  t_k8s_sb sb_group_stop fake/px-selftest pherf 10
+  t_equals k5_group_stop_deletes_the_deployments_and_keeps_the_claim "0 yes 0 yes yes" \
+    "$T_STATUS $(t_flag \
+    'delete statefulsets,deployments -l px.harness.cluster=selftest,px.harness.group=pherf' \
+    "$(cat "$T_SHIM_LOG")") $(grep -c '^pherf-' "$T_K8S_STATE/k8s-pods.txt") $(grep -qx \
+    data-pherf-controller-0 "$T_K8S_STATE/k8s-pvc.txt" && echo yes || echo no) $(grep -q \
+    '^regionserver-0|' "$T_K8S_STATE/k8s-pods.txt" && echo yes || echo no)"
+  # Verify that a full teardown deletes both the Deployments and the persistent volume claim,
+  # whereas a retained teardown (--keep) preserves the claim.
+  t_k5_provision
+  t_k8s_sb sb_group_start fake/px-selftest pherf 10
+  t_shim_log_reset
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --cluster selftest down --keep
+  calls="$(cat "$T_SHIM_LOG")"
+  t_equals k5_teardown_keep_retains_the_claim "0 yes no yes 0" "$T_STATUS $(t_flag \
+    'delete statefulsets,deployments,jobs,pods -l px.harness.cluster=selftest' "$calls")\
+ $(t_flag 'delete pvc' "$calls") $(grep -qx data-pherf-controller-0 \
+    "$T_K8S_STATE/k8s-pvc.txt" && echo yes || echo no) $(grep -c . "$T_K8S_STATE/k8s-deploy.txt")"
+  t_k5_provision
+  t_k8s_sb sb_group_start fake/px-selftest pherf 10
+  t_shim_log_reset
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --cluster selftest down
+  calls="$(cat "$T_SHIM_LOG")"
+  t_equals k5_teardown_deletes_the_deployments_and_the_claim "0 yes yes yes" "$T_STATUS $(t_flag \
+    'delete statefulsets,deployments,jobs,pods -l px.harness.cluster=selftest' "$calls")\
+ $(t_flag 'delete pvc -l px.harness.cluster=selftest' "$calls") $(t_flag \
+    'get statefulsets,deployments,jobs,pods,pvc -l px.harness.cluster=selftest' "$calls")"
+  t_k8s_provision
+  t_shim_log_reset
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --cluster selftest down
+  t_equals k5_teardown_of_a_render_without_the_tier_names_no_deployment "0 no" "$T_STATUS\
+ $(t_flag deployments "$(cat "$T_SHIM_LOG")")"
+  # When a newly scheduled pod has not yet been authorized for its assigned node by the node
+  # authorizer, the kubelet transiently reports CreateContainerConfigError with "failed to sync
+  # configmap cache" and retries container creation. The readiness barrier treats that transient
+  # condition as pending until its timeout expires, whereas any other configuration error aborts
+  # the barrier immediately.
+  t_k5_config_pod 'failed to sync configmap cache: timed out waiting for the condition'
+  cp "$T_K1/ready-pods" "$T_K8S_STATE/k8s-next.txt"
+  printf '2\n' >"$T_K8S_STATE/k8s-next-after"
+  t_k8s_sb sb_wait_ready fake/px-selftest 10
+  t_equals k5_wait_holds_a_configmap_sync_error_as_pending "0 ready no" "$T_STATUS $(printf \
+    '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "client" { print $3 }') $(t_flag \
+    'terminated while the barrier waited' "$T_STDERR")"
+  # If a pod disappears between the inventory listing and the subsequent query for its waiting
+  # message, the readiness barrier treats it as pending and defers the decision to the next poll.
+  t_k5_config_pod 'configmap "px-env" not found'
+  awk -F '|' -v OFS='|' '$1 == "client-0" { $25 = "doomed:1" } { print }' \
+    "$T_K8S_STATE/k8s-pods.txt" >"$T_K1/pod"
+  mv "$T_K1/pod" "$T_K8S_STATE/k8s-pods.txt"
+  cp "$T_K1/ready-pods" "$T_K8S_STATE/k8s-next.txt"
+  printf '2\n' >"$T_K8S_STATE/k8s-next-after"
+  t_k8s_sb sb_wait_ready fake/px-selftest 10
+  t_equals k5_wait_holds_a_pod_gone_before_its_message_read_as_pending "0 ready no no" \
+    "$T_STATUS $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "client" { print $3 }') $(t_flag \
+    'did not read the waiting message' "$T_STDERR") $(t_flag 'terminated while' "$T_STDERR")"
+  t_k5_config_pod 'configmap "px-env" not found'
+  t_k8s_sb sb_wait_ready fake/px-selftest 10
+  t_equals k5_wait_stops_on_another_config_error "3 yes" "$T_STATUS $(t_flag \
+    'client/0(CreateContainerConfigError: configmap "px-env" not found)' "$T_STDERR")"
+  t_k5_config_pod 'failed to sync configmap cache: timed out waiting for the condition'
+  t_k8s_sb sb_wait_ready fake/px-selftest 1
+  t_equals k5_wait_expiry_reports_the_last_configmap_message "4 yes yes" "$T_STATUS $(t_flag \
+    'readiness barrier expired' "$T_STDERR") $(t_flag \
+    'client/0(failed to sync configmap cache: timed out waiting for the condition)' "$T_STDERR")"
+}
+
+## @description  Seeds the core scope with pod client-0 waiting on CreateContainerConfigError with
+##               a given waiting message (message), saving the ready pods in T_K1/ready-pods.
+## @return       Exit 0.
+t_k5_config_pod() {
+  t_k8s_seed "$T_K8S_STATE" "$T_K8S_OUT"
+  cp "$T_K8S_STATE/k8s-pods.txt" "$T_K1/ready-pods"
+  t_k8s_pod client-0 client 0 '' '' '' config >"$T_K1/pod"
+  grep -v '^client-0|' "$T_K8S_STATE/k8s-pods.txt" >>"$T_K1/pod"
+  mv "$T_K1/pod" "$T_K8S_STATE/k8s-pods.txt"
+  printf 'client-0|%s\n' "$1" >"$T_K8S_STATE/k8s-waiting.txt"
+}
+
+## @description  Verifies px-pherf and the pherf-distributed driver on Kubernetes, covering the
+##               loopback tunnel, pod-name agent IDs, and kubectl agent scaling (RQ-318, RQ-320).
+## @return       Records test assertions. Exit 0.
+t_group_k5_fleet() {
+  local calls record pid run line args=() scenario schema new dir="$T_A2_OUT/deploy/a2"
+  printf '# K5: px-pherf and the driver through a loopback tunnel\n'
+  t_k5_provision
+  t_shim_log_reset
+  t_k5_pherf start
+  calls="$(cat "$T_SHIM_LOG")"
+  t_equals k5_px_pherf_reaches_the_api_through_a_loopback_tunnel "0 yes no yes" "$T_STATUS\
+ $(t_flag "port-forward --address 127.0.0.1 pod/$T_K5_C :8780" "$calls") $(t_flag \
+    " exec -i $T_K5_C " "$calls") $(t_flag \
+    'GET /v1/agents' "$(cat "$T_K8S_STATE/pherf/calls.log" 2>/dev/null)")"
+  t_equals k5_agent_wait_expects_the_pod_names "$T_K5_A0 IDLE|$T_K5_A1 IDLE" \
+    "$(printf '%s\n' "$T_STDOUT" | cut -f1,2 | tr '\t' ' ' | paste -sd '|' -)"
+  record="$T_K8S_OUT/state/k8s/tunnel-fake_px-selftest_pherf-controller_0_rest.tsv"
+  pid="$(cut -f1 "$record" 2>/dev/null)"
+  t_k5_pherf status
+  t_equals k5_px_pherf_status_reuses_the_tunnel "0 pherf 3 3 up 2 $pid run" "$T_STATUS $(printf \
+    '%s\n' "$T_STDOUT" | sed -n 1p | tr '\t' ' ') $(printf '%s\n' "$T_STDOUT" |
+    grep -c '^pherf-agent-5c9f7d8b6-') $(cut -f1 "$record" 2>/dev/null) $(t_k5_tunnel_state "$pid")"
+  # Verify that on Kubernetes the agent readiness wait counts IDLE agents and aborts immediately
+  # if any agent reports the FAULTED state.
+  t_k5_agents "$T_K5_A0:IDLE"
+  t_k5_pherf -e PX_TIMEOUT_READY=2 --keep start
+  t_equals k5_agent_wait_counts_the_idle_agents "4 yes" "$T_STATUS $(t_flag \
+    ' 1 of 2 agents IDLE' "$T_STDERR")"
+  t_k5_agents "$T_K5_A0:IDLE" "$T_K5_A1:FAULTED"
+  t_k5_pherf -e PX_TIMEOUT_READY=2 --keep start
+  t_equals k5_agent_wait_stops_on_a_faulted_agent "3 yes" "$T_STATUS $(t_flag \
+    "$T_K5_A1 is FAULTED, and only a reset clears it: the fixture fault" "$T_STDERR")"
+  t_k5_agents "$T_K5_A0:IDLE" "$T_K5_A1:IDLE"
+  # Verify that replacing the controller pod terminates the existing port-forward tunnel and opens
+  # a new tunnel to the replacement pod.
+  t_k8s "$T_SHIM_DIR/kubectl" --context fake --namespace px-selftest delete pod "$T_K5_C"
+  t_shim_log_reset
+  : >"$T_K8S_STATE/k8s-forward.log"
+  t_k5_pherf status
+  new="$(awk -F '|' '$3 == "pherf-controller" { print $1 }' "$T_K8S_STATE/k8s-pods.txt")"
+  t_equals k5_controller_replacement_opens_a_new_tunnel "0 yes yes gone yes" "$T_STATUS\
+ $([ -n "$new" ] && [ "$new" != "$T_K5_C" ] && echo yes || echo no) $(t_flag \
+    "port-forward --address 127.0.0.1 pod/$new :8780" "$(cat "$T_SHIM_LOG")")\
+ $(t_k5_tunnel_state "$pid") $(t_flag "ended pod/$T_K5_C" "$(cat "$T_K8S_STATE/k8s-forward.log")")"
+  pid="$(cut -f1 "$record" 2>/dev/null)"
+  # Verify that px-pherf scale executes kubectl scale against the pherf-agent Deployment and waits
+  # for the target number of agents to become IDLE (RQ-318).
+  t_k5_agents "$T_K5_A0:IDLE"
+  t_shim_log_reset
+  # Because the seeded cluster has no persisted cluster record, the scale invocation passes
+  # PX_PHERF=1 explicitly just as cluster bring-up would have.
+  t_k5_pherf -e PX_K8S_STORAGE_CLASS=local-path -e PX_PHERF=1 scale 1
+  calls="$(cat "$T_SHIM_LOG")"
+  t_equals k5_px_pherf_scale_issues_kubectl_scale "0 yes 0 1 1" "$T_STATUS $(t_flag \
+    'kubectl --context fake --namespace px-selftest scale deployment pherf-agent --replicas=1' \
+    "$calls") $(printf '%s\n' "$calls" | sed -n '/ scale deployment /,$p' | grep -c \
+    'apply -f .*52-pherf-agent.yaml') $(grep -c \
+    "${PX_TAB}pherf-agent$PX_TAB" "$T_K8S_OUT/deploy-k8s/selftest/services.tsv") $(printf '%s\n' \
+    "$T_STDOUT" | awk -F '\t' '$2 == "IDLE"' | grep -c .)"
+  t_k5_pherf scale 0
+  t_equals k5_px_pherf_scale_refuses_a_count_out_of_range "2 yes" "$T_STATUS $(t_flag \
+    'an agent count of 1 to 9' "$T_STDERR")"
+  # Verify that failure to establish a port-forward tunnel to the controller is reported as an
+  # infrastructure anomaly.
+  : >"$T_K8S_STATE/k8s-forward-fails"
+  [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+  t_k5_pherf status
+  t_equals k5_controller_without_a_tunnel_is_an_anomaly "3 yes" "$T_STATUS $(t_flag \
+    'unable to forward port' "$T_STDERR")"
+  rm -f "$T_K8S_STATE/k8s-forward-fails"
+  t_k5_pherf status
+  pid="$(cut -f1 "$record" 2>/dev/null)"
+  line="$T_STATUS $(t_k5_tunnel_state "$pid")"
+  t_k5_pherf stop
+  t_equals k5_px_pherf_stop_releases_the_tunnel "0 run 0 no gone 0" "$line $T_STATUS $(t_exists \
+    "$record") $(t_k5_tunnel_state "$pid") $(grep -c '^pherf-' "$T_K8S_STATE/k8s-pods.txt")"
+  # Verify that a failed start command stops the tier group by default and releases the tunnel
+  # opened during startup. The preceding scale command left one agent in the rendered topology,
+  # while the stub controller reports zero registered agents.
+  t_k5_agents
+  : >"$T_K8S_STATE/k8s-forward.log"
+  line="$(grep -c . "$T_WORK/forward.pids" 2>/dev/null)" || line=0
+  t_k5_pherf -e PX_TIMEOUT_READY=2 start
+  pid="$(sed -n "$((line + 1))p" "$T_WORK/forward.pids" 2>/dev/null)"
+  t_equals k5_failed_start_releases_the_tunnel "4 no gone yes 0" "$T_STATUS $(t_exists \
+    "$record") $(t_k5_tunnel_state "$pid") $(t_flag 'ended pod/pherf-controller-' \
+    "$(cat "$T_K8S_STATE/k8s-forward.log")") $(grep -c '^pherf-' "$T_K8S_STATE/k8s-pods.txt")"
+  t_k5_agents "$T_K5_A0:IDLE" "$T_K5_A1:IDLE"
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --cluster selftest down
+  # Verify that the pherf-distributed driver executes unchanged against an external-target
+  # Kubernetes deployment: it interacts exclusively through backend contract calls, running curl
+  # inside pherf-controller 0, and waits for the required count of IDLE agents just as px-pherf
+  # does on Kubernetes.
+  rm -rf "$T_K1_A5"
+  mkdir -p "$T_K1_A5"
+  # Configure the fake metrics server to report 256 MiB per pod so the post-run peak memory check
+  # passes cleanly.
+  printf '256Mi\n' >"$T_K1_A5/top-mem"
+  t_mgen --class validation --cluster selftest -e PX_PHERF=1 -e PX_PHERF_TARGET=external \
+    -e PX_PHERF_ZOOKEEPER=zk1.k5.invalid:2181 --out deploy-k8s/k5drv
+  rm -rf "$PX_OUT/state/k8s" "$PX_OUT/state/scope-k8s-selftest" \
+    "$PX_OUT/state/cluster-selftest.env"
+  t_k8s "PX_FAKE_STATE_DIR=$T_K1_A5" "PX_OUT=$PX_OUT" "$T_BASH" "$T_WORK/probe/sb.sh" \
+    sb_scope_create selftest
+  printf 'fake/px-selftest\n' >"$PX_OUT/state/scope-k8s-selftest"
+  printf '%s\n' "$T_K8S_OUT/deploy-k8s/k5drv" >"$PX_OUT/state/deployment-k8s-selftest"
+  t_k8s "PX_FAKE_STATE_DIR=$T_K1_A5" "PX_OUT=$PX_OUT" "$T_BASH" "$T_WORK/probe/sb.sh" \
+    sb_provision fake/px-selftest "$T_K8S_OUT/deploy-k8s/k5drv" 30
+  t_k8s "PX_FAKE_STATE_DIR=$T_K1_A5" "PX_OUT=$PX_OUT" "$T_BASH" "$T_WORK/probe/sb.sh" \
+    sb_group_start fake/px-selftest pherf 10
+  line="$T_STATUS"
+  t_h3_driver_reset
+  cp -R "$T_A5_STATE/pherf" "$T_K1_A5/pherf"
+  sed -e "s/pherf-agent-0/$T_K5_A0/g" -e "s/pherf-agent-1/$T_K5_A1/g" "$T_A5_STATE/pherf/agents" \
+    >"$T_K1_A5/pherf/agents"
+  scenario="$PX_HOME/suites/pherf/px_fleet_scenario.xml"
+  schema="$PX_HOME/suites/pherf/px_fleet_schema.sql"
+  args=(--scenario "$scenario" --schema "$schema" --agents 2 --rows 2000 --rate 40
+    --duration-ms 15000 --threads 4)
+  t_shim_log_reset
+  t_k1_a5 "PATH=$T_H3_BIN:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_PHOENIX_HOME=$T_A5/phoenix" \
+    "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest pherf-distributed -- "${args[@]}"
+  run="$(t_bundle)"
+  calls="$(cat "$T_SHIM_LOG")"
+  t_equals k5_driver_runs_unchanged_on_kubernetes "0 0 describe:0 validate:0 prepare:0 run:0\
+ restore:0 report:0 7 0 no yes" "$line $T_STATUS $(t_verb_codes "$run") $(find \
+    "$run/drivers/pherf-distributed/controller" -type f 2>/dev/null | grep -c .) $(t_validate \
+    "$run" >/dev/null; printf '%s' "$T_STATUS") $(t_flag 'port-forward' "$calls") $(t_flag \
+    " exec -i $T_K5_C -c px -- " "$calls")"
+  rm -rf "$PX_OUT/state/k8s" "$PX_OUT/state/scope-k8s-selftest" \
+    "$PX_OUT/state/deployment-k8s-selftest" "$PX_OUT/state/cluster-selftest.env"
+  t_a5_state_reset
+  # Verify that on the Compose backend, px-pherf scale delegates scaling of the agent service to
+  # px-cluster scale.
+  # Bringing up a cluster from a rendered directory persists the render settings in the cluster
+  # record, so a subsequent scale requires neither the run class nor PX_PHERF=1.
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 --class validation -e PX_PHERF=1 render
+  t_a2_provision "$dir"
+  printf '%s\n' "$((64 * 1073741824))" >"$T_A2_STATE/mem-total"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 up "$dir" --no-wait
+  t_equals up_of_a_render_records_its_settings "0 yes yes" "$T_STATUS $(t_flag "PX_PHERF='1'" \
+    "$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)") $(t_flag \
+    "PX_RUN_CLASS='validation'" "$(cat "$T_A2_OUT/state/cluster-a2.env" 2>/dev/null)")"
+  t_h3_reset
+  t_h3_agents agents pherf-agent-0:IDLE pherf-agent-1:IDLE
+  t_h3_pherf --cluster a2 start
+  t_h3_agents agents pherf-agent-0:IDLE
+  t_shim_log_reset
+  t_h3_pherf --cluster a2 scale 1
+  t_equals px_pherf_scale_on_compose_scales_the_agent_service "0 1 yes 1" "$T_STATUS $(grep -c \
+    "${PX_TAB}pherf-agent$PX_TAB" "$dir/services.tsv") $(t_flag 'rm -f' "$(cat "$T_SHIM_LOG")")\
+ $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "IDLE"' | grep -c .)"
+  t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
+  printf '25165824000\n' >"$T_A2_STATE/mem-total"
+}
+
+# ---------------------------------------------------------------------------
 # Command-line option parsing and test suite execution
 # ---------------------------------------------------------------------------
 
@@ -16428,6 +17022,9 @@ t_group_k2_k3d
 t_group_k2_promotion
 t_group_k2_runs
 t_group_k2_boundary
+t_group_k5_render
+t_group_k5_backend
+t_group_k5_fleet
 t_group_tree
 
 t_daemons_stop

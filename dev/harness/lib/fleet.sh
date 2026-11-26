@@ -20,12 +20,15 @@
 # section "REST API".
 #
 # Three architectural rules shape this file:
-#   1. Every request reaches the controller exclusively through sb_exec in pherf-controller 0. The
-#      curl binary inside the pherf image connects to 127.0.0.1 at PHERF_REST_PORT within that
-#      container, matching the health probe that the image executes every 5 s. Because no harness
-#      code reads a port on the host, a single execution path serves the harness target, the
-#      external target, and a Kubernetes backend, leaving the port on 127.0.0.1 of the host for
-#      direct operator access.
+#   1. By default, requests reach the controller via sb_exec inside pherf-controller 0, where the
+#      curl binary packaged in the pherf image connects to 127.0.0.1 at PHERF_REST_PORT, mirroring
+#      the container health probe executed every 5 s. This design keeps workload drivers strictly
+#      within the substrate contract calls permitted to drivers (sb_exec, sb_copy_in, and
+#      sb_copy_out) across every backend. Alternatively, a client command can assign the local port
+#      of a loopback tunnel to PF_API_PORT: on Kubernetes, px-pherf establishes that tunnel through
+#      the backend endpoint facility and executes the same curl script on the host against
+#      127.0.0.1 at that port. A single invocation script and exit-status mapping therefore support
+#      both transport paths, both backends, and both deployment targets.
 #   2. Every call reads its request body from stdin and writes the response body to stdout. An
 #      HTTP error preserves its response body, which contains the {"error", "message"} error
 #      document returned by the controller.
@@ -51,8 +54,15 @@ PF_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # the startup overhead of the container exec.
 PF_API_BOUND=75
 
-# Inline shell script executed inside pherf-controller 0 for a single API request. It accepts the
-# HTTP method and request path as arguments, and for POST requests forwards stdin as the JSON body.
+# Local TCP port of a host loopback tunnel forwarding to the controller's REST port. When set by a
+# client command, requests execute directly from the host; when empty, requests execute inside
+# pherf-controller 0.
+PF_API_PORT=""
+
+# Inline shell script that executes a single REST API request either inside pherf-controller 0 or
+# on the host via the PF_API_PORT loopback tunnel. It takes the HTTP method and request path as
+# arguments and streams standard input as the JSON payload for POST requests. Executing on the host
+# requires curl 7.76 or later for --fail-with-body support.
 PF_CURL_SCRIPT="$(
   cat <<'SCRIPT_EOF'
 method=$1
@@ -74,8 +84,13 @@ SCRIPT_EOF
 ##               document, 3 if the tier is down or does not answer, 4 if expired, or 1 otherwise.
 pf_api() {
   local status=0
-  sb_exec "$1" pherf-controller 0 "$PF_API_BOUND" -- bash -c "$PF_CURL_SCRIPT" px-api "$2" \
-    "$3" || status=$?
+  if [ -n "$PF_API_PORT" ]; then
+    px_timeout "$PF_API_BOUND" env "PHERF_REST_PORT=$PF_API_PORT" bash -c "$PF_CURL_SCRIPT" \
+      px-api "$2" "$3" || status=$?
+  else
+    sb_exec "$1" pherf-controller 0 "$PF_API_BOUND" -- bash -c "$PF_CURL_SCRIPT" px-api "$2" \
+      "$3" || status=$?
+  fi
   case "$status" in
   0 | 22) return "$status" ;;
   # Treat a curl connection failure (7), a curl operation timeout (28), or a failure to start the
@@ -97,15 +112,32 @@ pf_agent_rows() {
   pb_json_rows "$rows" /agents id state incarnation
 }
 
-# Polls the controller until pherf-agent-0 through pherf-agent-<count - 1> reach the IDLE state
-# (taking the scope, agent count, timeout bound in seconds, and an optional file path for the last
-# agent list or none), and writes the resulting agent rows to stdout.
-## @description  Waits until pherf-agent-0 to pherf-agent-<count - 1> are IDLE in the given scope.
+# Each agent derives its operational identity from its host name, which corresponds to the service
+# name pherf-agent-<i> on Compose and the assigned pod name on Kubernetes. Because Deployment pod
+# names are not known in advance on Kubernetes, readiness polling counts the number of IDLE agents
+# rather than matching predetermined identifiers.
+## @description  Emits the expected operational identifiers for agents 0 through count - 1 (count),
+##               one per line.
+## @return       Writes the agent identifiers to stdout, or nothing on Kubernetes; exits with 0.
+pf_agent_ids() {
+  local index=0
+  [ "${PX_BACKEND:-compose}" != k8s ] || return 0
+  while [ "$index" -lt "$1" ]; do
+    printf 'pherf-agent-%s\n' "$index"
+    index=$((index + 1))
+  done
+}
+
+# Polls the controller until agents 0 through <count - 1> report IDLE, or until count registered
+# agents report IDLE when pf_agent_ids returns no predetermined identifiers. Accepts the scope,
+# expected agent count, timeout bound in seconds, and an optional destination path for persisting
+# the final agent list response, and writes the resulting agent rows to stdout.
+## @description  Waits until agents 0 through <count - 1> reach the IDLE state in the given scope.
 ## @return       Writes the agent rows to stdout. Exits 0, 3 on no answer or FAULTED, 4 if still
 ##               missing or expired, or 1 when no work directory can be created.
 pf_agents_wait() {
-  local scope=$1 count=$2 bound=$3 keep=${4:-} deadline dir rows missing faulted state index
-  local id fault listed status=0
+  local scope=$1 count=$2 bound=$3 keep=${4:-} deadline dir rows missing faulted state
+  local id ids idle faults fault listed status=0
   dir="$(px_mktemp_dir px-fleet)" || return "$PX_EXIT_FAIL"
   deadline=$(($(px_epoch_s) + bound))
   while :; do
@@ -121,17 +153,20 @@ pf_agents_wait() {
     fi
     listed=1
     missing="" faulted=""
-    index=0
-    while [ "$index" -lt "$count" ]; do
-      state="$(printf '%s\n' "$rows" | awk -F '\t' -v id="pherf-agent-$index" \
-        '$1 == id { print $2 }')"
+    ids="$(pf_agent_ids "$count")"
+    for id in $ids; do
+      state="$(printf '%s\n' "$rows" | awk -F '\t' -v id="$id" '$1 == id { print $2 }')"
       case "$state" in
       IDLE) ;;
-      FAULTED) faulted="$faulted pherf-agent-$index" ;;
-      *) missing="$missing pherf-agent-$index:${state:-absent}" ;;
+      FAULTED) faulted="$faulted $id" ;;
+      *) missing="$missing $id:${state:-absent}" ;;
       esac
-      index=$((index + 1))
     done
+    if [ -z "$ids" ] && [ "$count" -gt 0 ]; then
+      IFS="$PX_TAB" read -r idle faults <<<"$(printf '%s\n' "$rows" | awk -F '\t' '
+        $2 == "IDLE" { n++ } $2 == "FAULTED" { f = f " " $1 } END { print n + 0 "\t" f }')"
+      [ "$idle" -ge "$count" ] || missing=" $idle of $count agents IDLE" faulted=$faults
+    fi
     # Because only POST /v1/agents/{id}/reset clears a fault and the harness never issues a reset,
     # encountering any FAULTED agent terminates the wait immediately.
     if [ -n "$faulted" ]; then

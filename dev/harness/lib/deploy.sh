@@ -109,6 +109,22 @@ PXG_FRACTION_RE='^0\.[0-9][0-9]?$'
 PXG_VERSION_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 PXG_LABEL_RE='^[a-z0-9][a-z0-9.-]*$'
 PXG_PATH_RE='^/[A-Za-z0-9 ._/+@-]*$'
+# Regular-expression grammar that validates the ZooKeeper quorum string when the tier targets an
+# external cluster.
+PXG_QUORUM_RE='^[A-Za-z0-9._:,/-]+$'
+
+# Architectural constants for the Distributed Pherf tier defined by the docker/pherf image and
+# shared across both backend generators. Because agents connect to the controller's agent channel
+# port exclusively over the internal deployment network, the external port map omits that port just
+# as it omits internal MapReduce task ports. Each JVM sizes its heap as a fixed percentage of its
+# container memory limit: the controller allocates 50 percent (half of its container limit), whereas
+# each agent allocates 35 percent because the resident agent daemon and a concurrent Pherf child
+# process share the same container memory budget.
+PXG_PHERF_AGENT_PORT=8790
+PXG_PHERF_CONTROLLER_PCT=50
+PXG_PHERF_AGENT_PCT=35
+# Upper bound on the number of Distributed Pherf agents allowed under the validation run class.
+PXG_PHERF_VALIDATION_AGENTS=2
 
 # Memory totals recorded in topology.env are summed from the memory limits of rendered services:
 # PX_TOPOLOGY_MEM_MIB aggregates every rendered service, PX_TOPOLOGY_MEM_EAGER_MIB aggregates the
@@ -133,6 +149,7 @@ PXG_REPLICATION=0
 PXG_ZOOKEEPER=""
 PXG_HBASE_HADOOP=""
 PXG_TSV=""
+PXG_QUORUM=""
 
 # Command-line option state populated by pxg_cli, together with the resolved target deployment
 # directory populated by pxg_prepare.
@@ -208,6 +225,40 @@ pxg_service_row() {
   else
     PXG_MEM_EAGER=$((PXG_MEM_EAGER + mem))
   fi
+}
+
+# Because the Distributed Pherf tier image configures JVM memory as a percentage of the container
+# limit, the service table row records that percentage share as the heap size and reports zero
+# direct memory.
+## @description  Appends a service table row for a Distributed Pherf tier instance (role, index) to
+##               PXG_TSV and adds its container memory limit to the tier memory accumulators.
+## @return       Exits with 0.
+pxg_tier_row() {
+  local role=$1 index=$2 var mem pct=$PXG_PHERF_AGENT_PCT
+  var="PX_$(pxg_role "$role" key)_MEM_MIB" && mem=${!var}
+  [ "$role" != pherf-controller ] || pct=$PXG_PHERF_CONTROLLER_PCT
+  PXG_TSV="$PXG_TSV$(px_tsv_row "$role-$index" "$role" "$index" pherf on-demand "$mem" \
+    "$((mem * pct / 100))" 0 17)$PX_NL"
+  PXG_SERVICES=$((PXG_SERVICES + 1))
+  PXG_MEM_TOTAL=$((PXG_MEM_TOTAL + mem))
+  PXG_MEM_PHERF=$((PXG_MEM_PHERF + mem))
+}
+
+# Both backend generators assign each tier instance the same PHERF_* environment variables in an
+# identical order, except that the Kubernetes generator supplies the ZooKeeper quorum via the
+# pherf-target ConfigMap rather than an inline value.
+## @description  Emits the environment variables for a tier role (role, controller host name) as
+##               NAME=VALUE lines.
+## @return       Writes the environment lines to stdout and exits with 0.
+pxg_tier_env() {
+  if [ "$1" = pherf-controller ]; then
+    printf 'PHERF_JAVA_OPTS=-XX:MaxRAMPercentage=%s\n' "$PXG_PHERF_CONTROLLER_PCT"
+    printf 'PHERF_REST_PORT=%s\n' "$(pxg_port pherf-controller rest 0)"
+    return 0
+  fi
+  printf 'PHERF_CONTROLLER=http://%s:%s\n' "$2" "$PXG_PHERF_AGENT_PORT"
+  printf 'PHERF_JAVA_OPTS=-XX:MaxRAMPercentage=%s\n' "$PXG_PHERF_AGENT_PCT"
+  printf 'PHERF_ZOOKEEPER=%s\n' "$PXG_QUORUM"
 }
 
 ## @description  Determines whether the given role supports scaling across multiple instances.
@@ -541,6 +592,52 @@ pxg_configure() {
   if [ "$PX_PHERF" = 1 ]; then
     pxg_configure_tier
   fi
+}
+
+## @description  Validates the Distributed Pherf tier configuration, resolves PXG_QUORUM, and
+##               appends both tier roles to PXG_RENDERED.
+## @return       Exits with 0 when valid, or 2 if any configuration value is rejected.
+pxg_configure_tier() {
+  local name ver_zk=$PXG_ZOOKEEPER ver_hadoop=$PXG_HBASE_HADOOP
+  pxg_require PX_PHERF_AGENT_COUNT PX_PHERF_CONTROLLER_MEM_MIB PX_PHERF_AGENT_MEM_MIB \
+    PX_PHERF_IMAGE_TAG
+  pxg_check_count pherf-agent
+  if [ "$PX_RUN_CLASS" = validation ] &&
+    [ "$PX_PHERF_AGENT_COUNT" -gt "$PXG_PHERF_VALIDATION_AGENTS" ]; then
+    px_die "$PX_EXIT_USAGE" "PX_PHERF_AGENT_COUNT=$PX_PHERF_AGENT_COUNT: the validation class" \
+      "runs 1 to $PXG_PHERF_VALIDATION_AGENTS agents"
+  fi
+  for name in PX_PHERF_CONTROLLER_MEM_MIB PX_PHERF_AGENT_MEM_MIB; do
+    pxg_check_mib "$name"
+  done
+  if ! sb_image_tag_local "$PX_PHERF_IMAGE_TAG"; then
+    px_die "$PX_EXIT_USAGE" "PX_PHERF_IMAGE_TAG='$PX_PHERF_IMAGE_TAG' must be a local image" \
+      "reference repository:tag, with no registry host and no digest"
+  fi
+  # Targeting an external cluster requires an explicit operator-supplied ZooKeeper quorum, whereas
+  # targeting the harness cluster derives the quorum directly from the deployment's own ZooKeeper
+  # service and client port.
+  if [ "$PX_PHERF_TARGET" = external ]; then
+    [ -n "${PX_PHERF_ZOOKEEPER:-}" ] || px_die "$PX_EXIT_USAGE" "the external target needs" \
+      "PX_PHERF_ZOOKEEPER, the ZooKeeper quorum of the target cluster: host:port,..."
+    [[ $PX_PHERF_ZOOKEEPER =~ $PXG_QUORUM_RE ]] || px_die "$PX_EXIT_USAGE" \
+      "PX_PHERF_ZOOKEEPER='$PX_PHERF_ZOOKEEPER' must hold letters, digits and . _ : , / - only"
+    PXG_QUORUM=$PX_PHERF_ZOOKEEPER
+  else
+    [ -z "${PX_PHERF_ZOOKEEPER:-}" ] || px_die "$PX_EXIT_USAGE" "PX_PHERF_ZOOKEEPER is for" \
+      "PX_PHERF_TARGET=external. The harness target reads the ZooKeeper of the deployment"
+    PXG_QUORUM="zookeeper-0:$(pxg_port zookeeper client 0)"
+  fi
+  # For an external deployment, the ZooKeeper version is drawn from the staging record of the Pherf
+  # image, whereas a harness deployment retains the version recorded in the staging record of the
+  # harness image.
+  pxg_staged PX_PHERF_IMAGE_TAG hbase_profile:PX_PHOENIX_HBASE_PROFILE \
+    hbase_version:PX_DIST_HBASE_VERSION
+  if [ "$PX_PHERF_TARGET" = harness ]; then
+    PXG_ZOOKEEPER=$ver_zk
+    PXG_HBASE_HADOOP=$ver_hadoop
+  fi
+  PXG_RENDERED="$PXG_RENDERED pherf-controller pherf-agent"
 }
 
 ## @description  Validates configuration parameters for the harness cluster roles and appends each
