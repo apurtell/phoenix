@@ -526,7 +526,7 @@ planned_covers() {
 # ---------------------------------------------------------------------------
 
 ## @description  Copies the deployment artifacts for the active scope (topology.env, services.tsv,
-##               and plug-in records) into the bundle.
+##               and plug-in records) into the bundle and records its bring-up preflight rows.
 ## @return       Records a skip row if the deployment record is absent and exits 0.
 cluster_copy() {
   local file recorded="" dir="" name
@@ -554,6 +554,7 @@ cluster_copy() {
   if [ -d "$dir/plugins" ]; then
     cp -R "$dir/plugins" "$RUN_DIR/cluster/" || px_warn "cannot copy $dir/plugins"
   fi
+  [ ! -f "$dir/preflight.tsv" ] || record_rows "preflight$PX_TAB" "$(cat "$dir/preflight.tsv")"
 }
 
 ## @description  Writes cluster/images.tsv with the image reference and image ID of every instance

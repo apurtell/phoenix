@@ -169,6 +169,7 @@ row type permits superseding entries, readers retain the final row of that type.
 | `stage` | name ts_ms | marks a `px-run` milestone that a disruption trigger can reference |
 | `verb` | verb exit_code elapsed_ms timed_out | one row per verb call, with timed_out 0 or 1 |
 | `version` | phase component version | substrate tooling versions from `sb_version_info` |
+| `preflight` | check status detail | host preflight check rows captured during cluster bring-up |
 | `instance` | phase role index instance_id state ready image_ref node | state of each instance |
 | `restart` | phase role index count | records the container restart count per snapshot |
 | `sample` | phase ts_ms role index cpu_pct mem_bytes mem_limit_bytes ... | resource usage sample |
@@ -188,9 +189,12 @@ row type permits superseding entries, readers retain the final row of that type.
 | `result` | exit_code name anomaly | the final row; a record lacking this row was interrupted |
 
 Each `quiet` entry takes the form `sample ts_ms load_pct threshold_pct` or `quiet_host state samples
-waited_s load_pct`: the rows of `px-tool quiet-host` without its closing `result` row. A `diff`
-verdict is one of `unchanged`, `planned`, `unplanned`, `vanished`, or `unknown`. The `quiet_host`
-state is `quiet`, `contaminated`, `refused`, `unmeasured`, or `off`; on
+waited_s load_pct`: the rows of `px-tool quiet-host` without its closing `result` row. The
+`preflight` rows record the contents of `preflight.tsv`, which a passing host preflight during
+`px-cluster up` writes to the deployment directory and scaling operations preserve; a cluster that
+was not provisioned by `px-cluster up` has none. A `diff` verdict is one of `unchanged`, `planned`,
+`unplanned`, `vanished`, or `unknown`. The `quiet_host` state is `quiet`, `contaminated`, `refused`,
+`unmeasured`, or `off`; on
 Kubernetes, where the dedicated-node check runs in place of the quiet-host check, the state is
 `dedicated` (the target declares `PX_K8S_DEDICATED_NODES=1`, so the time evidence counts),
 `undeclared` (no declaration, recording the `dedicated-node` contamination), or `refused` (no
@@ -544,6 +548,7 @@ empty string, and an unknown numeric value is represented as `null`.
   ],
   "kubernetes": {
     "api_version": "v1.37.2+k3s1",
+    "mesh": "namespace.sidecar-injector.istio.io",
     "placement": [ { "role": "regionserver", "index": 0, "pod": "regionserver-0",
       "node": "k3d-px-agent-0" } ],
     "registry_digests": [ { "image_ref": "phoenix-harness:local", "digest": "sha256:..." } ]
@@ -565,7 +570,7 @@ empty string, and an unknown numeric value is represented as `null`.
 | `steady` | `stages.tsv`, `metrics/aggregate.tsv` | each steady-state window and its metrics |
 | `disruptions` | `disrupt` and `recover` rows | each disruption and its recovery outcome |
 | `artifacts` | `pb_artifact_rows` | the complete file inventory of the bundle |
-| `kubernetes` | `version`, `instance` pre rows, `cluster/images.tsv` | for a Kubernetes run only |
+| `kubernetes` | `version`, `preflight`, `instance` pre rows, `cluster/images.tsv` | for k8s runs |
 
 The field `run.started_ms` records the timestamp of the first milestone of `px-run`, while
 `run.ended_ms` records the timestamp at which the manifest is written, and `run.result` holds the
@@ -577,9 +582,13 @@ causes; an empty array indicates that the time evidence of the run is clean. Eac
 **The kubernetes member.** This member is included only for runs on the Kubernetes backend, leaving
 a Compose manifest byte-for-byte unchanged. The `api_version` field holds the `api_server` value
 from the pre-run version rows, and `placement` records the pod and node for each instance in the
-pre-run snapshot. The `registry_digests` array lists each image reference from `cluster/images.tsv`
-once together with the trailing `sha256` digest of its image ID, capturing the digest resolved by
-the nodes—the registry digest for a pulled image or the content digest for an imported one.
+pre-run snapshot. The optional `mesh` field records the Istio sidecar injector webhook observed by
+the `mesh_injector ok` preflight row during cluster bring-up; runs on flat deployments or on
+clusters not provisioned via `px-cluster up` omit the `mesh` field, ensuring that a bundle never
+reports a service mesh that preflight did not verify. Bundle validation does not inspect this field.
+The `registry_digests` array lists each unique image reference from `cluster/images.tsv` paired with
+the trailing `sha256` digest of its image ID, recording the digest resolved by the cluster nodes—the
+registry digest for a pulled image or the content digest for an imported image.
 
 **The anomaly.** The `anomaly` member is `null` whenever no instance changed state without a
 planned action, which corresponds exactly to the `result` row of `run-record.tsv` recording the

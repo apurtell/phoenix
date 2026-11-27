@@ -604,7 +604,12 @@ configuration digest that a kubelet reports for an image loaded by `px-k3d impor
 must store the pushed image under its local image ID. The function returns exit code 1 on a failed
 push, a missing digest, a registry digest that differs from the local ID, or when two local images
 match the configuration digest; 2 on invalid usage; and 6 when no local image matches the specified
-ID or configuration digest.
+ID or configuration digest. Following a verified push, the function removes the temporary local
+target tag that it created as long as the image retains at least one other name; it preserves any
+tag that already referenced an image before the push, as well as any tag that serves as the image's
+sole name and whose removal would untag the image itself. If the push or digest verification fails,
+the tag is retained for diagnostic inspection because its `RepoDigests` metadata still records the
+digest stored by the registry.
 It performs no image build, never logs in to a registry (relying instead on the operator's
 credential store to authenticate the push), and serves as the sole container runtime `push`
 operation in the repository. Only `px-cluster push` invokes it, and the Kubernetes backend
@@ -1347,8 +1352,10 @@ executed on px-k3d, the configuration digest reported by the kubelet, which `sb_
 resolves to the unique local image whose descriptor carries that digest. For each image, it invokes
 `sb_image_push` on the Compose backend to push that local image to
 `<PX_K8S_REGISTRY>/<repository>:<tag>`, which verifies that the registry stores the pushed image
-under its local ID (failing with exit code 1 without rendering if it does not), renders the target
-deployment manifests with `PX_K8S_IMAGE_DIGESTS` populated with the resulting registry digests into
+under its local ID (failing with exit code 1 without rendering if it does not, while retaining the
+created local tag for diagnostic inspection) before removing that local tag unless it is the image's
+only name or already referenced an image prior to the push, renders the target deployment manifests
+with `PX_K8S_IMAGE_DIGESTS` populated with the resulting registry digests into
 `$PX_OUT/deploy-k8s/push-<run id>`, and writes that directory path to stdout while logging an INFO
 line to stderr for each pushed image (noting any configuration digest that was mapped). In `-n`
 dry-run mode, the command does not query the container engine, so its plan rows report the bundle
@@ -1393,8 +1400,10 @@ exit code 3 any target cluster lacking a mutating webhook named
 `namespace.sidecar-injector.istio.io` (the default-revision Istio sidecar injector that acts on the
 `istio-injection` label). This check ensures that a result bundle never claims a service mesh that
 was absent during the run; to proceed, the operator must either install the mesh or render without
-`PX_K8S_MESH=1`. The pinned tool and runtime versions are aligned accordingly: k3s v1.37.2
-(`PX_K3S_IMAGE`), k3d 5.9.0, and Istio 1.32.0, which requires Kubernetes 1.33 or later.
+`PX_K8S_MESH=1`. When this check succeeds, every result bundle produced on that cluster records the
+injector webhook in `kubernetes.mesh` (`docs/bundle-format.md`), whereas bundles from flat
+deployments omit that field. The pinned tool and runtime versions are aligned accordingly: k3s
+v1.37.2 (`PX_K3S_IMAGE`), k3d 5.9.0, and Istio 1.32.0, which requires Kubernetes 1.33 or later.
 
 ### The local cluster: px-k3d
 

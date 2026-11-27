@@ -1119,14 +1119,20 @@ EOF
   px_json_close
 }
 
+# The mesh member records the Istio injector identified by the mesh_injector ok preflight row from
+# cluster bring-up; runs without that row omit the mesh member.
 ## @description  Emits the kubernetes member for a bundle (bundle), recording the API server
-##               version, each pod's node, and each image reference digest resolved by the nodes.
+##               version, the mesh injector, pod node placement, and node-resolved image digests.
 ## @return       Exits 0.
 pb_manifest_kubernetes() {
-  local rec="$1/run-record.tsv" role index pod node ref digest
+  local rec="$1/run-record.tsv" role index pod node ref digest mesh
   px_json_open kubernetes
   px_json_str api_version "$(pb_record_rows version "$rec" |
     awk -F '\t' '$1 == "pre" && $2 == "api_server" { v = $3 } END { print v }')"
+  mesh="$(pb_record_rows preflight "$rec" | awk -F '\t' '$1 == "mesh_injector" && $2 == "ok" &&
+    match($3, /[^ ]*\.sidecar-injector\.istio\.io/) { v = substr($3, RSTART, RLENGTH) }
+    END { print v }')"
+  [ -z "$mesh" ] || px_json_str mesh "$mesh"
   px_json_arr placement
   while IFS="$PB_US" read -r role index pod node; do
     [ -n "$role" ] || continue

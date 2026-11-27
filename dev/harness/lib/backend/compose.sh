@@ -2294,14 +2294,17 @@ px_compose_config_image() {
 # two local images sharing the config digest fail with exit code 1, whereas an image matching
 # neither a local ID nor a config digest returns exit code 6. This operation neither builds an
 # image nor logs into the registry, relying instead on the operator's credential store to
-# authenticate the push.
+# authenticate the push. Once the push is verified, any temporary local target tag created for the
+# operation is removed provided the image retains another name so the image itself is preserved; if
+# the push or digest check fails, the tag is retained for diagnostic inspection because it records
+# the registry digests.
 ## @description  Push a local image by ID or config digest and report its registry manifest digest.
 ## @param        image: local image ID or config digest of a local image (sha256:<64 hex>)
 ## @param        target_ref: target <registry>/<repository>:<tag> reference without a digest
 ## @return       Write one image TSV row (target_ref and registry digest) and exit 0; exit 1 on
 ##               engine, push, digest-mismatch, or duplicate-config failure; 2 on usage; 6 if none.
 sb_image_push() {
-  local id=${1:-} target=${2:-} found timeout status=0 line digest=""
+  local id=${1:-} target=${2:-} found timeout status=0 line digest="" known tags
   if ! [[ $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
     px_error "sb_image_push needs an image id sha256:<64 hex>, got '$id'"
     return "$SB_EXIT_USAGE"
@@ -2318,6 +2321,7 @@ sb_image_push() {
   if [ "$found" != "$id" ]; then
     found="$(px_compose_config_image "$id")" || return $?
   fi
+  known="$(px_compose_engine 60 image inspect --format '{{.Id}}' "$target" 2>/dev/null)" || known=""
   if ! px_compose_engine 60 tag "$found" "$target" >&2; then
     px_error "the engine could not tag $found as $target"
     return "$SB_EXIT_FAIL"
@@ -2340,12 +2344,24 @@ $(px_compose_engine 60 image inspect --format '{{range .RepoDigests}}{{println .
     "$target" 2>/dev/null || true)
 EOF_DIGESTS
   if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    px_error "the registry gave no digest for $target"
+    px_error "the registry gave no digest for $target: the tag stays for the diagnosis"
     return "$SB_EXIT_FAIL"
   fi
   if [ "$digest" != "$found" ]; then
-    px_error "the registry stores $target as $digest, and the local image is $found"
+    px_error "the registry stores $target as $digest, and the local image is $found:" \
+      "the tag stays for the diagnosis"
     return "$SB_EXIT_FAIL"
+  fi
+  # Preserve the target tag if it is the image's only name (since removing it would untag the image
+  # itself) or if it already referenced an image prior to the push.
+  tags="$(px_compose_engine 60 image inspect --format '{{len .RepoTags}}' "$found" 2>/dev/null)" ||
+    tags=0
+  if [ -n "$known" ]; then
+    px_info "the local tag $target stays, since it named an image before the push"
+  elif ! [[ $tags =~ ^[0-9]+$ ]] || [ "$tags" -lt 2 ]; then
+    px_info "the local tag $target stays, since it is the only name of $found"
+  else
+    px_compose_engine 60 rmi "$target" >&2 || px_warn "the engine kept the local tag $target"
   fi
   px_tsv_row "$target" "$digest"
 }

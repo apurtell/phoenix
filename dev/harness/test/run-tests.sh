@@ -834,7 +834,8 @@ t_fixtures_shim() {
 # the config digest of the descriptor annotation config.digest, as the
 # containerd image store reports it, and image ls with no reference lists
 # every id. tag records
-# the source of a reference in registry-tags.txt. push appends "push <ref>
+# the source of a reference in registry-tags.txt, and the RepoTags of an image
+# count its reference and the references that tag gave it. push appends "push <ref>
 # <id>" to registry.log and records the digest of the registry in
 # repo-digests.txt: the image id, or another digest with the flag
 # registry-digest-differs. push-fails makes a push fail, and
@@ -1178,6 +1179,13 @@ image)
     *RepoDigests*)
       awk -F '|' -v r="${!#}" '$1 == r { print $2 }' "$fake_state/repo-digests.txt" \
         2>/dev/null
+      ;;
+    *RepoTags*)
+      # The names of an image: its reference, if any, and each reference that tag gave it.
+      {
+        awk -F '|' -v r="${!#}" '$1 == r && $2 != "" { print $2 }' "$fake_state/local-images.txt"
+        awk -F '|' -v r="${!#}" '$2 == r { print $1 }' "$fake_state/registry-tags.txt" 2>/dev/null
+      } | sort -u | grep -c . || true
       ;;
     *)
       fake_id="$(awk -F '|' -v r="${!#}" '$1 == r || $2 == r { print $1; exit }' \
@@ -15993,11 +16001,21 @@ $(t_k2_row "$T_STDOUT" k3d_cluster) $(t_flag 'px-k3d create' "$T_STDOUT") $(t_fl
   t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
     --cluster selftest up "$T_K8S_OUT/deploy-k8s/meshed"
   bad="$bad $T_STATUS $(t_flag ' apply ' "$(cat "$T_SHIM_LOG")") $(t_flag 'drop PX_K8S_MESH=1' \
-    "$T_STDERR")"
+    "$T_STDERR") $(t_exists "$T_K8S_OUT/deploy-k8s/meshed/preflight.tsv")"
   t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
     --cluster selftest up -n -e PX_K8S_MESH=1 "$T_K8S_OUT/deploy-k8s/selftest"
-  t_equals k8s_up_refuses_a_mesh_without_an_injector "3 fail 3 no yes 0 no" "$bad $T_STATUS\
+  t_equals k8s_up_refuses_a_mesh_without_an_injector "3 fail 3 no yes no 0 no" "$bad $T_STATUS\
  $(t_flag mesh_injector "$T_STDOUT")"
+  # Verify that a live cluster bring-up persists its preflight rows in the deployment directory for
+  # px-run to read while still emitting those rows to stderr for the operator.
+  printf 'namespace.sidecar-injector.istio.io\n' >"$T_K8S_STATE/k8s-webhooks.txt"
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
+    --cluster selftest up "$T_K8S_OUT/deploy-k8s/meshed" --no-wait
+  t_equals k8s_up_keeps_its_preflight_rows "0 ok yes" "$T_STATUS $(t_k2_row "$(cat \
+    "$T_K8S_OUT/deploy-k8s/meshed/preflight.tsv" 2>/dev/null)" mesh_injector) $(t_flag \
+    "mesh_injector${PX_TAB}ok" "$T_STDERR")"
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --cluster selftest down
+  rm -f "$T_K8S_STATE/k8s-webhooks.txt"
 }
 
 ## @description  Verifies on-demand loopback port-forward tunnels for Kubernetes service endpoints
@@ -16075,7 +16093,7 @@ t_group_k2_tunnels() {
 ##               and the kubernetes manifest section for Kubernetes runs (RQ-288, RQ-299, RQ-300).
 ## @return       Records test assertions. Exit 0.
 t_group_k2_evidence() {
-  local run copy dir record calls key bad=""
+  local run copy dir record calls key line bad=""
   printf '# K2: restart, termination and out-of-memory evidence\n'
   # Verify that an unplanned container restart or an out-of-memory container termination aborts the
   # run with exit status 3 (RQ-288).
@@ -16143,6 +16161,29 @@ t_group_k2_evidence() {
       bad="$bad $key gave $T_STATUS;"
   done
   t_empty k8s_bundle_without_a_kubernetes_field_fails_validation "$bad"
+  # Verify that a run retains the preflight rows from its cluster bring-up and records the mesh in
+  # the manifest only when preflight observed the Istio injector, ensuring a flat bundle claims no
+  # mesh.
+  t_equals k8s_flat_run_manifest_claims_no_mesh "no no" "$(t_flag '"mesh"' \
+    "$(cat "$run/manifest.json")") $(t_flag "preflight$PX_TAB" "$(cat "$run/run-record.tsv")")"
+  t_k8s_seed "$T_K1_A5" "$PX_OUT"
+  line='the Istio sidecar injector namespace.sidecar-injector.istio.io serves context fake'
+  {
+    t_rows 3 storage_class ok 'the StorageClass local-path exists'
+    t_rows 3 mesh_injector ok "$line"
+  } >"$T_K1/deploy-selftest/preflight.tsv"
+  t_k1_a5 "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest "$T_WORK/drivers/exit-code.sh"
+  run="$(t_bundle)"
+  record="$T_STATUS $(t_manifest "$run" /kubernetes/mesh) $(t_flag "$(t_rows 4 preflight \
+    mesh_injector ok "$line")" "$(cat "$run/run-record.tsv" 2>/dev/null)")"
+  rm -f "$T_K1/deploy-selftest/preflight.tsv"
+  t_validate "$run"
+  t_equals k8s_meshed_run_manifest_names_the_injector \
+    "0 namespace.sidecar-injector.istio.io yes 0 ok" "$record $T_STATUS $(t_check_status \
+    "$T_STDOUT" kubernetes.api_version)"
+  t_validate "$T_K2_BUNDLE"
+  t_equals k8s_flat_bundle_validates_without_a_mesh 0 "$T_STATUS"
   t_a5_state_reset
   t_a5_run exit-code
   run="$(t_bundle)"
@@ -16224,6 +16265,17 @@ t_group_k2_k3d() {
   t_equals image_hint_follows_the_px_k3d_record "6 yes" "$T_STATUS $(t_flag \
     'promote a passing validation bundle with px-cluster push BUNDLE' "$(printf '%s\n' \
     "$T_STDOUT" | grep "^image$PX_TAB")")"
+  # Verify that on a px-k3d context, the image row identifies the nodes lacking the image rather
+  # than the host and leads with instructions to import a host image into px-k3d.
+  mkdir -p "$T_K8S_OUT/state/px-k3d"
+  printf 'scope\tk3d-px\n' >"$T_K8S_OUT/state/px-k3d/scope-k3d-px.tsv"
+  t_k8s PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-cluster" up \
+    "$T_K8S_OUT/deploy-k8s/selftest" -n
+  line="$(printf '%s\n' "$T_STDOUT" | grep "^image$PX_TAB")"
+  t_equals image_hint_on_px_k3d_names_the_nodes "6 yes no yes" "$T_STATUS $(t_flag \
+    'the nodes of context k3d-px hold no image' "$line") $(t_flag 'the host holds no' "$line")\
+ $(t_flag ' so no instance is created: run px-k3d import -e PX_K8S_CONTEXT=k3d-px ' "$line")"
+  rm -rf "$T_K8S_OUT/state/px-k3d"
   t_k2_reset
   t_k3d check
   t_equals px_k3d_check_runs_before_create "0 ok ok ok" "$T_STATUS $(t_k2_row "$T_STDOUT" \
@@ -16453,6 +16505,12 @@ t_group_k2_promotion() {
   t_equals push_pushes_exactly_the_bundle_digests \
     "0 push reg.example:5000/phx/phoenix-harness:selftest $T_K8S_IMAGE_ID" \
     "$T_STATUS $(cat "$state/registry.log" 2>/dev/null)"
+  # Verify that once the registry digest is verified, push removes the registry tag it created on
+  # the host.
+  t_equals push_untags_the_registry_tag_after_the_digest_check yes "$(awk '
+    /RepoDigests/ && !d { d = NR }
+    $0 == "rmi reg.example:5000/phx/phoenix-harness:selftest" { r = NR }
+    END { print (d && r > d) ? "yes" : "no" }' "$T_SHIM_LOG")"
   t_equals push_runs_no_login "no no" "$(t_flag login "$calls") $(t_flag login \
     "$(cat "$T_K1/calls.log")")"
   t_equals push_creates_no_secret "no yes" "$(t_flag 'create' "$calls")\
@@ -16537,11 +16595,35 @@ t_group_k2_promotion() {
   printf '%s|phoenix-harness:selftest\n' "$T_K8S_IMAGE_ID" >"$state/local-images.txt"
   : >"$state/registry-digest-differs"
   rm -rf "$dir"
+  t_shim_log_reset
   t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
     --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
   t_equals push_refuses_a_registry_digest_that_differs "1 yes no" "$T_STATUS $(t_flag \
     'no render' "$T_STDERR") $(t_exists "$dir")"
+  # Verify that a failed digest check retains the registry tag, which continues to report the
+  # digest of the registry.
+  t_equals push_keeps_the_tag_of_a_failed_digest_check "yes no" "$(t_flag \
+    'the tag stays for the diagnosis' "$T_STDERR") $(t_flag 'rmi ' "$(cat "$T_SHIM_LOG")")"
   rm -f "$state/registry-digest-differs"
+  # Verify that push retains a registry tag when no other name references the image, since an image
+  # is removed along with its last tag, as well as any registry tag that already named a local
+  # image before the push and therefore was not created by push.
+  printf '%s|\n' "$T_K8S_IMAGE_ID" >"$state/local-images.txt"
+  rm -rf "$dir" "$state/registry-tags.txt"
+  t_shim_log_reset
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  line="$T_STATUS $(t_flag 'rmi ' "$(cat "$T_SHIM_LOG")") $(t_flag 'it is the only name of' \
+    "$T_STDERR")"
+  printf '%s|%s\n' "$T_K8S_IMAGE_ID" phoenix-harness:selftest "$T_K8S_IMAGE_ID" \
+    reg.example:5000/phx/phoenix-harness:selftest >"$state/local-images.txt"
+  rm -rf "$dir" "$state/registry-tags.txt"
+  t_shim_log_reset
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_keeps_a_sole_name_and_a_tag_that_it_did_not_make "0 no yes 0 no yes" "$line\
+ $T_STATUS $(t_flag 'rmi ' "$(cat "$T_SHIM_LOG")") $(t_flag 'named an image before the push' \
+    "$T_STDERR")"
   # Verify that push promotes a run bundle produced on a local px-k3d cluster. Because the kubelet
   # records the configuration digest of an imported image whereas the containerd image store
   # identifies the local image by its manifest digest, the engine links the two through its
@@ -17394,10 +17476,16 @@ t_group_k5_fleet() {
   t_h3_pherf --cluster a2 start
   t_h3_agents agents pherf-agent-0:IDLE
   t_shim_log_reset
+  line="$(cat "$dir/preflight.tsv" 2>/dev/null)"
   t_h3_pherf --cluster a2 scale 1
   t_equals px_pherf_scale_on_compose_scales_the_agent_service "0 1 yes 1" "$T_STATUS $(grep -c \
     "${PX_TAB}pherf-agent$PX_TAB" "$dir/services.tsv") $(t_flag 'rm -f' "$(cat "$T_SHIM_LOG")")\
  $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$2 == "IDLE"' | grep -c .)"
+  # Verify that re-rendering during a scale operation preserves the preflight rows from cluster
+  # bring-up for subsequent runs.
+  t_equals scale_keeps_the_preflight_rows_of_the_bring_up "yes yes" "$(t_flag \
+    "engine_memory${PX_TAB}ok" "$line") $([ "$line" = "$(cat "$dir/preflight.tsv" \
+    2>/dev/null)" ] && echo yes || echo no)"
   t_h3 "$T_BASH" "$T_BIN/px-cluster" --cluster a2 down
   printf '25165824000\n' >"$T_A2_STATE/mem-total"
 }

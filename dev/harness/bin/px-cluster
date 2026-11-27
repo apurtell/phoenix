@@ -560,18 +560,26 @@ pc_render_guard() {
 }
 
 # Executes the host preflight check (verifying container engine health, port availability, and total
-# memory capacity) against a rendered deployment directory.
+# memory capacity) against a rendered deployment directory. When preflight succeeds, it persists its
+# check rows to preflight.tsv in the deployment directory so that px-run can record what the
+# bring-up observed, such as the service mesh. A failing preflight modifies no files, and an
+# unwritable deployment directory produces only a warning.
 ## @description  Runs the host preflight (engine, ports, memory sum) against a deployment directory.
 ## @return       Exits 0 when the host can hold it, or with the preflight status: 1 on no reply, 2
 ##               on usage, 3 if refused, 4 if expired, 5 on client refusal or no preflight script.
 pc_preflight() {
-  local script status=0
+  local script status=0 rows="$1/preflight.tsv.new"
   script="$(px_preflight_script)" ||
     px_die "$?" "no host preflight for the $PX_BACKEND backend, so no instance is created"
   # Export private configuration variables so the child process sees the container engine bound by
-  # this process.
-  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" \
-    --deployment "$1" >&2 || status=$?
+  # this process. Copying the check rows into the side file does not determine the exit status.
+  px_with_private px_timeout "${PX_TIMEOUT_DEFAULT:-300}" "$script" --deployment "$1" |
+    { tee "$rows" 2>/dev/null || rm -f "$rows" 2>/dev/null || true; } >&2 || status=$?
+  if [ "$status" != 0 ]; then
+    rm -f "$rows" 2>/dev/null || true
+  elif ! mv -f "$rows" "$1/preflight.tsv" 2>/dev/null; then
+    px_warn "cannot keep the preflight rows in $1/preflight.tsv"
+  fi
   case "$status" in
   0) return 0 ;;
   124 | 137) px_die "$PX_EXIT_TIMEOUT" "the preflight expired after ${PX_TIMEOUT_DEFAULT:-300}s" ;;
@@ -670,7 +678,9 @@ pc_check_image() {
 # of this bring-up so that the build resolves the same configuration. Building the Pherf image
 # requires PX_PHERF=1, which a bring-up from a pre-rendered directory might not specify on the
 # command line. A Kubernetes context is recognized as a local px-k3d cluster when a px-k3d scope
-# record exists for it, matching the detection used by both the build and the preflight checks.
+# record exists for it, matching the detection used by both the build and the preflight checks. In
+# that context, the image check inspects the cluster nodes, so the host may already hold an image
+# that the nodes lack.
 ## @description  Formats the remediation message for a missing image (tag, dir): the build command,
 ##               the px-k3d import guidance on a px-k3d context, or bundle promotion otherwise.
 ## @return       Writes a single diagnostic line to stdout and exits with 0.
@@ -693,12 +703,15 @@ pc_image_hint() {
   if [ "$tag" = "${PX_PHERF_IMAGE_TAG:-}" ] && ! px_is_true "${PX_PHERF:-0}"; then
     words="$words -e PX_PHERF=1"
   fi
-  printf 'the host holds no image %s, which %s names, so no instance is created: run %s%s' \
-    "$tag" "$dir" "px-cluster build" "$words"
   if [ "$PX_BACKEND" = k8s ]; then
-    printf ', which imports it into px-k3d, or px-k3d import when the host holds the image'
+    printf '%s %s, which %s names, so no instance is created: run %s %s, or %s%s, %s\n' \
+      "the nodes of context $context hold no image" "$tag" "$dir" \
+      "px-k3d import -e $(printf '%q' "PX_K8S_CONTEXT=$context") $tag" "when the host holds it" \
+      "px-cluster build" "$words" "which builds it and imports it into px-k3d"
+    return 0
   fi
-  printf '\n'
+  printf 'the host holds no image %s, which %s names, so no instance is created: run %s%s\n' \
+    "$tag" "$dir" "px-cluster build" "$words"
 }
 
 ## @description  Executes a single bring-up check (check...) and terminates with its diagnostic
@@ -1306,6 +1319,10 @@ pc_scale() {
     px_die "$status" "the memory check refused $role=$count, so nothing changed"
   fi
   changed="$(pc_count_changes "$backup/topology.env" "$dir/topology.env")"
+  # Preserve the preflight rows captured during cluster bring-up, since a scaling operation does not
+  # repeat the preflight.
+  [ ! -f "$backup/preflight.tsv" ] || cp "$backup/preflight.tsv" "$dir/preflight.tsv" ||
+    px_warn "cannot keep $dir/preflight.tsv"
   rm -rf "$backup"
   pc_planned "$scope" scale "$role" "" "count $count"
   rows="$(sb_scale "$scope" "$role" "$count" "$timeout")" || status=$?
