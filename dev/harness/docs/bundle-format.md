@@ -536,7 +536,7 @@ empty string, and an unknown numeric value is represented as `null`.
     { "path": "run-record.tsv", "status": "present", "required": true, "reason": "" }
   ],
   "kubernetes": {
-    "api_version": "v1.31.4+k3s1",
+    "api_version": "v1.37.2+k3s1",
     "placement": [ { "role": "regionserver", "index": 0, "pod": "regionserver-0",
       "node": "k3d-px-agent-0" } ],
     "registry_digests": [ { "image_ref": "phoenix-harness:local", "digest": "sha256:..." } ]

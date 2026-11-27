@@ -710,9 +710,34 @@ $out
 EOF
 }
 
+# Because the service mesh overlay applies the istio-injection=enabled label to the namespace,
+# sidecar injection occurs only when the default-revision Istio mutating webhook
+# namespace.sidecar-injector.istio.io is present on the cluster to act on that label.
+## @description  Verifies and reports the mesh_injector preflight check row for the target cluster.
+## @return       Writes one check TSV row to stdout; exits with 0 when the Istio sidecar injector is
+##               present, or 3 if it is absent or kubectl cannot list the mutating webhooks.
+px_k8s_preflight_mesh() {
+  local hooks
+  hooks="$(px_k8s_call 30 get mutatingwebhookconfigurations \
+    -o 'jsonpath={range .items[*]}{range .webhooks[*]}{.name}{"\n"}{end}{end}' 2>/dev/null)" || {
+    px_tsv_row mesh_injector fail "kubectl did not list the mutating webhook configurations of\
+ context $PXK_CONTEXT, so PX_K8S_MESH=1 has no proof of a mesh: grant the list, or drop\
+ PX_K8S_MESH=1"
+    return "$SB_EXIT_ANOMALY"
+  }
+  if ! printf '%s\n' "$hooks" | grep -qFx namespace.sidecar-injector.istio.io; then
+    px_tsv_row mesh_injector fail "context $PXK_CONTEXT has no Istio sidecar injector, so no\
+ pod joins the mesh of PX_K8S_MESH=1: install the mesh, or drop PX_K8S_MESH=1"
+    return "$SB_EXIT_ANOMALY"
+  fi
+  px_tsv_row mesh_injector ok "the Istio sidecar injector namespace.sidecar-injector.istio.io\
+ serves context $PXK_CONTEXT"
+}
+
 # Executes the target portion of preflight validation: the kubectl binary and its version, API
 # server reachability and version, caller permissions, target deployment state, the configured
-# StorageClass, the pull secret, the nodes selected by PX_K8S_NODE_SELECTOR, and namespace quotas.
+# StorageClass, the image pull secret, the Istio sidecar injector required by PX_K8S_MESH=1, the
+# nodes matching PX_K8S_NODE_SELECTOR, and namespace ResourceQuotas.
 ## @description  Runs target preflight checks against the cluster and namespace of a scope.
 ## @param        scope_id: the scope identifier whose target the checks inspect
 ## @return       Writes check TSV rows to stdout; exits with 0 when no check fails, 3 if any check
@@ -800,6 +825,7 @@ sb_preflight() {
       failed=1
     fi
   fi
+  [ "${PX_K8S_MESH:-0}" = 0 ] || px_k8s_preflight_mesh || failed=1
   [ -z "${PX_K8S_NODE_SELECTOR:-}" ] || select=(-l "$PX_K8S_NODE_SELECTOR")
   nodes='jsonpath={range .items[*]}{.status.allocatable.memory}|'
   nodes="$nodes"'{.status.allocatable.cpu}{"\n"}{end}'

@@ -1907,9 +1907,9 @@ fi
 case "$fk_verb" in
 version)
   printf '{\n  "clientVersion": {\n    "gitVersion": "%s"\n  },\n' \
-    "$(cat "$st/client-version" 2>/dev/null || printf 'v1.31.0')"
+    "$(cat "$st/client-version" 2>/dev/null || printf 'v1.37.0')"
   printf '  "serverVersion": {\n    "gitVersion": "%s"\n  }\n}\n' \
-    "$(cat "$st/server-version" 2>/dev/null || printf 'v1.31.4+k3s1')"
+    "$(cat "$st/server-version" 2>/dev/null || printf 'v1.37.2+k3s1')"
   ;;
 auth)
   if [ -e "$st/cannot-i" ]; then
@@ -2055,6 +2055,14 @@ get)
     ;;
   resourcequota)
     cat "$st/k8s-quotas.txt" 2>/dev/null || true
+    ;;
+  mutatingwebhookconfigurations)
+    # One webhook name a line, as the jsonpath of the backend asks.
+    if [ -e "$st/webhooks-forbidden" ]; then
+      printf 'Error from server (Forbidden): mutatingwebhookconfigurations is forbidden\n' >&2
+      exit 1
+    fi
+    cat "$st/k8s-webhooks.txt" 2>/dev/null || true
     ;;
   events)
     awk -F '|' -v p="${fk_field_sel#involvedObject.name=}" '$1 == p { print $2 "|" $3 }' \
@@ -14844,7 +14852,7 @@ $(grep -c '^data-datanode-' "$T_K8S_STATE/k8s-pvc.txt") $(grep -c '^datanode-' \
   # Verify target cluster version reporting and preflight checks for API server version and client
   # authentication.
   t_k8s_sb sb_version_info
-  t_equals k8s_version_info_names_the_target "0 v1.31.4+k3s1 fake" "$T_STATUS $(printf '%s\n' \
+  t_equals k8s_version_info_names_the_target "0 v1.37.2+k3s1 fake" "$T_STATUS $(printf '%s\n' \
     "$T_STDOUT" | awk -F '\t' '$1 == "api_server" || $1 == "context" { printf "%s ", $2 }' |
     sed 's/ $//')"
   printf 'v1.27.9\n' >"$T_K8S_STATE/server-version"
@@ -15308,7 +15316,7 @@ t_fixtures_k2() {
   T_K2="$T_WORK/k2"
   mkdir -p "$T_K2"
   : >"$T_WORK/forward.pids"
-  T_K3S_PIN="rancher/k3s:v1.31.4-k3s1@sha256:$(printf 'c%.0s' $(seq 1 64))"
+  T_K3S_PIN="rancher/k3s:v1.37.2-k3s1@sha256:$(printf 'c%.0s' $(seq 1 64))"
   cat >"$T_WORK/drivers/k8s-restart-wait.sh" <<'DRIVER_EOF'
 #!/usr/bin/env bash
 . "${0%/*}/stub-lib.sh" "$@"
@@ -15651,7 +15659,7 @@ t_group_k2_target() {
     "$PX_HOME/scripts/preflight-k8s.sh" --deployment "$dir" --phase fast
   calls="$(cat "$T_SHIM_LOG")"
   for key in "--context tgt-ctx --namespace tgt-tc" 'get storageclass fast-ssd' \
-    'get secret regcred' 'get nodes -l pool=phx'; do
+    'get secret regcred' 'get nodes -l pool=phx' 'get mutatingwebhookconfigurations'; do
     [[ $calls == *"$key"* ]] || bad="$bad call [$key];"
   done
   for key in 'namespace: tgt-tc' "image: \"reg.example/phx/phoenix-harness@$T_K8S_IMAGE_ID\"" \
@@ -15788,6 +15796,33 @@ $(t_k2_row "$T_STDOUT" deployment_absent) $(t_flag 'holds a harness deployment' 
   t_pfk PX_K8S_PULL_SECRET=other
   t_equals k8s_preflight_refuses_an_absent_pull_secret "3 fail yes" "$T_STATUS $(t_k2_row \
     "$T_STDOUT" pull_secret) $(t_flag 'prepare the namespace with the secret' "$T_STDOUT")"
+  # Verify that a deployment rendered with PX_K8S_MESH=1 requires the default-revision Istio
+  # sidecar injector (which acts on the istio-injection label) so that a result bundle never claims
+  # a service mesh that was absent during the run. The rendered namespace label—rather than
+  # PX_K8S_MESH in the preflight environment—determines whether this check executes.
+  t_shim_log_reset
+  t_pfk PX_K8S_MESH=1
+  t_equals k8s_flat_preflight_asks_no_webhook "0 no no" "$T_STATUS $(t_flag mesh_injector \
+    "$T_STDOUT") $(t_flag mutatingwebhookconfigurations "$(cat "$T_SHIM_LOG")")"
+  t_mgen --class validation --cluster selftest -e PX_K8S_MESH=1
+  t_pfk
+  t_equals k8s_preflight_refuses_a_mesh_without_an_injector "3 fail yes" "$T_STATUS $(t_k2_row \
+    "$T_STDOUT" mesh_injector) $(t_flag 'install the mesh, or drop PX_K8S_MESH=1' "$T_STDOUT")"
+  printf '%s.sidecar-injector.istio.io\n' rev.namespace rev.object object \
+    >"$T_K8S_STATE/k8s-webhooks.txt"
+  t_pfk
+  bad="$T_STATUS $(t_k2_row "$T_STDOUT" mesh_injector)"
+  printf 'namespace.sidecar-injector.istio.io\n' >>"$T_K8S_STATE/k8s-webhooks.txt"
+  t_pfk
+  t_equals k8s_preflight_admits_only_the_default_injector "3 fail 0 ok yes" "$bad $T_STATUS\
+ $(t_k2_row "$T_STDOUT" mesh_injector) $(t_flag 'injector namespace.sidecar-injector.istio.io' \
+    "$T_STDOUT")"
+  : >"$T_K8S_STATE/webhooks-forbidden"
+  t_pfk
+  t_equals k8s_preflight_refuses_a_mesh_it_cannot_list "3 fail yes" "$T_STATUS $(t_k2_row \
+    "$T_STDOUT" mesh_injector) $(t_flag 'grant the list, or drop PX_K8S_MESH=1' "$T_STDOUT")"
+  rm -f "$T_K8S_STATE/webhooks-forbidden" "$T_K8S_STATE/k8s-webhooks.txt"
+  t_mgen --class validation --cluster selftest
   t_k8s_sb sb_scope_create selftest
   t_shim_log_reset
   t_k8s_sb sb_scope_delete fake/px-selftest
@@ -15897,6 +15932,23 @@ $(t_k2_row "$T_STDOUT" k3d_cluster) $(t_flag 'px-k3d create' "$T_STDOUT") $(t_fl
     / version -o json$/ && !v { v = NR } / apply -f / && !a { a = NR }
     END { print (v && a > v) ? "yes" : "no" }' "$T_SHIM_LOG")"
   t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --cluster selftest down
+  # Verify that both up DIR and up -n DIR reject a deployment rendered with PX_K8S_MESH=1 on a
+  # target cluster lacking a sidecar injector even when -e PX_K8S_MESH=1 is not passed at bring-up,
+  # and that passing -e PX_K8S_MESH=1 when bringing up a flat deployment checks for no injector.
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
+    --cluster selftest --class validation -e PX_K8S_MESH=1 render --out deploy-k8s/meshed
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
+    --cluster selftest up -n "$T_K8S_OUT/deploy-k8s/meshed"
+  bad="$T_STATUS $(t_k2_row "$T_STDOUT" mesh_injector)"
+  t_shim_log_reset
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
+    --cluster selftest up "$T_K8S_OUT/deploy-k8s/meshed"
+  bad="$bad $T_STATUS $(t_flag ' apply ' "$(cat "$T_SHIM_LOG")") $(t_flag 'drop PX_K8S_MESH=1' \
+    "$T_STDERR")"
+  t_k8s "$T_BASH" "$T_BIN/px-cluster" --backend k8s --config "$PX_HOME/k8s/env/k3d.env" \
+    --cluster selftest up -n -e PX_K8S_MESH=1 "$T_K8S_OUT/deploy-k8s/selftest"
+  t_equals k8s_up_refuses_a_mesh_without_an_injector "3 fail 3 no yes 0 no" "$bad $T_STATUS\
+ $(t_flag mesh_injector "$T_STDOUT")"
 }
 
 ## @description  Verifies on-demand loopback port-forward tunnels for Kubernetes service endpoints
@@ -16024,7 +16076,7 @@ t_group_k2_evidence() {
     -e PX_SCOPE_ID=fake/px-selftest "$T_WORK/drivers/exit-code.sh"
   run="$(t_bundle)"
   t_equals k8s_run_manifest_carries_the_kubernetes_member \
-    "0 v1.31.4+k3s1 fake-node regionserver-0 phoenix-harness:selftest $T_K8S_IMAGE_ID" \
+    "0 v1.37.2+k3s1 fake-node regionserver-0 phoenix-harness:selftest $T_K8S_IMAGE_ID" \
     "$T_STATUS $(t_manifest "$run" /kubernetes/api_version) $(t_manifest "$run" \
     /kubernetes/placement/0/node) $(t_manifest "$run" /kubernetes/placement/1/pod) $(t_manifest \
     "$run" /kubernetes/registry_digests/0/image_ref) $(t_manifest "$run" \
@@ -16253,7 +16305,7 @@ t_group_k2_k3d() {
   # Verify that cluster creation rejects a k3s image reference that lacks an immutable SHA-256
   # digest pin before invoking k3d (RQ-291).
   t_shim_log_reset
-  t_k8s PX_K8S_CONTEXT=k3d-px PX_K3S_IMAGE=rancher/k3s:v1.31.4-k3s1 "$T_BASH" "$T_BIN/px-k3d" \
+  t_k8s PX_K8S_CONTEXT=k3d-px PX_K3S_IMAGE=rancher/k3s:v1.37.2-k3s1 "$T_BASH" "$T_BIN/px-k3d" \
     create
   t_equals px_k3d_create_refuses_a_pin_without_digest "2 yes no" "$T_STATUS $(t_flag @sha256 \
     "$T_STDERR") $(t_flag 'cluster create' "$(cat "$T_SHIM_LOG")")"

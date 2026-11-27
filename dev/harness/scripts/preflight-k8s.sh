@@ -70,13 +70,14 @@ about Checks that the target cluster of PX_K8S_CONTEXT can hold the rendered
 + deployment, by default $PX_OUT/deploy-k8s/<cluster>.
 about The fast phase checks the client and its version, the API server and its
 + version, the rights of the client, no other harness deployment, the
-+ StorageClass, the pull secret, and the rows of px-k3d check for a cluster of
-+ px-k3d; a k3d-* context that px-k3d did not create fails. The memory phase
-+ checks the requests of the deployment against the allocatable memory and CPU of
-+ the selected nodes, the largest pod against the largest node, the ResourceQuotas
-+ of the namespace, the engine memory of a local cluster less 4 GiB and the k3s
-+ allowance, and the free disk under PX_OUT. A dry run asks no backend and checks
-+ only the deployment files.
++ StorageClass, the pull secret, the Istio injector of a meshed deployment,
++ and the rows of px-k3d check for a cluster of px-k3d; a k3d-* context that
++ px-k3d did not create fails. The memory phase checks the requests of the
++ deployment against the allocatable memory and CPU of the selected nodes, the
++ largest pod against the largest node, the ResourceQuotas of the namespace, the
++ engine memory of a local cluster less 4 GiB and the k3s allowance, and the
++ free disk under PX_OUT. A dry run asks no backend and checks only the
++ deployment files.
 exits 1 also means that the API server did not answer or a figure could not be
 + measured, 2 an HBase release outside the range of the profile or a local
 + cluster without PX_K3S_ALLOWANCE_MIB, 3 a check refused the deployment, 5 the
@@ -326,8 +327,16 @@ px_config_load -- ${PX_CLI_FILES[@]+"${PX_CLI_FILES[@]}"}
 px_versions_check
 
 PF_DEPLOY="$(pf_deploy_dir deploy-k8s)" || exit $?
+# The rendered deployment manifests—rather than the active configuration of this preflight
+# process—determine whether the service mesh gate runs, because pods join the mesh solely when the
+# mesh overlay applies its injection label to the namespace.
 if [ -d "$PF_DEPLOY" ]; then
   px_config_load_ports "$PF_DEPLOY"
+  PX_K8S_MESH=0
+  if grep -qs '^    istio-injection: "enabled"$' "$PF_DEPLOY/manifests/00-namespace.yaml"; then
+    PX_K8S_MESH=1
+  fi
+  export PX_K8S_MESH
 fi
 
 if pf_phase_wanted fast; then

@@ -845,7 +845,8 @@ on a single named object—such as `exec POD`, `logs POD`, `cp`, `port-forward p
 `delete pod NAME`, or `delete namespace NAME`—are scoped by the target namespace. Only read-only
 queries inspecting target cluster properties omit a label selector: `version`, `auth can-i`,
 `get nodes`, `get storageclass NAME`, `get secret NAME` (retrieving only the secret name, never its
-data payload), `get resourcequota`, and `get events` for a single pod.
+data payload), `get resourcequota`, `get mutatingwebhookconfigurations` (retrieving only webhook
+names), and `get events` for a single pod.
 
 ### The deployment directory
 
@@ -1240,6 +1241,7 @@ returned by `sb_preflight`:
 | `deployment_absent` | Another harness namespace is on the target, or workloads are in its own. |
 | `storage_class` | `PX_K8S_STORAGE_CLASS` is unset, or the named StorageClass does not exist. |
 | `pull_secret` | `PX_K8S_PULL_SECRET` is set, and no such secret exists in the namespace. |
+| `mesh_injector` | The render includes the mesh overlay, and the target lacks its Istio injector. |
 | `engine_memory`, `engine_cpus`, `node_memory` | Never; reports the selected nodes' figures. |
 | `quota:<class>` | Never; reports the hard limit and usage of each ResourceQuota and resource. |
 
@@ -1381,6 +1383,14 @@ sets `PX_K8S_MESH=1` activates the overlay. The Distributed Pherf tier forms the
 group: when the overlay is active, the pod templates of both tier Deployments automatically receive
 `sidecar.istio.io/inject: "true"` without requiring any additional opt-in, regardless of
 `PX_K8S_MESH_CORE`.
+
+When a deployment is rendered with `PX_K8S_MESH=1`, the `mesh_injector` preflight row rejects with
+exit code 3 any target cluster lacking a mutating webhook named
+`namespace.sidecar-injector.istio.io` (the default-revision Istio sidecar injector that acts on the
+`istio-injection` label). This check ensures that a result bundle never claims a service mesh that
+was absent during the run; to proceed, the operator must either install the mesh or render without
+`PX_K8S_MESH=1`. The pinned tool and runtime versions are aligned accordingly: k3s v1.37.2
+(`PX_K3S_IMAGE`), k3d 5.9.0, and Istio 1.32.0, which requires Kubernetes 1.33 or later.
 
 ### The local cluster: px-k3d
 
