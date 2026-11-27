@@ -16449,7 +16449,7 @@ t_group_k2_promotion() {
   # verdicts and SKIP checks without a source, functional ones too. It refuses every other result.
   for word in ADVISORY SKIP INCONCLUSIVE ERROR; do
     rm -f "$state/registry.log"
-    copy="$(t_bundle_copy "$bundle" "k2-$word")"
+    copy="$(t_bundle_copy "$bundle" "k2-$word" "$T_K8S_OUT")"
     sed "s/\"result\": \"PASS\"/\"result\": \"$word\"/" "$copy/manifest.json" >"$copy/m.json" &&
       mv "$copy/m.json" "$copy/manifest.json"
     t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$copy" \
@@ -17548,7 +17548,7 @@ regionserver n1|regionserver n2|regionserver n3|tooling n2 3 2" "$T_STATUS $(t_k
   # Verify that promoting that run bundle pushes both images to the target registry and renders the
   # target manifests, including the tier, with each image pinned by its promoted digest (RQ-295,
   # RQ-306).
-  bundle="$(t_bundle_copy "$run" k7-pass)"
+  bundle="$(t_bundle_copy "$run" k7-pass "$T_K8S_OUT")"
   sed 's/"result": "[A-Z]*"/"result": "PASS"/' "$bundle/manifest.json" >"$bundle/m.json" &&
     mv "$bundle/m.json" "$bundle/manifest.json"
   printf '%s|phoenix-harness:selftest\n%s|%s\n' "$T_K8S_IMAGE_ID" "$d2" "$tier" \
