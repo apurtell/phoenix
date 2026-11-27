@@ -829,12 +829,16 @@ t_fixtures_shim() {
 # file replaces the inventory after one listing, so a case stages a change
 # during a wait in the same way.
 #
-# The fake is also the fake registry. local-images.txt (id|ref) lists the
-# local images that image inspect finds by id or by reference. tag records
+# The fake is also the fake registry. local-images.txt (id|ref|config) lists
+# the local images that image inspect finds by id or by reference; config is
+# the config digest of the descriptor annotation config.digest, as the
+# containerd image store reports it, and image ls with no reference lists
+# every id. tag records
 # the source of a reference in registry-tags.txt. push appends "push <ref>
 # <id>" to registry.log and records the digest of the registry in
 # repo-digests.txt: the image id, or another digest with the flag
-# registry-digest-differs. push-fails makes a push fail. login is refused,
+# registry-digest-differs. push-fails makes a push fail, and
+# descriptor-fails an image inspect of the descriptors. login is refused,
 # because the harness never logs in.
 if [ -n "${PX_FAKE_DOCKER_LOG:-}" ]; then
   printf '%s\n' "$*" >>"$PX_FAKE_DOCKER_LOG"
@@ -1157,8 +1161,20 @@ push)
   printf '%s|%s@%s\n' "${1:-}" "${1%:*}" "$fake_digest" >>"$fake_state/repo-digests.txt"
   ;;
 image)
-  if [ "${1:-}" = inspect ] && [ -f "$fake_state/local-images.txt" ]; then
+  if [ "${1:-}" = ls ] && [ "${!#}" = --no-trunc ] && [ -f "$fake_state/local-images.txt" ]; then
+    cut -d'|' -f1 "$fake_state/local-images.txt"
+  elif [ "${1:-}" = inspect ] && [ -f "$fake_state/local-images.txt" ]; then
     case "$*" in
+    *Descriptor*)
+      [ ! -e "$fake_state/descriptor-fails" ] || exit 1
+      shift 3
+      for fake_id in "$@"; do
+        awk -F '|' -v r="$fake_id" '$1 == r { a = ($3 == "") ? "" : \
+          "\"annotations\":{\"config.digest\":\"" $3 "\"},"
+          printf "%s {%s\"digest\":\"%s\"}\n", $1, a, $1; exit }' \
+          "$fake_state/local-images.txt"
+      done
+      ;;
     *RepoDigests*)
       awk -F '|' -v r="${!#}" '$1 == r { print $2 }' "$fake_state/repo-digests.txt" \
         2>/dev/null
@@ -1456,13 +1472,17 @@ SHIM_EOF
 # the nodes of the fake kubectl hold it, and to k3d-images.txt. k3d-version
 # holds the version that it reports; k3d-create-fails makes a create fail,
 # k3d-create-partial makes it fail after it registered the cluster, and
-# k3d-create-stops-list makes every list after a create fail.
+# k3d-create-stops-list makes every list after a create fail. k3d-env.txt
+# records the verb of each call and the helper images of its environment:
+# verb|K3D_IMAGE_LOADBALANCER|K3D_IMAGE_TOOLS.
 # Any other verb, a registry verb included, is recorded only.
 if [ -n "${PX_FAKE_DOCKER_LOG:-}" ]; then
   printf 'k3d %s\n' "$*" >>"$PX_FAKE_DOCKER_LOG"
 fi
 st=${PX_FAKE_STATE_DIR:-/nonexistent}
 clusters="$st/k3d-clusters.txt"
+[ ! -d "$st" ] || printf '%s %s|%s|%s\n' "${1:-}" "${2:-}" "${K3D_IMAGE_LOADBALANCER:-}" \
+  "${K3D_IMAGE_TOOLS:-}" >>"$st/k3d-env.txt"
 case "${1:-} ${2:-}" in
 'version '*)
   printf 'k3d version %s\nk3s version v1.31.4-k3s1 (default)\n' \
@@ -1523,8 +1543,10 @@ SHIM_EOF
 # line per pod in the field order of px_k8s_pod_format of the backend, then
 # two fields of the fake: the kind of the owner and a warm flag. A pod that
 # a kill restarted is unready in two listings and ready in the next. The
-# StatefulSets are in k8s-sts.txt (name|replicas|strategy|cksum|claims), the
-# claims in k8s-pvc.txt, the namespaces in k8s-namespaces.txt and every
+# StatefulSets are in k8s-sts.txt (name|replicas|strategy|cksum|claims, the
+# claim template names or no), the claims in k8s-pvc.txt, one
+# <claim>-<set>-<ordinal> per template and pod, the namespaces in
+# k8s-namespaces.txt and every
 # applied file in k8s-applied/. A flag file turns on one fault. k8s-next.txt
 # replaces the pods after k8s-next-after listings, for a change during a wait,
 # and then the flag file that k8s-next-flag names, if any, is created. When
@@ -1692,10 +1714,12 @@ fk_sts_pod() {
 }
 
 ## @description  Applies one StatefulSet record (name|replicas|strategy|cksum|claims|image|limit|
-##               drain). Ordinals come and go, and a changed template replaces pods unless OnDelete.
+##               drain), claims being the comma-separated claim template names or no. Ordinals come
+##               and go with a claim <claim>-<name>-<i> each, and a changed template replaces pods
+##               unless OnDelete.
 ## @return       Exit 0.
 fk_apply_sts() {
-  local name replicas strategy sum claims image limit drain old i n
+  local name replicas strategy sum claims image limit drain old i n claim
   IFS='|' read -r name replicas strategy sum claims image limit drain <<<"$1"
   old="$(awk -F '|' -v n="$name" '$1 == n { print $4 }' "$sts")"
   awk -F '|' -v n="$name" '$1 != n' "$sts" >"$sts.new.$$"
@@ -1709,9 +1733,10 @@ fk_apply_sts() {
       fk_drop "^$name-$i\$"
       fk_sts_pod "$name" "$i" "$drain" "$image" "$limit"
     fi
-    if [ "$claims" = yes ] && ! grep -qx "data-$name-$i" "$pvc"; then
-      printf 'data-%s-%s\n' "$name" "$i" >>"$pvc"
-    fi
+    for claim in ${claims//,/ }; do
+      [ "$claim" != no ] || continue
+      grep -qx "$claim-$name-$i" "$pvc" || printf '%s-%s-%s\n' "$claim" "$name" "$i" >>"$pvc"
+    done
     i=$((i + 1))
   done
   for n in $(awk -F '|' -v s="$name" '$1 ~ "^" s "-[0-9]+$" { print $1 }' "$pods"); do
@@ -1721,7 +1746,7 @@ fk_apply_sts() {
     else
       fk_drop "^$n\$"
     fi
-    grep -vx "data-$n" "$pvc" >"$pvc.new.$$" || true
+    grep -vE "^[a-z]+-$n\$" "$pvc" >"$pvc.new.$$" || true
     mv -f "$pvc.new.$$" "$pvc"
   done
 }
@@ -1761,6 +1786,7 @@ fk_docs() {
       if (kind != "") print kind "|" name "|" reps "|" strat "|" claims "|" image "|" lim "|" \
         drain "|" clu
       kind = name = reps = strat = image = lim = drain = clu = ""; claims = "no"; meta = 0; tpl = 0
+      vct = 0
       n++
     }
     BEGIN { n = 0; claims = "no" }
@@ -1771,8 +1797,8 @@ fk_docs() {
     /^  replicas: / { reps = $2 }
     /^    type: (OnDelete|RollingUpdate|Recreate)/ { strat = $2 }
     /^  template:/ { tpl = 1 }
-    /^  volumeClaimTemplates:/ { tpl = 0; vct = 1; next }
-    vct == 1 { if ($0 ~ /^    - /) claims = "yes"; vct = 0 }
+    /^  volumeClaimTemplates:/ { tpl = 0; vct = 1; claims = ""; next }
+    vct == 1 && /^        name: / { claims = claims (claims == "" ? "" : ",") $2 }
     tpl == 1 { print > (dir "/tpl." n) }
     /^ +image: / && image == "" { image = $2; gsub(/"/, "", image) }
     /^ +memory: / { lim = $2 }
@@ -8692,6 +8718,50 @@ AVG_MIN_TIME_MS,RUN_COUNT,EXPLAIN_PLAN,RESULT_ROW_COUNT"
   t_contains java_main_records_the_second_metric \
     "steady@main${PX_TAB}fixture.share${PX_TAB}share${PX_TAB}0.5${PX_TAB}ratio" "$aggregate"
   t_absent java_main_keeps_program_lines_out_of_the_metrics 'starting the fixture' "$aggregate"
+  # Verify that java-main --prepare provisions a dedicated user table for the target class using
+  # the same lifecycle semantics as the psql driver: the prepare verb executes each SQL file inside
+  # the setup@schema window and records the tables it creates, while the restore verb drops those
+  # tables so the cluster returns to its initial state.
+  run="$(t_a5_bundle)"
+  : >"$T_A5_STATE/java.log"
+  line=""
+  for csv in prepare run restore; do
+    t_a5_verb java-main "$csv" "$run" --prepare "$PX_HOME/suites/sql/smoke-schema.sql" \
+      org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb ITEMS -s PX_SMOKE
+    line="$line $csv:$T_STATUS"
+  done
+  t_equals java_main_prepare_runs_its_sql_in_setup_schema " prepare:0 run:0 restore:0 yes yes\
+ yes" "$line $(t_flag "${PX_TAB}begin${PX_TAB}setup@schema$PX_TAB" "$(cat "$run/stages.tsv" \
+    2>/dev/null)") $(t_flag 'org.apache.phoenix.util.PhoenixRuntime' "$(cat \
+    "$T_A5_STATE/java.log" 2>/dev/null)") $(t_flag '/sql/smoke-schema.sql' "$(cat \
+    "$T_A5_STATE/java.log" 2>/dev/null)")"
+  t_equals java_main_restore_drops_the_tables_of_its_prepare \
+    'DROP TABLE IF EXISTS "PX_SMOKE"."ITEMS" CASCADE;' \
+    "$(cat "$run/drivers/java-main/restore.sql" 2>/dev/null)"
+  t_contains java_main_runs_the_class_after_its_prepare \
+    'SchemaTool -m EXTRACT -tb ITEMS -s PX_SMOKE' "$(cat "$T_A5_STATE/java.log" 2>/dev/null)"
+  # Because the fake catalog reports every table without an explicit schema name, this test case
+  # inspects a table created in the default schema.
+  printf 'CREATE TABLE JM1 (ID INTEGER NOT NULL PRIMARY KEY) UPDATE_CACHE_FREQUENCY=60000;\n' \
+    >"$T_A5/sql/jm-schema.sql"
+  run="$(t_a5_bundle)"
+  t_a5_verb java-main prepare "$run" --prepare "$T_A5/sql/jm-schema.sql" org.example.Fixture
+  t_contains java_main_records_the_tables_of_its_prepare "$(t_rows 3 default JM1 60000)" \
+    "$(cat "$run/tables.tsv" 2>/dev/null)"
+  printf 'SELECT 1;\n' >"$T_A5/sql/prepare.txt"
+  t_a5_verb java-main validate "$run" --prepare "$T_A5/sql/prepare.txt" org.example.Fixture
+  t_equals java_main_refuses_a_prepare_file_that_is_not_sql "1 FAIL" "$T_STATUS $(t_severity_of \
+    "$run" java-main.prepare)"
+  run="$(t_a5_bundle)"
+  : >"$T_A5_STATE/java.log"
+  t_a5_verb java-main prepare "$run" org.example.Fixture
+  t_equals java_main_without_prepare_opens_no_setup_window "0 no no" "$T_STATUS $(t_flag \
+    setup@schema "$(cat "$run/stages.tsv" 2>/dev/null)") $(t_flag PhoenixRuntime "$(cat \
+    "$T_A5_STATE/java.log" 2>/dev/null)")"
+  t_a5_describe java-main "$PX_HOME/drivers/java-main/driver.sh"
+  t_equals java_main_describes_its_setup_anchor "setup@schema prepare steady@main run" \
+    "$(printf '%s\n' "$T_STDOUT" | sed -nE 's/^ *"(anchor|verb)": "(.*)",?$/\2/p' |
+      tr '\n' ' ' | sed 's/ $//')"
   # Confirm that remote staging for fake client 0 writes only inside the fake state directory and
   # never directly under /tmp/px on the host.
   t_equals drivers_stage_only_below_the_fake_client 0 \
@@ -9598,7 +9668,7 @@ t_core_sums() {
 ##               covering discovery, manifest refusal, all nine hooks in a full run, and dry runs.
 ## @return       Records test assertions. Exit 0.
 t_group_a5_plugins() {
-  local deploy session run copy core bad="" kind dir all
+  local deploy session run copy core bad="" kind dir all line
   printf '# A5: the plug-in contract and the suites\n'
   # Verify requirement R-076: plug-in discovery scans only the default directory when
   # PX_PLUGIN_DIRS is unset, and includes external directories when specified by PX_PLUGIN_DIRS.
@@ -9770,8 +9840,25 @@ t_group_a5_plugins() {
   t_equals smoke_suite_dry_run_resolves "0 2 psql java-main" "$T_STATUS $(printf '%s\n' \
     "$T_STDOUT" | grep -c .) $(printf '%s\n' "$T_STDOUT" | cut -f 5 | tr '\n' ' ' | sed 's/ $//')"
   t_run "$T_BASH" "$T_BIN/px-suite" --dry-run functional
-  t_equals functional_suite_dry_run_resolves "0 3 psql psql pherf" "$T_STATUS $(printf '%s\n' \
-    "$T_STDOUT" | grep -c .) $(printf '%s\n' "$T_STDOUT" | cut -f 5 | tr '\n' ' ' | sed 's/ $//')"
+  t_equals functional_suite_dry_run_resolves "0 4 psql java-main psql pherf" "$T_STATUS $(printf \
+    '%s\n' "$T_STDOUT" | grep -c .) $(printf '%s\n' "$T_STDOUT" | cut -f 5 | tr '\n' ' ' |
+    sed 's/ $//')"
+  # Verify that the functional suite exercises all three built-in drivers: its java-main test
+  # executes after the schema test and before the disruption test, and the java-main tests in both
+  # suites read a user table created by their own prepare step.
+  t_equals functional_suite_runs_the_java_main_driver "schema client:java-main recover pherf" \
+    "$(printf '%s\n' "$T_STDOUT" | awk -F '\t' '{ printf "%s%s%s", s, $2, \
+      ($5 == "java-main") ? ":java-main" : ""; s = " " }')"
+  # Collect the arguments configured for the client test in each suite by joining its args lines in
+  # declaration order.
+  line="$(for kind in smoke functional; do
+    awk '/^test: / { t = $2 } t == "client" && /^  args: / { sub(/^  args: /, ""); printf "%s%s",
+      s, $0; s = " " } END { print "" }' "$PX_HOME/suites/$kind.suite"
+  done)"
+  t_equals smoke_client_extracts_a_user_table "--prepare sql/smoke-schema.sql\
+ org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb ITEMS -s PX_SMOKE$PX_NL--prepare\
+ sql/functional-schema.sql org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb EVENTS -s\
+ PX_FUNCTIONAL" "$line"
   dir="$T_A5/suites"
   mkdir -p "$dir"
   printf 'suite: broken\nclass: validation\n\ntest: one\n  driver: %s\n' \
@@ -14204,7 +14291,9 @@ EOF
       /backoffLimit: / { b = $2 } /claimName: / { c = $2 }
       /px.harness.role: "setup"/ { s = "setup" }
       END { print k, n, r, b, c, s }' "$m/30-setup.yaml")"
-  t_equals k8s_client_and_tooling_are_pods "Pod Never Pod Never" "$(awk '/^kind: /{ printf "%s ",
+  t_equals k8s_client_and_tooling_are_pods \
+    "PersistentVolumeClaim Pod Never PersistentVolumeClaim Pod Never" "$(awk '/^kind: /{
+    printf "%s ",
     $2 } /^ *restartPolicy: / { printf "%s ", $2 }' "$m/40-client.yaml" "$m/41-tooling.yaml" |
     sed 's/ $//')"
   # Verify that every pod binds the unshifted base port so that multiple RegionServer ordinals use
@@ -14288,9 +14377,77 @@ EOF
   # StorageClass and that rendering fails when no StorageClass is configured (RQ-269).
   t_equals k8s_stateful_roles_claim_volumes "zookeeper namenode secondarynamenode datanode" \
     "$(for file in "$full"/manifests/2?-*.yaml; do
-      grep -q '^ *storageClassName: local-path$' "$file" && printf '%s ' \
+      grep -q '^        name: data$' "$file" && printf '%s ' \
         "$(sed -n 's/^  serviceName: //p' "$file")"
     done | sed 's/ $//')"
+  # Verify that every harness-image pod addressed by a run mounts a dedicated persistent volume
+  # claim at /tmp/px, which serves as the remote working directory for drivers and collectors, so
+  # that run files survive pod replacement during a recovery restart. Each StatefulSet provisions
+  # this volume through a second claim template named tmp, while the client and tooling Pods mount
+  # a standalone claim document rendered ahead of the Pod manifest; neither the setup Job nor the
+  # Pherf tier mounts a temporary claim.
+  docs="$(t_k8s_docs "$full"/manifests/*.yaml "$full"/groups/*/*.yaml |
+    grep -E '\|kind: (StatefulSet|Pod)\|')"
+  t_equals k8s_every_harness_pod_mounts_tmp_px "11 " "$(printf '%s\n' "$docs" | grep -c .) $(
+    printf '%s\n' "$docs" | grep -vE '\| *- name: tmp\| *mountPath: /tmp/px\| *readOnly: false\|' |
+      sed -n 's/.*|  name: \([a-z-]*\)|.*/\1/p' | tr '\n' ' ')"
+  t_equals k8s_statefulsets_claim_tmp_per_pod \
+    "datanode:data,tmp:tmp=local-path/10Gi/k1full/datanode\
+ hbase-master:tmp:tmp=local-path/10Gi/k1full/hbase-master\
+ jobhistory:tmp:tmp=local-path/10Gi/k1full/jobhistory\
+ namenode:data,tmp:tmp=local-path/10Gi/k1full/namenode\
+ nodemanager:tmp:tmp=local-path/10Gi/k1full/nodemanager\
+ regionserver:tmp:tmp=local-path/10Gi/k1full/regionserver\
+ resourcemanager:tmp:tmp=local-path/10Gi/k1full/resourcemanager\
+ secondarynamenode:data,tmp:tmp=local-path/10Gi/k1full/secondarynamenode\
+ zookeeper:data,tmp:tmp=local-path/10Gi/k1full/zookeeper" "$(for file in \
+    "$full"/manifests/2?-*.yaml "$full"/groups/yarn/*.yaml; do
+      awk '/^  serviceName: / { role = $2 } /^  volumeClaimTemplates:$/ { v = 1; next }
+        v && /^        name: / { c = $2; names = names (names == "" ? "" : ",") c }
+        v && c == "tmp" && /storageClassName: / { sc = $2 }
+        v && c == "tmp" && /storage: / { gib = $2 }
+        v && c == "tmp" && /px\.harness\.cluster: / { cl = $2; gsub(/"/, "", cl) }
+        v && c == "tmp" && /px\.harness\.role: / { r = $2; gsub(/"/, "", r) }
+        END { print role ":" names ":tmp=" sc "/" gib "/" cl "/" r }' "$file"
+    done | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+  got=""
+  for role in client tooling; do
+    got="$got $(awk 'BEGIN { d = 0 } /^---$/ { d++ } /^kind: / { k[d] = $2 }
+      /^  name: / && !n[d]++ { nm[d] = $2 } /storageClassName: / { sc[d] = $2 }
+      /storage: / { g[d] = $2 } /px\.harness\.role: / { r[d] = $2; gsub(/"/, "", r[d]) }
+      /px\.harness\.cluster: / { c[d] = $2; gsub(/"/, "", c[d]) }
+      /^    - name: tmp$/ { t[d] = 1; next } t[d] && /claimName: / { cn[d] = $2; t[d] = 0 }
+      END { print k[0] ":" nm[0] ":" sc[0] "/" g[0] "/" c[0] "/" r[0] "," k[1] ":" nm[1] ":" \
+        cn[1] }' "$(t_k8s_role_file "$dir" "$role")")"
+  done
+  t_equals k8s_pods_claim_tmp_by_name \
+    " PersistentVolumeClaim:tmp-client-0:local-path/10Gi/k1/client\
+,Pod:client-0:tmp-client-0 PersistentVolumeClaim:tmp-tooling-0:local-path/10Gi/k1/tooling\
+,Pod:tooling-0:tmp-tooling-0" "$got"
+  t_mgen --class validation --cluster k1tier -e PX_PHERF=1
+  t_equals k8s_setup_and_tier_mount_no_tmp_claim "0 no no" "$T_STATUS $(t_flag 'tmp' \
+    "$(grep -hE 'claimName|/tmp/px|^        name: ' "$m/30-setup.yaml" \
+      "$T_K8S_OUT/deploy-k8s/k1tier/groups/pherf/"*.yaml)") $(t_flag 'tmp-pherf' \
+    "$(cat "$T_K8S_OUT/deploy-k8s/k1tier/groups/pherf/"*.yaml)")"
+  t_equals k8s_requests_count_the_tmp_claims \
+    "Deployment:pherf-agent:0 Deployment:pherf-controller:1 Job:setup-0:0 Pod:client-0:1\
+ Pod:tooling-0:1 StatefulSet:datanode:2 StatefulSet:hbase-master:1 StatefulSet:jobhistory:1\
+ StatefulSet:namenode:2 StatefulSet:nodemanager:1 StatefulSet:regionserver:1\
+ StatefulSet:resourcemanager:1 StatefulSet:secondarynamenode:2 StatefulSet:zookeeper:2" "$({
+      awk -F '\t' '!/^#/ && NF { print $1 ":" $2 ":" $6 }' "$full/requests.tsv"
+      awk -F '\t' '$2 ~ /^pherf-/ { print $1 ":" $2 ":" $6 }' \
+        "$T_K8S_OUT/deploy-k8s/k1tier/requests.tsv"
+    } | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+  t_equals k8s_tmp_mount_is_the_remote_root "/tmp/px /tmp/px /tmp/px" "$(sed -n \
+    's/^PXK_TMP_MOUNT=//p' "$PX_HOME/k8s/manifests.gen.sh") $(sed -n 's/^DV_REMOTE_ROOT=//p' \
+    "$PX_HOME/drivers/lib/driver.sh") $(sed -n 's|^  CK_REMOTE="\(/tmp/px\)/.*|\1|p' \
+    "$PX_HOME/lib/collect.sh")"
+  t_equals k8s_data_claim_renders_unchanged "$(printf '%s\n' '  volumeClaimTemplates:' \
+    '    - metadata:' '        name: data' '        labels:' \
+    '          px.harness.cluster: "k1"' '          px.harness.role: "zookeeper"' '      spec:' \
+    '        accessModes:' '          - ReadWriteOnce' '        storageClassName: local-path' \
+    '        resources:' '          requests:' '            storage: 10Gi')" "$(sed -n \
+    '/^  volumeClaimTemplates:$/,/^            storage: /p' "$m/20-zookeeper.yaml")"
   t_equals k3d_env_resolves_local_path PX_K8S_STORAGE_CLASS=local-path \
     "$(grep '^PX_K8S_STORAGE_CLASS=' "$PX_HOME/k8s/env/k3d.env")"
   printf 'PX_K8S_CONTEXT=fake\n' >"$T_K1/nosc-target.env"
@@ -14327,7 +14484,10 @@ EOF
   done <<EOF
 $docs
 EOF
-  t_equals k8s_every_container_runs_unprivileged "9 " "$(printf '%s\n' "$docs" | grep -c .) $bad"
+  # The client and tooling Pods appear as separate documents following their claim documents,
+  # whereas the Job in 30-setup.yaml is merged with the preceding StatefulSet document because
+  # t_k8s_docs splits solely on --- delimiters.
+  t_equals k8s_every_container_runs_unprivileged "11 " "$(printf '%s\n' "$docs" | grep -c .) $bad"
   t_equals k8s_run_as_user_is_not_root yes "$([ "$(id -u)" != 0 ] && echo yes || echo no)"
   # Verify that every Service port declaration specifies both an appProtocol and a matching port
   # name prefix (RQ-276).
@@ -14361,6 +14521,7 @@ EOF
   t_empty k8s_every_pod_template_mounts_the_configuration "$(printf '%s\n' "$docs" |
     grep -vF '|              mountPath: /opt/px/conf|' |
     grep -vF '|            mountPath: /opt/px/conf|' |
+    grep -vF '|          mountPath: /opt/px/conf|' |
     cut -c1-80; printf '%s\n' "$docs" | grep -vF 'name: px-env' | cut -c1-80)"
   # Verify that injecting a sentinel comment into a configuration template in a harness copy
   # propagates identically into both the Kubernetes and Compose renders.
@@ -14886,7 +15047,7 @@ t_group_k1_faults() {
 ##               and that psql fixture output matches Compose (RQ-260, RQ-279).
 ## @return       Records test assertions. Exit 0.
 t_group_k1_runs() {
-  local run psql dir subject all="" want got
+  local run psql dir subject all="" want got="" now file
   printf '# K1: drivers and checks on the Kubernetes backend\n'
   t_empty no_runtime_token_in_drivers_suites_plugins "$(grep -rnE "$T_RUNTIME_RE" \
     "$PX_HOME/drivers" "$PX_HOME/suites" "$PX_HOME/plugins" 2>/dev/null)"
@@ -14902,6 +15063,10 @@ t_group_k1_runs() {
   t_equals k8s_psql_run_passes_every_verb "0 describe:0 validate:0 prepare:0 run:0 restore:0\
  report:0 k8s 0" "$T_STATUS $(t_verb_codes "$psql") $(t_manifest "$psql" /run/backend)\
  $(t_validate "$psql" >/dev/null; printf '%s' "$T_STATUS")"
+  # Verify that cluster checks executed during a Kubernetes backend run enforce the Kubernetes
+  # recovery bound.
+  t_equals k8s_run_bundle_holds_the_kubernetes_recovery_bound "recovery.seconds.max=220" \
+    "$(grep '^recovery\.seconds\.max=' "$psql/thresholds.properties" 2>/dev/null)"
   t_k8s_seed "$T_K1_A5" "$PX_OUT"
   t_k1_a5 "PX_PHOENIX_HOME=$T_A5/phoenix" "PX_HBASE_HOME=$T_A5/hbase" "$T_BASH" \
     "$T_BIN/px-run" --backend k8s --class validation \
@@ -14936,6 +15101,56 @@ t_group_k1_runs() {
   t_k1_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID=fake/px-selftest PX_RUN_CLASS=validation \
     "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
   t_equals k8s_check_cluster_suite_runs_unchanged 0 "$T_STATUS"
+  # Verify that the Kubernetes backend defines its own recovery bound as a single threshold
+  # configuration setting in k8s/env/k8s.env, combining the 120 s Compose gate with the additional
+  # time that pod CPU limits introduce during a drain-aware restart. A drain-aware restart measured
+  # at 168.6 s on k3d in K3 passes under the Kubernetes bound while failing the Compose gate, and
+  # an explicit operator override still takes precedence over the backend default.
+  now="$(px_epoch_ms)"
+  for subject in k8s compose; do
+    dir="$(t_check_bundle "bound-$subject" "$(t_rows 5 recover 1 "$((now - 170000))" \
+      "$((now - 1400))" ok)")"
+    t_k1_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID= PX_RUN_CLASS=validation "PX_BACKEND=$subject" \
+      "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+    got="$got $subject:$T_STATUS:$(t_severity_of "$dir" cluster.recovery):$(sed -n \
+      's/^recovery\.seconds\.max=//p' "$dir/thresholds.properties" 2>/dev/null)"
+  done
+  t_equals k8s_recovery_bound_passes_a_drain_aware_restart " k8s:0:PASS:220 compose:0:FAIL:120" \
+    "$got"
+  t_equals k8s_recovery_bound_is_in_force "# config:PX_THRESHOLD_RECOVERY_SECONDS_MAX" \
+    "$(awk '/^recovery\.seconds\.max=/ { print p } { p = $0 }' \
+      "$PX_OUT/checks/bound-k8s/thresholds.properties" 2>/dev/null)"
+  t_equals compose_recovery_bound_stays_120 "recovery.seconds.max=120 no" "$(grep \
+    '^recovery\.seconds\.max=' "$dir/thresholds.properties" 2>/dev/null) $(t_flag \
+    RECOVERY_SECONDS "$(cat "$dir/thresholds.properties" 2>/dev/null)")"
+  dir="$(t_check_bundle bound-operator)"
+  t_k1_a5 "PX_RUN_DIR=$dir" PX_SCOPE_ID= PX_RUN_CLASS=validation PX_BACKEND=k8s \
+    PX_THRESHOLD_RECOVERY_SECONDS_MAX=300 "$T_BASH" "$PX_HOME/suites/check-cluster.sh"
+  t_equals operator_recovery_bound_wins_on_k8s "0 recovery.seconds.max=300" "$T_STATUS $(grep \
+    '^recovery\.seconds\.max=' "$dir/thresholds.properties" 2>/dev/null)"
+  # Verify that the recovery bound matches the documented sizing formula: across every shipped
+  # sizing profile, each container receives ceil(MiB x PX_K8S_CPU_MILLI_PER_GIB / 1024) millicores,
+  # and a CPU-bound phase requiring W core-seconds takes W x 1000 / c seconds under a limit of
+  # c < 1000 millicores. A drain-aware restart launches two region mover JVMs in tooling 0 at
+  # 6.25 core-seconds each (45 to 50 s at 125m in K3) and one RegionServer JVM requiring 16.7 s to
+  # reach readiness on Compose (K4). The resulting bound equals the base gate plus the worst-case
+  # throttling penalty rounded up to a 10 s multiple, ensuring that any change to the CPU ratio or
+  # pod memory sizing fails this test until k8s/env/k8s.env is updated accordingly.
+  got="$(for file in class-validation.env class-measurement.env override-24gib.env; do
+    printf '%s ' "$file"
+    sed -nE 's/^PX_(TOOLING|RS)_MEM_MIB=/\1 /p' "$PX_HOME/docker/env/$file" | tr '\n' ' '
+    printf '\n'
+  done | awk -v base="$(sed -n 's/^recovery\.seconds\.max=//p' \
+    "$PX_HOME/suites/thresholds.properties")" -v ratio="$(sed -n \
+    's/^PX_K8S_CPU_MILLI_PER_GIB=//p' "$PX_HOME/k8s/env/k8s.env")" '
+    function milli(mib) { return int((mib * ratio + 1023) / 1024) }
+    function slow(work, c) { return (c < 1000) ? work * (1000 / c - 1) : 0 }
+    { for (i = 2; i < NF; i += 2) mem[$i] = $(i + 1)
+      p = 2 * slow(6.25, milli(mem["TOOLING"])) + slow(16.7, milli(mem["RS"]))
+      if (p > worst) worst = p }
+    END { b = base + worst; print (b % 10) ? (int(b / 10) + 1) * 10 : b }')"
+  t_equals k8s_recovery_bound_follows_the_cpu_ratio "$got" "$(sed -n \
+    's/^PX_THRESHOLD_RECOVERY_SECONDS_MAX=//p' "$PX_HOME/k8s/env/k8s.env")"
   # Verify backend parity by confirming that executing the psql fixture against the fake Kubernetes
   # backend produces statement and verdict records identical to the fake Compose backend (RQ-279).
   t_a5_state_reset
@@ -15296,8 +15511,8 @@ EOF
       k == "StatefulSet" && /^  replicas: / { r = $2 }
       k != "" && /^ *requests:$/ { q = 1; next } q && /cpu:/ { c = $2; sub(/m$/, "", c) }
       q && /memory:/ { m = $2; sub(/Mi$/, "", m); q = 0 }
-      k == "StatefulSet" && /storage: / { g = $2; sub(/Gi$/, "", g) }
-      END { if (k != "") print k, n, (r == "" ? 1 : r), c, m, (g == "" ? 0 : 1), g + 0 }' \
+      /^ +storage: / { g = $2; sub(/Gi$/, "", g); s++ }
+      END { if (k != "") print k, n, (r == "" ? 1 : r), c, m, s + 0, g + 0 }' \
       "$file"
   done | LC_ALL=C sort)"
   want="$(grep -v '^#' "$dir/requests.tsv" | tr '\t' ' ' | LC_ALL=C sort)"
@@ -15897,7 +16112,7 @@ t_group_k2_evidence() {
 ##               and one cluster per host (RQ-284, RQ-291, RQ-292, RQ-298, RQ-303, RQ-304, R-258).
 ## @return       Records test assertions. Exit 0.
 t_group_k2_k3d() {
-  local line calls bad="" word pin
+  local line calls bad="" word pin lb tools
   printf '# K2: the local cluster manager\n'
   t_k2_reset
   # The diagnostic remedy for a missing image is determined by whether the context has a px-k3d
@@ -15932,6 +16147,18 @@ t_group_k2_k3d() {
     'servicelb' "$line") $(t_flag '-p 127.0.0.1:8081:80@loadbalancer' "$line") $(t_flag \
     '--api-port 127.0.0.1:6550' "$line")$bad"
   t_contains px_k3d_keeps_the_current_context '--kubeconfig-switch-context=false' "$line"
+  # Verify that the k3d load balancer and tools node helper images are pinned by digest in
+  # docker/versions.env alongside the k3s image, and that every k3d invocation receives both pins
+  # so that k3d pulls each image by digest while retaining the version tag as documentation.
+  lb="$(sed -n 's/^PX_K3D_LOADBALANCER_IMAGE=//p' "$PX_HOME/docker/versions.env")"
+  tools="$(sed -n 's/^PX_K3D_TOOLS_IMAGE=//p' "$PX_HOME/docker/versions.env")"
+  t_equals versions_env_pins_the_k3d_helpers_by_digest "yes yes" "$(printf '%s\n' "$lb" |
+    grep -qE '^ghcr\.io/k3d-io/k3d-proxy:[0-9.]+@sha256:[0-9a-f]{64}$' && echo yes || echo no)\
+ $(printf '%s\n' "$tools" | grep -qE '^ghcr\.io/k3d-io/k3d-tools:[0-9.]+@sha256:[0-9a-f]{64}$' &&
+    echo yes || echo no)"
+  t_equals k3d_create_runs_with_the_pinned_helper_images "cluster create|$lb|$tools yes" \
+    "$(grep '^cluster create|' "$T_K8S_STATE/k3d-env.txt" 2>/dev/null | tail -n 1) $([ -n \
+    "$lb" ] && [ -n "$tools" ] && echo yes || echo no)"
   t_equals px_k3d_records_its_cluster "scope created_at k3d-px" "$(cut -f1 \
     "$T_K8S_OUT/state/px-k3d/scope-k3d-px.tsv" 2>/dev/null | tr '\n' ' ')$(sed -n \
     's/^scope\t//p' "$T_K8S_OUT/state/px-k3d/scope-k3d-px.tsv" 2>/dev/null)"
@@ -15949,6 +16176,9 @@ t_group_k2_k3d() {
   t_equals px_k3d_import_imports_each_harness_image "0 2 yes yes" "$T_STATUS $(grep -c \
     '^k3d image import -c px ' "$T_SHIM_LOG") $(t_flag 'k3d image import -c px img-a:1' \
     "$(cat "$T_SHIM_LOG")") $(t_flag 'k3d image import -c px img-b:2' "$(cat "$T_SHIM_LOG")")"
+  t_equals k3d_import_runs_with_the_pinned_tools_image "image import|$lb|$tools yes" \
+    "$(grep '^image import|' "$T_K8S_STATE/k3d-env.txt" 2>/dev/null | tail -n 1) $([ -n \
+    "$tools" ] && echo yes || echo no)"
   t_k3d import reg.example/img:1
   t_equals px_k3d_import_refuses_a_remote_reference 2 "$T_STATUS"
   t_k3d -e PX_PHERF=1 import -n
@@ -15965,6 +16195,25 @@ t_group_k2_k3d() {
   t_equals px_k3d_check_reports_k3d_and_the_engine "0 ok ok ok" "$T_STATUS $(t_k2_row \
     "$T_STDOUT" k3d_binary) $(t_k2_row "$T_STDOUT" k3d_version) $(t_k2_row "$T_STDOUT" \
     engine_memory)"
+  # Verify that the preflight check evaluates the helper image pins, reporting ok when their tag
+  # matches the installed k3d version or emitting a non-fatal warning with the remediation steps
+  # when the tag differs.
+  printf 'v5.9.0\n' >"$T_K8S_STATE/k3d-version"
+  t_k3d check
+  t_equals k3d_check_reports_the_helper_pins "0 ok yes" "$T_STATUS $(t_k2_row "$T_STDOUT" \
+    k3d_helpers) $(t_flag 'the tag 5.9.0' "$(printf '%s\n' "$T_STDOUT" | grep "^k3d_helpers")")"
+  printf 'v5.10.0\n' >"$T_K8S_STATE/k3d-version"
+  t_k3d check
+  t_equals k3d_check_warns_on_a_helper_tag_other_than_k3d "0 warn yes" "$T_STATUS $(t_k2_row \
+    "$T_STDOUT" k3d_helpers) $(t_flag 'PX_K3D_LOADBALANCER_IMAGE and PX_K3D_TOOLS_IMAGE' \
+    "$(printf '%s\n' "$T_STDOUT" | grep "^k3d_helpers")")"
+  rm -f "$T_K8S_STATE/k3d-version"
+  # Verify that the diagnostic check reports a helper image pin lacking a digest as a failed row
+  # while continuing to evaluate and report the container engine memory.
+  t_k3d -e "PX_K3D_TOOLS_IMAGE=${tools%@*}" check
+  t_equals k3d_check_fails_a_helper_pin_without_a_digest "3 fail yes ok" "$T_STATUS $(t_k2_row \
+    "$T_STDOUT" k3d_helpers) $(t_flag "PX_K3D_TOOLS_IMAGE='${tools%@*}' names no digest" \
+    "$(printf '%s\n' "$T_STDOUT" | grep "^k3d_helpers")") $(t_k2_row "$T_STDOUT" engine_memory)"
   # Verify that cluster deletion refuses to proceed while an active harness deployment is recorded
   # on the context, and that it deletes only a cluster recorded by px-k3d.
   mkdir -p "$T_K8S_OUT/state/k8s"
@@ -15992,7 +16241,13 @@ t_group_k2_k3d() {
   t_equals px_k3d_measurement_is_one_flat_node "0 yes yes yes no" "$T_STATUS $(t_flag \
     '--servers 1 --agents 0 ' "$line") $(t_flag '--k3s-arg --disable=traefik@server:*' \
     "$line") $(t_flag '--k3s-arg --disable=servicelb@server:*' "$line") $(t_flag ' -p ' "$line")"
-  t_k3d delete
+  # Because cluster deletion does not start any helper containers, a helper image pin lacking a
+  # digest must never block teardown of a cluster owned by px-k3d.
+  t_shim_log_reset
+  t_k3d -e "PX_K3D_LOADBALANCER_IMAGE=${lb%@*}" delete
+  t_equals k3d_delete_ignores_a_helper_pin_without_a_digest "0 yes no" "$T_STATUS $(t_flag \
+    'k3d cluster delete px' "$(cat "$T_SHIM_LOG")") $(t_exists \
+    "$T_K8S_OUT/state/px-k3d/scope-k3d-px.tsv")"
   t_k3d create --class validation --agents 10
   t_equals px_k3d_agents_out_of_range_refused 2 "$T_STATUS"
   # Verify that cluster creation rejects a k3s image reference that lacks an immutable SHA-256
@@ -16002,6 +16257,13 @@ t_group_k2_k3d() {
     create
   t_equals px_k3d_create_refuses_a_pin_without_digest "2 yes no" "$T_STATUS $(t_flag @sha256 \
     "$T_STDERR") $(t_flag 'cluster create' "$(cat "$T_SHIM_LOG")")"
+  t_shim_log_reset
+  t_k3d -e "PX_K3D_TOOLS_IMAGE=${tools%@*}" create
+  line="$T_STATUS $(t_flag 'PX_K3D_TOOLS_IMAGE' "$T_STDERR") $(t_flag 'k3d ' "$(cat \
+    "$T_SHIM_LOG")")"
+  t_k3d -e "PX_K3D_LOADBALANCER_IMAGE=${lb%@*}" import
+  t_equals k3d_helper_pin_without_a_digest_is_refused "2 yes no 2 yes no" "$line $T_STATUS\
+ $(t_flag 'PX_K3D_LOADBALANCER_IMAGE' "$T_STDERR") $(t_flag 'k3d ' "$(cat "$T_SHIM_LOG")")"
   # Verify that the default image pin shipped in docker/versions.env satisfies the digest
   # validation rule and is passed through to k3d unaltered (RQ-291, RQ-298).
   t_shim_log_reset
@@ -16160,6 +16422,62 @@ t_group_k2_promotion() {
   t_equals push_refuses_a_registry_digest_that_differs "1 yes no" "$T_STATUS $(t_flag \
     'no render' "$T_STDERR") $(t_exists "$dir")"
   rm -f "$state/registry-digest-differs"
+  # Verify that push promotes a run bundle produced on a local px-k3d cluster. Because the kubelet
+  # records the configuration digest of an imported image whereas the containerd image store
+  # identifies the local image by its manifest digest, the engine links the two through its
+  # config.digest descriptor annotation. The push command resolves the configuration digest to the
+  # single matching local image, pushes that image to the target registry, and renders the
+  # deployment manifests using the registry digest.
+  word="sha256:$(printf 'd%.0s' $(seq 1 64))"
+  printf '%s|phoenix-harness:selftest|%s\n' "$word" "$T_K8S_IMAGE_ID" >"$state/local-images.txt"
+  rm -rf "$dir" "$state/registry.log"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_maps_a_config_digest_to_its_local_image \
+    "0 push reg.example:5000/phx/phoenix-harness:selftest $word 1 yes yes" "$T_STATUS $(cat \
+    "$state/registry.log" 2>/dev/null) $(cat "$dir"/manifests/*.yaml 2>/dev/null |
+    sed -n 's/^ *image: "\(.*\)"$/\1/p' | LC_ALL=C sort -u |
+    grep -c "^reg.example:5000/phx/phoenix-harness@$word$") $(t_flag \
+    "PX_K8S_IMAGE_DIGESTS='phoenix-harness:selftest=$word'" "$(cat "$dir/render.env" \
+    2>/dev/null)") $(t_flag "pushed reg.example:5000/phx/phoenix-harness:selftest as $word (the\
+ config digest $T_K8S_IMAGE_ID of the bundle)" "$T_STDERR")"
+  # Verify that a dry-run push does not query the container engine, emitting a plan that references
+  # the bundle digest directly and explicitly notes that behavior.
+  rm -rf "$dir" "$state/registry.log"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" --dry-run push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_dry_run_marks_the_bundle_digests "0 yes yes no" "$T_STATUS $(t_flag \
+    "plan${PX_TAB}push${PX_TAB}reg.example:5000/phx/phoenix-harness:selftest $T_K8S_IMAGE_ID" \
+    "$T_STDOUT") $(t_flag 'the plan names the digests of the bundle' "$T_STDERR") $(t_exists \
+    "$state/registry.log")"
+  printf '%s|phoenix-harness:%s|%s\n' "$word" selftest "$T_K8S_IMAGE_ID" \
+    "sha256:$(printf 'b%.0s' $(seq 1 64))" other "$T_K8S_IMAGE_ID" >"$state/local-images.txt"
+  rm -rf "$dir" "$state/registry.log"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_refuses_a_config_digest_of_two_local_images "1 yes no" "$T_STATUS $(t_flag \
+    "images sha256:$(printf 'b%.0s' $(seq 1 64)) $word have the config digest $T_K8S_IMAGE_ID" \
+    "$T_STDERR") $(t_exists "$state/registry.log")"
+  printf '%s|phoenix-harness:selftest|sha256:%s\n' "$word" "$(printf 'a%.0s' $(seq 1 64))" \
+    >"$state/local-images.txt"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_refuses_a_config_digest_that_no_local_image_has "6 no" "$T_STATUS $(t_exists \
+    "$state/registry.log")"
+  : >"$state/descriptor-fails"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_fails_when_the_engine_inspects_no_descriptor "1 yes no" "$T_STATUS $(t_flag \
+    'the engine did not inspect its images' "$T_STDERR") $(t_exists "$state/registry.log")"
+  rm -f "$state/descriptor-fails"
+  printf '%s|phoenix-harness:selftest|%s\n' "$word" "$T_K8S_IMAGE_ID" >"$state/local-images.txt"
+  : >"$state/registry-digest-differs"
+  t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$bundle" \
+    --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+  t_equals push_checks_the_registry_digest_of_a_mapped_image "1 yes yes no" "$T_STATUS $(t_flag \
+    'no render' "$T_STDERR") $(t_flag "the local image is $word" "$T_STDERR") $(t_exists "$dir")"
+  rm -f "$state/registry-digest-differs"
+  printf '%s|phoenix-harness:selftest\n' "$T_K8S_IMAGE_ID" >"$state/local-images.txt"
   t_k8s "$T_BASH" "$T_BIN/px-cluster" push "$bundle" --class validation
   t_equals push_needs_a_target_registry 2 "$T_STATUS"
   target="$(t_k2_target hub PX_K8S_STORAGE_CLASS=fast PX_K8S_REGISTRY=apurtell)"
@@ -16234,6 +16552,49 @@ t_group_k2_runs() {
   t_equals k8s_measurement_on_dedicated_nodes_is_authoritative "dedicated 0 1 FAIL" \
     "$(t_manifest "$run" /quiet_host/state) $(t_manifest "$run" /quiet_host/tags) $T_STATUS\
  $(t_result)"
+  # Verify that a run against a local px-k3d cluster executes the same local quiet-host check as a
+  # Compose run, enforcing identical wait, refusal, and evidence semantics because the cluster
+  # nodes run as containers on the local container engine. Because those shared nodes always
+  # contaminate the run, any failed timing verdicts remain ADVISORY, whereas a context without a
+  # px-k3d state record retains the remote dedicated-node check regardless of its context name.
+  t_k2_seed_on k3d-px "$T_K1_A5" "$PX_OUT"
+  mkdir -p "$PX_OUT/state/px-k3d"
+  printf 'scope\tk3d-px\n' >"$PX_OUT/state/px-k3d/scope-k3d-px.tsv"
+  : >"$T_HOST_DIR/uptime.log"
+  t_k1_a5 PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-run" --backend k8s --class measurement \
+    -e PX_QUIET_HOST_WAIT_S=0 -e PX_SCOPE_ID=k3d-px/px-selftest "$T_WORK/drivers/exit-code.sh"
+  run="$(t_bundle)"
+  record="$(cat "$run/run-record.tsv" 2>/dev/null)"
+  t_equals k3d_measurement_runs_the_host_quiet_check "0 quiet yes 1 dedicated-node" \
+    "$T_STATUS $(t_manifest "$run" /quiet_host/state) $(t_flag "quiet${PX_TAB}sample" \
+    "$record") $(grep -c . "$T_HOST_DIR/uptime.log") $(t_manifest "$run" /quiet_host/tags/0)"
+  line='the nodes of the local px-k3d cluster share this host'
+  t_contains k3d_shared_nodes_contaminate_the_run "$(t_rows 3 contamination dedicated-node \
+    "$line, so a failed time verdict is ADVISORY")" "$record"
+  printf '99.00\n' >"$T_HOST_DIR/load"
+  t_k2_seed_on k3d-px "$T_K1_A5" "$PX_OUT"
+  t_k1_a5 PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-run" --backend k8s --class measurement \
+    -e PX_QUIET_HOST_WAIT_S=0 -e PX_SCOPE_ID=k3d-px/px-selftest "$T_WORK/drivers/exit-code.sh"
+  record="$(cat "$(t_bundle)/run-record.tsv" 2>/dev/null)"
+  t_equals k3d_busy_host_refuses_a_measurement_run "4 refused no" "$T_STATUS $(t_manifest \
+    "$(t_bundle)" /quiet_host/state) $(t_flag "verb${PX_TAB}prepare" "$record")"
+  printf '0.00\n' >"$T_HOST_DIR/load"
+  t_k2_seed_on k3d-px "$T_K1_A5" "$PX_OUT"
+  t_k1_a5 PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=k3d-px/px-selftest "$T_WORK/drivers/exit-code.sh"
+  run="$(t_bundle)"
+  t_equals k3d_validation_run_is_contaminated_by_its_shared_nodes \
+    "0 off quiet-host dedicated-node" "$T_STATUS $(t_manifest "$run" /quiet_host/state)\
+ $(t_manifest "$run" /quiet_host/tags/0) $(t_manifest "$run" /quiet_host/tags/1)"
+  rm -f "$PX_OUT/state/px-k3d/scope-k3d-px.tsv"
+  t_k2_seed_on k3d-px "$T_K1_A5" "$PX_OUT"
+  : >"$T_HOST_DIR/uptime.log"
+  t_k1_a5 PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-run" --backend k8s --class measurement \
+    -e PX_QUIET_HOST_WAIT_S=0 -e PX_SCOPE_ID=k3d-px/px-selftest "$T_WORK/drivers/exit-code.sh"
+  t_equals remote_k8s_keeps_the_dedicated_node_check "2 refused 0" "$T_STATUS $(t_manifest \
+    "$(t_bundle)" /quiet_host/state) $(grep -c . "$T_HOST_DIR/uptime.log")"
+  t_empty k3d_env_sets_no_quiet_host_requirement "$(grep 'PX_REQUIRE_QUIET_HOST' \
+    "$PX_HOME/k8s/env/k3d.env")"
   # Individual runs leave the deployment namespace in place. Invoking px-cluster down removes only
   # the namespace that it provisioned across all run classes (D1). Specifying down --label
   # k3d.cluster=px additionally deletes the local k3d cluster after removing the namespace, whereas
@@ -16245,7 +16606,8 @@ t_group_k2_runs() {
   printf 'px|--servers 1\n' >"$T_K1_A5/k3d-clusters.txt"
   t_shim_log_reset
   t_k1_a5 PX_K8S_CONTEXT=k3d-px "$T_BASH" "$T_BIN/px-run" --backend k8s --class measurement \
-    -e PX_REQUIRE_QUIET_HOST=0 -e PX_SCOPE_ID=k3d-px/px-selftest "$T_WORK/drivers/exit-code.sh"
+    -e PX_REQUIRE_QUIET_HOST=0 -e PX_QUIET_HOST_WAIT_S=0 -e PX_SCOPE_ID=k3d-px/px-selftest \
+    "$T_WORK/drivers/exit-code.sh"
   calls="$(cat "$T_SHIM_LOG")"
   t_equals k8s_run_leaves_the_namespace "0 no no" "$T_STATUS $(t_flag \
     'delete namespace px-selftest' "$calls") $(t_flag 'k3d ' "$calls")"

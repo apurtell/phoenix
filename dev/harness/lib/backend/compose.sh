@@ -2250,14 +2250,56 @@ LIST
   px_tsv_row "$ref" "$digest"
 }
 
-# Push a local image, identified by its image ID, to a target registry reference and report the
-# manifest digest assigned by the registry. This operation neither builds an image nor logs into the
-# registry, relying instead on the operator's credential store to authenticate the push.
-## @description  Push a local image by ID to a registry reference and report its registry digest.
-## @param        image_id: local image ID formatted as sha256:<64 hex>
+# Under the containerd image store, a local image is identified by its manifest digest while its
+# descriptor carries the configuration digest in the config.digest annotation, which is the value a
+# kubelet records as the image ID of an imported image. The classic Docker image store does not
+# populate this descriptor annotation.
+## @description  Resolve the single local image whose descriptor carries config.digest (digest).
+## @return       Write the local image ID to stdout and exit 0, exit 1 when the engine does not
+##               respond or two local images share the config digest, or exit 6 when none has it.
+px_compose_config_image() {
+  local config=$1 listed found=""
+  listed="$(px_compose_engine 60 image ls --quiet --no-trunc)" || {
+    px_error "the engine did not list its images"
+    return "$SB_EXIT_FAIL"
+  }
+  listed="$(printf '%s\n' "$listed" | grep -E '^sha256:[0-9a-f]{64}$' | LC_ALL=C sort -u)"
+  if [ -n "$listed" ]; then
+    # shellcheck disable=SC2086 # each listed word is sha256:<64 hex>, so the split is exact
+    found="$(px_compose_engine 60 image inspect --format '{{.Id}} {{json .Descriptor}}' \
+      $listed 2>/dev/null)" || {
+      px_error "the engine did not inspect its images"
+      return "$SB_EXIT_FAIL"
+    }
+    found="$(printf '%s\n' "$found" | awk -v c="\"config.digest\":\"$config\"" \
+      'index($0, c) { print $1 }' | LC_ALL=C sort -u)"
+  fi
+  case "$found" in
+  '')
+    px_error "no local image has the id or the config digest $config"
+    return "$SB_EXIT_NO_OBJECT"
+    ;;
+  *"$PX_NL"*)
+    px_error "local images $(printf '%s\n' "$found" | tr '\n' ' ')have the config digest $config"
+    return "$SB_EXIT_FAIL"
+    ;;
+  esac
+  printf '%s\n' "$found"
+}
+
+# Push a local image—identified either by its local image ID or by the config digest of a single
+# local image—to a target registry reference and report the manifest digest assigned by the
+# registry. The registry must store the pushed image under a digest matching its local image ID;
+# push failures, engine communication errors, a registry digest that differs from the local ID, or
+# two local images sharing the config digest fail with exit code 1, whereas an image matching
+# neither a local ID nor a config digest returns exit code 6. This operation neither builds an
+# image nor logs into the registry, relying instead on the operator's credential store to
+# authenticate the push.
+## @description  Push a local image by ID or config digest and report its registry manifest digest.
+## @param        image: local image ID or config digest of a local image (sha256:<64 hex>)
 ## @param        target_ref: target <registry>/<repository>:<tag> reference without a digest
-## @return       Write one image TSV row (target_ref and registry digest) and exit 0, 1 on no engine
-##               answer, push failure, or missing digest, 2 on usage, or 6 if no local image has ID.
+## @return       Write one image TSV row (target_ref and registry digest) and exit 0; exit 1 on
+##               engine, push, digest-mismatch, or duplicate-config failure; 2 on usage; 6 if none.
 sb_image_push() {
   local id=${1:-} target=${2:-} found timeout status=0 line digest=""
   if ! [[ $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -2274,11 +2316,10 @@ sb_image_push() {
   fi
   found="$(px_compose_engine 60 image inspect --format '{{.Id}}' "$id" 2>/dev/null)" || found=""
   if [ "$found" != "$id" ]; then
-    px_error "no local image has the id $id"
-    return "$SB_EXIT_NO_OBJECT"
+    found="$(px_compose_config_image "$id")" || return $?
   fi
-  if ! px_compose_engine 60 tag "$id" "$target" >&2; then
-    px_error "the engine could not tag $id as $target"
+  if ! px_compose_engine 60 tag "$found" "$target" >&2; then
+    px_error "the engine could not tag $found as $target"
     return "$SB_EXIT_FAIL"
   fi
   timeout="$(sb_seconds PX_TIMEOUT_PROVISION 900)"
@@ -2300,6 +2341,10 @@ $(px_compose_engine 60 image inspect --format '{{range .RepoDigests}}{{println .
 EOF_DIGESTS
   if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
     px_error "the registry gave no digest for $target"
+    return "$SB_EXIT_FAIL"
+  fi
+  if [ "$digest" != "$found" ]; then
+    px_error "the registry stores $target as $digest, and the local image is $found"
     return "$SB_EXIT_FAIL"
   fi
   px_tsv_row "$target" "$digest"

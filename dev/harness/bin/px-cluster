@@ -271,13 +271,16 @@ about BUNDLE is a path or a run id under $PX_OUT/runs of a run of the class
 + the target file, which sets PX_K8S_REGISTRY. The render takes the class as up
 + does, and it needs one; it reads no cluster record. push builds nothing, never
 + logs in and creates no secret.
+about A digest of the bundle is a local image ID, or the config digest of a local
++ image, as a run on px-k3d records it.
 output the rendered deployment directory, $PX_OUT/deploy-k8s/push-<run id>.
 + Each pushed image is an INFO line on stderr: its registry reference and its
 + digest.
 exits 1 also means that the bundle is refused, failed or not of the validation
-+ class, that a push failed, that the registry gave another digest or that the
-+ render failed, 2 no registry or a refused one in the target, or a bundle
-+ outside PX_OUT, 6 no bundle, or no local image has a digest of the bundle.
++ class, that a push failed, that the registry gave another digest, that two
++ local images have the config digest of the bundle or that the render failed,
++ 2 no registry or a refused one in the target, or a bundle outside PX_OUT, 6 no
++ bundle, or no local image has a digest of the bundle.
 example px-cluster push BUNDLE --class validation -e PX_K8S_TARGET=FILE
 EOF
 
@@ -1702,16 +1705,18 @@ EOF
 }
 
 # A remote deployment runs the exact images proven by a validation run: only a bundle from a
-# passing validation run can be promoted, the target registry must store each image under the
-# digest recorded in the bundle, and the rendered deployment references the images by those
-# digests. Promotion pushes through the local container engine via sb_image_push using the
-# operator's existing registry credentials; it builds nothing, never logs in, and creates no
-# secret.
+# passing validation run can be promoted, each digest in the bundle identifies a single local image
+# (either by its local ID or by the config digest recorded during a px-k3d run), the target
+# registry must store that image under its local ID, and the rendered deployment references the
+# images by those registry digests. Image promotion pushes through the local container engine via
+# sb_image_push using the operator's existing registry credentials; it builds nothing, never logs
+# in, and creates no secret.
 ## @description  Promotes the images from a passing validation bundle (dir) and renders the target.
 ## @return       Writes the deployment directory; exits 0, 1 on a refused bundle, push, or render,
 ##               2 on a missing or refused registry, or 6 on a missing bundle or local image.
 pc_push() {
   local bundle=$1 rows result class id images pairs="" ref digest target row dir file status=0
+  local pushed note
   local -a args=()
   sb_load compose
   px_run_class_require
@@ -1747,23 +1752,27 @@ pc_push() {
   while read -r ref digest; do
     [ -n "$ref" ] || continue
     target="$PX_K8S_REGISTRY/$ref"
-    pairs="${pairs:+$pairs,}$ref=$digest"
-    px_plan push "$target" "$digest" && continue
-    status=0
-    row="$(sb_image_push "$digest" "$target")" || status=$?
-    case "$status" in
-    0) ;;
-    "$PX_EXIT_NO_OBJECT") px_die "$status" "no local image has the digest $digest of $ref" ;;
-    *) px_die "$PX_EXIT_FAIL" "the push of $ref to $target failed" ;;
-    esac
-    if [ "$(px_tsv_field 2 "$row")" != "$digest" ]; then
-      px_die "$PX_EXIT_FAIL" "the registry stores $target as $(px_tsv_field 2 "$row")," \
-        "and the bundle proved $digest: no render"
+    pushed=$digest
+    if ! px_plan push "$target" "$digest"; then
+      status=0 note=""
+      row="$(sb_image_push "$digest" "$target")" || status=$?
+      case "$status" in
+      0) ;;
+      "$PX_EXIT_NO_OBJECT") px_die "$status" "no local image has the digest $digest of $ref" ;;
+      *) px_die "$PX_EXIT_FAIL" "the push of $ref to $target failed: no render" ;;
+      esac
+      pushed="$(px_tsv_field 2 "$row")"
+      [ "$pushed" = "$digest" ] || note=" (the config digest $digest of the bundle)"
+      px_info "pushed $target as $pushed$note"
     fi
-    px_info "pushed $target as $digest"
+    pairs="${pairs:+$pairs,}$ref=$pushed"
   done <<EOF
 $images
 EOF
+  # Because a dry run does not query the container engine, its execution plan cannot resolve a
+  # config digest to a local image.
+  ! px_is_dry_run || px_info "the plan names the digests of the bundle: push maps a config" \
+    "digest of a run on px-k3d to its local image and renders the digest of the registry"
   # Rendering the target deployment neither reads a cluster record nor replaces any cluster's
   # deployment directory.
   args=(--no-record --class "$PX_RUN_CLASS" --out "deploy-k8s/push-$id")

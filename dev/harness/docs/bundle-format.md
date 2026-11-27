@@ -805,7 +805,8 @@ of an enabled plug-in may print `key=value` lines that override existing keys or
 leaving all other keys unchanged. The run configuration can also override individual keys through
 variables of the form `PX_THRESHOLD_<KEY>`—the threshold key converted to uppercase with each dot
 replaced by an underscore, such as `PX_THRESHOLD_LOG_WARNINGS_MAX=5`. The merge order starts with
-the base properties file, layers on values from a run-class file or configuration file, applies
+the base properties file, layers on settings from a run-class file, a configuration file, or the
+backend defaults file (`k8s/env/k8s.env` defines the Kubernetes recovery bound), and then applies
 plug-in threshold lines in the order of `PX_PLUGINS`, and finishes with explicit operator values
 from the environment or `px-run -e`, where a later assignment for the same key wins. In this way, a
 plug-in overrides the run class—matching the precedence of the configuration loader—and the operator
@@ -825,7 +826,7 @@ key is absent, which the calling check records as `ERROR`.
 | `log.errors.max` | 0 | `ERROR` and `FATAL` lines in the daemon instance logs |
 | `log.warnings.max` | 100 | `WARN` lines in the daemon instance logs |
 | `gc.pause_ms.max` | 1000 | longest garbage-collection pause of any JVM instance, in milliseconds |
-| `recovery.seconds.max` | 120 | recovery time (mttr) of each injected disruption, in seconds |
+| `recovery.seconds.max` | 120 | mttr of each injected disruption in seconds (220 on Kubernetes) |
 | `post_recovery.faults.max` | 0 | readiness or probe faults remaining after the final recovery |
 | `steady.p99_ms.max` | 1000 | highest `query_latency.p99_ms` of any steady window, in ms |
 | `steady.attainment_pct.min` | 90 | lowest `achieved_qps` of a window, as a % of `offered_rate` |
@@ -924,7 +925,8 @@ contaminated host.
 By contrast, `cluster.recovery` carries the class `none` and is never demoted. Its two-minute upper
 bound acts as a structural liveness gate for the A4, A7, and K3 proofs across both run classes and
 on any host, providing a wide margin above the measured 40 to 70 seconds rather than acting as a
-timing measurement.
+timing measurement. On Kubernetes, the higher 220 s bound accounts for the additional time that pod
+CPU limits add to a drain-aware restart, as derived in k8s/env/k8s.env.
 
 **Plug-in checks.** Custom plug-in check scripts are defined in `docs/PLUGINS.md`, section "Check
 scripts". A check script emits verdict rows with `sx_verdict_row` and may record aggregate metrics

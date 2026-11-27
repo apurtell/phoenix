@@ -25,12 +25,17 @@
 #
 # Test workload definitions follow the argument syntax:
 #
-#   [--cp FILE]... CLASS [ARGUMENT...]
+#   [--cp FILE]... [--prepare FILE]... CLASS [ARGUMENT...]
 #
 # Each file or directory supplied via --cp (such as the JAR containing the target class) is staged
 # into the remote working directory during the prepare phase and prepended to the Java classpath
-# ahead of the Phoenix client JARs during the run phase. The first positional argument specifies the
-# main class name, and all subsequent arguments are forwarded to the class unchanged.
+# ahead of the Phoenix client JARs during the run phase. Each --prepare argument designates a SQL
+# script that follows the semantics of psql --prepare: the prepare phase executes the script via
+# PhoenixRuntime within the setup@schema anchor and records the created tables, while the restore
+# phase drops those tables. This lifecycle allows the target class to query its own dedicated tables
+# without interference from prior tests, whose tables are removed during their respective restore
+# phases. The first positional argument names the target main class, and all remaining arguments are
+# passed through to that class unmodified.
 #
 # The executed class emits metrics by writing formatted lines to standard output:
 #
@@ -50,14 +55,16 @@ px_trap_enable
 JM_NAME=java-main
 JM_CLASS_RE='^[A-Za-z_$][A-Za-z0-9_$]*([.][A-Za-z_$][A-Za-z0-9_$]*)*$'
 JM_CP=()
+JM_PREPARE=()
 JM_CLASS=""
 JM_ARGS=()
 
-## @description  Parses the workload arguments into the JM_CP, JM_CLASS, and JM_ARGS variables.
+## @description  Parses workload arguments to populate JM_CP, JM_PREPARE, JM_CLASS, and JM_ARGS.
 ## @return       Returns exit code 0 on success, or exits with code 2 on an unknown option, a
 ##               missing option value, or a missing main class name.
 jm_args() {
   JM_CP=()
+  JM_PREPARE=()
   JM_CLASS=""
   JM_ARGS=()
   while [ $# -gt 0 ]; do
@@ -67,7 +74,15 @@ jm_args() {
       JM_CP+=("$(dv_path "$2")")
       shift 2
       ;;
-    -*) px_die "$PX_EXIT_USAGE" "unknown option '$1', expected [--cp FILE]... CLASS [ARG...]" ;;
+    --prepare)
+      [ $# -ge 2 ] || px_die "$PX_EXIT_USAGE" "--prepare needs a SQL file"
+      JM_PREPARE+=("$(dv_path "$2")")
+      shift 2
+      ;;
+    -*)
+      px_die "$PX_EXIT_USAGE" "unknown option '$1', expected [--cp FILE]... [--prepare FILE]..." \
+        "CLASS [ARG...]"
+      ;;
     *)
       JM_CLASS=$1
       shift
@@ -84,7 +99,8 @@ jm_args() {
 verb_describe() {
   dv_describe "$JM_NAME" \
     "Runs one Java main class with px.jdbc.url and records the metrics it prints." \
-    "steady@main|run" \
+    "setup@schema|prepare
+steady@main|run" \
     "query_errors" \
     "" \
     "" \
@@ -96,8 +112,9 @@ achieved_qps|only the class knows what it measures" \
     "drivers/$JM_NAME/output.txt"
 }
 
-## @description  Validates the workload definition (argument...), verifying that the class name is
-##               a valid Java binary name and that each --cp path exists.
+# Verifies that the target class name is a valid Java binary class name, every --cp path is
+# readable, and every --prepare path refers to a readable regular file ending in .sql.
+## @description  Validates the workload definition arguments (argument...).
 ## @return       Returns exit code 0 when valid, 1 when invalid, or exits with 2 on bad arguments.
 verb_validate() {
   local entry failed=0
@@ -112,6 +129,14 @@ verb_validate() {
       sx_verdict java-main.classpath FAIL "$entry: no readable file or directory"
     fi
   done
+  # PhoenixRuntime selects its SQL script reader based on the filename suffix.
+  for entry in ${JM_PREPARE[@]+"${JM_PREPARE[@]}"}; do
+    case "$entry" in
+    *.sql) [ -f "$entry" ] && [ -r "$entry" ] && continue ;;
+    esac
+    failed=$((failed + 1))
+    sx_verdict java-main.prepare FAIL "$entry: no readable SQL file whose name ends in .sql"
+  done
   if [ "$failed" != 0 ]; then
     sx_verdict driver.workload_valid FAIL "$failed parts of the definition are refused"
     return "$PX_EXIT_FAIL"
@@ -119,19 +144,43 @@ verb_validate() {
   sx_verdict driver.workload_valid PASS "class $JM_CLASS, ${#JM_CP[@]} class path entries"
 }
 
-## @description  Stages each --cp path into the remote working directory under cp/<n>-<name>.
-## @return       Returns exit code 0 on success, the copy driver exit code (1, 2, or 3) on failure,
-##               or exits with code 2 on invalid arguments.
+# When neither --cp nor --prepare is specified, the prepare phase performs no cluster operations:
+# it creates no remote working directory, opens no setup@schema stage window, and runs no catalog
+# query. Otherwise, it uploads each --cp entry, executes each --prepare SQL script within the
+# setup@schema window, and records the catalog metadata for all tables created by those scripts.
+## @description  Stages --cp paths, runs --prepare scripts in setup@schema, and records tables.
+## @return       Returns exit code 0 on success, the driver code (1, 2, or 3) of a failed copy or
+##               SQL script execution, or exits with code 2 on invalid arguments.
 verb_prepare() {
-  local entry index=0
+  local entry index=0 url status=0
   jm_args "$@"
-  [ "${#JM_CP[@]}" -gt 0 ] || return 0
+  [ "${#JM_CP[@]}" -gt 0 ] || [ "${#JM_PREPARE[@]}" -gt 0 ] || return 0
   dv_cluster
   dv_remote >/dev/null || return $?
-  for entry in "${JM_CP[@]}"; do
+  for entry in ${JM_CP[@]+"${JM_CP[@]}"}; do
     index=$((index + 1))
     dv_put "$entry" "cp/$index-${entry##*/}" || return $?
   done
+  [ "${#JM_PREPARE[@]}" -gt 0 ] || return 0
+  dv_tables_parse "${JM_PREPARE[@]}" >"$PX_DRIVER_DIR/tables.list" || return "$PX_EXIT_FAIL"
+  url="$(dv_jdbc_url || exit "$?")" || return $?
+  mkdir -p "$PX_DRIVER_DIR/out" || return "$PX_EXIT_FAIL"
+  index=0
+  pb_stage begin setup@schema || return
+  for entry in "${JM_PREPARE[@]}"; do
+    index=$((index + 1))
+    # Bound workload execution by PX_TIMEOUT_RUN, the timeout shared across the prepare and run
+    # verbs; px-run terminates the active verb first when that shared deadline expires.
+    dv_sql "${PX_TIMEOUT_RUN:-3600}" "$url" "$entry" "$PX_DRIVER_DIR/out/prepare-$index.out" ||
+      status=$?
+    if [ "$status" != 0 ]; then
+      sx_verdict java-main.prepare FAIL "$entry: PhoenixRuntime failed with driver code $status"
+      break
+    fi
+  done
+  pb_stage end setup@schema || return
+  [ "$status" = 0 ] || return "$status"
+  dv_tables_record "$PX_DRIVER_DIR/tables.list" "${PX_TIMEOUT_DEFAULT:-300}" "$url"
 }
 
 # Executes the target main class within the steady@main stage, passing the cluster JDBC URL via the
@@ -168,13 +217,15 @@ verb_run() {
   return "$status"
 }
 
-## @description  Removes the remote working directory; repeated invocations succeed idempotently.
-## @return       Returns exit code 0 on success, the remote execution driver code (1 or 3) on
-##               failure, or exits with code 2 on invalid arguments.
+# Cleans up the state provisioned during prepare by dropping all tables created by the --prepare
+# SQL scripts and removing the remote working directory; repeated calls are idempotent.
+## @description  Idempotently drops --prepare tables and removes the remote working directory.
+## @return       Returns exit code 0 on success, the driver code (1, 2, or 3) of a failed table
+##               drop or directory removal, or exits with code 2 on invalid arguments.
 verb_restore() {
   jm_args "$@"
   dv_cluster
-  dv_remote_remove
+  dv_tables_restore
 }
 
 # Parses px-metric lines from output.txt into aggregate metric records for the steady@main window,

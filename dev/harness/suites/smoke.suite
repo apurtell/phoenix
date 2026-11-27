@@ -17,9 +17,11 @@
 # through two drivers. The psql test creates a table and a covered index and loads it in prepare,
 # then runs fixed point, range, and write statements in run so that its row counts are
 # deterministic. The java-main test runs a single Phoenix client class on client 0, verifying the
-# class path, client configuration, and JVM options of the client role. Because SchemaTool opens
-# its own connection and does not read px.jdbc.url, its request metrics stay off. Every test leaves
-# the cluster as it found it, with the psql test dropping its table during restore.
+# class path, client configuration, and JVM options of the client role by invoking SchemaTool to
+# extract the DDL of a user table created from the same schema file during the test's prepare
+# phase. Because SchemaTool establishes its own connection rather than reading px.jdbc.url, its
+# request metrics remain disabled. Every test leaves the cluster as it found it, with each test
+# dropping its tables during the restore phase.
 
 suite: smoke
 description: The smoke check of a build, through the psql and java-main drivers
@@ -32,7 +34,8 @@ test: sql
   args: --prepare sql/smoke-schema.sql sql/smoke-query.sql
 
 test: client
-  name: Read the catalog with a Phoenix client class
+  name: Extract the DDL of a user table with a Phoenix client class
   needs: sql
   driver: java-main
-  args: org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb CATALOG -s SYSTEM
+  args: --prepare sql/smoke-schema.sql
+  args: org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb ITEMS -s PX_SMOKE

@@ -21,7 +21,8 @@
 #
 # Five design rules govern this script:
 #   1. k3d is invoked from a single function, pxd_call, using an absolute path stored in an
-#      unexported private variable.
+#      unexported private variable, and every invocation receives the digest-pinned k3d helper
+#      image references.
 #   2. A state directory record tracks every cluster provisioned by this command. Both delete and
 #      import verify this record before invoking k3d so that delete never removes an externally
 #      managed cluster; check executes prior to create without requiring a record, and targeting a
@@ -52,6 +53,9 @@ PXD_API_PORT=127.0.0.1:6550
 PXD_LB_PORT=127.0.0.1:8081:80@loadbalancer
 # Regular expression enforcing that the k3s image pin specifies an immutable digest reference.
 PXD_PIN_RE='k3s(:[^@]+)?@sha256:[0-9a-f]{64}$'
+# Regular expression validating a helper image pin, which must carry both a release tag (compared
+# by check against the installed k3d version) and an immutable digest.
+PXD_HELPER_RE='^[^@]+:([0-9][0-9.]*)@sha256:[0-9a-f]{64}$'
 
 # Holds the resolved absolute path to the k3d executable. It remains unexported so child processes
 # cannot access k3d through it, and invoking an absolute path bypasses the trap function in
@@ -64,6 +68,10 @@ PXD_CONTEXT=""
 PXD_CLUSTER=""
 PXD_LABEL=""
 PXD_IMAGES=()
+# Stores the release tags extracted from the two helper image pins, or the diagnostic reason why a
+# pin was rejected, as populated by pxd_helpers.
+PXD_HELPER_TAGS=""
+PXD_HELPER_ERROR=""
 
 px_cli_spec <<'EOF'
 about Manages the local k3d cluster that proves the Kubernetes backend.
@@ -78,6 +86,8 @@ about measurement: one server, no agent, Traefik and the service load balancer
 + disabled. validation (the default): one server and N agents (0 to 9, default 2),
 + Traefik disabled, the load balancer on 127.0.0.1:8081. The API server binds
 + 127.0.0.1:6550, and the current context of the kubeconfig does not change.
+about The helper images of k3d, the load balancer and the tools node, come from
++ PX_K3D_LOADBALANCER_IMAGE and PX_K3D_TOOLS_IMAGE, pinned by digest too.
 opt --agents N PXD_AGENTS | the agent count of the validation shape, 0 to 9
 sub delete
 about delete the cluster that create recorded, after the
@@ -89,12 +99,13 @@ about import local images into the node cache,
 + PX_IMAGE_TAG by default and PX_PHERF_IMAGE_TAG
 + with PX_PHERF=1
 sub check
-about report k3d, its version and the memory of the engine
+about report k3d, the helper pins and the engine memory
 about check runs before create, so it needs no cluster.
 output check rows: check, status and detail, then result, ok or fail, the code
 + and host.
 exits 1 also means that k3d failed or is absent or that the engine did not answer, 2
-+ a pin without a digest, 3 a gate or a version floor refused, 4 a wait expired,
++ a pin without a digest for create and import, 3 a gate refused or a check row
++ failed, 4 a wait expired,
 + 6 no cluster of px-k3d on the context for delete and import, or a context that
 + is no context of k3d.
 example px-k3d create --class validation --agents 1
@@ -135,7 +146,8 @@ pxd_call() {
   shift
   pxd_resolve || return "$PX_EXIT_FAIL"
   px_debug "k3d call: $*"
-  px_timeout "$timeout" "$_PXD_K3D" "$@"
+  K3D_IMAGE_LOADBALANCER=${PX_K3D_LOADBALANCER_IMAGE:-} K3D_IMAGE_TOOLS=${PX_K3D_TOOLS_IMAGE:-} \
+    px_timeout "$timeout" "$_PXD_K3D" "$@"
 }
 
 ## @description  Extracts and reports the k3d version string from its version command output.
@@ -147,6 +159,26 @@ pxd_version() {
     sed -n 1p)"
   [ -n "$text" ] || return "$PX_EXIT_FAIL"
   printf '%s\n' "$text"
+}
+
+# Unless overridden in the environment, k3d pulls each helper image using <repository>:<its own
+# version>, so pxd_call supplies both digest pins on every k3d invocation. Because only create and
+# import launch helper containers, only those subcommands abort on an invalid pin; check reports
+# the validation outcome as a check row, and delete requires no helper images.
+## @description  Validates both helper image pins and records their release tags in PXD_HELPER_TAGS.
+## @return       Returns 0 when valid, or 2 with the failure detail in PXD_HELPER_ERROR if a pin
+##               lacks a release tag or digest.
+pxd_helpers() {
+  local name
+  PXD_HELPER_TAGS=""
+  for name in PX_K3D_LOADBALANCER_IMAGE PX_K3D_TOOLS_IMAGE; do
+    if ! [[ ${!name:-} =~ $PXD_HELPER_RE ]]; then
+      PXD_HELPER_ERROR="$name='${!name:-}' names no digest: pin it as <repository>:<tag>@sha256:<64"
+      PXD_HELPER_ERROR="$PXD_HELPER_ERROR hex> in versions.env"
+      return "$PX_EXIT_USAGE"
+    fi
+    PXD_HELPER_TAGS="${PXD_HELPER_TAGS:+$PXD_HELPER_TAGS }${BASH_REMATCH[1]}"
+  done
 }
 
 ## @description  Resolves the state record file path for the cluster associated with the context.
@@ -210,6 +242,7 @@ pxd_create() {
     px_die "$PX_EXIT_USAGE" "PX_K3S_IMAGE='${PX_K3S_IMAGE:-}' names no digest: pin the k3s" \
       "image as rancher/k3s:<tag>@sha256:<64 hex> in versions.env"
   fi
+  pxd_helpers || px_die "$PX_EXIT_USAGE" "$PXD_HELPER_ERROR"
   px_run_class_require "$PXD_CLASS"
   case "$PXD_CLASS" in
   measurement)
@@ -292,10 +325,11 @@ pxd_delete() {
 # When no explicit IMAGE arguments are supplied, import loads every image tag required by the
 # active configuration: the primary harness image, plus the pherf image when the tier is enabled.
 ## @description  Imports local images into the recorded cluster's node cache in individual calls.
-## @return       Returns 0 on success, 1 on k3d failure, 2 if an image is not a local tag, 4 if an
-##               import timed out, or 6 if no px-k3d cluster is recorded for the context.
+## @return       Returns 0 on success, 1 on k3d failure, 2 if a helper pin lacks a digest or an
+##               image is not a local tag, 4 if an import expires, or 6 when no record exists.
 pxd_import() {
   local image timeout status
+  pxd_helpers || px_die "$PX_EXIT_USAGE" "$PXD_HELPER_ERROR"
   pxd_need_record
   if [ "${#PXD_IMAGES[@]}" = 0 ]; then
     PXD_IMAGES=("$PX_IMAGE_TAG")
@@ -317,7 +351,7 @@ pxd_import() {
   done
 }
 
-## @description  Checks the k3d binary, its version against the minimum floor, and engine memory.
+## @description  Verifies the k3d binary, version floor, helper image pin tags, and engine memory.
 ## @return       Writes check TSV rows and returns 0, 1 if k3d is absent or the engine did not
 ##               respond, or 3 when any check row fails.
 pxd_check_rows() {
@@ -336,6 +370,18 @@ pxd_check_rows() {
   else
     px_tsv_row k3d_version fail "k3d $version is below the floor $floor"
     failed=1
+  fi
+  # Because helper images from a different k3d release remain functional in most cases, a version
+  # mismatch emits a warning rather than rejecting the check.
+  if ! pxd_helpers; then
+    px_tsv_row k3d_helpers fail "$PXD_HELPER_ERROR"
+    failed=1
+  elif [ "$PXD_HELPER_TAGS" = "${version#v} ${version#v}" ]; then
+    px_tsv_row k3d_helpers ok "the tag ${version#v} of both helper pins is the version of k3d"
+  else
+    px_tsv_row k3d_helpers warn "the helper pins have the tags ${PXD_HELPER_TAGS/ / and }, and" \
+      "k3d is $version: re-pin PX_K3D_LOADBALANCER_IMAGE and PX_K3D_TOOLS_IMAGE in" \
+      "versions.local.env"
   fi
   # Because the cluster runs inside the host container engine, its available memory budget is the
   # total memory of that engine as reported by the Compose backend.

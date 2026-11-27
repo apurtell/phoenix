@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This template defines the persistent volume claim template for a stateful role, provisioned on
-# the configured StorageClass.
+# This template defines a persistent volume claim template entry for a StatefulSet, dynamically
+# provisioned using the configured StorageClass. It is instantiated as the data claim for the data
+# directory of each stateful role and as the tmp claim mounted at /tmp/px inside every pod.
 
 - metadata:
-    name: data
+    name: ${PX_M_CLAIM}
     labels:
 ${PX_M_LABELS}
   spec:

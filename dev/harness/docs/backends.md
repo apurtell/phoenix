@@ -595,10 +595,16 @@ instances in a stopped state without starting them.
 without pushing to any registry, rejecting any image tag that includes a registry hostname or a
 digest. The container engine builds for the host architecture; arm64 is the primary architecture
 while amd64 is supported on a best-effort basis, which the staging step notes in its
-output when executing on an amd64 host. `sb_image_push image_id target_ref` pushes a single local
-image, identified by its image ID `sha256:<64 hex>`, to `<registry>/<repository>:<tag>` and emits
-one image row containing the target reference and the registry-assigned digest (returning exit code
-1 on a failed push or missing digest, 2 on invalid usage, and 6 when no local image matches the ID).
+output when executing on an amd64 host. `sb_image_push image target_ref` pushes a single local
+image to `<registry>/<repository>:<tag>` and emits one image row containing the target reference
+and the registry-assigned digest. The `sha256:<64 hex>` image argument specifies either a local
+image ID or the configuration digest of a single local image: the containerd image store identifies
+an image by its manifest digest, while the `config.digest` annotation on its descriptor records the
+configuration digest that a kubelet reports for an image loaded by `px-k3d import`. The registry
+must store the pushed image under its local image ID. The function returns exit code 1 on a failed
+push, a missing digest, a registry digest that differs from the local ID, or when two local images
+match the configuration digest; 2 on invalid usage; and 6 when no local image matches the specified
+ID or configuration digest.
 It performs no image build, never logs in to a registry (relying instead on the operator's
 credential store to authenticate the push), and serves as the sole container runtime `push`
 operation in the repository. Only `px-cluster push` invokes it, and the Kubernetes backend
@@ -870,7 +876,8 @@ deploy-k8s/<cluster>/
     2N-<role>.yaml      the headless Service and the StatefulSet of a cluster role,
                         N its position in the role table
     30-setup.yaml       the setup Job
-    40-client.yaml  41-tooling.yaml   the standalone Pods
+    40-client.yaml  41-tooling.yaml   the claims tmp-client-0 and tmp-tooling-0, and the
+                                      standalone Pods
   groups/<group>/       the files of an on-demand group, applied by sb_group_start
   groups/pherf/         with PX_PHERF=1, the Distributed Pherf tier:
     50-pherf-target.yaml      ConfigMap pherf-target: PHERF_ZOOKEEPER, the one quorum
@@ -940,12 +947,37 @@ backend-specific branching.
 * Resource requests are set equal to resource limits so that every pod is assigned to the
   Guaranteed QoS class. Memory limits, heap sizes, and direct memory allocations match the role's
   Compose values; because Compose does not specify CPU limits, each container's CPU allocation is
-  computed as `ceil(memory MiB * PX_K8S_CPU_MILLI_PER_GIB / 1024)` millicores.
+  computed as `ceil(memory MiB * PX_K8S_CPU_MILLI_PER_GIB / 1024)` millicores. Because these CPU
+  limits lengthen each CPU-bound recovery phase, `k8s/env/k8s.env` derives and configures the
+  Kubernetes recovery bound `PX_THRESHOLD_RECOVERY_SECONDS_MAX` at 220 s (compared to 120 s on
+  Compose).
 * Persistent volume claims for `zookeeper`, `namenode`, `secondarynamenode`, and `datanode` are
   provisioned through `volumeClaimTemplates` backed by `PX_K8S_STORAGE_CLASS` at `PX_K8S_VOLUME_GIB`
   GiB per claim; attempting to render manifests without a configured StorageClass fails with exit
   code 2. Furthermore, `/var/lib/px/logs` is mounted as an `emptyDir` volume so that a daemon's
   garbage-collection log survives container restarts within the same pod.
+* Every harness-image pod addressed during a run mounts a ReadWriteOnce persistent volume claim
+  `tmp` at `/tmp/px`, configured with the same StorageClass and size and carrying the cluster and
+  role labels: a StatefulSet provisions it via a second `volumeClaimTemplates` entry (creating
+  claim `tmp-<role>-<i>`, placed after `data` on roles that also declare a data volume), whereas
+  the standalone `client` and `tooling` Pods mount the claims `tmp-client-0` and `tmp-tooling-0`
+  defined ahead of the Pod objects in their manifest files. The `/tmp/px` mount holds the driver
+  working directory on client 0 (staged inputs, output files awaiting retrieval, and catalog and
+  restore SQL scripts) together with the collector artifacts on each target instance
+  (`/tmp/px/<run-id>/collect/<collector>/`, containing the jHiccup log, JFR recordings, profiler
+  output, and trace counters). Because a recovery restart replaces the pod—which an `emptyDir`
+  volume does not survive—the persistent claim preserves these files across pod replacement in the
+  same way that the writable layer of a restarted Compose container does. Mounting a claim also
+  schedules a replacement pod back onto the node hosting its volume (for local-path storage) or
+  into the same availability zone (for zonal block storage). The setup Job and the Pherf tier do
+  not mount a tmp claim: the Job retains no run state, and the Pherf agents run as Deployment
+  replicas that cannot own individual claims, so collector output captured with
+  `--targets pherf-agent` is still lost if an agent pod is replaced. `requests.tsv` accounts for
+  the tmp claim in its `claims` column, and teardown removes it by label alongside the other
+  claims. Because each pod requests an additional `PX_K8S_VOLUME_GIB` of storage, any namespace
+  ResourceQuota on claim count or storage capacity must accommodate the tmp claims, and because
+  collectors leave `/tmp/px/<run-id>/collect` in place, a long-lived cluster retains each run's
+  collector artifacts on the claim until teardown.
 * When `PX_PHERF=1` is enabled, the Distributed Pherf tier is rendered as the on-demand `pherf`
   group comprising two Deployments under `groups/pherf/`. Both Deployments specify the `Recreate`
   strategy so that rolling out an updated pod template starts a replacement pod only after the old
@@ -1302,12 +1334,18 @@ px-cluster --backend k8s -e PX_K8S_TARGET="$HOME/targets/perf-east.env" up DIR
 requires a run bundle that passes `px-bundle validate` with `run.class` set to validation and
 `run.result` set to PASS (failing with exit code 1 otherwise, or exit code 6 if the bundle path does
 not exist), and whose recorded image references are local tags each mapped to a single `sha256`
-digest. For each image, it invokes `sb_image_push` on the Compose backend to push the image by its
-ID to `<PX_K8S_REGISTRY>/<repository>:<tag>`, verifies that the digest returned by the registry
-matches the digest recorded in the bundle (failing with exit code 1 without rendering if they
-differ), renders the target deployment manifests with `PX_K8S_IMAGE_DIGESTS` into
+digest. Each digest recorded in the bundle is either a local image ID or, for a run executed on
+px-k3d, the configuration digest reported by the kubelet, which `sb_image_push` resolves to the
+unique local image whose descriptor carries that digest. For each image, it invokes `sb_image_push`
+on the Compose backend to push that local image to `<PX_K8S_REGISTRY>/<repository>:<tag>`, which
+verifies that the registry stores the pushed image under its local ID (failing with exit code 1
+without rendering if it does not), renders the target deployment manifests with
+`PX_K8S_IMAGE_DIGESTS` populated with the resulting registry digests into
 `$PX_OUT/deploy-k8s/push-<run id>`, and writes that directory path to stdout while logging an INFO
-line to stderr for each pushed image. Because neither the push operation nor its manifest render
+line to stderr for each pushed image (noting any configuration digest that was mapped). In `-n`
+dry-run mode, the command does not query the container engine, so its plan rows report the bundle
+digests directly and an INFO message notes this distinction. Because neither the push operation
+nor its manifest render
 consults a cluster record, an active local cluster neither alters the promoted render nor has its
 own deployment directory modified; `render.env` inside the rendered directory persists the
 resolved digests so that subsequent scaling operations on the promoted cluster require no
@@ -1351,6 +1389,14 @@ stripping the `k3d-` prefix from the context name. The command invokes `k3d` thr
 absolute binary path stored in `_PXD_K3D`, discovered by searching `PATH` followed by
 `/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bin`.
 
+* Every `k3d` invocation receives the two helper image pins from `docker/versions.env` as
+  `K3D_IMAGE_LOADBALANCER` (`PX_K3D_LOADBALANCER_IMAGE`, the service load balancer) and
+  `K3D_IMAGE_TOOLS` (`PX_K3D_TOOLS_IMAGE`, the tools node used by `create` and `import`), ensuring
+  that the container engine pulls each helper image by its pinned digest rather than
+  `<repository>:<k3d version>`. Each pin must conform to `<repository>:<tag>@sha256:<64 hex>`,
+  where the digest identifies the image index for the tag; any malformed value causes `create` and
+  `import` to fail with exit code 2 before `k3d` is invoked, whereas `delete` starts no helper
+  container and proceeds normally. Operators can re-pin both helper images in `versions.local.env`.
 * `create [--class validation|measurement] [--agents N]` rejects with exit code 2 any `PX_K3S_IMAGE`
   pin that does not match `k3s(:<tag>)?@sha256:<64 hex>` (in `docker/versions.env`), and rejects
   with exit code 3 an existing Compose cluster record on the host, a k3d version below
@@ -1373,8 +1419,11 @@ absolute binary path stored in `_PXD_K3D`, discovered by searching `PATH` follow
   automatically invokes this import step after building the images. No container registry is
   created and no image is pushed.
 * `check` executes prior to `create` without requiring a state record. It emits the `k3d_binary`,
-  `k3d_version`, and `engine_memory` check rows, querying the total engine memory through the
-  Compose backend, which `px-k3d` binds solely to produce that row.
+  `k3d_version`, `k3d_helpers`, and `engine_memory` check rows, querying total container engine
+  memory through the Compose backend, which `px-k3d` binds solely to produce that row. The
+  `k3d_helpers` row reports `ok` when both helper pin tags match the installed k3d version, `warn`
+  with re-pinning guidance on a version mismatch (as version skew never rejects the check), and
+  `fail` (returning exit code 3) if a helper pin lacks a digest.
 * `delete` fails with exit code 3 if an active Kubernetes scope is still recorded for the target
   context; otherwise, it deletes the k3d cluster and removes its state record.
 
@@ -1394,16 +1443,22 @@ target context during `delete` or `import`.
 
 ### Dedicated nodes and the end of a measurement
 
-Because the CPU load on the operator's local workstation does not reflect the load on Kubernetes
-worker nodes, px-run replaces the local quiet-host check with a dedicated-node check when running on
-the Kubernetes backend. Setting `PX_K8S_DEDICATED_NODES=1` records the quiet state as `dedicated`
+Because CPU utilization on the operator's local workstation does not reflect the load on the worker
+nodes of a remote Kubernetes cluster, px-run replaces the local quiet-host check with a
+dedicated-node check on remote targets. Setting `PX_K8S_DEDICATED_NODES=1` records the quiet state
+as `dedicated`
 without flagging run contamination, allowing measurement runs to produce authoritative timing
 verdicts. A target cluster without that setting is rejected with exit code 2 prior to the prepare
 phase whenever the run requires a quiet host (`PX_REQUIRE_QUIET_HOST`, which defaults to 1 in the
 measurement class); when a quiet host is not required, the run records the quiet state as
 `undeclared` and marks the bundle with `dedicated-node` contamination, downgrading timing verdicts
-to ADVISORY while preserving the full severity of count-based verdicts. `k3d.env` sets
-`PX_REQUIRE_QUIET_HOST=0`, meaning that a measurement run executed against a local k3d cluster
+to ADVISORY while preserving the full severity of count-based verdicts. Because the nodes of a
+cluster provisioned by px-k3d (identified by a px-k3d state record for the context) run as
+containers inside the local container engine, a run targeting that cluster executes the local
+quiet-host check just as on Compose—applying the same wait bound (`PX_QUIET_HOST_WAIT_S`), the same
+refusal (exit 4 when a quiet host is required and the host remains busy), and the same `quiet`
+record rows—while always adding `dedicated-node` contamination so that timing verdicts remain
+ADVISORY and the run
 evaluates count parity only. Both the workstation sleep inhibitor and the cluster health monitor
 operate on Kubernetes just as they do on Compose.
 
@@ -1433,13 +1488,14 @@ execution established several runtime behaviors that cannot be observed against 
 * Following `px-k3d import`, the kubelet reports the digest of the image configuration as the
   container's image ID rather than the manifest digest used as the local image ID by the containerd
   image store. Consequently, a Kubernetes run bundle records a digest that does not match any local
-  image ID.
+  image ID, and `px-cluster push` resolves that digest back to the local image via the
+  `config.digest` annotation on the image descriptor.
 * A cgroup out-of-memory kill sets the container termination reason to `OOMKilled` with exit code
   137, while k3s emits neither an `OOMKilling` nor an `OOMKilled` pod event, making the container
   termination state the sole evidence of the kill.
-* At the 250 millicores per GiB CPU ratio, the 125-millicore tooling pod requires approximately
-  45 s to launch the region mover JVM, resulting in a total drain-aware restart duration of
-  approximately 130 to 170 s.
+* Under the 250 millicores per GiB CPU allocation ratio, the 125-millicore tooling pod takes 45 to
+  50 s to start the region mover JVM, yielding an overall drain-aware restart duration of roughly
+  130 to 170 s that is accommodated by the 220 s Kubernetes recovery bound.
 
 Subsequent milestones build on this baseline: milestone K4 validates behavioral parity with Compose
 and end-to-end measurement run teardown; milestone K5 validates the Distributed Pherf tier and its

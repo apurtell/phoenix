@@ -14,18 +14,20 @@
 # limitations under the License.
 
 # Functional test suite providing validation-class verification of both the build and the test
-# harness across the psql and pherf drivers:
+# harness across the psql, java-main, and pherf drivers:
 #   schema    Creates a salted table with UPDATE_CACHE_FREQUENCY and a covered global index, then
 #             verifies fixed row counts queried through both the index and the base table.
+#   client    Creates the same table during prepare and executes SchemaTool on client 0 to extract
+#             its DDL along with the table properties before the disruption test runs.
 #   recover   Executes the same workload while px-run kills RegionServer 0 at the start of the
 #             steady window; the recovery gate restarts the process, after which the cluster checks
-#             enforce the two-minute recovery bound and confirm that no residual fault remains.
+#             enforce the backend's recovery bound and verify that no residual fault remains.
 #   pherf     Runs a small Pherf scenario consisting of a data load followed by a serial query set.
 # Each test is fully self-contained: the prepare phase creates the state that run reads, and the
 # restore phase drops it, allowing any test to run alone with --from or --filter.
 
 suite: functional
-description: The functional proof, through the psql and pherf drivers, with one disruption
+description: The functional proof through the psql, java-main and pherf drivers, with one disruption
 class: validation
 timeout: 900
 
@@ -33,6 +35,13 @@ test: schema
   name: Apply a salted and indexed schema, then query it through the index
   driver: psql
   args: --prepare sql/functional-schema.sql sql/functional-query.sql
+
+test: client
+  name: Extract the DDL of the salted table with a Phoenix client class
+  needs: schema
+  driver: java-main
+  args: --prepare sql/functional-schema.sql
+  args: org.apache.phoenix.schema.tool.SchemaTool -m EXTRACT -tb EVENTS -s PX_FUNCTIONAL
 
 test: recover
   name: Query through a kill of RegionServer 0 and its recovery

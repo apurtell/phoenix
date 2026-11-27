@@ -388,7 +388,9 @@ A driver stages input and output files through a dedicated remote working direct
 `/tmp/px/<run-id>` inside the client instance. It provisions this directory via
 `sb_exec ... -- mkdir -p`, uploads workload inputs using `sb_copy_in`, and retrieves generated
 outputs into `$PX_DRIVER_DIR` using `sb_copy_out`. The `restore` verb removes the remote working
-directory during cleanup.
+directory during cleanup. On the Kubernetes backend, the client's `/tmp/px` directory is backed by
+the persistent volume claim `tmp-client-0`, ensuring that the directory survives if the client pod
+is replaced.
 
 `sb_exec` propagates the exit status of the remote program. For substrate calls managed by the
 harness—specifically `dv_remote`, `dv_put`, `dv_get`, and the clear script—the driver translates
@@ -698,18 +700,24 @@ every emitted metric window is clamped to the host's steady window boundaries.
 ### java-main
 
 ```text
-[--cp FILE]... CLASS [ARG...]
+[--cp FILE]... [--prepare FILE]... CLASS [ARG...]
 ```
 
 Executes a single Java main class designated by the first test argument, forwarding all subsequent
 arguments to that class. Any file or directory supplied via `--cp` is placed on the class path ahead
-of the Phoenix client JARs. The driver passes the cluster JDBC URL to the class through the
-`px.jdbc.url` system property with the `RequestMetric=true` connection attribute appended. When the
-target class opens its JDBC connection using `System.getProperty("px.jdbc.url")`, that attribute
-enables request-level metric collection, which Phoenix inspects via
-`JDBCUtil.isCollectingRequestLevelMetricsEnabled`; a class that constructs its own JDBC URL will not
-collect request metrics. The class may emit custom ad hoc metrics to stdout, formatted one per line
-as follows:
+of the Phoenix client JARs. Each `--prepare` option specifies a SQL script following `psql
+--prepare`: its name ends in `.sql` (else `java-main.prepare` is `FAIL` in `validate`), the
+`prepare` verb executes it through PhoenixRuntime within the `setup@schema` phase and records the
+`UPDATE_CACHE_FREQUENCY` of every table that it creates, and the `restore` verb drops those tables.
+This lifecycle allows a class to query its own dedicated user table, because the restore phase of
+any preceding test drops the tables created by that test. Without `--prepare`, `prepare` opens no
+setup window. The driver supplies the cluster JDBC URL to the class via the `px.jdbc.url` system
+property with the `RequestMetric=true` connection attribute appended. When the target class
+establishes its JDBC connection using `System.getProperty("px.jdbc.url")`, that attribute enables
+request-level metric collection, which Phoenix checks through
+`JDBCUtil.isCollectingRequestLevelMetricsEnabled`; a class that constructs its own JDBC URL does
+not collect request metrics. The class may emit custom ad hoc metrics to stdout, formatted one per
+line as follows:
 
 ```text
 px-metric <key> <class> <value> <unit>
@@ -719,7 +727,8 @@ The driver records each emitted `px-metric` line as an aggregate metric record b
 `steady@main` while preserving all other stdout lines as standard program output. Any non-zero exit
 status from the Java class produces a `FAIL` verdict row. If the class emits no `px-metric` line
 for `query_errors`, the `report` verb records `query_errors` as 0 when the class exited with 0, and
-as 1 otherwise. Its steady anchor is `steady@main`. Aside from `query_errors`, the driver declares
+as 1 otherwise. The driver declares the phase anchors `setup@schema` (`prepare`) and `steady@main`
+(`run`), using `steady@main` as its steady anchor. Aside from `query_errors`, the driver declares
 all standard steady-state metrics unsupported because only the custom Java class knows what
 measurements it produces.
 

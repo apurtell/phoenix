@@ -257,5 +257,7 @@ PX_K8S_MESH_CORE         # 1 injects the core daemons too; 0 keeps them out of t
 PX_K8S_IMAGE_DIGESTS     # ref=sha256:<hex>[,...]: the digests that px-cluster push promoted
 PX_K3S_ALLOWANCE_MIB     # the memory of the k3s control plane, which a local budget deducts
 PX_K3S_IMAGE             # the k3s image of px-k3d, pinned by digest
+PX_K3D_LOADBALANCER_IMAGE # the load balancer image of px-k3d, pinned by digest
+PX_K3D_TOOLS_IMAGE       # the tools image of px-k3d, pinned by digest
 PX_KUBECTL_MIN_VERSION   # the oldest kubectl client that the harness supports, major.minor
 PX_K3D_MIN_VERSION       # the oldest k3d that px-k3d supports, major.minor

@@ -15,7 +15,8 @@
 
 # Defines a standalone PersistentVolumeClaim backed by the configured StorageClass. The Distributed
 # Pherf controller stores its run directory on this claim, ensuring that frozen reports persist
-# across controller pod replacements as well as stops of its role group.
+# across controller pod replacements as well as stops of its role group. Client and tooling Pods
+# likewise retain /tmp/px on such a claim across pod replacements.
 
 apiVersion: v1
 kind: PersistentVolumeClaim
