@@ -415,7 +415,14 @@ image omits async-profiler, JFR tooling, and jHiccup, and the tier operates as t
 rather than a cluster daemon.
 Collectors interact with the cluster exclusively through `sb_exec` and retrieve remote files by
 streaming the output of `cat`, while diagnostic output from remote tools is captured in
-`logs/collect.log`. Each sample row in `metrics/host.tsv` and
+`logs/collect.log`. On each target instance, remote artifacts are staged beneath
+`/tmp/px/<run-id>/collect/<collector>/`. After an artifact has been copied into the bundle, a
+second `sb_exec` invocation removes the remote file along with any parent directories up to
+`/tmp/px/<run-id>` that become empty, while preserving any directory that still contains the driver
+working directory or another artifact file. If a file transfer fails, the file is retained on the
+target as diagnostic evidence and its index row records the failure. This cleanup behavior applies
+uniformly to both automated runs and manual collections, and `PX_KEEP` does not alter it. Each
+sample row in `metrics/host.tsv` and
 `metrics/container/<role>-<index>.tsv` records a single sampling pass taken at the interval
 `PX_COLLECT_INTERVAL_S` and concludes with the `run_class` and `contamination` columns; because the
 initial pass executes before the run verb starts and the final pass executes after it finishes, the

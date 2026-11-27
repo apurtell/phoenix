@@ -142,6 +142,9 @@ shared --cluster
 about stop what start recorded and copy the files in
 about Without BUNDLE, stop stops the active collection of the cluster. Each
 + collector stops with the targets and the bound that start recorded.
+about A file copied into the bundle is deleted from its target, and so is each
++ directory up to /tmp/px/<run id> that this leaves empty. A failed copy keeps
++ the file on the target.
 output the index rows of what it stopped, then result, ok|fail|skip, the code
 + and the directory.
 sub list
@@ -691,6 +694,11 @@ collect_stop() {
   if px_is_dry_run; then
     for name in $names; do
       px_plan stop "$name" "$dir"
+      case "$name" in
+      profile | jfr | hiccup)
+        px_plan delete "$name" "/tmp/px/${dir##*/}/collect/$name after the copy"
+        ;;
+      esac
     done
     exit "$PX_EXIT_OK"
   fi

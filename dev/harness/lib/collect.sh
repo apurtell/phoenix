@@ -23,7 +23,8 @@
 # Five core design invariants govern this library:
 #   1. Collectors interact with cluster instances exclusively through sb_exec. Remote artifact
 #      files are retrieved over the standard output of cat, avoiding the need for a dedicated file
-#      transfer function in the substrate contract.
+#      transfer function in the substrate contract. Each remote file is removed only after its
+#      bundle copy is in place, preserving the file on the target as evidence if retrieval fails.
 #   2. Target instances and the JDK path for each target are resolved from cluster/services.tsv
 #      within the bundle so that collectors always inspect the exact deployment topology used by
 #      the run. Across all collectors, the target specification all expands to every service role
@@ -65,9 +66,13 @@ CK_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # which is always the oldest java process running inside the target instance.
 CK_JVM_PID="pid=\"\$(pgrep -o -x java)\" || exit 6"
 
-# Remote one-liner that streams a collected artifact file to standard output and removes the remote
-# copy.
-CK_FETCH_SCRIPT="cat -- \"\$1\" || exit 1; rm -f -- \"\$1\""
+# Remote command script that streams a collected artifact file to standard output.
+CK_FETCH_SCRIPT="cat -- \"\$1\""
+
+# Remote command script that removes a copied artifact file (file, directory...) and then prunes
+# each listed directory that is empty. Any directory that still contains other files, such as the
+# driver working directory on client 0 or an artifact from another collector, is left intact.
+CK_DELETE_SCRIPT="rm -f -- \"\$1\" || exit 1; shift; rmdir -- \"\$@\" 2>/dev/null || true"
 
 # Remote scripts for the session collectors. Each script accepts the target instance's JDK name,
 # the remote recording file path, the collection duration bound in seconds, and any collector-
@@ -180,9 +185,12 @@ ck_jvm_exec() {
   ck_exec "$role" "$index" "$CK_JVM_PID$PX_NL$script" "$@"
 }
 
-# Streams a remote file specified by (role, index, path below CK_REMOTE, path in the bundle) over
-# cat into a local temporary file, atomically moves it into place, and deletes the remote file.
-## @description  Retrieves a remote artifact file into the run bundle and removes the remote copy.
+# Streams a remote file identified by (role, index, <collector>/<file> below CK_REMOTE, path in the
+# bundle) over cat into a local temporary file and atomically moves it into its destination. Only
+# after the local move succeeds does it delete the remote file and prune any empty parent
+# directories up to /tmp/px/<run-id>. A deletion failure does not affect the return status because
+# the artifact is already stored in the bundle.
+## @description  Transfers a remote artifact file into the bundle and deletes the remote file.
 ## @return       Returns 0 on success, the non-zero status of sb_exec, or 1 when the local file
 ##               cannot be written.
 ck_fetch() {
@@ -194,6 +202,10 @@ ck_fetch() {
     mv -f "$file.tmp" "$file" || status=$PX_EXIT_FAIL
   fi
   rm -f "$file.tmp"
+  if [ "$status" = 0 ]; then
+    ck_exec "$1" "$2" "$CK_DELETE_SCRIPT" "$CK_REMOTE/$3" "$CK_REMOTE/${3%/*}" "$CK_REMOTE" \
+      "${CK_REMOTE%/*}" || true
+  fi
   return "$status"
 }
 

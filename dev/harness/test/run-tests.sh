@@ -11094,6 +11094,18 @@ t_a6_leftovers() {
   [ -z "$pid" ] || ! kill -s 0 "$pid" 2>/dev/null || printf 'control JVM %s\n' "$pid"
 }
 
+# Identifies remote deletion calls by matching the rmdir cleanup script from lib/collect.sh, whose
+# first operand is the target file path, and counts a deletion as post-copy only when an earlier
+# px-fetch call streamed that same file.
+## @description  Counts remote file deletion calls in the fake runtime log and those after a copy.
+## @return       Writes "<deletes> <deletes after a copy>" to standard output. Exit 0.
+t_a6_deletes() {
+  awk '/ px-fetch / { f[$NF] = NR; next }
+    / rmdir / { p = ""; for (i = 1; i < NF; i++) if ($i == "px-collect") { p = $(i + 1); break }
+      n++; if ((p in f) && f[p] < NR) a++ }
+    END { print n + 0, a + 0 }' "$T_SHIM_LOG"
+}
+
 ## @description  Verifies the run-class collector defaults and opt-in flags (RQ-127) together with
 ##               the five-RegionServer topology recipe in override-24gib.env (RQ-135).
 ## @return       Records assertions. Exit 0.
@@ -11163,6 +11175,15 @@ t_group_a6_classes() {
   t_equals run_dry_run_plans_the_collection "regionserver 70" "$(printf '%s\n' "$T_STDOUT" |
     awk -F '\t' '$2 == "collect_targets" { t = $3 } $2 == "collect_bound_s" { b = $3 }
       END { print t " " b }')"
+  # Verify that dry-run planning schedules remote file deletion only for collectors that stage
+  # artifact files on target instances.
+  got="$(printf '%s\n' "$T_STDOUT" | grep -c "^plan${PX_TAB}collect_delete$PX_TAB")"
+  t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
+    --collect host,jfr
+  t_equals run_dry_run_plans_the_delete_after_the_copy "0 yes" "$got $(t_flag "$(t_rows 3 \
+    plan collect_delete "/tmp/px/$(printf '%s\n' "$T_STDOUT" | awk -F '\t' \
+      '$2 == "run_id" { print $3 }')/collect on each target, a file after its copy")" \
+    "$T_STDOUT")"
   t_a6 "$T_BASH" "$T_BIN/px-run" "$T_WORK/drivers/exit-code.sh" --dry-run --class validation \
     --strict -e PX_COLLECT_DURATION_S=1
   t_equals px_collect_duration_s_is_undeclared "2 yes" "$T_STATUS $(t_flag \
@@ -11428,6 +11449,28 @@ $(printf '%s\n' "$T_STDOUT" | awk -F '\t' '$1 == "container" && $3 == "ok" { f =
     "$dir" collector.container) $(t_flag 'the sampler did not stop within 1s and was killed' \
     "$(cat "$dir/verdicts.tsv")") $(t_a6_alive "$pid")"
   rm -f "$T_A6_STATE/stats-sleep"
+  # Verify that any artifact whose retrieval fails is retained on its target instance as evidence,
+  # while successfully copied files are removed. Here, the remote cat on regionserver-0 fails,
+  # whereas the cat on regionserver-1 succeeds but the local move into the bundle fails, proving
+  # that the remote file is preserved because deletion runs only after the move completes.
+  t_a6_state_reset
+  t_shim_log_reset
+  t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect hiccup --class validation --duration 60
+  dir="$(printf '%s\n' "$T_STDOUT" | sed -n 1p)"
+  line="$T_A6_STATE/remote/${dir##*/}/collect/hiccup"
+  rm -f "$line/regionserver-0.hlog"
+  mkdir -p "$line/regionserver-0.hlog" \
+    "$dir/metrics/hiccup/regionserver-1.hlog/regionserver-1.hlog.tmp"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop -n
+  t_equals collect_stop_dry_run_plans_the_delete_after_the_copy "0 $(t_rows 3 plan stop \
+    "hiccup $dir" plan delete "hiccup /tmp/px/${dir##*/}/collect/hiccup after the copy") 0" \
+    "$T_STATUS $T_STDOUT $(t_a6_deletes | cut -d ' ' -f 1)"
+  t_a6 "$T_BASH" "$T_BIN/px-collect" stop
+  t_equals collect_stop_keeps_the_file_of_a_failed_copy "1 fail|fail yes yes no 1 1 0" \
+    "$T_STATUS $(awk -F '\t' '$1 == "hiccup" && $2 ~ /^regionserver-[01]$/ { print $3 }' \
+    "$dir/metrics/index.tsv" | paste -sd '|' -) $(t_exists "$line/regionserver-0.hlog") \
+$(t_exists "$line/regionserver-1.hlog") $(t_exists "$line/control.hlog") $(t_a6_deletes) $(grep \
+    -c 'rmdir .*/regionserver-[01]\.hlog' "$T_SHIM_LOG")"
   # Verify that px-cluster down stops every recorded active collection before tearing down the
   # cluster.
   t_a6 "$T_BASH" "$T_BIN/px-collect" start --collect host --class validation --duration 60
@@ -11452,9 +11495,15 @@ t_group_a6_run() {
   printf '# A6: the collectors of a run\n'
   # A measurement-class run launches all six collectors bracketing the workload driver's run verb.
   t_a6_state_reset
+  t_shim_log_reset
   t_a6_run measurement -- 3
   run="$(t_bundle)"
   t_equals measurement_run_with_every_collector_passes 0 "$T_STATUS"
+  # Verify that each of the seven collector artifact files is removed from its target only after
+  # being copied into the bundle, leaving no /tmp/px/<run-id> directory on targets that held only
+  # collector artifacts.
+  t_equals run_deletes_each_file_from_its_target_after_the_copy "7 7 no yes" "$(t_a6_deletes) \
+$(t_exists "$T_A6_STATE/remote/${run##*/}") $(t_exists "$run/metrics/hiccup/control.hlog")"
   # RQ-134: Every active collector's stage window must completely enclose the run verb's window.
   IFS="$PX_TAB" read -r begin end <<EOF
 $(t_a6_window "$run" verb@run)

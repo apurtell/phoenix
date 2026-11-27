@@ -976,9 +976,13 @@ backend-specific branching.
   `--targets pherf-agent` is still lost if an agent pod is replaced. `requests.tsv` accounts for
   the tmp claim in its `claims` column, and teardown removes it by label alongside the other
   claims. Because each pod requests an additional `PX_K8S_VOLUME_GIB` of storage, any namespace
-  ResourceQuota on claim count or storage capacity must accommodate the tmp claims, and because
-  collectors leave `/tmp/px/<run-id>/collect` in place, a long-lived cluster retains each run's
-  collector artifacts on the claim until teardown.
+  ResourceQuota governing claim counts or storage capacity must account for the tmp claims. Once an
+  artifact file has been copied into the bundle, the collector removes it from the claim along with
+  any parent directories up to `/tmp/px/<run-id>` that become empty, while the driver's `restore`
+  verb removes the working directory on client 0 so that a long-lived cluster does not accumulate
+  output across runs. Only files whose transfer into the bundle failed remain on the claim as
+  diagnostic evidence until teardown. Compose containers enforce this same cleanup policy for
+  `/tmp/px` within their writable layer.
 * When `PX_PHERF=1` is enabled, the Distributed Pherf tier is rendered as the on-demand `pherf`
   group comprising two Deployments under `groups/pherf/`. Both Deployments specify the `Recreate`
   strategy so that rolling out an updated pod template starts a replacement pod only after the old

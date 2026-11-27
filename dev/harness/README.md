@@ -225,9 +225,10 @@ By default, the measurement run class starts all six collectors while the valida
 none; `px-run --collect LIST` selects the collectors to run and `--targets LIST` selects their
 target roles, whereas a driver's HDR histograms remain enabled across both run classes. When invoked
 manually, `px-collect start` either attaches to the cluster's active collection or initializes a new
-collection directory at `$PX_OUT/collect/<run-id>`, and `px-collect stop` terminates the collectors
-and retrieves their output artifacts into the bundle. Every collector writes exclusively within its
-assigned bundle, and any collector failure yields an `ADVISORY` verdict rather than failing the run.
+collection directory at `$PX_OUT/collect/<run-id>`, while `px-collect stop` halts the active
+collectors, transfers their output artifacts into the bundle, and removes each retrieved file from
+its target instance. Each collector writes solely within its designated bundle, and any collector
+failure produces an `ADVISORY` verdict rather than failing the overall run.
 See the "The collectors" section of `docs/bundle-format.md` for the artifact file specifications.
 
 ## Policy

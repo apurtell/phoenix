@@ -115,8 +115,8 @@ about The collectors are profile, jfr, hiccup, host, container and trace, and
 + pre-workload hook and right before the run verb, and px-collect stop right after
 + it, also at a failure or an interrupt. Each call has one PX_TIMEOUT_VERB for
 + each step, and each collector ends by itself one verb bound after the deadline
-+ of the run verb. Their files go into the bundle; a collector that fails gives
-+ ADVISORY.
++ of the run verb. Their files go into the bundle and then leave their targets;
++ a collector that fails gives ADVISORY.
 about The run holds the host awake while it runs and leaves the cluster up;
 + px-cluster down removes it.
 shared --cluster --class --backend
@@ -1780,6 +1780,12 @@ plan_print() {
   if [ -n "$COLLECTORS" ]; then
     record_row plan collect_targets "${PX_COLLECT_TARGETS:-all}"
     record_row plan collect_bound_s "$((DRIVER_TIMEOUT + VERB_TIMEOUT))"
+    case " $COLLECTORS " in
+    *" profile "* | *" jfr "* | *" hiccup "*)
+      record_row plan collect_delete \
+        "/tmp/px/$RUN_ID/collect on each target, a file after its copy"
+      ;;
+    esac
   fi
   record_row plan snapshot_pre \
     "sb_list sb_restart_count sb_image_ref sb_version_info sb_sample_resources"
