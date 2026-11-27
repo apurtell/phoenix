@@ -1331,16 +1331,18 @@ px-cluster --backend k8s -e PX_K8S_TARGET="$HOME/targets/perf-east.env" up DIR
 ```
 
 `px-cluster push` promotes the exact container images verified in a passing validation run. It
-requires a run bundle that passes `px-bundle validate` with `run.class` set to validation and
-`run.result` set to PASS (failing with exit code 1 otherwise, or exit code 6 if the bundle path does
-not exist), and whose recorded image references are local tags each mapped to a single `sha256`
-digest. Each digest recorded in the bundle is either a local image ID or, for a run executed on
-px-k3d, the configuration digest reported by the kubelet, which `sb_image_push` resolves to the
-unique local image whose descriptor carries that digest. For each image, it invokes `sb_image_push`
-on the Compose backend to push that local image to `<PX_K8S_REGISTRY>/<repository>:<tag>`, which
-verifies that the registry stores the pushed image under its local ID (failing with exit code 1
-without rendering if it does not), renders the target deployment manifests with
-`PX_K8S_IMAGE_DIGESTS` populated with the resulting registry digests into
+requires a run bundle that passes `px-bundle validate` with `run.class` set to validation and a
+`run.result` that maps to exit code 0 (PASS, SKIP or ADVISORY, that is no check failed: timing
+verdicts are advisory, and a check without a source is SKIP, a functional check such as
+`query_errors` or `driver.rpc_calls` too), failing with exit code 1 otherwise or exit code 6 if the
+bundle path does not exist, and whose recorded image references are local tags each mapped to a
+single `sha256` digest. Each digest recorded in the bundle is either a local image ID or, for a run
+executed on px-k3d, the configuration digest reported by the kubelet, which `sb_image_push`
+resolves to the unique local image whose descriptor carries that digest. For each image, it invokes
+`sb_image_push` on the Compose backend to push that local image to
+`<PX_K8S_REGISTRY>/<repository>:<tag>`, which verifies that the registry stores the pushed image
+under its local ID (failing with exit code 1 without rendering if it does not), renders the target
+deployment manifests with `PX_K8S_IMAGE_DIGESTS` populated with the resulting registry digests into
 `$PX_OUT/deploy-k8s/push-<run id>`, and writes that directory path to stdout while logging an INFO
 line to stderr for each pushed image (noting any configuration digest that was mapped). In `-n`
 dry-run mode, the command does not query the container engine, so its plan rows report the bundle

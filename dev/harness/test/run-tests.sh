@@ -16393,6 +16393,25 @@ t_group_k2_promotion() {
   t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$copy" \
     --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
   t_equals push_refuses_a_failed_bundle "1 no" "$T_STATUS $(t_exists "$state/registry.log")"
+  # Promotion takes every result that maps to exit 0, that is no check failed: ADVISORY timing
+  # verdicts and SKIP checks without a source, functional ones too. It refuses every other result.
+  for word in ADVISORY SKIP INCONCLUSIVE ERROR; do
+    rm -f "$state/registry.log"
+    copy="$(t_bundle_copy "$bundle" "k2-$word")"
+    sed "s/\"result\": \"PASS\"/\"result\": \"$word\"/" "$copy/manifest.json" >"$copy/m.json" &&
+      mv "$copy/m.json" "$copy/manifest.json"
+    t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push "$copy" \
+      --class validation -e PX_IMAGE_TAG=phoenix-harness:selftest
+    line="$T_STATUS $(cat "$state/registry.log" 2>/dev/null | grep -c .) $(t_flag \
+      'promotes its images' "$T_STDERR")"
+    case "$word" in
+    ADVISORY) t_equals push_promotes_an_advisory_validation_bundle "0 1 no" "$line" ;;
+    SKIP) t_equals push_promotes_a_skip_validation_bundle "0 1 no" "$line" ;;
+    INCONCLUSIVE) t_equals push_refuses_an_inconclusive_bundle "1 0 yes" "$line" ;;
+    ERROR) t_equals push_refuses_an_error_bundle "1 0 yes" "$line" ;;
+    esac
+  done
+  rm -f "$state/registry.log"
   t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$T_BIN/px-cluster" push \
     "$T_K8S_OUT/no-bundle" --class validation
   t_equals push_refuses_a_missing_bundle "6 no" "$T_STATUS $(t_exists \

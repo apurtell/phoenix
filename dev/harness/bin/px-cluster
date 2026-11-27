@@ -267,10 +267,12 @@ about promote the images of a passing validation bundle
 + to the registry of the target, then render the
 + target deployment with their digests
 about BUNDLE is a path or a run id under $PX_OUT/runs of a run of the class
-+ validation with the result PASS; it must lie under PX_OUT. PX_K8S_TARGET names
-+ the target file, which sets PX_K8S_REGISTRY. The render takes the class as up
-+ does, and it needs one; it reads no cluster record. push builds nothing, never
-+ logs in and creates no secret.
++ validation with the result PASS, SKIP or ADVISORY, that is no check failed: a
++ SKIP check had no source, a functional check such as query_errors too. It must
++ lie under PX_OUT. PX_K8S_TARGET names the target file, which sets
++ PX_K8S_REGISTRY. The render takes the class as up does, and it needs one; it
++ reads no cluster record. push builds nothing, never logs in and creates no
++ secret.
 about A digest of the bundle is a local image ID, or the config digest of a local
 + image, as a run on px-k3d records it.
 output the rendered deployment directory, $PX_OUT/deploy-k8s/push-<run id>.
@@ -1741,9 +1743,12 @@ pc_push() {
     px_die "$PX_EXIT_FAIL" "cannot read $bundle/manifest.json"
   result="$(pb_json_get /run/result "$rows" || true)"
   class="$(pb_json_get /run/class "$rows" || true)"
-  if [ "$result" != PASS ] || [ "$class" != validation ]; then
+  # The gate is the exit code of the run result, not the word PASS: a result maps to 0 when no
+  # check failed. ADVISORY marks a timing verdict, and SKIP a check without a source, a functional
+  # check such as query_errors or rpc_calls too, so a promoted bundle can lack such a check.
+  if [ "$(px_verdict_exit "$result" || true)" != 0 ] || [ "$class" != validation ]; then
     px_die "$PX_EXIT_FAIL" "the bundle $bundle is a $class run with the result '$result':" \
-      "only a validation run with the result PASS promotes its images"
+      "only a validation run with the result PASS, SKIP or ADVISORY promotes its images"
   fi
   id="$(pb_json_get /run/id "$rows" || true)"
   [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
