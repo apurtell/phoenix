@@ -17481,6 +17481,13 @@ EOF
       bad="$bad $line;"
   done
   t_empty k7_three_datanodes_and_regionservers_spread_by_host "$bad"
+  line="$(printf '%s\n' "$docs" | sed 's/| */|/g' | grep '|kind: Deployment|' |
+    grep 'role: "pherf-agent"' || true)"
+  case "$line" in
+  *'|podAntiAffinity:|'*'|topologyKey: kubernetes.io/hostname|'*) line=yes ;;
+  *) line=no ;;
+  esac
+  t_equals k7_agents_spread_by_host yes "$line"
   rm -rf "$T_K8S_OUT/deploy-k8s/k7x"
   t_k8s "PX_K8S_TARGET=$target" "$T_BASH" "$PX_HOME/k8s/manifests.gen.sh" --class validation \
     --cluster k7x -e PX_PHERF=1 -e PX_IMAGE_TAG=phoenix-harness:selftest \

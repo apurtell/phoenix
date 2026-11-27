@@ -426,7 +426,9 @@ pxk_affinity() {
     return 0
   fi
   case "$1" in
-  datanode | regionserver) pxk_t affinity-spread 0 "PX_M_SELECTOR=$(pxk_labels 14 "$1")" ;;
+  datanode | regionserver | pherf-agent)
+    pxk_t affinity-spread 0 "PX_M_SELECTOR=$(pxk_labels 14 "$1")"
+    ;;
   *) pxk_t affinity-none 0 ;;
   esac
 }
@@ -587,7 +589,7 @@ EOF
   env=${env%"$PX_NL"}
   probes="$(pxk_t tier-container 4 "PX_M_VERB=$verb")" || exit $?
   pxk_t pod-spec 6 PX_M_RESTART=Always "PX_M_GRACE=$PX_TIMEOUT_STOP" \
-    "PX_M_AFFINITY=$(pxk_t affinity-none 0)" \
+    "PX_M_AFFINITY=$(pxk_affinity "$role" deployment)" \
     "PX_M_NODE_SELECTOR=$(pxk_list 2 "$PXK_NODE_SELECTOR" '{}')" \
     "PX_M_TOLERATIONS=$(pxk_list 2 "$PXK_TOLERATIONS")" \
     "PX_M_PULL_SECRETS=$(pxk_list 2 "$PXK_PULL_SECRETS")" \
