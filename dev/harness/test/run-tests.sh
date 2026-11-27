@@ -10811,11 +10811,12 @@ t_fixtures_a6() {
   mkdir -p "$T_A6/bin" "$T_A6/tools/async-profiler/bin" "$T_A6/tools/jhiccup" \
     "$T_A6/jdk/17/bin" "$T_A6/jdk-nojcmd/17/bin" "$T_A6/deploy" "$T_A6_STATE" "$T_A6_OUT"
   # The fake runtime executes container commands on the host and exports the target service in
-  # PX_FAKE_SERVICE. Only RegionServer instances report a running JVM process.
+  # PX_FAKE_SERVICE. Only RegionServer instances report a running JVM process, returning the PID
+  # recorded in the state directory's jvm-pid file when present.
   cat >"$T_A6/bin/pgrep" <<'A6_EOF'
 #!/usr/bin/env bash
 case "${PX_FAKE_SERVICE:-}" in
-regionserver*) printf '4242\n' ;;
+regionserver*) cat "$PX_FAKE_STATE_DIR/jvm-pid" 2>/dev/null || printf '4242\n' ;;
 *) exit 1 ;;
 esac
 A6_EOF
@@ -10850,10 +10851,14 @@ A6_EOF
   printf 'fake jHiccup\n' >"$T_A6/tools/jhiccup/jHiccup.jar"
   # Fake JDK binaries. The java shim logs its arguments; in attacher mode it writes the target
   # histogram log, and in control-JVM mode it writes its log, records its PID, and stays alive.
+  # By default, each generated log contains a header and a single interval. On the k-th attach to
+  # a service, the shim writes the interval count specified on line k of hiccup-<service>
+  # (repeating the final line for subsequent attaches) and appends the timestamp in milliseconds,
+  # the service name, and the log path to attach.log.
   cat >"$T_A6/jdk/17/bin/java" <<'A6_EOF'
 #!/usr/bin/env bash
 printf '%s %s\n' "${PX_FAKE_SERVICE:-}" "$*" >>"$PX_FAKE_STATE_DIR/java.log"
-log="" prev="" mode=""
+log="" prev="" mode="" count=1 calls=0
 for arg in "$@"; do
   [ "$prev" != -l ] || log=$arg
   case "$arg" in
@@ -10862,7 +10867,28 @@ for arg in "$@"; do
   esac
   prev=$arg
 done
-[ -z "$log" ] || printf '#[Histogram log format version 1.3]\n' >"$log"
+if [ "$mode" = attach ]; then
+  file="$PX_FAKE_STATE_DIR/hiccup-${PX_FAKE_SERVICE:-}"
+  calls=$(($(cat "$file.calls" 2>/dev/null || echo 0) + 1))
+  printf '%s\n' "$calls" >"$file.calls"
+  [ ! -f "$file" ] || count="$(awk -v n="$calls" 'NR <= n { v = $0 } END { print v }' "$file")"
+  ms="$(date -u '+%s%3N' 2>/dev/null)"
+  case "$ms" in
+  '' | *[!0-9]*) ms="$(gdate -u '+%s%3N' 2>/dev/null || printf '%s000' "$(date -u '+%s')")" ;;
+  esac
+  printf '%s %s %s\n' "$ms" "${PX_FAKE_SERVICE:-}" "$log" >>"$PX_FAKE_STATE_DIR/attach.log"
+fi
+if [ -n "$log" ]; then
+  {
+    printf '#[Histogram log format version 1.3]\n#[px fake attach %s]\n' "$calls"
+    printf '"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"\n'
+    n=0
+    while [ "$n" -lt "$count" ]; do
+      printf '%s.000,1.000,0.500,HISTFAAAAB\n' "$n"
+      n=$((n + 1))
+    done
+  } >"$log"
+fi
 if [ "$mode" = control ]; then
   printf '%s\n' "$$" >"$PX_FAKE_STATE_DIR/control.pid"
   exec sleep 30
@@ -11112,6 +11138,58 @@ t_a6_deletes() {
     / rmdir / { p = ""; for (i = 1; i < NF; i++) if ($i == "px-collect") { p = $(i + 1); break }
       n++; if ((p in f) && f[p] < NR) a++ }
     END { print n + 0, a + 0 }' "$T_SHIM_LOG"
+}
+
+## @description  Resets the A6 fake cluster and assigns the drain label to each RegionServer so a
+##               kill disruption recovers via a drain-aware restart.
+## @return       Reinitializes the A6 fake cluster state and exits with code 0.
+t_a6_drainable() {
+  t_a6_state_reset
+  awk -F '|' -v OFS='|' '$2 == "regionserver" { $12 = "regionmover" } { print }' \
+    "$T_A6_STATE/instances.txt" >"$T_A6_STATE/instances.new"
+  mv -f "$T_A6_STATE/instances.new" "$T_A6_STATE/instances.txt"
+}
+
+# Supplies the region mover command and RPC port required to recover from the kill disruption.
+## @description  Executes a validation px-run with hdr.sh on the A6 fake cluster, collecting hiccup
+##               telemetry and killing RegionServer 0 when steady@stub opens.
+## @return       Populates T_STATUS, T_STDOUT, and T_STDERR, and exits with code 0.
+t_a6_kill_run() {
+  t_a6 "PX_REGION_MOVER_CMD=$T_MOVER_CMD" PX_PORT_REGIONSERVER_RPC_0=16020 "$T_BASH" \
+    "$T_BIN/px-run" --class validation \
+    "${T_A6_RUN[@]}" --collect hiccup --disrupt 'phase:steady@stub,kill,regionserver,0' -- 2
+}
+
+# Reports yes when the second attach occurred at or after the recovery timestamp and wrote to
+# <instance>.2.hlog.
+## @description  Summarizes fake jHiccup attachments for an instance (bundle, instance, state
+##               directory defaulting to the A6 state directory) across run recovery.
+## @return       Writes "<recover state> <attaches> <yes|no>" to stdout and exits with code 0.
+t_a6_reattach() {
+  local state=${3:-$T_A6_STATE} recover
+  recover="$(awk -F '\t' '$1 == "recover" { print $4 " " $5 }' "$1/run-record.tsv")"
+  printf '%s ' "${recover#* }"
+  awk -v r="${recover%% *}" -v s="$2" '$2 == s { n++
+      if (n == 2) ok = (r != "" && $1 >= r && index($3, "/" s ".2.hlog") > 0) }
+    END { print n + 0, (ok ? "yes" : "no") }' "$state/attach.log" 2>/dev/null
+}
+
+## @description  Identifies the fake attach that produced a bundle jHiccup log (bundle, target) and
+##               counts its recorded intervals.
+## @return       Writes "attach <k> <intervals>" to stdout (or none without the log) and exits 0.
+t_a6_hlog() {
+  local file="$1/metrics/hiccup/$2.hlog"
+  [ -f "$file" ] || { printf 'none\n' && return 0; }
+  awk '/^#\[px fake attach / { a = $4; sub(/\]$/, "", a) } /^[0-9]/ { n++ }
+    END { print "attach " a " " n + 0 }' "$file"
+}
+
+## @description  Extracts the hiccup collector index entry for a target in a bundle (bundle,
+##               target).
+## @return       Writes "<status> <detail>" to stdout (or nothing without the row) and exits 0.
+t_a6_hiccup_row() {
+  awk -F '\t' -v t="$2" '$1 == "hiccup" && $2 == t { print $3 " " $5 }' \
+    "$1/metrics/index.tsv" 2>/dev/null
 }
 
 ## @description  Verifies the run-class collector defaults and opt-in flags (RQ-127) together with
@@ -11580,6 +11658,72 @@ $(grep -c . "$run/collect/started.tsv" 2>/dev/null) $(find "$run/logs" -name 'co
   printf 'gc\tx\tok\t../out\t\n' >>"$copy/metrics/index.tsv"
   t_validate "$copy"
   t_equals bundle_refuses_a_bad_collector_row fail "$(t_check_status "$T_STDOUT" collectors)"
+  # Per the owner decision of 2026-11-26 (K6b defect 2), once recovery from a kill or restart
+  # disruption completes, jHiccup attaches to the replacement JVM and writes to a distinct log file
+  # so that the first JVM's log is preserved. Here, the initial JVM terminates before recording its
+  # first interval, reproducing the live failure mode.
+  t_a6_drainable
+  printf '0\n2\n' >"$T_A6_STATE/hiccup-regionserver-0"
+  t_a6_kill_run
+  run="$(t_bundle)"
+  t_equals hiccup_attaches_the_replacement_after_its_recovery "0 ok 2 yes" "$T_STATUS $(
+    t_a6_reattach "$run" regionserver-0)"
+  t_equals hiccup_keeps_the_log_of_each_jvm "attach 1 0|attach 2 2|attach 1 1" \
+    "$(t_a6_hlog "$run" regionserver-0)|$(t_a6_hlog "$run" regionserver-0.2)|$(t_a6_hlog \
+      "$run" regionserver-1)"
+  t_equals hiccup_of_a_replaced_instance_reads_its_replacement \
+    "skip the JVM was replaced before its first interval|ok the jHiccup log, 2 intervals|PASS" \
+    "$(t_a6_hiccup_row "$run" regionserver-0)|$(t_a6_hiccup_row "$run" regionserver-0.2)|$(
+      t_severity_of "$run" collector.hiccup)"
+  t_validate "$run"
+  t_equals hiccup_bundle_of_a_replacement_validates "0 present true present false" \
+    "$T_STATUS $(t_inventory "$run" metrics/hiccup/regionserver-0.2.hlog) $(t_inventory "$run" \
+      metrics/hiccup/regionserver-0.hlog)"
+  # If the replacement JVM's log contains only a header, the replaced instance lacks post-recovery
+  # data; the collector verdict becomes ADVISORY, while the intervals captured from the first JVM
+  # remain preserved in the bundle.
+  t_a6_drainable
+  printf '1\n0\n' >"$T_A6_STATE/hiccup-regionserver-0"
+  t_a6_kill_run
+  run="$(t_bundle)"
+  t_equals hiccup_replacement_without_data_is_advisory "0 attach 1 1|ok|fail the jHiccup log\
+ holds no interval|ADVISORY 1 of 6 targets failed, the first regionserver-0.2: the jHiccup log\
+ holds no interval" "$T_STATUS $(t_a6_hlog "$run" regionserver-0)|$(t_a6_hiccup_row "$run" \
+    regionserver-0 | cut -d' ' -f1)|$(t_a6_hiccup_row "$run" regionserver-0.2)|$(t_detail_of \
+    "$run" collector.hiccup)"
+  # A header-only log from an instance that was never replaced by a recovery never yields PASS.
+  t_a6_state_reset
+  printf '0\n' >"$T_A6_STATE/hiccup-regionserver-1"
+  t_a6_run validation --collect hiccup -- 1
+  run="$(t_bundle)"
+  t_equals hiccup_header_only_log_is_not_pass \
+    "0 1|fail the jHiccup log holds no interval|ADVISORY" "$T_STATUS $(grep -c \
+      ' regionserver-0 ' "$T_A6_STATE/attach.log")|$(t_a6_hiccup_row "$run" \
+      regionserver-1)|$(t_severity_of "$run" collector.hiccup)"
+  # Because a signal disruption leaves the existing JVM process running, its recover row does not
+  # trigger a reattachment. Here, the QUIT signal is sent to a process configured to ignore it.
+  t_a6_state_reset
+  (trap '' QUIT && exec sleep 30) &
+  pid=$!
+  printf '%s\n' "$pid" >"$T_A6_STATE/jvm-pid"
+  t_a6_run validation --collect hiccup --disrupt 'phase:steady@stub,signal,regionserver,0,QUIT' \
+    -- 2
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  run="$(t_bundle)"
+  t_equals hiccup_signal_recovery_keeps_one_attach "0 1 1 none|PASS" "$T_STATUS $(grep -c \
+    '^recover' "$run/run-record.tsv") $(grep -c ' regionserver-0 ' "$T_A6_STATE/attach.log") $(
+    t_a6_hlog "$run" regionserver-0.2)|$(t_severity_of "$run" collector.hiccup)"
+  # When a kill disruption completes recovery before collection starts, the initial attach
+  # instruments the replacement JVM without triggering a second attach.
+  t_a6_drainable
+  t_a6 "PX_REGION_MOVER_CMD=$T_MOVER_CMD" PX_PORT_REGIONSERVER_RPC_0=16020 "$T_BASH" \
+    "$T_BIN/px-run" --class validation \
+    "${T_A6_RUN[@]}" --collect hiccup --disrupt 'phase:snapshot_pre,kill,regionserver,0' -- 1
+  run="$(t_bundle)"
+  t_equals hiccup_recovery_before_collection_keeps_one_attach "0 ok 1 no|attach 1 1|none|PASS" \
+    "$T_STATUS $(t_a6_reattach "$run" regionserver-0)|$(t_a6_hlog "$run" regionserver-0)|$(
+      t_a6_hlog "$run" regionserver-0.2)|$(t_severity_of "$run" collector.hiccup)"
   # RQ-132: A validation run with the host sampler opted in records one row per second, tagging
   # every sample row with the run class and host contamination state.
   t_a6_state_reset
@@ -14993,7 +15137,7 @@ $(grep -c '^data-datanode-' "$T_K8S_STATE/k8s-pvc.txt") $(grep -c '^datanode-' \
 ##               backend (RQ-274, RQ-275).
 ## @return       Records test assertions. Exit 0.
 t_group_k1_faults() {
-  local base record calls
+  local base record calls uid
   printf '# K1: faults on the Kubernetes backend\n'
   # Verify that a drain-aware restart unloads regions via tooling 0, deletes the target pod, waits
   # for a replacement pod to be created and pass readiness, and reloads regions (RQ-275).
@@ -15106,6 +15250,27 @@ t_group_k1_faults() {
   t_equals k8s_scheduled_kill_restart_is_planned "planned" "$(printf '%s\n' "$record" |
     awk -F '\t' '$1 == "diff" && $2 == "regionserver" { print $6 }')"
   t_equals k8s_scheduled_kill_run_names_the_backend k8s "$(t_manifest "$base" /run/backend)"
+  # Verify K6b defect 2 on the Kubernetes backend: a restart replaces the pod and changes its uid.
+  # Once recovery completes, jHiccup attaches to the JVM in the replacement pod, while the initial
+  # JVM's log—which ended before its first interval—persists on the tmp volume claim until stop
+  # retrieves it.
+  t_k8s_seed "$T_K1_A5" "$PX_OUT"
+  printf '0\n2\n' >"$T_K1_A5/hiccup-regionserver-0"
+  uid="$(awk -F '|' '$1 == "regionserver-0" { print $2 }' "$T_K1_A5/k8s-pods.txt")"
+  t_k1_a5 "PATH=$T_A6/bin:$T_A5/bin:$T_SHIM_DIR:$PATH" "PX_TOOLS_DIR=$T_A6/tools" \
+    "PX_JDK_ROOT=$T_A6/jdk" "$T_BASH" "$T_BIN/px-run" --backend k8s --class validation \
+    -e PX_SCOPE_ID=fake/px-selftest --collect hiccup "$T_WORK/drivers/phase-kill.sh" \
+    --disrupt 'phase:phase@kill,restart,regionserver,0'
+  base="$(t_bundle)"
+  t_equals k8s_hiccup_attaches_the_new_pod "0 ok 2 yes uid-regionserver-0 no" "$T_STATUS $(
+    t_a6_reattach "$base" regionserver-0 "$T_K1_A5") $uid $(awk -F '|' '$1 == "regionserver-0" {
+      print ($2 == u) ? "yes" : "no" }' "u=$uid" "$T_K1_A5/k8s-pods.txt")"
+  t_equals k8s_hiccup_reads_the_new_pod "attach 1 0|attach 2 2|skip ok|PASS" \
+    "$(t_a6_hlog "$base" regionserver-0)|$(t_a6_hlog "$base" regionserver-0.2)|$(
+      t_a6_hiccup_row "$base" regionserver-0 | cut -d' ' -f1) $(t_a6_hiccup_row "$base" \
+      regionserver-0.2 | cut -d' ' -f1)|$(t_severity_of "$base" collector.hiccup)"
+  t_equals k8s_hiccup_leaves_no_control_jvm no "$(t_a6_alive "$(cat "$T_K1_A5/control.pid" \
+    2>/dev/null)")"
 }
 
 ## @description  Verifies that unmodified drivers and cluster checks run on the Kubernetes backend

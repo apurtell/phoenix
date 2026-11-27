@@ -207,8 +207,8 @@ single variable, or if a host stall occurs in the control JVM during only one of
    trace      start           ok    traces/start.tsv                    160 counters
    trace      stop            ok    traces/stop.tsv                     160 counters
    trace      counters        ok    traces/counters.tsv                 the change of each ...
-   hiccup     control         ok    metrics/hiccup/control.hlog         the idle control JVM
-   hiccup     regionserver-0  ok    metrics/hiccup/regionserver-0.hlog  the jHiccup log
+   hiccup     control         ok    metrics/hiccup/control.hlog         the log of the idle ...
+   hiccup     regionserver-0  ok    metrics/hiccup/regionserver-0.hlog  the jHiccup log, 18 ...
    host       host            ok    metrics/host.tsv                    34 samples
    container  client-0        ok    metrics/container/client-0.tsv      34 samples
    container  regionserver-0  ok    metrics/container/regionserver-0.tsv  34 samples

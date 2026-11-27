@@ -111,6 +111,10 @@ COLLECT_VERB=0
 COLLECT_WAIT=0
 HICCUP_LIVE=""
 HICCUP_CONTROL=0
+HICCUP_TARGETS=""
+HICCUP_JVMS=""
+HICCUP_RECOVERS=0
+HICCUP_START_MS=0
 
 px_cli_spec <<'EOF'
 about Collects profiles, recordings, counters and samples by hand: the collectors
@@ -129,6 +133,8 @@ about start collectors in a bundle or a collection
 about Without BUNDLE, start joins the active collection of the cluster, or creates
 + $PX_OUT/collect/<run id>. It records what it started in collect/started.tsv and
 + returns; the samplers run in the background until stop or --duration.
+about When px-run recovers a target from a kill or a restart, hiccup attaches
++ to its new JVM.
 opt --collect LIST PX_COLLECTORS | the collectors to start, comma separated,
 + required unless PX_COLLECTORS is set
 opt --targets LIST PX_COLLECT_TARGETS | the roles to target, comma separated, default
@@ -227,6 +233,10 @@ EOF
 ## @description  Executes a single sampling pass across every active periodic sampler.
 ## @return       Returns exit code 0.
 collect_pass() {
+  if collect_in hiccup "$COLLECT_SAMPLERS"; then
+    PX_RECORD_SOURCE=collector:hiccup
+    collect_hiccup_recovered
+  fi
   if collect_in host "$COLLECT_SAMPLERS"; then
     collect_host_pass
   fi
@@ -238,25 +248,83 @@ collect_pass() {
   fi
 }
 
+# The n-th JVM of an instance writes to hiccup/<role>-<index>.hlog when n = 1, and to
+# hiccup/<role>-<index>.<n>.hlog otherwise, ensuring that the log of a replaced JVM is preserved
+# across its replacement.
+## @description  Attaches jHiccup to the n-th daemon JVM of a target instance (role, index, jdk,
+##               n) for the remainder of the collection duration.
+## @return       Returns exit code 0.
+collect_hiccup_attach() {
+  local role=$1 index=$2 jdk=$3 n=$4 name="$1-$2" status=0 left
+  [ "$n" = 1 ] || name="$name.$n"
+  left=$((COLLECT_DURATION * 1000 - $(px_epoch_ms) + HICCUP_START_MS))
+  [ "$left" -ge 1 ] || left=1
+  ck_jvm_exec "$role" "$index" "$HICCUP_ATTACH_SCRIPT" "$jdk" "$CK_REMOTE/hiccup/$name.hlog" \
+    "$((COLLECT_INTERVAL * 1000))" "$left" || status=$?
+  if [ "$status" = 0 ]; then
+    HICCUP_LIVE="$HICCUP_LIVE$role$PX_TAB$index$PX_TAB$n$PX_NL"
+  elif [ "$n" = 1 ]; then
+    ck_outcome hiccup "$name" "$status" "" "the jHiccup attach" || true
+  else
+    pb_collector hiccup "$name" fail "" "the jHiccup attach to the replacement JVM of" \
+      "$role-$index ended with exit $status"
+  fi
+}
+
+## @description  Reports the sequence number of the latest JVM for a target instance (role-index).
+## @return       Writes the number to stdout (1 if no recovery replaced the instance) and exits 0.
+collect_hiccup_jvm() {
+  printf '%s' "$HICCUP_JVMS" | awk -F '\t' -v t="$1" '$1 == t { n = $2 } END { print n ? n : 1 }'
+}
+
+# A recover row written by px-run in run-record.tsv indicates that the recovery gate for a
+# disruption has completed. Because only a kill or restart action launches a new JVM, only those
+# recover rows trigger a reattachment. Rows already recorded in HICCUP_RECOVERS are skipped, and a
+# collection without a run record has none.
+## @description  Attaches jHiccup to the replacement JVM of every target instance that has
+##               completed recovery from a kill or restart disruption since the last check.
+## @return       Returns exit code 0.
+collect_hiccup_recovered() {
+  local file="$PX_RUN_DIR/run-record.tsv" rows tag role index jdk n
+  [ -f "$file" ] || return 0
+  rows="$(awk -F '\t' -v seen="$HICCUP_RECOVERS" '
+    $1 == "disrupt" && !($2 in act) { act[$2] = $5; who[$2] = $6 "\t" $7 }
+    $1 == "recover" && ++n > seen && (act[$2] == "kill" || act[$2] == "restart") {
+      print "new\t" who[$2] }
+    END { print "seen\t" n + 0 }' "$file" 2>/dev/null)" || return 0
+  while IFS="$PX_TAB" read -r tag role index; do
+    case "$tag" in
+    seen) HICCUP_RECOVERS=$role ;;
+    new)
+      jdk="$(printf '%s' "$HICCUP_TARGETS" | awk -F '\t' -v r="$role" -v i="$index" \
+        '$1 == r && $2 == i { print $3 }')"
+      [ -n "$jdk" ] || continue
+      n=$(($(collect_hiccup_jvm "$role-$index") + 1))
+      HICCUP_JVMS="$HICCUP_JVMS$role-$index$PX_TAB$n$PX_NL"
+      collect_hiccup_attach "$role" "$index" "$jdk" "$n"
+      ;;
+    esac
+  done <<EOF
+$rows
+EOF
+}
+
+# Any recover rows recorded before the initial attach are marked as already seen, because the
+# initial attach pass directly instruments the JVMs launched by those earlier recoveries.
 ## @description  Attaches jHiccup to the daemon JVM of each target instance and starts the idle
 ##               control JVM in tooling 0, bounding both by the collection duration.
 ## @return       Returns exit code 0, or exits with code 6 when the bundle has no services.tsv.
 collect_hiccup_start() {
-  local rows role index jdk status interval=$((COLLECT_INTERVAL * 1000))
+  local role index jdk status interval=$((COLLECT_INTERVAL * 1000))
   local limit=$((COLLECT_DURATION * 1000))
-  rows="$(ck_targets "$COLLECT_TARGETS")" || exit "$?"
+  HICCUP_START_MS="$(px_epoch_ms)"
+  collect_hiccup_recovered
+  HICCUP_TARGETS="$(ck_targets "$COLLECT_TARGETS")" || exit "$?"
   while IFS="$PX_TAB" read -r role index jdk; do
     [ -n "$role" ] || continue
-    status=0
-    ck_jvm_exec "$role" "$index" "$HICCUP_ATTACH_SCRIPT" "$jdk" \
-      "$CK_REMOTE/hiccup/$role-$index.hlog" "$interval" "$limit" || status=$?
-    if [ "$status" = 0 ]; then
-      HICCUP_LIVE="$HICCUP_LIVE$role$PX_TAB$index$PX_NL"
-    else
-      ck_outcome hiccup "$role-$index" "$status" "" "the jHiccup attach" || true
-    fi
+    collect_hiccup_attach "$role" "$index" "$jdk" 1
   done <<EOF
-$rows
+$HICCUP_TARGETS
 EOF
   jdk="$(ck_targets tooling | awk -F '\t' '$2 == 0 { print $3 }')" || jdk=""
   status=$PX_EXIT_NO_OBJECT
@@ -272,24 +340,55 @@ EOF
   fi
 }
 
+# In a jHiccup log, each interval line begins with a timestamp after an optional Tag= field, while
+# header lines start with # or a quotation mark. A log without intervals is never marked ok: it is
+# recorded as skip when a later JVM replaced that instance, and as fail otherwise, yielding an
+# ADVISORY collector verdict.
+## @description  Writes the index row for a copied jHiccup log (target, file, what, replaced) as ok
+##               when it contains an interval, skip when replaced is 1, or fail otherwise.
+## @return       Returns exit code 0.
+collect_hiccup_row() {
+  local count
+  count="$(awk '/^(Tag=[^,]*,)?[0-9]/ { n++ } END { print n + 0 }' "$PX_RUN_DIR/$2")" || count=0
+  if [ "$count" -gt 0 ]; then
+    pb_collector hiccup "$1" ok "$2" "$3, $count intervals"
+  elif [ "$4" = 1 ]; then
+    pb_collector hiccup "$1" skip "$2" "the JVM was replaced before its first interval"
+  else
+    pb_collector hiccup "$1" fail "$2" "$3 holds no interval"
+  fi
+}
+
 ## @description  Terminates the idle control JVM, copies each jHiccup log into metrics/hiccup/, and
 ##               records its entry in the collector index.
 ## @return       Returns exit code 0.
 collect_hiccup_stop() {
-  local role index status file
+  local role index n name status file replaced
   if [ "$HICCUP_CONTROL" = 1 ]; then
     ck_exec tooling 0 "$HICCUP_KILL_SCRIPT" "$CK_REMOTE/hiccup/control.pid" || true
     file=metrics/hiccup/control.hlog
     status=0
     ck_fetch tooling 0 hiccup/control.hlog "$file" || status=$?
-    ck_outcome hiccup control "$status" "$file" "the idle control JVM" || true
+    if [ "$status" = 0 ]; then
+      collect_hiccup_row control "$file" "the log of the idle control JVM" 0
+    else
+      ck_outcome hiccup control "$status" "$file" "the idle control JVM" || true
+    fi
   fi
-  while IFS="$PX_TAB" read -r role index; do
+  while IFS="$PX_TAB" read -r role index n; do
     [ -n "$role" ] || continue
-    file="metrics/hiccup/$role-$index.hlog"
+    name="$role-$index"
+    [ "$n" = 1 ] || name="$name.$n"
+    file="metrics/hiccup/$name.hlog"
     status=0
-    ck_fetch "$role" "$index" "hiccup/$role-$index.hlog" "$file" || status=$?
-    ck_outcome hiccup "$role-$index" "$status" "$file" "the jHiccup log" || true
+    ck_fetch "$role" "$index" "hiccup/$name.hlog" "$file" || status=$?
+    if [ "$status" = 0 ]; then
+      replaced=0
+      [ "$(collect_hiccup_jvm "$role-$index")" = "$n" ] || replaced=1
+      collect_hiccup_row "$name" "$file" "the jHiccup log" "$replaced"
+    else
+      ck_outcome hiccup "$name" "$status" "$file" "the jHiccup log" || true
+    fi
   done <<EOF
 $HICCUP_LIVE
 EOF

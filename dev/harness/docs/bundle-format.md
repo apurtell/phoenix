@@ -63,6 +63,7 @@ runs/<run-id>/
   metrics/host.tsv              the host samples of px-collect                     optional
   metrics/container/<role>-<index>.tsv  the samples of one instance               optional
   metrics/hiccup/<role>-<index>.hlog    the jHiccup log of one target JVM         optional
+  metrics/hiccup/<role>-<index>.<n>.hlog  the log of the n-th JVM of a target    optional
   metrics/hiccup/control.hlog   the jHiccup log of the idle control JVM            optional
   cluster/images.tsv            the image of each instance
   cluster/topology.env          the topology and version record of the deployment
@@ -465,14 +466,38 @@ missing async-profiler or jHiccup binary). The output file named by an `ok` row 
 path in the artifact inventory, so any missing file from a successful collection causes
 `px-bundle validate` to fail. For any other status, the artifact file is treated as optional: if
 stopping a `profile` or `jfr` session fails, the collector still retrieves whatever partial
-recording was produced and logs it under a `fail` row.
+recording was produced and logs it under a `fail` row. A retrieved jHiccup log is recorded as `ok`
+only when it contains at least one interval line, with the detail field reporting the total interval
+count. A log containing only header lines is marked `skip`
+("the JVM was replaced before its first interval") if the sampler subsequently attached—or attempted
+to attach—to a later JVM on the same instance, and `fail` ("holds no interval") otherwise; as a
+result, both the control JVM log and the log from the latest JVM of each target instance must
+contain recorded intervals. A failed attempt to attach to a replacement JVM produces its own `fail`
+row under the target `<role>-<index>.<n>` with no artifact file.
+
+**jHiccup across a recovery.** At collection startup, the `hiccup` sampler attaches jHiccup to the
+daemon JVM of each target instance. When `px-run` injects a `kill` or `restart` disruption, that
+JVM is replaced: Compose restarts the container in place, whereas Kubernetes recreates the pod with
+a new uid. During each sampling pass, the sampler inspects the `recover` rows of `run-record.tsv`,
+and for each new entry from a `kill` or `restart` disruption on a target instance, it attaches
+jHiccup to the replacement JVM now running in that instance, regardless of the recovery outcome and
+bounded by the remaining `--duration`. Any recover rows recorded before collection begins are
+treated as already processed, and a standalone collection without a run record attaches only once at
+startup. The n-th JVM of an instance writes to a dedicated log file so that output from each
+replaced JVM is preserved: the first JVM writes `<role>-<index>.hlog`, and each subsequent JVM from
+the second onward writes `<role>-<index>.<n>.hlog` under the matching index target name. Because
+remote staging files persist across the restart—in the container's writable layer on Compose or on
+the pod's `tmp` claim on Kubernetes—the stop operation retrieves every log.
 
 **The verdict.** Each collector emits a single verdict row under `collector.<name>` with evidence
 class `none` and source `collector:<name>`, recording `ADVISORY` if any target row failed, `PASS` if
-no row failed and at least one row succeeded with `ok`, or `SKIP` otherwise. A sampler that fails to
-start or stop within its timeout bound likewise records `ADVISORY`, and `px-run` emits an `ADVISORY`
+no row failed and at least one row succeeded with `ok`, or `SKIP` otherwise. Consequently, a
+header-only jHiccup log never yields a `PASS` verdict: it results in `ADVISORY` unless a subsequent
+replacement JVM for that instance recorded interval data, whereas a target instance to which jHiccup
+could never attach remains a `skip` row carrying its skip reason. A sampler that fails to start or
+stop within its timeout bound similarly records `ADVISORY`, and `px-run` records an `ADVISORY`
 verdict for each configured collector whenever `px-collect start` or `stop` exits with a status code
-other than 0 or 1. Collectors never emit `FAIL` or `ERROR` verdicts, ensuring that lost telemetry
+other than 0 or 1. Collectors never produce `FAIL` or `ERROR` verdicts, ensuring that lost telemetry
 never causes a workload run to fail.
 
 **The bounds.** Every `px-collect` invocation launched by `px-run` budgets one `PX_TIMEOUT_VERB`
